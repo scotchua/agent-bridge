@@ -2765,6 +2765,45 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_platform_guard() -> None:
+    """An unsupported platform must refuse with an explanation, not degrade."""
+    print("\n[platform guard]")
+    import agent_bridge as pkg
+
+    check("PG: this platform is supported", pkg.platform_supported())
+
+    # Simulate a non-POSIX platform without needing one.
+    real = os.name
+    try:
+        os.name = "nt"
+        try:
+            pkg.assert_platform_supported()
+            check("PG: a non-POSIX platform is refused", False, "it was allowed")
+        except RuntimeError as exc:
+            message = str(exc)
+            check("PG: a non-POSIX platform is refused", True)
+            check("PG: the message names the platform requirement",
+                  "POSIX" in message and "macOS or Linux" in message)
+            check("PG: it points at WSL rather than leaving them stuck",
+                  "WSL" in message)
+            check("PG: it explains that the gaps are safety machinery",
+                  "safety machinery" in message)
+            check("PG: and warns against stubbing the missing modules",
+                  "stubbing" in message and "worse than not running" in message)
+            for requirement in ("fcntl", "killpg", "fchmod", "selectors"):
+                check(f"PG: it names {requirement} specifically",
+                      requirement in message)
+    finally:
+        os.name = real
+    check("PG: the guard is restored afterwards", pkg.platform_supported())
+
+    # The guard must run at package import, before any submodule can fail on a
+    # missing module with an unhelpful error.
+    source = inspect.getsource(pkg)
+    check("PG: the check runs at import time, not on first use",
+          source.rstrip().endswith("assert_platform_supported()"))
+
+
 def main() -> int:
     test_contract_accepted_by_both_peers()
     test_tool_exposure()
@@ -2773,6 +2812,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_platform_guard()
     test_external_review_findings()
     test_per_peer_classification_limits()
     test_output_cap()

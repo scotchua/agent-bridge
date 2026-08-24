@@ -6,7 +6,12 @@ not, that is a bug worth reporting.
 
 ## What you need first
 
-- **macOS or Linux.** Windows is untested.
+- **macOS or Linux.** Windows is not supported. The tool refuses to start
+  there, because the things it would be missing are the ones that make its
+  safety promises true, not conveniences. If you are on Windows, install
+  [WSL](https://learn.microsoft.com/windows/wsl/install) and follow these steps
+  inside the Linux environment. Everything works there; it is what half the
+  automated tests run on.
 - **Python 3.11 or newer.** Check with `python3 --version`. No packages to
   install: this uses only the standard library on purpose, so there is nothing
   to keep updated and nothing new to trust.

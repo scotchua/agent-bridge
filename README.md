@@ -237,8 +237,23 @@ stays a decision a person makes.
 
 ## Requirements
 
-Python 3.11+, the Claude Code CLI, the Codex CLI. No third-party Python
-packages, deliberately: the audit surface is this repository and nothing else.
+**macOS or Linux.** Python 3.11+, the Claude Code CLI, the Codex CLI. No
+third-party Python packages, deliberately: the audit surface is this repository
+and nothing else.
+
+**Windows is not supported, and this is a refusal rather than an omission.**
+The bridge depends on POSIX facilities that carry its guarantees: `fcntl`
+advisory locking for every lock it takes, process groups for terminating a peer
+and everything it spawned, `fchmod` for the owner-only permissions on all state,
+and `selectors` over pipes for reading peer output while enforcing size caps
+(Windows `select` supports sockets only). Importing the package on a non-POSIX
+platform raises with that explanation.
+
+Please do not work around it by stubbing the missing modules. That produces a
+build where locking silently does nothing, a runaway peer cannot be terminated,
+and state files are not owner-only, while the documentation still promises all
+three. **On Windows, use WSL** and install inside the Linux environment; the
+Linux build is covered by CI.
 
 Built and measured against `claude 2.1.229` and `codex-cli 0.147.0` on macOS.
 Several documented behaviours are version-specific, which is why setup pins your
