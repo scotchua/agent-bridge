@@ -127,6 +127,17 @@ def main(argv: list[str] | None = None) -> int:
     problems: list[str] = []
 
     print("agent-bridge setup\n" + "=" * 60)
+
+    # Catch a state root that cannot keep permissions before anything is
+    # written to it. On WSL this is the /mnt/c mistake.
+    from .errors import BrokerError, hint as error_hint
+    try:
+        perms = preflight.assert_state_root_secure(config.Config(defaults, "setup"))
+        print(f"\nstate root: {perms['state_root']}  "
+              f"(dir {perms['directory_mode']}, files {perms['file_mode']})")
+    except BrokerError as exc:
+        print(f"\nSTATE ROOT PROBLEM\n  {error_hint(exc.category)}")
+        problems.append("state root does not keep owner-only permissions")
     for peer in ("claude", "codex"):
         forced = getattr(args, peer)
         candidates = [os.path.expanduser(forced)] if forced else find_all(peer)

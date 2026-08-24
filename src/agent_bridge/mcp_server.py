@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from . import broker, store
 from .config import Config, load as load_config
-from .errors import BrokerError, ErrorCategory
+from .errors import BrokerError, ErrorCategory, hint
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agent-bridge"
@@ -331,6 +331,15 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     for directory in ("ledger", "conversations", "jobs", "workspaces", "quarantine"):
         store.secure_mkdir(cfg.state(directory))
+    # Fail at startup rather than writing history somewhere that cannot keep it
+    # private. A server that started and then quietly stored readable state
+    # would be worse than one that refused.
+    from . import preflight
+    try:
+        preflight.assert_state_root_secure(cfg)
+    except BrokerError as exc:
+        sys.stderr.write(f"agent-bridge: {hint(exc.category)}\n")
+        return 2
     return Server(args.caller, cfg).serve()
 
 

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from typing import Any
 
+from . import store
 from .config import Config
 from .errors import BrokerError, ErrorCategory
 
@@ -93,6 +94,42 @@ def check_peer(cfg: Config, peer: str) -> dict[str, Any]:
         "allowed_versions": allowed,
         "version_pinned": bool(allowed),
     }
+
+
+def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
+    """Confirm the state root actually honours owner-only permissions.
+
+    Every guarantee about state being readable only by you rests on chmod
+    working. On some filesystems it does not: notably WSL's DrvFs, which is what
+    you get if the state root ends up under /mnt/c. There, chmod appears to
+    succeed and the mode does not stick, so the promise would be quietly false
+    rather than loudly broken. That is the failure mode this project refuses
+    everywhere else, so it refuses here too.
+
+    Returns a small report for diagnostics. Raises if the filesystem cannot
+    hold the permissions this tool documents.
+    """
+    root = store.secure_mkdir(cfg.state_root)
+    observed_dir = os.stat(root).st_mode & 0o777
+    probe_path = os.path.join(root, ".permission-probe")
+    observed_file = None
+    try:
+        store.atomic_write_bytes(probe_path, b"probe\n")
+        observed_file = os.stat(probe_path).st_mode & 0o777
+    finally:
+        try:
+            os.unlink(probe_path)
+        except OSError:
+            pass
+    report = {
+        "state_root": root,
+        "directory_mode": oct(observed_dir),
+        "file_mode": oct(observed_file) if observed_file is not None else None,
+        "honours_permissions": observed_dir == 0o700 and observed_file == 0o600,
+    }
+    if not report["honours_permissions"]:
+        raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
+    return report
 
 
 def assert_workspace_clean(workspace: str, stop_at: str | None = None,

@@ -37,6 +37,7 @@ class ErrorCategory(str, enum.Enum):
     PREFLIGHT_SCHEMA_MISSING = "preflight_schema_missing"
     WORKSPACE_CONTAMINATED = "workspace_contaminated"
     WORKSPACE_UNVERIFIABLE = "workspace_unverifiable"
+    STATE_ROOT_INSECURE = "state_root_insecure"
     PEER_HOME_CONFIG_PRESENT = "peer_home_config_present"
     PEER_AUTH_FAILURE = "peer_auth_failure"
 
@@ -85,6 +86,7 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.PREFLIGHT_SCHEMA_MISSING,
     ErrorCategory.WORKSPACE_CONTAMINATED,
     ErrorCategory.WORKSPACE_UNVERIFIABLE,
+    ErrorCategory.STATE_ROOT_INSECURE,
     ErrorCategory.PEER_HOME_CONFIG_PRESENT,
     ErrorCategory.PEER_AUTH_FAILURE,
     ErrorCategory.PEER_CONTRACT_VERSION_MISMATCH,
@@ -147,6 +149,12 @@ _HINTS: dict[ErrorCategory, str] = {
     ErrorCategory.PREFLIGHT_SCHEMA_MISSING: "Response contract schema file was not found.",
     ErrorCategory.WORKSPACE_CONTAMINATED: (
         "Isolated workspace or an ancestor contains agent instruction files."
+    ),
+    ErrorCategory.STATE_ROOT_INSECURE: (
+        "The state directory is on a filesystem that does not keep owner-only "
+        "permissions, so consultation history would not be private. On WSL "
+        "this means the state root is under /mnt/c; move it into the Linux "
+        "filesystem, for example ~/.agent-bridge."
     ),
     ErrorCategory.WORKSPACE_UNVERIFIABLE: (
         "An ancestor of the isolated workspace could not be enumerated, so it "

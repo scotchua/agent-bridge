@@ -6,12 +6,9 @@ not, that is a bug worth reporting.
 
 ## What you need first
 
-- **macOS or Linux.** Windows is not supported. The tool refuses to start
-  there, because the things it would be missing are the ones that make its
-  safety promises true, not conveniences. If you are on Windows, install
-  [WSL](https://learn.microsoft.com/windows/wsl/install) and follow these steps
-  inside the Linux environment. Everything works there; it is what half the
-  automated tests run on.
+- **macOS or Linux.** Windows is not supported directly. See
+  [Windows: use WSL](#windows-use-wsl) below, which is a short detour and then
+  these same instructions.
 - **Python 3.11 or newer.** Check with `python3 --version`. No packages to
   install: this uses only the standard library on purpose, so there is nothing
   to keep updated and nothing new to trust.
@@ -21,12 +18,58 @@ not, that is a bug worth reporting.
 Both CLIs are paid products on their own subscriptions. This tool does not
 change what they cost; it just lets them talk to each other.
 
+## Windows: use WSL
+
+The tool refuses to start on Windows, because what it would be missing there
+are the pieces that make its safety promises true rather than conveniences.
+WSL is Microsoft's official way to run Linux inside Windows, and inside it
+everything works normally. Half of this project's automated tests run on Linux
+on every change, so this is the supported path and not a workaround.
+
+**1. Install WSL.** Open PowerShell as Administrator and run:
+
+```
+wsl --install
+```
+
+Reboot when it asks. On first launch it will ask you to create a Linux username
+and password. That password is only for Linux and is separate from your Windows
+login. Microsoft's own guide is at
+<https://learn.microsoft.com/windows/wsl/install>.
+
+**2. Open the Linux terminal.** Search your Start menu for "Ubuntu", or run
+`wsl` from PowerShell. Everything from here happens in that window, not in
+PowerShell or Command Prompt.
+
+**3. Install the two CLIs INSIDE Linux.** This is the step people get wrong.
+A Claude or Codex CLI installed on Windows is not visible to the Linux side.
+Install both from inside the Ubuntu window, following each vendor's Linux
+instructions, and sign in from there too. When you sign in, the browser window
+that opens is your normal Windows browser, which is expected.
+
+**4. Keep everything on the Linux side of the filesystem.** Do not put this
+tool, or its state directory, under `/mnt/c` or any other `/mnt/` path. Those
+are your Windows drives seen from Linux, and they do not keep Linux file
+permissions: the tool would ask for owner-only and silently get
+world-readable. Consultation history would not be private.
+
+The tool checks this at startup and refuses rather than storing your history
+somewhere it cannot protect. If you see a message about the state directory not
+keeping owner-only permissions, this is why. Your Linux home directory, which
+is where you start, is the right place, and the default `~/agent-bridge` and
+`~/.agent-bridge` are already correct.
+
+Then continue with step 1 below, in the Ubuntu window.
+
 ## 1. Get the code
 
 ```
 git clone https://github.com/scotchua/agent-bridge.git ~/agent-bridge
 cd ~/agent-bridge
 ```
+
+On WSL, `~` is your Linux home directory, which is correct. Do not substitute a
+`/mnt/c/...` path here.
 
 ## 2. Find and pin your CLIs
 

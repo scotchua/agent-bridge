@@ -252,8 +252,12 @@ platform raises with that explanation.
 Please do not work around it by stubbing the missing modules. That produces a
 build where locking silently does nothing, a runaway peer cannot be terminated,
 and state files are not owner-only, while the documentation still promises all
-three. **On Windows, use WSL** and install inside the Linux environment; the
-Linux build is covered by CI.
+three. **On Windows, use WSL** and install inside the Linux environment.
+[INSTALL.md](INSTALL.md#windows-use-wsl) has step-by-step instructions,
+including the two things people get wrong: the CLIs must be installed inside
+Linux, not on Windows, and nothing may live under `/mnt/c`, because those paths
+do not keep Linux file permissions. The tool checks the second one at startup
+and refuses rather than storing your history somewhere it cannot keep private.
 
 Built and measured against `claude 2.1.229` and `codex-cli 0.147.0` on macOS.
 Several documented behaviours are version-specific, which is why setup pins your

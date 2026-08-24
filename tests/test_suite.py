@@ -2765,6 +2765,55 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_state_root_permissions() -> None:
+    """State must live on a filesystem that actually keeps it private.
+
+    On WSL a state root under /mnt/c sits on DrvFs, where chmod appears to
+    succeed and the mode does not stick. The owner-only promise would then be
+    quietly false, which is the exact failure mode this project refuses
+    everywhere else.
+    """
+    print("\n[state root permissions]")
+    sb = Sandbox()
+    try:
+        report = preflight.assert_state_root_secure(sb.cfg)
+        check("SR: a POSIX filesystem passes", report["honours_permissions"])
+        check("SR: and the report names the observed modes",
+              report["directory_mode"] == "0o700"
+              and report["file_mode"] == "0o600", json.dumps(report))
+        check("SR: the probe file does not linger",
+              not os.path.exists(os.path.join(sb.cfg.state_root,
+                                              ".permission-probe")))
+
+        # Simulate a filesystem that reports a permissive mode back.
+        import stat as statmod
+        real_stat = os.stat
+
+        def wide_stat(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            mode = 0o040777 if statmod.S_ISDIR(st.st_mode) else 0o100777
+            return os.stat_result((mode,) + tuple(st)[1:])
+
+        preflight.os.stat = wide_stat
+        try:
+            preflight.assert_state_root_secure(sb.cfg)
+            check("SR: a filesystem that ignores chmod is refused", False,
+                  "it was accepted")
+        except BrokerError as exc:
+            check("SR: a filesystem that ignores chmod is refused",
+                  exc.category == ErrorCategory.STATE_ROOT_INSECURE,
+                  exc.category.value)
+        finally:
+            preflight.os.stat = real_stat
+
+        from agent_bridge.errors import hint as error_hint
+        message = error_hint(ErrorCategory.STATE_ROOT_INSECURE)
+        check("SR: the hint tells a WSL user exactly what went wrong",
+              "WSL" in message and "/mnt/c" in message, message)
+    finally:
+        sb.cleanup()
+
+
 def test_platform_guard() -> None:
     """An unsupported platform must refuse with an explanation, not degrade."""
     print("\n[platform guard]")
@@ -2812,6 +2861,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_state_root_permissions()
     test_platform_guard()
     test_external_review_findings()
     test_per_peer_classification_limits()
