@@ -90,6 +90,8 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.PEER_CONTRACT_VERSION_MISMATCH,
     ErrorCategory.PEER_SESSION_MIGRATED,
     ErrorCategory.PEER_OUTPUT_INCOMPLETE,
+    ErrorCategory.PEER_OUTPUT_TOO_LARGE,
+    ErrorCategory.PEER_SESSION_ID_MISSING,
     ErrorCategory.GATE_TIMEOUT,
     ErrorCategory.CANCELLED,
 })
@@ -191,6 +193,33 @@ _HINTS: dict[ErrorCategory, str] = {
     ErrorCategory.INTERNAL_ERROR: "Broker internal error.",
     ErrorCategory.OK: "",
 }
+
+
+#: Terminal bookkeeping. These never reach the retry decision at all: they are
+#: written after it, or by the reconciler, or by the top-level handler. Named
+#: explicitly so the four sets below are an exhaustive statement of policy
+#: rather than three sets plus an unstated remainder.
+TERMINAL_BOOKKEEPING: frozenset[ErrorCategory] = frozenset({
+    ErrorCategory.WORKER_DIED,
+    ErrorCategory.RETRY_EXHAUSTED,
+    ErrorCategory.INTERNAL_ERROR,
+})
+
+#: Every category must belong to exactly one class. Checked at import so a new
+#: category cannot be added without a deliberate decision about how it retries.
+_CLASSES = (DETERMINISTIC, TRANSIENT, CORRECTIVE, TERMINAL_BOOKKEEPING)
+_unclassified = sorted(
+    c.value for c in ErrorCategory
+    if c is not ErrorCategory.OK and not any(c in cls for cls in _CLASSES)
+)
+if _unclassified:  # pragma: no cover - import-time guard
+    raise AssertionError(f"unclassified error categories: {_unclassified}")
+_overlapping = sorted(
+    c.value for c in ErrorCategory
+    if sum(1 for cls in _CLASSES if c in cls) > 1
+)
+if _overlapping:  # pragma: no cover - import-time guard
+    raise AssertionError(f"error categories in more than one class: {_overlapping}")
 
 
 def hint(category: ErrorCategory) -> str:

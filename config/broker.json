@@ -15,8 +15,7 @@
   },
   "retention": {
     "job_retention_days": 30,
-    "conversation_retention_days": 30,
-    "ledger_retention_days": 365
+    "conversation_retention_days": 30
   },
   "allowed_source_classifications": [
     "internal",
@@ -56,5 +55,6 @@
     "python_executable": null,
     "poll_interval_seconds": 0.25
   },
-  "_note_source_classifications": "Set peers.<name>.allowed_source_classifications to give one peer a narrower list than the other. See the Data policy section of README.md."
+  "_note_source_classifications": "Set peers.<name>.allowed_source_classifications to give one peer a narrower list than the other. See the Data policy section of README.md.",
+  "_note_ledger": "The append-only ledger is never deleted by cleanup: it is the audit record. There is deliberately no ledger retention setting, because a number here would imply a rotation that does not happen."
 }

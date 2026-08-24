@@ -140,7 +140,8 @@ def execute(job_dir: str) -> int:
         schema, schema_sha = cfg.load_schema()
         peer_info = preflight.check_peer(cfg, peer)
         workspace = store.secure_mkdir(cfg.workspace(peer, conversation_id))
-        preflight.assert_workspace_clean(workspace)
+        preflight.assert_workspace_clean(
+            workspace, record_to=cfg.state("last-contamination.json"))
         schema_file = os.path.join(job_dir, "contract.schema.json")
         store.atomic_write_bytes(
             schema_file, json.dumps(schema, indent=2, sort_keys=True).encode("utf-8")
@@ -224,13 +225,21 @@ def execute(job_dir: str) -> int:
                 break  # never retried, by rule
             if category in CORRECTIVE:
                 _quarantine(cfg, job_dir, attempt, outcome)
+                # The corrective prompt is deliberately built only from an error
+                # code plus schema metadata, never from quarantined text. That
+                # works ONLY because the retry resumes the same peer session,
+                # which still holds the original question. With no session to
+                # resume, attempt two would open a fresh one whose entire prompt
+                # is "your previous reply did not satisfy the contract", asking
+                # about a conversation the peer has never seen. A schema-valid
+                # but contentless answer could then be committed as the turn.
+                if not outcome.peer_session_id:
+                    break
                 prompt_text = envelope.build_corrective(
                     category.value, violations, schema, cfg.contract_version
                 )
-                # A corrective retry continues the same peer session.
-                if outcome.peer_session_id:
-                    peer_session_id = outcome.peer_session_id
-                    resume = True
+                peer_session_id = outcome.peer_session_id
+                resume = True
                 continue
             if category in TRANSIENT:
                 continue  # one plain retry, same prompt
@@ -278,6 +287,10 @@ def execute(job_dir: str) -> int:
         "finished_at": finished_at,
         "contract_version": cfg.contract_version,
         "contract_schema_sha256": schema_sha,
+        "config_snapshot_sha256": (
+            store.sha256_file(os.path.join(job_dir, "config.snapshot.json"))
+            if os.path.isfile(os.path.join(job_dir, "config.snapshot.json")) else None
+        ),
         "prompt_sha256": store.sha256_text(request["prompt"]),
         "prompt_chars": len(request["prompt"]),
         "response_sha256": (
@@ -288,6 +301,7 @@ def execute(job_dir: str) -> int:
         "peer_observed_version": peer_info.get("observed_version"),
         "peer_requested_model": cfg.peer(peer).get("model"),
         "peer_observed_model": final.observed_model if final else None,
+        "peer_observed_models": (final.observed_models if final else []) or None,
         "peer_cost_usd": final.cost_usd if final else None,
         "attempts": attempts_log,
         "attempt_count": len(attempts_log),

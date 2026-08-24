@@ -172,7 +172,14 @@ def run_consultation(
     outcome.cost_usd = envelope.get("total_cost_usd")
     usage_models = envelope.get("modelUsage")
     if isinstance(usage_models, dict) and usage_models:
-        outcome.observed_model = sorted(usage_models)[0]
+        # Record every model the run reported. Naming one by taking the
+        # alphabetically first key would be an arbitrary choice presented as a
+        # fact; leave the single-value field empty when it is genuinely
+        # ambiguous.
+        outcome.observed_models = sorted(usage_models)
+        outcome.observed_model = (
+            outcome.observed_models[0] if len(outcome.observed_models) == 1 else None
+        )
     outcome.notes = {
         "descendant_held_pipes": result.descendant_held_pipes,
         "envelope_subtype": envelope.get("subtype"),

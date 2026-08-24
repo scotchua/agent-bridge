@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import REPO, Sandbox, check, summary  # noqa: E402
 
 sys.path.insert(0, os.path.join(REPO, "src"))
+from agent_bridge import config as config_module  # noqa: E402
 from agent_bridge import (  # noqa: E402
     admin, broker, envelope, preflight, registry, runner,
     schema_validate, store, worker,
@@ -2566,6 +2567,204 @@ def test_attempt_marker_lifecycle() -> None:
         sb.cleanup()
 
 
+def test_external_review_findings() -> None:
+    """Findings from Charlie Barmore's external review, head 533f418."""
+    print("\n[external review findings]")
+
+    # F1 (HIGH): the worker must run the MERGED config, not the committed
+    # defaults. Previously the broker handed the worker its own cfg.path, which
+    # in a normal install is the default path, so config/local.json was lost and
+    # the per-job version check verified nothing.
+    sb = Sandbox()
+    try:
+        started, status, _ = sb.run_to_completion("codex")
+        job_dir = sb.cfg.job_dir(started["job_id"])
+        snapshot = os.path.join(job_dir, "config.snapshot.json")
+        check("F1: each job snapshots the config it was admitted under",
+              os.path.isfile(snapshot))
+        snap = store.read_json(snapshot)
+        check("F1: the snapshot carries the broker's merged peer settings",
+              snap["peers"]["claude"]["executable"]
+              == sb.cfg.peer("claude")["executable"], "snapshot diverged")
+        request = store.read_json(os.path.join(job_dir, "request.json"))
+        check("F1: the worker is pointed at the snapshot, not the source config",
+              request["config_path"] == snapshot, request["config_path"])
+        prov = sb.provenance(started["job_id"])
+        check("F1: the snapshot is hashed into provenance",
+              isinstance(prov.get("config_snapshot_sha256"), str)
+              and len(prov["config_snapshot_sha256"]) == 64,
+              str(prov.get("config_snapshot_sha256")))
+    finally:
+        sb.cleanup()
+
+    # F1b: the WORKER enforces the pin carried in its snapshot. Admission
+    # catches drift first in the normal flow, so this drives the worker
+    # directly, which is the code path the bug actually disabled.
+    sb = Sandbox()
+    try:
+        cid, job = "f1b-conv", "f1b-job"
+        store.atomic_write_json(sb.cfg.conversation_path(cid), {
+            "conversation_id": cid, "caller": "codex", "peer": "claude",
+            "peer_session_id": None, "turns": 0, "closed": False,
+            "active_job_id": job, "active_job_claimed_at": store.utc_now(),
+            "workspace": sb.cfg.workspace("claude", cid),
+            "created_at": store.utc_now(), "updated_at": store.utc_now()})
+        job_dir = store.secure_mkdir(sb.cfg.job_dir(job))
+        # A snapshot pinning a version the fake peer will not report.
+        snap = json.load(open(sb.config_path))
+        snap["peers"]["claude"]["allowed_versions"] = ["0.0.0 (Claude Code)"]
+        store.atomic_write_json(os.path.join(job_dir, "config.snapshot.json"), snap)
+        store.atomic_write_json(os.path.join(job_dir, "request.json"), {
+            "job_id": job, "conversation_id": cid, "caller": "codex",
+            "peer": "claude", "prompt": "must not reach the peer",
+            "source_classification": "internal", "label": None, "resume": False,
+            "config_path": os.path.join(job_dir, "config.snapshot.json"),
+            "created_at": store.utc_now()})
+        registry.write_status(sb.cfg, job, "queued", conversation_id=cid,
+                              peer="claude", caller="codex")
+        log = sb.marker("f1b-calls.log")
+        before = len(open(log).readlines()) if os.path.exists(log) else 0
+        env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
+        env["AGENT_BRIDGE_CONFIG"] = os.path.join(job_dir, "config.snapshot.json")
+        subprocess.run([sys.executable, "-m", "agent_bridge.worker",
+                        "--job-dir", job_dir],
+                       capture_output=True, cwd=REPO, env=env, timeout=90)
+        status = registry.read_status(sb.cfg, job)
+        check("F1b: the worker refuses a drifted version from its own snapshot",
+              status["error_category"]
+              == ErrorCategory.PREFLIGHT_VERSION_MISMATCH.value,
+              status["error_category"])
+        after = len(open(log).readlines()) if os.path.exists(log) else 0
+        check("F1b: and makes no peer call when the pin fails",
+              after - before == 0, f"{after - before} calls")
+    finally:
+        sb.cleanup()
+
+    # F1c: layering itself works when no explicit path is given. This is the
+    # path the suite never exercised, which is why the bug survived.
+    check("F1c: load() layers local.json only when no explicit path is given",
+          "local = local_config_path()" in inspect.getsource(config_module.load)
+          and "explicit" in inspect.getsource(config_module.load))
+
+    # F2: no retention knob that implies a rotation which does not happen.
+    committed = json.load(open(os.path.join(REPO, "config", "broker.json")))
+    check("F2: the dead ledger_retention_days knob is gone",
+          "ledger_retention_days" not in committed["retention"],
+          str(committed["retention"]))
+    check("F2: and the config says why the ledger is never rotated",
+          "never deleted" in json.dumps(committed))
+
+    # F3: a corrective retry with no session to resume must not be attempted.
+    sb = Sandbox()
+    try:
+        sb.env(FAKE_CLAUDE_MODE="not_json")   # unparseable stdout, exit 0
+        started, status, result = sb.run_to_completion("codex")
+        prov = sb.provenance(started["job_id"])
+        check("F3: no session to resume means no contextless corrective retry",
+              prov["attempt_count"] == 1, f"attempts={prov['attempt_count']}")
+        check("F3: and it still fails closed with the substantive category",
+              status["error_category"] == ErrorCategory.PEER_OUTPUT_MALFORMED.value,
+              status["error_category"])
+        check("F3: the offending output is still quarantined",
+              os.path.isdir(os.path.join(sb.cfg.job_dir(started["job_id"]),
+                                         "quarantine")))
+    finally:
+        sb.cleanup()
+
+    # F3b: with a session, the corrective retry still happens.
+    sb = Sandbox()
+    try:
+        sb.env(FAKE_CLAUDE_MODE="schema_invalid_then_ok",
+               FAKE_CLAUDE_STATE=sb.marker("f3b-marker"))
+        started, status, _ = sb.run_to_completion("codex")
+        check("F3b: a resumable session still gets its one corrective retry",
+              status["status"] == "complete"
+              and sb.provenance(started["job_id"])["attempt_count"] == 2,
+              json.dumps(status))
+    finally:
+        sb.cleanup()
+
+    # F4: the caller error stays closed; the operator gets the specifics.
+    sb = Sandbox()
+    try:
+        ancestor = os.path.join(sb.state, "workspaces", "codex")
+        store.secure_mkdir(ancestor)
+        with open(os.path.join(ancestor, "AGENTS.md"), "w", encoding="utf-8") as h:
+            h.write("x\n")
+        out = sb.mcp("claude", [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                 "params": {"name": "codex_start", "arguments": {
+                                     "prompt": "hi",
+                                     "source_classification": "internal"}}}])
+        r = out[0]["result"]["structuredContent"]
+        check("F4: the caller still sees only the closed category",
+              r.get("error_category") == ErrorCategory.WORKSPACE_CONTAMINATED.value,
+              json.dumps(r))
+        check("F4: and no path leaks to the caller",
+              "AGENTS.md" not in json.dumps(r) and sb.state not in json.dumps(r))
+        record = store.read_json_or_none(sb.cfg.state("last-contamination.json"))
+        # Compare realpaths: the walk resolves symlinks, and on macOS /var is a
+        # symlink to /private/var, so a literal comparison fails on a correct
+        # record.
+        check("F4: the operator record names the offending file and directory",
+              bool(record) and "agents.md" in (record.get("files") or [])
+              and os.path.realpath(record.get("directory") or "")
+              == os.path.realpath(ancestor), json.dumps(record))
+        env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
+        proc = subprocess.run([sys.executable, "-m", "agent_bridge.admin",
+                               "--config", sb.config_path, "status"],
+                              capture_output=True, cwd=REPO, env=env, timeout=60)
+        text = proc.stdout.decode()
+        check("F4: status surfaces it with the file named",
+              "WARNING" in text and "agents.md" in text, text[:200])
+    finally:
+        sb.cleanup()
+
+    # F5: admission cost tracks concurrency, not retention.
+    sb = Sandbox()
+    try:
+        for i in range(300):
+            registry.write_status(sb.cfg, f"retained-{i}", "queued")
+            registry.write_status(sb.cfg, f"retained-{i}", "complete",
+                                  error_category="ok")
+        registry.write_status(sb.cfg, "in-flight", "running", worker_pid=os.getpid())
+        t0 = time.perf_counter()
+        n = registry.count_active(sb.cfg)
+        elapsed = time.perf_counter() - t0
+        check("F5: 300 retained jobs do not inflate the active count",
+              n == 1, str(n))
+        check("F5: and admission stays fast regardless of retention",
+              elapsed < 0.05, f"{elapsed*1000:.1f} ms")
+        check("F5: the index holds only in-flight jobs",
+              len(os.listdir(sb.cfg.state("active"))) == 1,
+              str(os.listdir(sb.cfg.state("active"))))
+        registry.write_status(sb.cfg, "ghost", "running", worker_pid=999999)
+        registry.count_active(sb.cfg)
+        check("F5: a stale index entry is self-healed rather than accumulating",
+              "ghost" not in os.listdir(sb.cfg.state("active")),
+              str(os.listdir(sb.cfg.state("active"))))
+    finally:
+        sb.cleanup()
+
+    # F6: the retry classes are an exhaustive, non-overlapping statement.
+    from agent_bridge import errors as errors_module
+    classes = (errors_module.DETERMINISTIC, errors_module.TRANSIENT,
+               errors_module.CORRECTIVE, errors_module.TERMINAL_BOOKKEEPING)
+    unclassified = [c.value for c in ErrorCategory
+                    if c is not ErrorCategory.OK
+                    and not any(c in cls for cls in classes)]
+    check("F6: every error category belongs to a retry class",
+          not unclassified, str(unclassified))
+    overlapping = [c.value for c in ErrorCategory
+                   if sum(1 for cls in classes if c in cls) > 1]
+    check("F6: and to exactly one", not overlapping, str(overlapping))
+    check("F6: the guard runs at import, so a new category cannot slip through",
+          "_unclassified" in inspect.getsource(errors_module))
+    check("F6: an ambiguous model list is recorded rather than picked from",
+          "observed_models" in inspect.getsource(
+              __import__("agent_bridge.backends.claude_backend",
+                         fromlist=["x"])))
+
+
 def main() -> int:
     test_contract_accepted_by_both_peers()
     test_tool_exposure()
@@ -2574,6 +2773,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_external_review_findings()
     test_per_peer_classification_limits()
     test_output_cap()
     test_version_mismatch_and_missing_executable()

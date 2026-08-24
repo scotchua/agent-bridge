@@ -117,6 +117,19 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
                 rec = store.read_json_or_none(entry.path) or {}
                 if rec.get("indeterminate"):
                     indeterminate.append(str(rec.get("conversation_id")))
+    contamination = store.read_json_or_none(cfg.state("last-contamination.json"))
+    if contamination:
+        print("WARNING: a consultation was refused because instruction files "
+              "were found near the isolated workspace.")
+        print(f"  {contamination.get('reason')}")
+        print(f"  directory: {contamination.get('directory')}")
+        if contamination.get("files"):
+            print(f"  files: {', '.join(contamination['files'])}")
+        print(f"  detected: {contamination.get('detected_at')}")
+        print("  Move or rename those files, then retry. This record is "
+              "overwritten by the next occurrence.")
+        print()
+
     if indeterminate:
         # Deliberately loud. A hold has no timeout by design, so a dormant one
         # would otherwise sit unnoticed until somebody happened to retry it.
@@ -136,6 +149,7 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
         "conversations_total": conversations,
         "conversations_open": open_conversations,
         "conversations_indeterminate": len(indeterminate),
+        "last_contamination": contamination,
         "indeterminate_conversation_ids": indeterminate,
         "ledger_records": ledger_lines,
         "retention_days": cfg.raw["retention"],

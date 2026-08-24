@@ -64,7 +64,14 @@ def claim_conversation_slot(
     claim is the `active_job_id` field; the worker clears it on the way out.
     """
     path = cfg.conversation_path(conversation_id)
-    with store.file_lock(path + ".lock"):
+    # A timeout here means another process holds this conversation's lock, which
+    # is "busy", not the global admission gate timing out. Reporting GATE_TIMEOUT
+    # would name the right genus and the wrong species.
+    try:
+        lock = store.file_lock(path + ".lock")
+    except TimeoutError as exc:
+        raise BrokerError(ErrorCategory.CONVERSATION_BUSY) from exc
+    with lock:
         record = store.read_json_or_none(path)
         if record is None:
             raise BrokerError(ErrorCategory.CONVERSATION_NOT_FOUND)
@@ -363,6 +370,7 @@ def write_status(
                 document[key] = previous[key]
         document.update(extra)
         store.atomic_write_json(path, document)
+        _index_active(cfg, job_id, status)
         return document
 
 
@@ -572,6 +580,38 @@ def reconcile(cfg: Config, job_id: str) -> dict[str, Any]:
     return status
 
 
+def _active_marker(cfg: Config, job_id: str) -> str:
+    return cfg.state("active", job_id)
+
+
+def _index_active(cfg: Config, job_id: str, status: str) -> None:
+    """Maintain a small index of jobs in flight.
+
+    count_active runs inside the global admission lock, so scanning every
+    retained job directory made admission cost grow with retention rather than
+    with concurrency: with a 30 day window that is thousands of status reads
+    per start, serialised across every broker process. This index is bounded by
+    the number of jobs actually in flight.
+
+    The index is a cache, never the source of truth. count_active still
+    confirms liveness per entry and drops stale ones, so losing or corrupting
+    it degrades throughput, never correctness.
+    """
+    try:
+        marker = _active_marker(cfg, job_id)
+        if status in TERMINAL_STATUSES:
+            try:
+                os.unlink(marker)
+            except OSError:
+                pass
+        else:
+            store.secure_mkdir(os.path.dirname(marker))
+            if not os.path.exists(marker):
+                store.atomic_write_json(marker, {"job_id": job_id})
+    except OSError:
+        pass
+
+
 def count_active(cfg: Config) -> int:
     """Count jobs in flight, including ones still inside their spawn window.
 
@@ -579,15 +619,21 @@ def count_active(cfg: Config) -> int:
     the window between its `queued` write and its pid being attached. Under a
     burst those uncounted jobs let the global limit be exceeded.
     """
-    root = cfg.state("jobs")
+    root = cfg.state("active")
     if not os.path.isdir(root):
         return 0
     active = 0
     for entry in os.scandir(root):
-        if not entry.is_dir():
-            continue
         if _job_still_running(cfg, entry.name):
             active += 1
+        else:
+            # Stale index entry, for instance a worker killed before it could
+            # write a terminal status. Drop it so the index cannot grow without
+            # bound when jobs die badly.
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                pass
     return active
 
 

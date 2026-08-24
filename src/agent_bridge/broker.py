@@ -87,8 +87,8 @@ def _spawn_worker(cfg: Config, job_dir: str) -> int:
     }
     env["PYTHONPATH"] = src_root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    if cfg.path:
-        env["AGENT_BRIDGE_CONFIG"] = cfg.path
+    snapshot = os.path.join(job_dir, "config.snapshot.json")
+    env["AGENT_BRIDGE_CONFIG"] = snapshot if os.path.isfile(snapshot) else cfg.path
     argv = [cfg.python_executable, "-m", "agent_bridge.worker", "--job-dir", job_dir]
     log_path = os.path.join(job_dir, "worker.log")
     handle = open(log_path, "ab", buffering=0)  # noqa: SIM115 - handed to the child
@@ -131,7 +131,8 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     conversation_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     workspace = store.secure_mkdir(cfg.workspace(peer, conversation_id))
-    preflight.assert_workspace_clean(workspace)
+    preflight.assert_workspace_clean(
+        workspace, record_to=cfg.state("last-contamination.json"))
     preflight.assert_workspace_empty(workspace)
 
     # The first turn holds a claim too. Making ownership universal is what lets
@@ -224,6 +225,23 @@ def _prepare_job(
 ) -> str:
     """Write the request and the first status. Runs inside the admission gate."""
     job_dir = store.secure_mkdir(cfg.job_dir(job_id))
+
+    # Snapshot the MERGED config the request was admitted under, and point the
+    # worker at that file rather than at the path this process was loaded from.
+    #
+    # config.load() layers config/local.json only when given no explicit path,
+    # for test determinism. The broker handed the worker its own cfg.path, which
+    # in the normal install IS the default path, so the worker re-loaded the
+    # committed defaults and silently lost the overlay: no pinned executable, so
+    # it PATH-discovered one, and an empty allowed_versions, so the per-job
+    # version check verified nothing. The binary executed could differ from the
+    # binary admission validated.
+    #
+    # The snapshot also makes the config auditable: a job records exactly what
+    # it ran under, not a path whose contents may since have changed.
+    snapshot_path = os.path.join(job_dir, "config.snapshot.json")
+    store.atomic_write_json(snapshot_path, cfg.raw)
+
     store.atomic_write_json(os.path.join(job_dir, "request.json"), {
         "job_id": job_id,
         "conversation_id": conversation_id,
@@ -233,7 +251,7 @@ def _prepare_job(
         "source_classification": args["source_classification"].strip().lower(),
         "label": args.get("label"),
         "resume": resume,
-        "config_path": cfg.path,
+        "config_path": snapshot_path,
         "created_at": store.utc_now(),
     })
     registry.write_status(

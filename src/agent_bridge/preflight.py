@@ -15,6 +15,22 @@ from typing import Any
 from .config import Config
 from .errors import BrokerError, ErrorCategory
 
+def _now() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _record_contamination(record_to: str | None, detail: dict[str, Any]) -> None:
+    """Write the specifics for an operator. Never raises, never reaches a caller."""
+    if not record_to:
+        return
+    try:
+        from . import store
+        store.atomic_write_json(record_to, detail)
+    except Exception:  # noqa: BLE001 - diagnostics must not break the refusal
+        pass
+
+
 #: Instruction files that would give a peer a project-level directive.
 CONTAMINANTS = ("agents.md", ".rules", "claude.md", ".codexrules")
 
@@ -79,7 +95,8 @@ def check_peer(cfg: Config, peer: str) -> dict[str, Any]:
     }
 
 
-def assert_workspace_clean(workspace: str, stop_at: str | None = None) -> None:
+def assert_workspace_clean(workspace: str, stop_at: str | None = None,
+                           record_to: str | None = None) -> None:
     """Refuse to run if the workspace or ANY ancestor holds instruction files.
 
     Walks all the way to the filesystem root by default.  An earlier version
@@ -108,8 +125,26 @@ def assert_workspace_clean(workspace: str, stop_at: str | None = None) -> None:
             # Fail closed. An ancestor that cannot be enumerated may still be
             # searchable, so a peer could open a known AGENTS.md inside it. An
             # unverifiable ancestor is not a clean one.
+            _record_contamination(record_to, {
+                "reason": "an ancestor directory could not be enumerated",
+                "directory": current,
+                "workspace": os.path.realpath(workspace),
+                "detected_at": _now(),
+            })
             raise BrokerError(ErrorCategory.WORKSPACE_UNVERIFIABLE) from exc
-        if names & set(CONTAMINANTS):
+        offenders = sorted(names & set(CONTAMINANTS))
+        if offenders:
+            # The caller-visible error stays a closed category with a constant
+            # hint. The specifics go to the operator instead: a stray
+            # ~/AGENTS.md would otherwise fail every consultation with a message
+            # that names nothing, which is a guaranteed confused bug report.
+            _record_contamination(record_to, {
+                "reason": "instruction files found in an ancestor",
+                "directory": current,
+                "files": offenders,
+                "workspace": os.path.realpath(workspace),
+                "detected_at": _now(),
+            })
             raise BrokerError(ErrorCategory.WORKSPACE_CONTAMINATED)
         parent = os.path.dirname(current)
         if current == boundary or current == parent:

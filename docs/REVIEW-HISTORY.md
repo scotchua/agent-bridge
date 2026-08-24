@@ -131,6 +131,50 @@ What helps: assert on the **reason** something happened, not only the outcome.
 One patch in this project silently failed to apply, leaving safe behaviour with a
 misleading explanation. Only a reason-string assertion caught it.
 
+## The external review, and the bug the whole suite was blind to
+
+A fifth round, by an outside reviewer reading the published repository rather
+than by either model. It found one genuine high-severity defect that four
+adversarial rounds and 367 tests had all missed.
+
+**The worker never loaded the machine-local config.** Configuration is layered:
+committed defaults, then a gitignored local file holding your pinned CLI paths
+and versions. That layering happens only when no explicit config path is given,
+deliberately, so tests stay deterministic. But the broker handed the worker its
+own config path, which in a normal install *is* the default path. So the worker
+re-loaded the committed defaults and silently lost the overlay.
+
+The consequences were exactly backwards from the guarantee in the README. The
+worker saw no pinned executable, so it fell back to searching the PATH, which
+is the very situation the setup command exists to prevent. And it saw an empty
+version allow-list, so its per-job version check verified nothing. The binary
+that ran could differ from the binary admission had validated.
+
+**Why no test caught it:** every test sandbox passes an explicit config path, so
+the layered path was never exercised end to end. The suite was thorough about
+behaviour and blind to a code path it structurally never entered. A test suite
+cannot find a bug in a branch it never takes, and 392 green checks say nothing
+about the branch nobody wrote a test for.
+
+The fix takes the reviewer's suggestion, which improves auditability as well as
+correctness: each job snapshots the *merged* configuration into its own
+directory, and the worker is pointed at that snapshot. The job then provably
+runs the exact configuration it was admitted under, and the snapshot is hashed
+into provenance rather than being a path whose contents may since have changed.
+
+The same round also found a corrective retry that, in one narrow case, would
+open a fresh peer session whose entire prompt was "your previous reply did not
+satisfy the contract", about a conversation that peer had never seen; a
+retention setting that implied a rotation which never happened; an error
+category taxonomy with an unstated remainder, now enforced at import; a
+contamination refusal that named no file, so a stray ~/AGENTS.md would fail
+every consultation with a message identifying nothing; and an admission scan
+whose cost grew with retention rather than with concurrency.
+
+The transferable lesson is the first one. **Ask which code paths your tests
+structurally cannot reach**, and treat those as unreviewed no matter how many
+tests pass.
+
 ## Things accepted rather than fixed
 
 Named as accepted risks, not solved problems. The reviewer confirmed they do not

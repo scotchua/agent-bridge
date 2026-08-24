@@ -16,6 +16,8 @@ class PeerOutcome:
     payload: Any = None                    # parsed JSON object, if any
     peer_session_id: str | None = None
     observed_model: str | None = None
+    #: Every model the peer reported using, when it reports more than one.
+    observed_models: list[str] = field(default_factory=list)
     argv: list[str] = field(default_factory=list)
     returncode: int | None = None
     duration_seconds: float = 0.0
