@@ -19,7 +19,7 @@ change what they cost; it just lets them talk to each other.
 ## 1. Get the code
 
 ```
-git clone <this-repo> ~/agent-bridge
+git clone https://github.com/scotchua/agent-bridge.git ~/agent-bridge
 cd ~/agent-bridge
 ```
 

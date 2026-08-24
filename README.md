@@ -1,6 +1,6 @@
 # agent-bridge
 
-![tests](https://github.com/OWNER/REPO/actions/workflows/tests.yml/badge.svg)
+![tests](https://github.com/scotchua/agent-bridge/actions/workflows/tests.yml/badge.svg)
 
 A local bridge that lets Claude and Codex consult each other for a second
 opinion, and keeps a record of every exchange.
