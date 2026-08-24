@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+PY=${AGENT_BRIDGE_PYTHON:-python3}
+export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$PY" -m agent_bridge.admin "$@"

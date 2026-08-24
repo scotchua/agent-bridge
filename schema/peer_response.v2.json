@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "agent-bridge peer consultation response, contract version 2",
+  "description": "Version 2 exists because the two peers enforce schemas differently. Codex routes --output-schema through OpenAI structured outputs, which requires every key in properties to also appear in required, at every object level. Version 1 left analysis, disagreements, risks, questions and mitigation optional, so Codex rejected it outright with invalid_json_schema while Claude accepted it. Every field is therefore required here, and absence is expressed as an empty array or an empty string rather than a missing key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "status",
+    "summary",
+    "analysis",
+    "disagreements",
+    "risks",
+    "questions",
+    "confidence"
+  ],
+  "properties": {
+    "contract_version": {
+      "type": "string",
+      "enum": [
+        "2"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "answer",
+        "needs_context",
+        "refusal"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "analysis": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      },
+      "description": "Substantive points supporting your answer. Empty if the summary says it all."
+    },
+    "disagreements": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      },
+      "description": "Specific disagreements with a position the caller actually stated in the question. Empty when the caller stated no position, or when you have no disagreement. Never populate this against a position nobody took: a fabricated objection is worse than none, because the caller may act on it."
+    },
+    "risks": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "issue",
+          "mitigation"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "issue": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "mitigation": {
+            "type": "string",
+            "maxLength": 2000
+          }
+        }
+      },
+      "description": "Risks you actually identify. Empty if you see none worth naming."
+    },
+    "questions": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      },
+      "description": "Facts you need from the caller to answer. Empty unless status is needs_context."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    }
+  }
+}

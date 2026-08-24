@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "agent-bridge peer consultation response, contract version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "status", "summary", "confidence"],
+  "properties": {
+    "contract_version": { "type": "string", "enum": ["1"] },
+    "status": { "type": "string", "enum": ["answer", "needs_context", "refusal"] },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "analysis": {
+      "type": "array", "maxItems": 40,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
+    },
+    "disagreements": {
+      "type": "array", "maxItems": 40,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
+    },
+    "risks": {
+      "type": "array", "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "issue"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+          "issue": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "mitigation": { "type": "string", "maxLength": 2000 }
+        }
+      }
+    },
+    "questions": {
+      "type": "array", "maxItems": 40,
+      "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+    },
+    "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+  }
+}

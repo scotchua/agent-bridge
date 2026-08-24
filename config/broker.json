@@ -1,0 +1,59 @@
+{
+  "config_version": "1",
+  "contract_version": "2",
+  "state_root": "~/.agent-bridge",
+  "schema_path": "schema/peer_response.v2.json",
+  "limits": {
+    "prompt_max_chars": 100000,
+    "label_max_chars": 200,
+    "peer_stdout_max_bytes": 4000000,
+    "peer_stderr_capture_max_bytes": 200000,
+    "peer_last_message_max_bytes": 1000000,
+    "max_turns_per_conversation": 20,
+    "max_concurrent_jobs": 4,
+    "claim_grace_seconds": 30
+  },
+  "retention": {
+    "job_retention_days": 30,
+    "conversation_retention_days": 30,
+    "ledger_retention_days": 365
+  },
+  "allowed_source_classifications": [
+    "internal",
+    "synthetic",
+    "public"
+  ],
+  "refused_source_classifications": [
+    "client-derived",
+    "client_derived"
+  ],
+  "peers": {
+    "claude": {
+      "executable": null,
+      "allowed_versions": [],
+      "version_argv": [
+        "--version"
+      ],
+      "model": "sonnet",
+      "max_budget_usd": 0.5,
+      "timeout_seconds": 300,
+      "grace_seconds": 5
+    },
+    "codex": {
+      "executable": null,
+      "allowed_versions": [],
+      "version_argv": [
+        "--version"
+      ],
+      "model": null,
+      "codex_home": "~/.agent-bridge/codex-home",
+      "sandbox_mode": "read-only",
+      "timeout_seconds": 420,
+      "grace_seconds": 5
+    }
+  },
+  "worker": {
+    "python_executable": null,
+    "poll_interval_seconds": 0.25
+  }
+}

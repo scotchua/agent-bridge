@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.canary-*.json
+canaries/.timeout-*.json
+.DS_Store
+config/local.json
