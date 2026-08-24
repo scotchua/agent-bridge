@@ -180,8 +180,26 @@ def run_consultation(
         outcome.observed_model = (
             outcome.observed_models[0] if len(outcome.observed_models) == 1 else None
         )
+    requested_model = spec.get("model")
     outcome.notes = {
         "descendant_held_pipes": result.descendant_held_pipes,
+        # Absence of these has been observed intermittently on 2.1.241, and not
+        # together. Recording presence separately turns a null in the ledger
+        # into a distinguishable "the CLI did not report it" rather than an
+        # ambiguous null that could equally mean the bridge failed to read it.
+        "model_usage_present": isinstance(usage_models, dict) and bool(usage_models),
+        "total_cost_present": envelope.get("total_cost_usd") is not None,
+        "requested_model": requested_model,
+        # The config passes an alias such as "sonnet" and the CLI reports a full
+        # name such as "claude-sonnet-5". The alias mapping belongs to the CLI,
+        # not to this bridge, so this is a heuristic consistency signal and is
+        # named as one. False on a present model is worth investigating: it
+        # means you asked for one family and a different one answered.
+        "requested_alias_in_observed_model": (
+            None if not (requested_model and outcome.observed_models)
+            else any(str(requested_model).lower() in m.lower()
+                     for m in outcome.observed_models)
+        ),
         "envelope_subtype": envelope.get("subtype"),
         "envelope_is_error": envelope.get("is_error"),
         "terminal_reason": envelope.get("terminal_reason"),

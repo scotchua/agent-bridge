@@ -302,6 +302,16 @@ def execute(job_dir: str) -> int:
         "peer_requested_model": cfg.peer(peer).get("model"),
         "peer_observed_model": final.observed_model if final else None,
         "peer_observed_models": (final.observed_models if final else []) or None,
+        # Whether the peer REPORTED these, as opposed to whether we captured
+        # them. A null model with reported=false is the CLI's silence; a null
+        # with reported=true would be a bug here.
+        "peer_model_reported": (
+            (final.notes or {}).get("model_usage_present") if final else None),
+        "peer_cost_reported": (
+            (final.notes or {}).get("total_cost_present") if final else None),
+        "peer_requested_alias_in_observed": (
+            (final.notes or {}).get("requested_alias_in_observed_model")
+            if final else None),
         "peer_cost_usd": final.cost_usd if final else None,
         "attempts": attempts_log,
         "attempt_count": len(attempts_log),

@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import sys
 from typing import Any
 
@@ -33,6 +34,31 @@ EXTRA_LOOKUP = {
         "/usr/local/bin/codex",
     ],
 }
+
+
+#: Directories whose contents are periodically cleaned by the OS, or created
+#: fresh per session by tooling. A CLI found here works right now and may not
+#: exist tomorrow.
+def _ephemeral_roots() -> list[str]:
+    roots = {tempfile.gettempdir(), "/tmp", "/var/tmp", "/private/tmp",
+             "/var/folders", "/private/var/folders"}
+    return [os.path.realpath(r) for r in roots if r]
+
+
+def is_durable(path: str) -> bool:
+    """Whether a discovered CLI is somewhere that will still exist tomorrow.
+
+    Wrapper shims commonly live in the per-user temp directory, and they are
+    first on PATH precisely because they are meant to intercept. Pinning one
+    creates two problems: the path is cleaned periodically, so every job later
+    fails with a missing executable; and a shim is not the binary whose
+    behaviour this project measured, so the facts in
+    docs/verified-cli-behaviour.md may simply not hold for it, while the version
+    string still matches.
+    """
+    real = os.path.realpath(path)
+    return not any(real == root or real.startswith(root + os.sep)
+                   for root in _ephemeral_roots())
 
 
 def find_all(peer: str) -> list[str]:
@@ -122,7 +148,15 @@ def main(argv: list[str] | None = None) -> int:
     store.set_umask()
 
     defaults = store.read_json(config.DEFAULT_CONFIG_PATH)
-    codex_home = defaults["peers"]["codex"]["codex_home"]
+    codex_home = os.path.expanduser(defaults["peers"]["codex"]["codex_home"])
+    # Codex refuses to start when CODEX_HOME names a directory that does not
+    # exist, and it will not create one. Until this ran here, the only thing
+    # that created it was the first consultation, which needs a signed-in home,
+    # which needs the login, which needs the directory. A clean machine could
+    # not complete the documented order at all.
+    #
+    # secure_mkdir rather than a plain mkdir: auth.json is about to land here.
+    store.secure_mkdir(codex_home)
     chosen: dict[str, dict[str, Any]] = {}
     problems: list[str] = []
 
@@ -157,19 +191,40 @@ def main(argv: list[str] | None = None) -> int:
             rows.append((path, version, signed))
             flag = {True: "signed in", False: "NOT signed in",
                     None: "sign-in unknown"}[signed]
-            print(f"  {path}")
+            durability = "" if is_durable(path) else "  [TEMPORARY PATH]"
+            print(f"  {path}{durability}")
             print(f"      version: {version or 'unknown'}   ({flag})")
 
         # Prefer a signed-in install. Discovery alone can pick a second copy
         # that has never been logged in, which then fails on every call.
-        preferred = next((r for r in rows if r[2] is True), None)
-        if preferred is None:
-            preferred = next((r for r in rows if r[2] is None), rows[0])
+        # Prefer signed in, then durable. Discovery alone can pick a second
+        # copy that has never been logged in, or a temp-directory shim that
+        # will be cleaned out from under the pin.
+        def rank(row: tuple[str, str, bool | None]) -> tuple[int, int]:
+            signed_rank = {True: 0, None: 1, False: 2}[row[2]]
+            return (signed_rank, 0 if is_durable(row[0]) else 1)
+
+        ordered = sorted(rows, key=rank)
+        preferred = ordered[0]
+        if preferred[2] is not True:
             problems.append(
                 f"{peer}: no install is confirmed signed in "
                 f"(picked {preferred[0]})")
         if len(rows) > 1:
             print(f"  -> {len(rows)} installs found; pinning {preferred[0]}")
+        if not is_durable(preferred[0]):
+            durable_alternatives = [r[0] for r in rows if is_durable(r[0])]
+            print(f"  -> WARNING: {preferred[0]}")
+            print("     is inside a temporary directory. It will not survive a")
+            print("     cleanup, and every job will then fail with a missing")
+            print("     executable. Re-running setup would pin another")
+            print("     temporary path and appear to fix it.")
+            print("     A wrapper shim there is also not the binary this")
+            print("     project measured, so documented CLI behaviour may not")
+            print("     hold for it even though --version matches.")
+            if durable_alternatives:
+                print(f"     Prefer: --{peer} {durable_alternatives[0]}")
+            problems.append(f"{peer}: pinned path is in a temporary directory")
         chosen[peer] = {"executable": preferred[0],
                         "allowed_versions": [preferred[1]] if preferred[1] else []}
 

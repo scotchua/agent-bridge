@@ -142,7 +142,12 @@ _HINTS: dict[ErrorCategory, str] = {
         "running status, so the worker abandoned it without contacting the "
         "peer. Nothing was sent."
     ),
-    ErrorCategory.PREFLIGHT_EXECUTABLE_MISSING: "Configured peer executable was not found.",
+    ErrorCategory.PREFLIGHT_EXECUTABLE_MISSING: (
+        "Configured peer executable was not found. If the pinned path is inside "
+        "a temporary directory it has probably been cleaned; re-run setup and "
+        "pass --claude or --codex with a durable path, because setup would "
+        "otherwise pin another temporary one."
+    ),
     ErrorCategory.PREFLIGHT_VERSION_MISMATCH: (
         "Peer CLI version is not in the allowed list. Re-ratify the pin before use."
     ),

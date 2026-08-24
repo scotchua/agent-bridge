@@ -22,7 +22,7 @@ from agent_bridge import (  # noqa: E402
     schema_validate, store, worker,
 )
 from agent_bridge.backends import base  # noqa: E402
-from agent_bridge.errors import BrokerError  # noqa: E402
+from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
 
@@ -2765,6 +2765,107 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_reported_issues() -> None:
+    """Issues reported by an outside user doing a first install."""
+    print("\n[reported issues]")
+    from agent_bridge import setup_cmd
+
+    # I1: a temp-directory shim must not outrank a durable install.
+    tmp_root = tempfile.gettempdir()
+    check("I1: a temp-directory path is not durable",
+          not setup_cmd.is_durable(os.path.join(tmp_root, "cmux-cli-shims",
+                                                "abc", "claude")))
+    check("I1: /var/folders is not durable",
+          not setup_cmd.is_durable("/var/folders/t2/xyz/T/shim/codex"))
+    check("I1: a normal install location is durable",
+          setup_cmd.is_durable(os.path.expanduser("~/.local/bin/claude"))
+          and setup_cmd.is_durable("/opt/homebrew/bin/codex"))
+
+    # The ranking itself: signed-in first, then durable.
+    def rank(path, signed):
+        signed_rank = {True: 0, None: 1, False: 2}[signed]
+        return (signed_rank, 0 if setup_cmd.is_durable(path) else 1)
+
+    shim = os.path.join(tmp_root, "shims", "claude")
+    durable = os.path.expanduser("~/.local/bin/claude")
+    ordered = sorted([(shim, True), (durable, True)], key=lambda r: rank(*r))
+    check("I1: a durable signed-in install outranks a signed-in shim",
+          ordered[0][0] == durable, ordered[0][0])
+    ordered = sorted([(durable, False), (shim, True)], key=lambda r: rank(*r))
+    check("I1: but signed-in still beats durable-but-not-signed-in",
+          ordered[0][0] == shim, ordered[0][0])
+    source = inspect.getsource(setup_cmd)
+    check("I1: choosing a temporary path warns loudly rather than silently",
+          "WARNING" in source and "temporary directory" in source)
+    check("I1: and the missing-executable hint explains the later failure",
+          "temporary directory" in error_hint(
+              ErrorCategory.PREFLIGHT_EXECUTABLE_MISSING))
+
+    # I2: the documented login flow deadlocked because nothing created
+    # CODEX_HOME before the login that needs it.
+    check("I2: setup creates the isolated codex home before probing it",
+          "store.secure_mkdir(codex_home)" in source
+          and source.index("store.secure_mkdir(codex_home)")
+          < source.index("codex_signed_in(path, codex_home)"))
+    real_home = os.path.expanduser(
+        json.load(open(os.path.join(REPO, "config", "broker.json")))
+        ["peers"]["codex"]["codex_home"])
+    # Assert the actual call, not a phrase: an earlier version of this check
+    # searched for wording that appears in the explanatory comment.
+    check("I2: and it uses secure_mkdir, since auth.json lands there",
+          "store.secure_mkdir(codex_home)" in source
+          and "os.makedirs(codex_home" not in source
+          and "os.mkdir(codex_home" not in source)
+    if os.path.isdir(real_home):
+        check("I2: the isolated home is owner-only",
+              (os.stat(real_home).st_mode & 0o777) == 0o700,
+              oct(os.stat(real_home).st_mode & 0o777))
+
+    # I3: a null model in the ledger must be distinguishable from a read failure.
+    for label, envelope_bits, expect in (
+        ("both reported", {"modelUsage": {"claude-sonnet-5": {}},
+                           "total_cost_usd": 0.01}, (True, True, True)),
+        ("model absent", {"modelUsage": {}, "total_cost_usd": 0.03},
+         (False, True, None)),
+        ("cost absent", {"modelUsage": {"claude-sonnet-5": {}}},
+         (True, False, True)),
+        ("different family", {"modelUsage": {"claude-opus-5": {}},
+                              "total_cost_usd": 0.02}, (True, True, False)),
+    ):
+        usage = envelope_bits.get("modelUsage")
+        observed = sorted(usage) if isinstance(usage, dict) and usage else []
+        model_present = bool(observed)
+        cost_present = envelope_bits.get("total_cost_usd") is not None
+        alias = (None if not observed
+                 else any("sonnet" in m.lower() for m in observed))
+        check(f"I3: {label} is recorded distinguishably",
+              (model_present, cost_present, alias) == expect,
+              f"{(model_present, cost_present, alias)} != {expect}")
+
+    source_backend = inspect.getsource(
+        __import__("agent_bridge.backends.claude_backend", fromlist=["x"]))
+    for field in ("model_usage_present", "total_cost_present",
+                  "requested_alias_in_observed_model"):
+        check(f"I3: the backend records {field}", field in source_backend)
+    source_worker = inspect.getsource(worker)
+    for field in ("peer_model_reported", "peer_cost_reported",
+                  "peer_requested_alias_in_observed"):
+        check(f"I3: the ledger record carries {field}", field in source_worker)
+
+    # And end to end: a real job carries the new provenance.
+    sb = Sandbox()
+    try:
+        started, _, _ = sb.run_to_completion("codex")
+        prov = sb.provenance(started["job_id"])
+        check("I3: a completed job records whether the peer reported a model",
+              prov.get("peer_model_reported") is not None,
+              json.dumps(prov.get("peer_model_reported")))
+        check("I3: and whether it reported a cost",
+              prov.get("peer_cost_reported") is not None)
+    finally:
+        sb.cleanup()
+
+
 def test_state_root_permissions() -> None:
     """State must live on a filesystem that actually keeps it private.
 
@@ -2861,6 +2962,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_reported_issues()
     test_state_root_permissions()
     test_platform_guard()
     test_external_review_findings()
