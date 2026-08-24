@@ -43,6 +43,9 @@ class RunResult:
     duration_seconds: float
     pgid: int | None
     spawn_failed: bool = False
+    #: True when the run was refused because its in-flight marker could not be
+    #: written. No peer process was created.
+    marker_write_failed: bool = False
     group_kill: dict[str, Any] = field(default_factory=dict)
     cap_exceeded: bool = False
     descendant_held_pipes: bool = False
@@ -118,8 +121,15 @@ def run(
     # though it names no process: not knowing whether a peer was created is
     # itself a reason to hold.
     if pgid_file:
-        _write_marker(pgid_file, {"phase": "pre_spawn", "argv0": argv[0],
-                                  "marker_written_at": time.time()})
+        if not _write_marker(pgid_file, {"phase": "pre_spawn", "argv0": argv[0],
+                                         "marker_written_at": time.time()}):
+            # Fail before creating anything. Without the marker a crash would
+            # leave a peer nothing could see, quarantine or reap.
+            return RunResult(
+                argv=argv, returncode=None, stdout=b"", stderr=b"",
+                timed_out=False, duration_seconds=time.monotonic() - started,
+                pgid=None, spawn_failed=True, marker_write_failed=True,
+            )
 
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off
@@ -371,16 +381,26 @@ def run(
     )
 
 
-def _write_marker(path: str, payload: dict[str, Any]) -> None:
-    """Write an in-flight marker durably. Best effort, never raises."""
+def _write_marker(path: str, payload: dict[str, Any]) -> bool:
+    """Write an in-flight marker durably. Returns whether it landed.
+
+    The caller must check this for the PRE-SPAWN write. Treating a safety
+    mechanism as best-effort is a contradiction: if the marker cannot be
+    written there is no durable evidence, and spawning anyway produces exactly
+    the invisible orphan the marker exists to prevent.
+    """
     try:
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(json.dumps(payload, sort_keys=True))
             handle.flush()
             os.fsync(handle.fileno())
+        return True
     except OSError:
-        pass
+        return False
 
 
 def scrubbed_env(extra: dict[str, str] | None = None) -> dict[str, str]:

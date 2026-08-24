@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shutil
 import tempfile
 import threading
 import subprocess
@@ -1948,9 +1949,9 @@ def test_round_four_second_pass() -> None:
 
     # V2: a completed peer run leaves no pgid file, so a recycled group number
     # can never be signalled for an attempt that finished.
-    probe = "/tmp/claude-501/v2-probe.pgid"
-    if os.path.exists(probe):
-        os.unlink(probe)
+    probe_fd, probe = tempfile.mkstemp(suffix=".pgid", prefix="ab_v2_")
+    os.close(probe_fd)
+    os.unlink(probe)
     result = runner.run(["/bin/sh", "-c", "echo done"], cwd="/tmp",
                         env=runner.scrubbed_env(), stdin_data="", timeout=10,
                         grace=1, stdout_cap=100, stderr_cap=100, pgid_file=probe)
@@ -2162,9 +2163,9 @@ def test_round_four_fourth_pass() -> None:
     check("X1: the in-flight marker is written before the peer is spawned",
           pre < spawn, f"marker at {pre}, Popen at {spawn}")
 
-    marker_path = "/tmp/claude-501/x1-marker.json"
-    if os.path.exists(marker_path):
-        os.unlink(marker_path)
+    marker_fd, marker_path = tempfile.mkstemp(suffix=".json", prefix="ab_x1_")
+    os.close(marker_fd)
+    os.unlink(marker_path)
     result = runner.run(["/bin/sh", "-c", "echo ok"], cwd="/tmp",
                         env=runner.scrubbed_env(), stdin_data="", timeout=10,
                         grace=1, stdout_cap=100, stderr_cap=100,
@@ -2379,9 +2380,9 @@ def test_attempt_marker_lifecycle() -> None:
     # A confirmed spawn failure retires the marker: no peer ever existed.
     sb = Sandbox(**{"claude.executable": "/nonexistent/claude"})
     try:
-        marker = "/tmp/claude-501/lc-spawnfail.json"
-        if os.path.exists(marker):
-            os.unlink(marker)
+        marker_fd, marker = tempfile.mkstemp(suffix=".json", prefix="ab_lc_")
+        os.close(marker_fd)
+        os.unlink(marker)
         result = runner.run(["/nonexistent/binary"], cwd="/tmp",
                             env=runner.scrubbed_env(), stdin_data="", timeout=5,
                             grace=1, stdout_cap=10, stderr_cap=10,
@@ -2390,6 +2391,25 @@ def test_attempt_marker_lifecycle() -> None:
               result.spawn_failed and not os.path.exists(marker))
     finally:
         sb.cleanup()
+
+    # A marker that cannot be written must stop the run BEFORE a peer exists.
+    # Found by CI: the write was best-effort and silently swallowed failure, so
+    # on any machine where the path was not writable the bridge would have
+    # spawned a peer with no durable evidence of it.
+    base = os.path.join(tempfile.gettempdir(), "ab-ro-%d" % os.getpid())
+    os.makedirs(base, exist_ok=True)
+    os.chmod(base, 0o500)
+    try:
+        blocked = runner.run(["/bin/sh", "-c", "echo should-not-run"], cwd="/tmp",
+                             env=runner.scrubbed_env(), stdin_data="", timeout=10,
+                             grace=1, stdout_cap=100, stderr_cap=100,
+                             pgid_file=os.path.join(base, "nested", "marker.json"))
+        check("LC: an unwritable marker refuses the run rather than spawning blind",
+              blocked.spawn_failed and blocked.marker_write_failed
+              and blocked.stdout == b"", f"stdout={blocked.stdout!r}")
+    finally:
+        os.chmod(base, 0o700)
+        shutil.rmtree(base, ignore_errors=True)
 
     # Retirement must be gated on the release SUCCEEDING, not merely ordered
     # after it. Codex's condition for lifting its withhold.
