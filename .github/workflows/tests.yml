@@ -1,0 +1,70 @@
+name: tests
+
+# Runs the offline test suite on every push and pull request.
+#
+# The suite uses stand-in programs in place of the real Claude and Codex CLIs,
+# so this needs no credentials, makes no network calls, and costs nothing. The
+# live verification in canaries/ is deliberately NOT run here: it spends real
+# model calls and needs signed-in CLIs, which is a human's decision to make.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Built and measured on macOS. Linux is included because the suite
+        # inspects processes, and that is exactly the kind of code that grows
+        # silent platform assumptions.
+        os: [macos-latest, ubuntu-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: No third-party dependencies, by design
+        run: |
+          python3 -c "import sys; print(sys.version)"
+          test ! -f requirements.txt || (echo "unexpected dependencies" && exit 1)
+
+      - name: Offline test suite
+        run: python3 tests/test_suite.py
+
+      - name: Setup reports cleanly with no CLIs installed
+        run: |
+          # Neither CLI exists on a runner, so this must fail informatively
+          # rather than crash. Exit code 1 is the documented "not ready" signal.
+          ./bin/agent-bridge-setup && rc=0 || rc=$?
+          test "$rc" = "1" || (echo "expected exit 1, got $rc" && exit 1)
+
+      - name: MCP server starts and lists the right tools
+        run: |
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+          | ./bin/agent-bridge-mcp --caller codex > out.json
+          python3 - <<'PY'
+          import json
+          names = set()
+          for line in open("out.json"):
+              line = line.strip()
+              if not line:
+                  continue
+              msg = json.loads(line)
+              if msg.get("id") == 2:
+                  names = {t["name"] for t in msg["result"]["tools"]}
+          expected = {f"claude_{v}" for v in
+                      ("start", "continue", "poll", "read", "close")}
+          assert names == expected, f"got {sorted(names)}"
+          assert not any(n.startswith("codex_") for n in names), \
+              "a caller must not be able to consult its own model"
+          print("tool exposure correct:", sorted(names))
+          PY

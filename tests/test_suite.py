@@ -57,13 +57,33 @@ def skip(name: str, reason: str) -> None:
 
 
 def group_survivors(pgid: int) -> list[str]:
-    """Processes still alive in a group, or an empty list if `ps` is unusable."""
+    """Pids still alive in a process group. Portable across macOS and Linux.
+
+    Uses `ps -A -o pid=,pgid=` and filters, rather than `ps -g <pgid>`: the
+    latter selects a process group on macOS but a session or effective group
+    NAME on Linux, so the obvious form was a silent platform assumption inside
+    a test that guards process cleanup.
+
+    Callers must reap their own direct child first. Anything still listed after
+    that is genuinely alive: a grandchild orphaned by the kill is reparented and
+    reaped by init, so it does not linger here as a zombie.
+    """
     try:
-        out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)],
+        out = subprocess.run(["ps", "-A", "-o", "pid=,pgid="],
                              capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
-    return [l for l in out.stdout.decode().splitlines() if l.strip()]
+    alive: list[str] = []
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            if int(parts[1]) == int(pgid) and int(parts[0]) != os.getpid():
+                alive.append(parts[0])
+        except ValueError:
+            continue
+    return alive
 
 
 def test_tool_exposure() -> None:
@@ -1766,11 +1786,7 @@ def test_round_four_regressions() -> None:
                  "spawned_at": time.time()})
             registry.write_status(sb.cfg, "J", "running", worker_pid=999999)
 
-            def live(group):
-                out = subprocess.run(["ps", "-o", "pid=,state=", "-g", str(group)],
-                                     capture_output=True).stdout.decode()
-                return [l for l in out.splitlines()
-                        if l.strip() and not l.split()[1].startswith("Z")]
+            live = group_survivors
 
             check("U2: the peer group is alive before reconcile", len(live(pgid)) >= 1)
             status = registry.reconcile(sb.cfg, "J")
@@ -1881,11 +1897,7 @@ def test_round_four_second_pass() -> None:
             registry.write_status(sb.cfg, "DEAD", "running", worker_pid=999999,
                                   conversation_id=cid, peer="claude", caller="codex")
 
-            def live(group):
-                out = subprocess.run(["ps", "-o", "pid=,state=", "-g", str(group)],
-                                     capture_output=True).stdout.decode()
-                return [l for l in out.splitlines()
-                        if l.strip() and not l.split()[1].startswith("Z")]
+            live = group_survivors
 
             check("V1: the orphaned peer is alive before admission",
                   len(live(pgid)) >= 1)
@@ -2084,11 +2096,7 @@ def test_round_four_third_pass() -> None:
                 {"pgid": os.getpgid(holder.pid), "leader_pid": holder.pid,
                  "leader_start": lstart, "spawned_at": time.time()})
 
-            def live(group):
-                out = subprocess.run(["ps", "-o", "pid=,state=", "-g", str(group)],
-                                     capture_output=True).stdout.decode()
-                return [l for l in out.splitlines()
-                        if l.strip() and not l.split()[1].startswith("Z")]
+            live = group_survivors
 
             pgid = os.getpgid(holder.pid)
             check("W4: the orphan is alive before admission", len(live(pgid)) >= 1)

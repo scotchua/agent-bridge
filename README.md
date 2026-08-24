@@ -1,5 +1,7 @@
 # agent-bridge
 
+![tests](https://github.com/OWNER/REPO/actions/workflows/tests.yml/badge.svg)
+
 A local bridge that lets Claude and Codex consult each other for a second
 opinion, and keeps a record of every exchange.
 
@@ -117,6 +119,14 @@ already listed. Porting this repository is the better option if you can.
 
 State lives in `~/.agent-bridge`, outside this repository, readable only by you.
 No consultation content is ever written into the repo.
+
+## Checking it yourself
+
+Every push runs the offline test suite on macOS and Linux, on two Python
+versions, via the badge at the top. That run uses stand-in programs in place of
+the two CLIs, so it needs no credentials and costs nothing. The live
+verification is deliberately not automated: it spends real model calls, so it
+stays a decision a person makes.
 
 ## Requirements
 
