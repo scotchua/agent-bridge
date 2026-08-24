@@ -65,6 +65,10 @@ answer.
 
 Read these before you trust it with anything that matters.
 
+- **Your two subscriptions may not have the same data protections.** This was
+  built assuming they do. If yours differ, the weaker plan governs whatever you
+  sent in that direction, and you can restrict what each side is allowed to
+  receive. See [Data policy](#data-policy-two-vendors-two-accounts-two-sets-of-terms).
 - **The consulted model is told not to read your filesystem. On the Codex side
   that is a rule, not a wall.** Its sandbox blocks writing, not reading. So treat
   the question you send as the boundary: assume anything in the prompt could be
@@ -85,6 +89,109 @@ Read these before you trust it with anything that matters.
   Stopping a local program does not prove the model on the other end stopped, so
   rather than guess, the conversation waits for you to look at it. There is no
   timeout, on purpose. `agent-bridge-admin status` tells you when one is waiting.
+
+## Data policy: two vendors, two accounts, two sets of terms
+
+This is the assumption most worth checking before you use it for anything real.
+
+### The technical shape
+
+Every consultation sends the prompt you composed to one of two **different
+companies**, through that company's own CLI, under your own account with them,
+governed by whatever plan you are on with them. The bridge adds no hosting of
+its own: there is no server in the middle, and nothing is stored anywhere except
+on your machine. But it does not change, improve, or unify what either company
+does with the text once it arrives.
+
+**This was built by someone whose Claude and Codex subscriptions have
+comparable data protections.** That is a fact about the author's accounts, not a
+property of this software. If your two plans differ, the software will happily
+send the same sentence to both, and the weaker plan governs what happens to the
+copy it received.
+
+The important consequence is that **your exposure is per direction, not an
+average of the two.** If one side retains prompts for longer, or trains on
+inputs where the other does not, then anything you send *in that direction* gets
+that treatment. Sending it once is the exposure. There is no netting.
+
+### What to check, on each plan separately
+
+Ask the same five questions of both vendors, for the specific plan you are on,
+because answers commonly differ between consumer, professional, team and
+enterprise tiers of the same product:
+
+1. Are my inputs used to train or improve models?
+2. How long is prompt and output content retained, and can I turn retention off?
+3. Who at the vendor can access content, and under what circumstances, for
+   example abuse review?
+4. Where is content processed and stored, geographically?
+5. Does a business or enterprise agreement change any of the above, and would
+   that agreement cover the CLI specifically rather than only the web product?
+
+Answers change. Check them yourself, on your own plan, rather than trusting a
+summary in a README, including this one.
+
+### Hardening one side
+
+If one side is weaker, you have three options, roughly in order of how much they
+cost you:
+
+**Narrow what the weaker peer may receive.** Each peer can be allowed a shorter
+list than the other, in `config/local.json`:
+
+```json
+{
+  "peers": {
+    "codex": { "allowed_source_classifications": ["public"] }
+  }
+}
+```
+
+That peer then refuses anything not on its list, and the refusal is enforced
+before any request leaves your machine. The tool description that peer's caller
+sees also advertises only the narrower list, so the calling model is told what
+it may send rather than discovering it by being refused.
+
+**Run only one direction.** The two directions are separate MCP servers. Skip
+the `mcp add` for the one you do not want, and that direction does not exist.
+
+**Upgrade the weaker plan**, if the vendor offers a tier with terms you are
+satisfied with.
+
+### What this means in plain language
+
+If you are an accountant, here is the whole thing without the jargon.
+
+This tool makes it very easy to send a question to two different AI companies.
+Easy enough that you will stop thinking about it, which is exactly the risk. The
+convenience is real and so is the exposure it creates.
+
+**Treat the question you type as a document you are handing to an outside firm.**
+Because that is what it is. You are handing it to two outside firms, and each one
+does what its own contract with you says, not what the other one does.
+
+Three practical rules:
+
+- **If you would not paste it into that company's public chat window, do not
+  send it through this.** The bridge is a nicer interface to the same act.
+- **Client-identifying information does not go in, ever.** Not names, not
+  account numbers, not enough surrounding detail to identify someone. If you
+  need a second opinion on a client situation, describe the *structure* of the
+  problem with the identifying facts removed. That is the same discipline you
+  would use asking a colleague at a conference.
+- **The label is a speed bump, not a lock.** Marking something `internal` does
+  not protect it. It exists to make you pause for one second and think about
+  what you are about to send. It refuses obvious mistakes; it cannot read your
+  prompt and tell you that paragraph three names a client.
+
+And the part people skip: **your obligations to clients do not change because a
+tool made something convenient.** Confidentiality rules, engagement letters, and
+any consent requirements that apply to disclosing client information apply
+exactly as they did before. A tool being on your own machine does not make the
+data local, because the whole point of it is to send the text somewhere else.
+
+None of this is legal advice, and it is not a substitute for reading your own
+vendor agreements or asking someone qualified about your own obligations.
 
 ## How it was built, and why that is in the repo
 

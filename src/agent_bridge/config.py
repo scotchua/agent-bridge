@@ -71,6 +71,22 @@ class Config:
     def allowed_classifications(self) -> tuple[str, ...]:
         return tuple(self.raw.get("allowed_source_classifications") or ())
 
+    def peer_allowed_classifications(self, peer: str) -> tuple[str, ...]:
+        """What a specific peer may receive.
+
+        Defaults to the global list. Overriding it per peer exists because the
+        two peers are different companies under different accounts and possibly
+        different plans: if one side's terms are weaker than the other's, the
+        weaker side should be allowed to receive less. Exposure is per
+        direction, not an average of the two.
+        """
+        override = self.peer(peer).get("allowed_source_classifications")
+        if override is None:
+            return self.allowed_classifications
+        if not isinstance(override, list) or not all(isinstance(x, str) for x in override):
+            raise ValueError(f"peers.{peer}.allowed_source_classifications must be a list of strings")
+        return tuple(override)
+
     @property
     def refused_classifications(self) -> tuple[str, ...]:
         return tuple(self.raw.get("refused_source_classifications") or ())

@@ -55,5 +55,6 @@
   "worker": {
     "python_executable": null,
     "poll_interval_seconds": 0.25
-  }
+  },
+  "_note_source_classifications": "Set peers.<name>.allowed_source_classifications to give one peer a narrower list than the other. See the Data policy section of README.md."
 }

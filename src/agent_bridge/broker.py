@@ -45,7 +45,8 @@ def ok_response(**fields: Any) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- validation
-def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str]) -> None:
+def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
+                     peer: str) -> None:
     if not isinstance(args, dict):
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
     unknown = set(args) - allowed
@@ -64,7 +65,9 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str]) -> No
     normalized = classification.strip().lower()
     if normalized in {c.lower() for c in cfg.refused_classifications}:
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
-    if normalized not in {c.lower() for c in cfg.allowed_classifications}:
+    # Checked against what THIS peer may receive, which can be narrower than
+    # the global list when one vendor's terms are weaker than the other's.
+    if normalized not in {c.lower() for c in cfg.peer_allowed_classifications(peer)}:
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
 
     label = args.get("label")
@@ -121,7 +124,7 @@ def _spawn_worker(cfg: Config, job_dir: str) -> int:
 # ------------------------------------------------------------------ operations
 def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     peer = PEER_OF[caller]
-    _validate_common(cfg, args, START_FIELDS)
+    _validate_common(cfg, args, START_FIELDS, peer)
     preflight.check_peer(cfg, peer)
     cfg.load_schema()
 
@@ -162,7 +165,7 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 
 def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     peer = PEER_OF[caller]
-    _validate_common(cfg, args, CONTINUE_FIELDS)
+    _validate_common(cfg, args, CONTINUE_FIELDS, peer)
     conversation_id = args.get("conversation_id")
     if not isinstance(conversation_id, str) or not conversation_id:
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)

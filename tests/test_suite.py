@@ -330,6 +330,67 @@ def test_input_validation() -> None:
         sb.cleanup()
 
 
+def test_per_peer_classification_limits() -> None:
+    """One peer can be allowed less than the other.
+
+    The two peers are different companies, under different accounts, possibly
+    on different plans. If one side's data terms are weaker, exposure is per
+    direction rather than an average, so the weaker side must be able to
+    receive less.
+    """
+    print("\n[per-peer classification limits]")
+    sb = Sandbox(**{"codex.allowed_source_classifications": ["public"]})
+    try:
+        check("PP: the narrowed peer reports the narrower list",
+              sb.cfg.peer_allowed_classifications("codex") == ("public",),
+              str(sb.cfg.peer_allowed_classifications("codex")))
+        check("PP: the other peer is unaffected",
+              sb.cfg.peer_allowed_classifications("claude")
+              == ("internal", "synthetic", "public"))
+
+        def call(caller, tool, args):
+            out = sb.mcp(caller, [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": tool, "arguments": args}}])
+            return out[0]["result"]["structuredContent"]
+
+        r = call("claude", "codex_start",
+                 {"prompt": "q", "source_classification": "internal"})
+        check("PP: internal is refused for the narrowed peer",
+              r.get("error_category")
+              == ErrorCategory.SOURCE_CLASSIFICATION_REFUSED.value, json.dumps(r))
+        r = call("claude", "codex_start",
+                 {"prompt": "q", "source_classification": "public"})
+        check("PP: public is still accepted for the narrowed peer", r.get("ok") is True,
+              json.dumps(r))
+        r = call("codex", "claude_start",
+                 {"prompt": "q", "source_classification": "internal"})
+        check("PP: the same classification is still accepted by the other peer",
+              r.get("ok") is True, json.dumps(r))
+
+        out = sb.mcp("claude", [{"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                                 "params": {}}])
+        enum = [t for t in out[-1]["result"]["tools"]
+                if t["name"] == "codex_start"][0]["inputSchema"]["properties"][
+                    "source_classification"]["enum"]
+        check("PP: the tool schema advertises only what that peer may receive",
+              enum == ["public"], str(enum))
+        for job in ("claude", "codex"):
+            pass
+    finally:
+        sb.cleanup()
+
+    # A malformed override must be rejected, not silently ignored.
+    sb = Sandbox(**{"codex.allowed_source_classifications": "public"})
+    try:
+        try:
+            sb.cfg.peer_allowed_classifications("codex")
+            check("PP: a malformed override is rejected", False, "it was accepted")
+        except ValueError:
+            check("PP: a malformed override is rejected", True)
+    finally:
+        sb.cleanup()
+
+
 def test_output_cap() -> None:
     print("\n[output caps]")
     sb = Sandbox(limits={"peer_stdout_max_bytes": 400})
@@ -2513,6 +2574,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_per_peer_classification_limits()
     test_output_cap()
     test_version_mismatch_and_missing_executable()
     test_timeout_and_process_group_cleanup()

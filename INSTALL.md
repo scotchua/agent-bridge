@@ -86,6 +86,25 @@ Read the four numbers it prints: how many replies were valid, how many worked
 first time, how long they took, and whether every follow-up landed on the
 intended conversation. One success proves nothing, which is why it runs forty.
 
+## 4b. Decide what each side is allowed to receive
+
+Before you turn it on, read the **Data policy** section of the README. The short
+version: this sends your text to two different companies under two different
+agreements, and it was built assuming both of your plans protect data equally.
+If yours do not, you can allow one side less than the other by adding this to
+`config/local.json`:
+
+```json
+{
+  "peers": {
+    "codex": { "allowed_source_classifications": ["public"] }
+  }
+}
+```
+
+Substitute whichever peer is on the weaker plan. Doing nothing keeps both sides
+equal, which is the right default only if your plans really are equal.
+
 ## 5. Turn it on
 
 Only after step 4 passes. These two commands change your MCP configuration.
