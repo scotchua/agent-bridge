@@ -13,6 +13,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Windows is not supported. This job proves the refusal is clean and the
+  # message is useful on a real Windows machine, rather than asserting it from
+  # a Mac. If someone later ports the platform layer, this job is where the
+  # evidence that it works would go.
+  windows-refuses-cleanly:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Importing the package raises a useful refusal, not an ImportError
+        shell: python
+        run: |
+          import sys, traceback
+          sys.path.insert(0, "src")
+          try:
+              import agent_bridge
+          except RuntimeError as exc:
+              message = str(exc)
+              print(message)
+              required = ["POSIX", "macOS or Linux", "WSL", "safety machinery",
+                          "stubbing", "fcntl", "killpg", "fchmod", "selectors"]
+              missing = [r for r in required if r not in message]
+              assert not missing, f"refusal message missing: {missing}"
+              print("\nrefusal is clean and complete")
+          except ImportError as exc:
+              print("FAILED: raised a bare ImportError instead of the guard")
+              traceback.print_exc()
+              sys.exit(1)
+          else:
+              print("FAILED: imported successfully on an unsupported platform")
+              sys.exit(1)
+
   offline-suite:
     strategy:
       fail-fast: false
