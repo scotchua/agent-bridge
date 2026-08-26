@@ -90,6 +90,20 @@ Read these before you trust it with anything that matters.
   rather than guess, the conversation waits for you to look at it. There is no
   timeout, on purpose. `agent-bridge-admin status` tells you when one is waiting.
 
+## One setting worth making deliberately
+
+Neither peer inherits a reasoning-effort setting from your own configuration.
+The Codex peer runs with your personal config ignored, which is the isolation
+working correctly, and the Claude peer is started fresh. So unless you set one,
+both run at their own default rather than at whatever you have chosen for
+yourself elsewhere.
+
+That is a reasonable default and a poor accident. For review work, set
+`reasoning_effort` per peer in `config/local.json`; see
+[INSTALL.md](INSTALL.md). Whatever you pick, including nothing, is recorded on
+every consultation, so the ledger can always answer how hard the model was
+asked to think about an answer you relied on.
+
 ## Data policy: two vendors, two accounts, two sets of terms
 
 This is the assumption most worth checking before you use it for anything real.

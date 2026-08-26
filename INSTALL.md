@@ -153,6 +153,31 @@ If yours do not, you can allow one side less than the other by adding this to
 Substitute whichever peer is on the weaker plan. Doing nothing keeps both sides
 equal, which is the right default only if your plans really are equal.
 
+## 4c. Decide how hard each side should think
+
+Optional, and worth thirty seconds. Neither peer inherits a reasoning setting
+from your own configuration: the Codex peer deliberately ignores your personal
+config file, and the Claude peer is started fresh. Left alone, both run at their
+own default.
+
+If you are using this for review work, where the whole point is catching what
+you missed, higher effort is usually worth the extra cost and time. Add to
+`config/local.json`:
+
+```json
+{
+  "peers": {
+    "claude": { "reasoning_effort": "xhigh" },
+    "codex":  { "reasoning_effort": "xhigh" }
+  }
+}
+```
+
+Accepted values are `low`, `medium`, `high`, `xhigh` and `max`. They can differ
+per side. Whatever you choose, including choosing nothing, is recorded on every
+consultation in the ledger, so you can always tell later how hard the model was
+asked to think about an answer you relied on.
+
 ## 5. Turn it on
 
 Only after step 4 passes. These two commands change your MCP configuration.
