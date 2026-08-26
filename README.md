@@ -264,8 +264,10 @@ surfaced, because the POSIX idiom and the Windows behaviour differ silently:
 `os.kill(pid, 0)` is a liveness probe on POSIX and a console interrupt on
 Windows; `start_new_session` is accepted and ignored; `os.replace` is not the
 clean swap that POSIX rename is, so a reader can find no file at all and a
-live job reported as `JOB_NOT_FOUND`; and a job-liveness check that looked
-only at the leader process reported a surviving descendant as contained.
+live job reported as `JOB_NOT_FOUND`, while the writer on the other side of
+that same race is refused outright and takes the worker down with it; and a
+job-liveness check that looked only at the leader process reported a surviving
+descendant as contained.
 
 ### If you are testing this on Windows
 
@@ -288,13 +290,24 @@ Verified on one machine, one locale, not domain-joined. An English-language
 ACL parser is the part most likely to need work on them. It fails closed, so an
 unrecognised ACL refuses the run rather than assuming privacy.
 
-**One open question.** A `worker_died` has been seen intermittently, on the
-order of one job in fifteen hundred, and it reproduces in no isolated loop. The
-machine it was seen on logs disk controller errors and 30 real-time-clock
-faults a day, so it cannot be told apart there from the platform's own
-instability. The verdict now carries its evidence: a `worker_died` record says
-whether the OS reported a real exit code or the liveness probe itself failed,
-which are different bugs. If you hit one, that record is the thing to send.
+**The intermittent `worker_died` is fixed, and it is worth saying what it
+was.** It appeared roughly once in fifteen hundred jobs and reproduced in no
+isolated loop. The machine it was first seen on logs disk controller errors and
+30 real-time-clock faults a day, and that was allowed to stand as the
+explanation for longer than it should have been. It was wrong. Two true facts,
+a flaky machine and a rare failure, are not a causal link, and the tell was
+there to read: genuinely bad hardware does not spare a 50-run stress loop and
+then hit the full suite. A race does, because only the full suite runs a reader
+against a writer.
+
+CI on a clean runner produced it with a stack trace. `os.replace` is
+`MoveFileExW` on Windows and is refused while another handle is open on the
+destination without `FILE_SHARE_DELETE`, which CPython's `open()` does not
+request. The reader side of that race had already been fixed; the writer side
+had not. Both are handled now, and the record that made it diagnosable is still
+attached to every `worker_died`: whether the OS reported a real exit code or
+the liveness probe itself failed, which are different bugs. If you hit one, that
+record is still the thing to send.
 [WSL](INSTALL.md#windows) remains supported and uses the POSIX path.
 
 A peer on Windows is also terminated immediately, with no graceful stage,
