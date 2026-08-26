@@ -487,7 +487,7 @@ def _group_identity_matches(marker: dict[str, Any]) -> tuple[bool, str]:
     if not observed_start and not observed_pgid:
         return False, "group leader is gone"
     if not observed_pgid:
-        return False, "unreadable ps output"
+        return False, "process group could not be determined"
     if observed_pgid != str(pgid):
         return False, "leader pid no longer belongs to the recorded group"
     recorded_start = str(marker.get("leader_start") or "").strip()

@@ -27,6 +27,54 @@ from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
 from agent_bridge.platform import platform as active_platform  # noqa: E402
+
+# A process group containing a SIBLING, not just its leader. Reaping must kill
+# the whole group, so a single-process group would let a leader-only kill pass.
+# Portable stand-in for the shell's "sleep 120 & sleep 120".
+GROUP_OF_TWO = ("import subprocess,sys,time;"
+                "subprocess.Popen([sys.executable,'-c',"
+                "'import time;time.sleep(120)']);"
+                "time.sleep(120)")
+
+
+def restrict_dir(path: str, kind: str):
+    """Make a directory unlistable or unwritable, on either platform.
+
+    POSIX uses mode bits. Windows has no mode bits that mean anything here, so
+    it uses a deny ACE. Both mechanisms were MEASURED in a Windows VM, not
+    assumed, and the measurements matter:
+
+      unlistable  POSIX 0o300     Windows deny (RD)
+                  listdir raises, traverse still works, on both.
+      unwritable  POSIX 0o500     Windows deny (WD,AD)
+                  Deny (WD) ALONE DOES NOT STOP mkdir. Only AD, "add
+                  subdirectory", does. A (WD)-only version of this helper
+                  passes its tests while restricting nothing.
+
+    The principal must be the *<SID> form; an account name fails with error
+    1332, and getpass.getuser() can return a machine account.
+
+    Returns a callable that restores the directory. Always call it, or the
+    temporary tree cannot be deleted.
+    """
+    posix_mode = {"unlistable": 0o300, "unwritable": 0o500}[kind]
+    if os.name != "nt":
+        os.chmod(path, posix_mode)
+        return lambda: os.chmod(path, 0o700)
+
+    deny = {"unlistable": "(RD)", "unwritable": "(WD,AD)"}[kind]
+    whoami = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
+                            capture_output=True, text=True, timeout=30, check=True)
+    sid = next(csv.reader([whoami.stdout.strip()]))[1]
+    subprocess.run(["icacls", path, "/deny", f"*{sid}:{deny}"],
+                   capture_output=True, text=True, timeout=30, check=True)
+
+    def restore():
+        subprocess.run(["icacls", path, "/remove:d", f"*{sid}"],
+                       capture_output=True, text=True, timeout=30, check=True)
+    return restore
+
+
 from agent_bridge.platform.windows_acl import (  # noqa: E402
     WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_is_owner_only,
 )
@@ -1351,16 +1399,7 @@ def test_round_two_regressions() -> None:
         blocked = os.path.join(sb.root, "blocked")
         inner = os.path.join(blocked, "ws")
         os.makedirs(inner, exist_ok=True)
-        deny_sid = None
-        if os.name == "nt":
-            whoami = subprocess.run(
-                ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
-                text=True, timeout=30, check=True)
-            deny_sid = next(csv.reader([whoami.stdout.strip()]))[1]
-            subprocess.run(["icacls", blocked, "/deny", f"*{deny_sid}:(RD)"],
-                           capture_output=True, text=True, timeout=30, check=True)
-        else:
-            os.chmod(blocked, 0o300)   # searchable, not listable
+        restore_blocked = restrict_dir(blocked, "unlistable")
         try:
             preflight.assert_workspace_clean(inner)
             check("R5: an unenumerable ancestor fails closed", False, "it passed")
@@ -1368,11 +1407,7 @@ def test_round_two_regressions() -> None:
             check("R5: an unenumerable ancestor fails closed",
                   exc.category == ErrorCategory.WORKSPACE_UNVERIFIABLE, exc.category.value)
         finally:
-            if deny_sid:
-                subprocess.run(["icacls", blocked, "/remove:d", f"*{deny_sid}"],
-                               capture_output=True, text=True, timeout=30, check=True)
-            else:
-                os.chmod(blocked, 0o700)
+            restore_blocked()
         check("R5: the walk resolves the real path, not the lexical one",
               "os.path.realpath(workspace)" in inspect.getsource(
                   preflight.assert_workspace_clean))
@@ -1907,8 +1942,7 @@ def test_round_four_regressions() -> None:
         try:
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("J"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen([sys.executable, "-c",
-                                     "import time;time.sleep(120)"],
+            proc = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
                                     start_new_session=True,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -2014,8 +2048,7 @@ def test_round_four_second_pass() -> None:
                 "created_at": store.utc_now(), "updated_at": store.utc_now()})
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("DEAD"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen([sys.executable, "-c",
-                                     "import time;time.sleep(120)"],
+            proc = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
                                     start_new_session=True,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -2190,20 +2223,25 @@ def test_round_four_third_pass() -> None:
     sb = Sandbox()
     try:
         make_conv(sb, "w3", "RECYCLED")
-        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"],
-                                start_new_session=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Spawn through the platform, not a bare Popen: the group must be one
+        # the platform can identify, or the refusal comes from "no group could
+        # be determined" instead of from the start-time mismatch under test.
+        proc = active_platform.spawn_isolated(
+            [sys.executable, "-c", "import time;time.sleep(60)"],
+            cwd=tempfile.gettempdir(), env=runner.scrubbed_env())
         try:
             # Real live group, but a spawn identity that cannot match it.
-            marker(sb, "RECYCLED", {"pgid": os.getpgid(proc.pid),
+            group_id = active_platform.isolated_process_group(proc.pid)
+            check("W3: the live group is identifiable before the mismatch test",
+                  group_id is not None, str(group_id))
+            marker(sb, "RECYCLED", {"pgid": group_id,
                                     "leader_pid": proc.pid,
                                     "leader_start": "Sat Jan  1 00:00:00 2020",
                                     "spawned_at": 1.0})
             outcomes = registry.reap_orphaned_peers(sb.cfg, "RECYCLED")
             check("W3: a start-time mismatch is refused, not signalled",
                   all(not o.get("signalled") for o in outcomes)
-                  and any(any(reason in str(o.get("identity")) for reason in (
-                      "recycled", "could not be verified")) for o in outcomes),
+                  and any("recycled" in str(o.get("identity")) for o in outcomes),
                   json.dumps(outcomes))
             check("W3: and the process is left alive rather than wrongly killed",
                   proc.poll() is None)
@@ -2225,8 +2263,7 @@ def test_round_four_third_pass() -> None:
                 os.path.join(sb.cfg.job_dir("REAL"), "attempts", "1"))
             # Spawn through the runner so the marker carries real identity,
             # then recreate it because a normal return deletes it.
-            holder = subprocess.Popen([sys.executable, "-c",
-                                       "import time;time.sleep(120)"],
+            holder = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
                                       start_new_session=True,
                                       stdout=subprocess.DEVNULL,
                                       stderr=subprocess.DEVNULL)
@@ -2539,7 +2576,7 @@ def test_attempt_marker_lifecycle() -> None:
     # spawned a peer with no durable evidence of it.
     base = os.path.join(tempfile.gettempdir(), "ab-ro-%d" % os.getpid())
     os.makedirs(base, exist_ok=True)
-    os.chmod(base, 0o500)
+    restore_base = restrict_dir(base, "unwritable")
     try:
         blocked = runner.run([sys.executable, "-c", "print('should-not-run')"],
                              cwd=tempfile.gettempdir(),
@@ -2550,7 +2587,7 @@ def test_attempt_marker_lifecycle() -> None:
               blocked.spawn_failed and blocked.marker_write_failed
               and blocked.stdout == b"", f"stdout={blocked.stdout!r}")
     finally:
-        os.chmod(base, 0o700)
+        restore_base()
         shutil.rmtree(base, ignore_errors=True)
 
     # Retirement must be gated on the release SUCCEEDING, not merely ordered
@@ -3210,7 +3247,10 @@ def test_state_root_permissions() -> None:
 
         # The privacy guarantee must be verified by the platform, not by a
         # POSIX-shaped assertion that a correct Windows ACL could never satisfy.
-        from agent_bridge.platform import platform as active_platform
+        # active_platform comes from the module-level import. A function-local
+        # re-import here would make the name local for the WHOLE function, so
+        # the Windows branch above it would raise UnboundLocalError. POSIX never
+        # runs that branch, which is why this survived until a Windows run.
         check("SR: verification is delegated to the platform",
               hasattr(active_platform, "verify_owner_only_path"))
         expected_mechanism = ("windows acl round-trip" if os.name == "nt"
