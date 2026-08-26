@@ -133,7 +133,12 @@ def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
         "Directory mode is exactly 0700 and file mode is exactly 0600.",
     )
     if not report["honours_permissions"]:
-        raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
+        # Attach the evidence to the exception. A closed category is right for
+        # the caller; an operator staring at a refused startup needs to know
+        # which path failed and what the platform actually observed.
+        error = BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
+        error.report = report  # type: ignore[attr-defined]
+        raise error
     return report
 
 

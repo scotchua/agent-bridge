@@ -344,11 +344,18 @@ def main(argv: list[str] | None = None) -> int:
         # caller can see which guarantee was actually being checked.
         sys.stderr.write(f"agent-bridge: {hint(exc.category)}\n")
         try:
-            from . import preflight as _preflight
+            import json as _json
             from .platform import platform as _platform
             sys.stderr.write(
-                f"agent-bridge: platform={type(_platform).__name__} "
-                f"owner_only_supported={_platform.supports_owner_only_permissions}\n")
+                f"agent-bridge: platform={type(_platform).__name__}\n")
+            report = getattr(exc, "report", None)
+            if report:
+                sys.stderr.write(f"agent-bridge: report={_json.dumps(report)}\n")
+            diagnose = getattr(_platform, "acl_diagnostics", None)
+            if diagnose:
+                for target in (cfg.state_root,):
+                    sys.stderr.write(
+                        f"agent-bridge: acl={_json.dumps(diagnose(target))}\n")
         except Exception:  # noqa: BLE001 - diagnostics must not mask the refusal
             pass
         return 2

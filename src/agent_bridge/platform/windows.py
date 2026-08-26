@@ -99,7 +99,11 @@ kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
 
 class WindowsPlatform:
     def __init__(self) -> None:
-        self.supports_owner_only_permissions = self._acl_round_trip_supported()
+        # Unknown until something actually verifies it. Deliberately not
+        # probed here: an import-time probe costs two subprocesses on every
+        # invocation, and a cached answer can disagree with the live read-back
+        # that preflight performs, which is the only answer that matters.
+        self.supports_owner_only_permissions = False
         self._jobs: dict[int, int] = {}
         self._jobs_lock = threading.Lock()
 
