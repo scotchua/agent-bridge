@@ -36,7 +36,8 @@
       "model": "sonnet",
       "max_budget_usd": 0.5,
       "timeout_seconds": 300,
-      "grace_seconds": 5
+      "grace_seconds": 5,
+      "reasoning_effort": null
     },
     "codex": {
       "executable": null,
@@ -48,7 +49,8 @@
       "codex_home": "~/.agent-bridge/codex-home",
       "sandbox_mode": "read-only",
       "timeout_seconds": 420,
-      "grace_seconds": 5
+      "grace_seconds": 5,
+      "reasoning_effort": null
     }
   },
   "worker": {
@@ -56,5 +58,6 @@
     "poll_interval_seconds": 0.25
   },
   "_note_source_classifications": "Set peers.<name>.allowed_source_classifications to give one peer a narrower list than the other. See the Data policy section of README.md.",
-  "_note_ledger": "The append-only ledger is never deleted by cleanup: it is the audit record. There is deliberately no ledger retention setting, because a number here would imply a rotation that does not happen."
+  "_note_ledger": "The append-only ledger is never deleted by cleanup: it is the audit record. There is deliberately no ledger retention setting, because a number here would imply a rotation that does not happen.",
+  "_note_reasoning_effort": "null means the CLI's own default. Neither peer inherits your personal setting: the Codex peer runs with --ignore-user-config and the Claude peer is invoked fresh. Set one of low, medium, high, xhigh, max per peer in config/local.json. Higher effort costs more and takes longer, and is usually worth it for review work."
 }

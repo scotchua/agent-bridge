@@ -71,6 +71,13 @@ def build_argv(
         "--output-last-message", last_message_file,
         "-c", f'sandbox_mode="{sandbox}"',
     ]
+    effort = cfg.peer_reasoning_effort(PEER)
+    if effort:
+        # Accepted on both `exec` and `exec resume`, verified against 0.147.0
+        # under --strict-config.
+        argv += ["-c", f'model_reasoning_effort="{effort}"']
+    argv += [
+    ]
     if not thread_id:
         # Only `exec` accepts these two; `exec resume` rejects them.
         argv += ["-s", sandbox, "-C", workspace]
@@ -185,6 +192,7 @@ def run_consultation(
     outcome.peer_session_id = thread_id if thread_id else parsed_thread_id
     outcome.notes = {
         "descendant_held_pipes": result.descendant_held_pipes,
+        "requested_reasoning_effort": cfg.peer_reasoning_effort(PEER),
         "peer_home": home_inventory,
         "event_count": len(events),
         "event_types": sorted({str(e.get("type")) for e in events})[:20],

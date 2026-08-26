@@ -300,6 +300,10 @@ def execute(job_dir: str) -> int:
         "peer_executable": peer_info.get("executable"),
         "peer_observed_version": peer_info.get("observed_version"),
         "peer_requested_model": cfg.peer(peer).get("model"),
+        # Recorded whether set or not. A null here means "the CLI's own
+        # default was used", which is a fact about the consultation and not an
+        # absence of one.
+        "peer_requested_reasoning_effort": cfg.peer_reasoning_effort(peer),
         "peer_observed_model": final.observed_model if final else None,
         "peer_observed_models": (final.observed_models if final else []) or None,
         # Whether the peer REPORTED these, as opposed to whether we captured

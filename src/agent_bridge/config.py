@@ -71,6 +71,29 @@ class Config:
     def allowed_classifications(self) -> tuple[str, ...]:
         return tuple(self.raw.get("allowed_source_classifications") or ())
 
+    #: Effort levels both CLIs accept. Kept identical so one setting means the
+    #: same thing on each side.
+    EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+    def peer_reasoning_effort(self, peer: str) -> str | None:
+        """Reasoning effort for a peer, or None to use the CLI's own default.
+
+        This is worth setting deliberately. Neither CLI inherits anything here:
+        the Codex peer runs with --ignore-user-config, so a personal
+        model_reasoning_effort is not read, and the Claude peer is invoked
+        without --effort. Left unset, both run at whatever their default is,
+        which for a tool whose entire job is adversarial review is a decision
+        worth making rather than inheriting by omission.
+        """
+        value = self.peer(peer).get("reasoning_effort")
+        if value is None:
+            return None
+        if not isinstance(value, str) or value not in self.EFFORT_LEVELS:
+            raise ValueError(
+                f"peers.{peer}.reasoning_effort must be one of "
+                f"{list(self.EFFORT_LEVELS)}, got {value!r}")
+        return value
+
     def peer_allowed_classifications(self, peer: str) -> tuple[str, ...]:
         """What a specific peer may receive.
 

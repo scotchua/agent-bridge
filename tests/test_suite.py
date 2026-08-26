@@ -2765,6 +2765,80 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_reasoning_effort() -> None:
+    """Effort must be a deliberate setting, and recorded either way.
+
+    Neither peer inherits one. The Codex peer runs with --ignore-user-config so
+    a personal model_reasoning_effort is never read, and the Claude peer is
+    invoked without --effort. Left unset both run at their own default, which
+    for a review tool is a decision worth making rather than inheriting by
+    omission.
+    """
+    print("\n[reasoning effort]")
+    from agent_bridge.backends import claude_backend as cb, codex_backend as cx
+
+    sb = Sandbox()
+    try:
+        check("RE: unset by default, meaning the CLI's own default",
+              sb.cfg.peer_reasoning_effort("claude") is None
+              and sb.cfg.peer_reasoning_effort("codex") is None)
+        schema, _ = sb.cfg.load_schema()
+        argv = cb.build_argv(sb.cfg, schema, "SID", False)
+        check("RE: and no --effort flag is passed when unset", "--effort" not in argv)
+        argv = cx.build_argv(sb.cfg, schema_file="/s.json",
+                             last_message_file="/m.txt", thread_id=None,
+                             workspace="/ws")
+        check("RE: nor a codex reasoning override",
+              not any("reasoning" in a for a in argv))
+    finally:
+        sb.cleanup()
+
+    for level in ("low", "xhigh", "max"):
+        sb = Sandbox(**{"claude.reasoning_effort": level,
+                        "codex.reasoning_effort": level})
+        try:
+            schema, _ = sb.cfg.load_schema()
+            argv = cb.build_argv(sb.cfg, schema, "SID", False)
+            check(f"RE: claude receives --effort {level}",
+                  "--effort" in argv and argv[argv.index("--effort") + 1] == level)
+            for thread in (None, "T"):
+                argv = cx.build_argv(sb.cfg, schema_file="/s.json",
+                                     last_message_file="/m.txt",
+                                     thread_id=thread, workspace="/ws")
+                where = "resume" if thread else "start"
+                check(f"RE: codex receives the override on {where}",
+                      f'model_reasoning_effort="{level}"' in argv, str(argv))
+        finally:
+            sb.cleanup()
+
+    # An invalid level must be refused, not silently ignored. The Claude CLI
+    # warns and falls back to its default, which would be an invisible downgrade.
+    sb = Sandbox(**{"codex.reasoning_effort": "very-high"})
+    try:
+        try:
+            sb.cfg.peer_reasoning_effort("codex")
+            check("RE: an invalid level is rejected", False, "it was accepted")
+        except ValueError as exc:
+            check("RE: an invalid level is rejected", "must be one of" in str(exc))
+    finally:
+        sb.cleanup()
+
+    # Recorded whether set or not: a null means "the CLI's default was used",
+    # which is a fact about the consultation rather than a missing one.
+    for level in (None, "high"):
+        overrides = {} if level is None else {"claude.reasoning_effort": level}
+        sb = Sandbox(**overrides)
+        try:
+            started, _, _ = sb.run_to_completion("codex")
+            prov = sb.provenance(started["job_id"])
+            check(f"RE: provenance records requested effort ({level or 'unset'})",
+                  "peer_requested_reasoning_effort" in prov
+                  and prov["peer_requested_reasoning_effort"] == level,
+                  json.dumps(prov.get("peer_requested_reasoning_effort")))
+        finally:
+            sb.cleanup()
+
+
 def test_reported_issues() -> None:
     """Issues reported by an outside user doing a first install."""
     print("\n[reported issues]")
@@ -2962,6 +3036,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_reasoning_effort()
     test_reported_issues()
     test_state_root_permissions()
     test_platform_guard()

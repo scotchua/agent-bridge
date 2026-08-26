@@ -55,6 +55,9 @@ def build_argv(cfg: Config, schema: dict[str, Any], session_id: str, resume: boo
         argv += ["--session-id", session_id]
     if spec.get("model"):
         argv += ["--model", str(spec["model"])]
+    effort = cfg.peer_reasoning_effort(PEER)
+    if effort:
+        argv += ["--effort", effort]
     if spec.get("max_budget_usd") is not None:
         argv += ["--max-budget-usd", str(spec["max_budget_usd"])]
     argv += [
@@ -190,6 +193,7 @@ def run_consultation(
         "model_usage_present": isinstance(usage_models, dict) and bool(usage_models),
         "total_cost_present": envelope.get("total_cost_usd") is not None,
         "requested_model": requested_model,
+        "requested_reasoning_effort": cfg.peer_reasoning_effort(PEER),
         # The config passes an alias such as "sonnet" and the CLI reports a full
         # name such as "claude-sonnet-5". The alias mapping belongs to the CLI,
         # not to this bridge, so this is a heuristic consistency signal and is
