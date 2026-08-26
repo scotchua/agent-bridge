@@ -227,7 +227,7 @@ def retire_attempt_markers(cfg: Config, job_id: str) -> list[str]:
         if not path:
             continue
         try:
-            os.replace(path, path + ".committed")
+            store.replace(path, path + ".committed")
             retired.append(str(marker.get("attempt")))
         except OSError:
             pass
@@ -249,7 +249,7 @@ def resolve_indeterminate(cfg: Config, conversation_id: str) -> dict[str, Any]:
             if not source:
                 continue
             try:
-                os.replace(source, source + ".resolved")
+                store.replace(source, source + ".resolved")
                 retired.append(marker.get("attempt"))
             except OSError:
                 pass

@@ -3246,6 +3246,84 @@ def test_status_read_race() -> None:
         sb.cleanup()
 
 
+def test_windows_atomic_replace_retry() -> None:
+    print("\n[Windows atomic replace retry]")
+    root = tempfile.mkdtemp()
+    path = os.path.join(root, "status.json")
+    real_windows = store.WINDOWS
+    real_replace = store.REPLACE
+    real_grace = store.ATOMIC_REPLACE_GRACE_SECONDS
+    reader_open = threading.Event()
+    release_reader = threading.Event()
+    attempts = 0
+
+    def counted_replace(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if os.name != "nt" and not release_reader.is_set():
+            raise PermissionError("destination reader still holds the file")
+        real_replace(source, destination)
+
+    def transient_reader():
+        with open(path, "rb"):
+            reader_open.set()
+            release_reader.wait()
+
+    try:
+        with open(path, "wb") as handle:
+            handle.write(b"old")
+        if os.name != "nt":
+            store.WINDOWS = True
+        store.REPLACE = counted_replace
+        store.ATOMIC_REPLACE_GRACE_SECONDS = 0.5
+        reader = threading.Thread(target=transient_reader)
+        reader.start()
+        reader_open.wait()
+        threading.Timer(0.05, release_reader.set).start()
+        store.atomic_write_bytes(path, b"new")
+        reader.join()
+        with open(path, "rb") as handle:
+            written = handle.read()
+        check("a transient destination reader allows the atomic write to succeed",
+              written == b"new")
+        check("the transient destination reader made the write retry",
+              attempts > 1, str(attempts))
+        check("no temp files remain after a retried atomic write succeeds",
+              sorted(os.listdir(root)) == ["status.json"], str(os.listdir(root)))
+
+        attempts = 0
+        release_reader.clear()
+        reader_open.clear()
+        with open(path, "wb") as handle:
+            handle.write(b"old")
+        reader = threading.Thread(target=transient_reader)
+        reader.start()
+        reader_open.wait()
+        store.ATOMIC_REPLACE_GRACE_SECONDS = 0.05
+        try:
+            store.atomic_write_bytes(path, b"never-written")
+            check("a reader held past the grace correctly makes the write fail",
+                  False, "it passed")
+        except PermissionError:
+            check("a reader held past the grace correctly makes the write fail",
+                  True)
+        finally:
+            release_reader.set()
+            reader.join()
+        check("no temp files remain after an atomic write gives up",
+              sorted(os.listdir(root)) == ["status.json"], str(os.listdir(root)))
+        with open(path, "rb") as handle:
+            written = handle.read()
+        check("a failed atomic write leaves the destination unchanged",
+              written == b"old")
+    finally:
+        release_reader.set()
+        store.WINDOWS = real_windows
+        store.REPLACE = real_replace
+        store.ATOMIC_REPLACE_GRACE_SECONDS = real_grace
+        shutil.rmtree(root)
+
+
 def test_reporting_command() -> None:
     print("\n[peer reporting]")
     import io
@@ -3494,6 +3572,7 @@ def main() -> int:
     test_reasoning_effort()
     test_reported_issues()
     test_status_read_race()
+    test_windows_atomic_replace_retry()
     test_reporting_command()
     test_state_root_permissions()
     test_windows_acl_parser()

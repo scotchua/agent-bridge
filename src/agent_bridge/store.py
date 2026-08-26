@@ -27,6 +27,22 @@ from .platform import platform
 
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+WINDOWS = os.name == "nt"
+REPLACE = os.replace
+ATOMIC_REPLACE_GRACE_SECONDS = 1.0
+
+
+def replace(source: str, destination: str) -> None:
+    """Replace destination, retrying transient Windows sharing violations."""
+    deadline = time.monotonic() + ATOMIC_REPLACE_GRACE_SECONDS
+    while True:
+        try:
+            REPLACE(source, destination)
+            return
+        except PermissionError:
+            if not WINDOWS or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def set_umask() -> None:
@@ -85,7 +101,7 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
