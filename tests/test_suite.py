@@ -25,7 +25,7 @@ from agent_bridge.backends import base  # noqa: E402
 from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
-from agent_bridge.platform import posix as platform_posix  # noqa: E402
+from agent_bridge.platform import platform as active_platform  # noqa: E402
 
 BOTH = [("codex", "claude"), ("claude", "codex")]
 
@@ -1459,7 +1459,7 @@ def test_self_found_round_three() -> None:
           result.stdout.decode().strip() == expected,
           f"got {result.stdout.decode().strip()!r} want {expected!r}")
     check("S2: a partial buffered write accounts for characters_written",
-          "characters_written" in inspect.getsource(platform_posix))
+          "characters_written" in inspect.getsource(type(active_platform)))
     os.unlink(reader)
 
 
