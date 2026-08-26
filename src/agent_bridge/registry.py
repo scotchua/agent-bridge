@@ -396,11 +396,27 @@ def attach_worker_pid(cfg: Config, job_id: str, pid: int) -> dict[str, Any]:
 
 
 def read_status(cfg: Config, job_id: str) -> dict[str, Any]:
-    path = os.path.join(cfg.job_dir(job_id), "status.json")
+    job_dir = cfg.job_dir(job_id)
+    path = os.path.join(job_dir, "status.json")
     data = store.read_json_or_none(path)
-    if data is None:
-        raise BrokerError(ErrorCategory.JOB_NOT_FOUND)
-    return data
+    if data is not None:
+        return data
+    # os.replace is not the clean swap on Windows that rename is on POSIX. A
+    # reader opening the path while a writer replaces it can transiently see no
+    # file at all, or be refused for sharing, and read_json_or_none turns every
+    # OSError into None. That made a live job report as JOB_NOT_FOUND, which a
+    # caller cannot tell apart from a job that genuinely never existed.
+    #
+    # The directory is the honest witness: the broker creates it and writes the
+    # first status before it returns a job id, so a present directory means the
+    # job exists and an unreadable status is a race, not an answer. Absent
+    # directory still fails immediately.
+    if os.path.isdir(job_dir):
+        try:
+            return store.read_json_atomic(path)
+        except (OSError, ValueError):
+            pass
+    raise BrokerError(ErrorCategory.JOB_NOT_FOUND)
 
 
 def read_result(cfg: Config, job_id: str) -> dict[str, Any] | None:
@@ -553,6 +569,22 @@ def reconcile(cfg: Config, job_id: str) -> dict[str, Any]:
         if age < claim_grace(cfg):
             return status
     if not pid_alive(pid):
+        # Declaring a worker dead is a verdict, so record what it rests on.
+        # An intermittent worker_died on Windows that reproduced in no isolated
+        # loop is the reason: without evidence, "the worker died" and "the
+        # liveness probe failed" look identical in the record.
+        # A job can reach here with no worker pid at all, when the spawn never
+        # got far enough to record one. That is already a complete explanation.
+        liveness = (platform.process_liveness(pid) if isinstance(pid, int)
+                    else {"probe": "none", "alive": False,
+                          "reason": "no worker pid was ever recorded"})
+        log_tail = ""
+        try:
+            with open(os.path.join(cfg.job_dir(job_id), "worker.log"), "rb") as h:
+                log_tail = h.read().decode("utf-8", "replace")[-400:]
+        except OSError:
+            pass
+        liveness["worker_log_tail"] = log_tail or "(empty)"
         # A dead worker may have left a live peer behind. Reap it before
         # declaring the job dead, so the peer cannot keep running against a
         # session a later continuation is about to reuse.
@@ -563,6 +595,7 @@ def reconcile(cfg: Config, job_id: str) -> dict[str, Any]:
         return write_status(
             cfg, job_id, "failed",
             error_category=ErrorCategory.WORKER_DIED.value,
+            worker_liveness=liveness,
             finished_at=store.utc_now(),
             expected_seq=int(status.get("seq", 0)),
             orphaned_peers_reaped=reaped or None,

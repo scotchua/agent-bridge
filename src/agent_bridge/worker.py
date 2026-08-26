@@ -80,7 +80,7 @@ def _run_peer(
 
 def execute(job_dir: str) -> int:
     store.set_umask()
-    request = store.read_json(os.path.join(job_dir, "request.json"))
+    request = store.read_json_atomic(os.path.join(job_dir, "request.json"))
     cfg = load_config(request.get("config_path") or None)
     job_id = request["job_id"]
     conversation_id = request["conversation_id"]

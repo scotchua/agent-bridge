@@ -70,6 +70,16 @@ class Platform(Protocol):
     def terminate_process_tree(self, group_id: int,
                                grace: float) -> dict[str, Any]: ...
 
+    def process_liveness(self, pid: int) -> dict[str, Any]:
+        """Why this platform believes a pid is alive or dead.
+
+        Diagnostic only, never a control-flow input. process_alive returns a
+        bool, and a bool cannot distinguish "the OS says this process exited"
+        from "the probe itself failed", which are different bugs. Called on the
+        path that declares a worker dead, so that verdict carries its evidence.
+        """
+        ...
+
     def process_alive(self, pid: int) -> bool:
         """Whether one process is still running.
 

@@ -155,6 +155,20 @@ class PosixPlatform:
                 continue
         return members
 
+    def process_liveness(self, pid: int) -> dict[str, Any]:
+        evidence: dict[str, Any] = {"probe": "os.kill signal 0"}
+        try:
+            os.kill(pid, 0)
+            evidence["alive"] = True
+        except ProcessLookupError:
+            evidence.update(alive=False, reason="no such process")
+        except PermissionError:
+            # Exists, owned by someone else. Alive for our purposes.
+            evidence.update(alive=True, reason="permission denied, so it exists")
+        except OSError as exc:
+            evidence.update(alive=False, reason=f"errno {exc.errno}")
+        return evidence
+
     def process_identity(self, pid: int) -> str:
         try:
             probe = subprocess.run(  # noqa: S603 - fixed argv, shell off

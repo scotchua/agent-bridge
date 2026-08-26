@@ -2,7 +2,15 @@
 
 Every directory this module creates is 0700 and every file 0600.  Writes are
 atomic (same-directory temp plus os.replace) so a poll that races a worker, or
-a poll after an MCP restart, always reads a complete document.
+a poll after an MCP restart, never reads a HALF-WRITTEN document.
+
+That is not the same as always reading a document, and the difference is the
+whole of Windows.  os.replace is a clean swap on POSIX, where a reader sees the
+old bytes or the new ones.  On Windows a reader can arrive in the instant the
+path has no file at all, or be refused for sharing mid-replace.  This docstring
+used to promise the stronger thing, and believing it is what let a live job
+report as JOB_NOT_FOUND there.  Read our own atomically-written files with
+read_json_atomic, which covers that window.
 """
 
 from __future__ import annotations
@@ -100,6 +108,34 @@ def atomic_write_json(path: str, obj: Any) -> None:
 def read_json(path: str) -> Any:
     with open(path, "rb") as handle:
         return json.loads(handle.read().decode("utf-8"))
+
+
+# Long enough to cover a replace, short enough that a genuinely missing file
+# is still reported promptly.
+ATOMIC_READ_GRACE_SECONDS = 1.0
+
+
+def read_json_atomic(path: str) -> Any:
+    """Read a file this codebase wrote with atomic_write_bytes.
+
+    os.replace is a clean swap on POSIX: a reader sees the old bytes or the new
+    ones and never nothing. On Windows it is not. A reader can open the path in
+    the instant it has no file, or be refused for sharing while the replace is
+    in flight, and both surface as OSError.
+
+    That is why a live job intermittently reported as JOB_NOT_FOUND on Windows
+    and never once on macOS or Linux. Retry across the window; a file that is
+    genuinely absent still raises once the grace is spent. Only OSError is
+    retried, so a corrupt document still fails immediately and loudly.
+    """
+    deadline = time.monotonic() + ATOMIC_READ_GRACE_SECONDS
+    while True:
+        try:
+            return read_json(path)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def read_json_or_none(path: str) -> Any:

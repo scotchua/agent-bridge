@@ -151,7 +151,8 @@ class Sandbox:
         return started, status, result
 
     def provenance(self, job_id: str) -> dict[str, Any]:
-        return store.read_json(os.path.join(self.cfg.job_dir(job_id), "provenance.json"))
+        return store.read_json_atomic(
+            os.path.join(self.cfg.job_dir(job_id), "provenance.json"))
 
     def ledger(self) -> list[dict[str, Any]]:
         path = self.cfg.ledger_path

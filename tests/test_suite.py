@@ -100,6 +100,30 @@ def skip(name: str, reason: str) -> None:
     print(f"  SKIP  {name}   [{reason}]")
 
 
+def try_symlink(source: str, link: str) -> bool:
+    """Create a symlink, or report that this session may not.
+
+    Creating one on Windows needs SeCreateSymbolicLinkPrivilege, which an
+    ordinary user does not hold unless Developer Mode is on. SYSTEM and
+    elevated sessions do hold it, so a suite driven through a service session
+    passes here and then crashes for the first person who runs it as
+    themselves. Any other OSError is a real failure and is re-raised.
+    """
+    if os.path.lexists(link):
+        return True
+    try:
+        os.symlink(source, link)
+        return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        return False
+
+
+SYMLINK_REMEDY = ("creating a symlink needs Developer Mode or an elevated "
+                  "session on Windows")
+
+
 def group_survivors(pgid: int) -> list[str]:
     """Pids still alive in a process group or Job Object."""
     return active_platform.process_group_members(pgid) or []
@@ -1399,15 +1423,20 @@ def test_round_two_regressions() -> None:
         with open(os.path.join(physical, "AGENTS.md"), "w", encoding="utf-8") as handle:
             handle.write("x\n")
         link = os.path.join(sb.root, "link")
-        if not os.path.exists(link):
-            os.symlink(physical, link)
-        try:
-            preflight.assert_workspace_clean(os.path.join(link, "deep"))
-            check("R5: a symlinked route to a contaminated ancestor is caught",
-                  False, "missed it")
-        except BrokerError as exc:
-            check("R5: a symlinked route to a contaminated ancestor is caught",
-                  exc.category == ErrorCategory.WORKSPACE_CONTAMINATED, exc.category.value)
+        # No way to exercise symlink resolution without a symlink, so this
+        # skips with the remedy rather than pretending to cover it.
+        if not try_symlink(physical, link):
+            skip("R5: a symlinked route to a contaminated ancestor is caught",
+                 SYMLINK_REMEDY)
+        else:
+            try:
+                preflight.assert_workspace_clean(os.path.join(link, "deep"))
+                check("R5: a symlinked route to a contaminated ancestor is caught",
+                      False, "missed it")
+            except BrokerError as exc:
+                check("R5: a symlinked route to a contaminated ancestor is caught",
+                      exc.category == ErrorCategory.WORKSPACE_CONTAMINATED,
+                      exc.category.value)
     finally:
         sb.cleanup()
 
@@ -1468,21 +1497,25 @@ def test_round_two_regressions() -> None:
         trap_parent = os.path.join(sb.cfg.state_root, "workspaces", "claude")
         os.makedirs(trap_parent, exist_ok=True)
         trap = os.path.join(trap_parent, "trap")
-        if not os.path.lexists(trap):
-            os.symlink(victim, trap)
-        registry.update_conversation(sb.cfg, cid, workspace=trap)
-        env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
-        proc = subprocess.run(
-            [sys.executable, "-m", "agent_bridge.admin", "--config", sb.config_path,
-             "cleanup", "--apply"],
-            capture_output=True, cwd=REPO, env=env, timeout=60)
-        output = proc.stdout.decode()
-        check("R8: a symlink out of the state root is refused",
-              "REFUSING" in output, output[-300:])
-        check("R8: and the target outside the state root survives",
-              os.path.isfile(os.path.join(victim, "canary.txt")))
-        check("R8: symlink component detection works",
-              admin._has_symlink_component(sb.cfg.state_root, trap))
+        if not try_symlink(victim, trap):
+            for name in ("R8: a symlink out of the state root is refused",
+                         "R8: and the target outside the state root survives",
+                         "R8: symlink component detection works"):
+                skip(name, SYMLINK_REMEDY)
+        else:
+            registry.update_conversation(sb.cfg, cid, workspace=trap)
+            env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
+            proc = subprocess.run(
+                [sys.executable, "-m", "agent_bridge.admin", "--config",
+                 sb.config_path, "cleanup", "--apply"],
+                capture_output=True, cwd=REPO, env=env, timeout=60)
+            output = proc.stdout.decode()
+            check("R8: a symlink out of the state root is refused",
+                  "REFUSING" in output, output[-300:])
+            check("R8: and the target outside the state root survives",
+                  os.path.isfile(os.path.join(victim, "canary.txt")))
+            check("R8: symlink component detection works",
+                  admin._has_symlink_component(sb.cfg.state_root, trap))
     finally:
         sb.cleanup()
 
@@ -1688,17 +1721,21 @@ def test_round_three_regressions() -> None:
             handle.write("must survive\n")
         trap_parent = store.secure_mkdir(sb.cfg.state("workspaces", "claude"))
         trap = os.path.join(trap_parent, "in-state-trap")
-        if not os.path.lexists(trap):
-            os.symlink(valuable, trap)     # both ends INSIDE the state root
-        registry.update_conversation(sb.cfg, cid, workspace=trap)
-        env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
-        proc = subprocess.run([sys.executable, "-m", "agent_bridge.admin", "--config",
-                               sb.config_path, "cleanup", "--apply"],
-                              capture_output=True, cwd=REPO, env=env, timeout=60)
-        check("T4: an in-state symlink is refused, not silently followed",
-              "symlink" in proc.stdout.decode().lower(), proc.stdout.decode()[-300:])
-        check("T4: the symlink's target survives",
-              os.path.isfile(os.path.join(valuable, "keep.txt")))
+        if not try_symlink(valuable, trap):   # both ends INSIDE the state root
+            skip("T4: an in-state symlink is refused, not silently followed",
+                 SYMLINK_REMEDY)
+            skip("T4: the symlink's target survives", SYMLINK_REMEDY)
+        else:
+            registry.update_conversation(sb.cfg, cid, workspace=trap)
+            env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
+            proc = subprocess.run([sys.executable, "-m", "agent_bridge.admin",
+                                   "--config", sb.config_path, "cleanup", "--apply"],
+                                  capture_output=True, cwd=REPO, env=env, timeout=60)
+            check("T4: an in-state symlink is refused, not silently followed",
+                  "symlink" in proc.stdout.decode().lower(),
+                  proc.stdout.decode()[-300:])
+            check("T4: the symlink's target survives",
+                  os.path.isfile(os.path.join(valuable, "keep.txt")))
     finally:
         sb.cleanup()
 
@@ -3152,6 +3189,63 @@ def test_reported_issues() -> None:
         sb.cleanup()
 
 
+def test_status_read_race() -> None:
+    print("\n[status read across a replace window]")
+    sb = Sandbox()
+    try:
+        job_dir = store.secure_mkdir(sb.cfg.job_dir("RACE"))
+        path = os.path.join(job_dir, "status.json")
+
+        # A job whose directory exists but whose status is momentarily
+        # unreadable is a race, not an answer. On Windows that window is real:
+        # os.replace is not POSIX rename, and read_json_or_none turns the
+        # resulting OSError into None.
+        def write_late():
+            time.sleep(0.25)
+            store.atomic_write_json(path, {"status": "queued", "job_id": "RACE"})
+
+        writer = threading.Thread(target=write_late)
+        writer.start()
+        try:
+            got = registry.read_status(sb.cfg, "RACE")
+            check("a status that appears inside the grace is returned, not denied",
+                  got.get("job_id") == "RACE", json.dumps(got))
+        except BrokerError as exc:
+            check("a status that appears inside the grace is returned, not denied",
+                  False, exc.category.value)
+        finally:
+            writer.join()
+
+        # Fail closed once the grace is spent: a directory alone is not a job.
+        os.unlink(path)
+        started = time.monotonic()
+        try:
+            registry.read_status(sb.cfg, "RACE")
+            check("a directory with no status still fails closed", False, "it passed")
+        except BrokerError as exc:
+            check("a directory with no status still fails closed",
+                  exc.category == ErrorCategory.JOB_NOT_FOUND, exc.category.value)
+        check("and it waits the grace before saying so, rather than guessing",
+              time.monotonic() - started >= store.ATOMIC_READ_GRACE_SECONDS * 0.5,
+              str(time.monotonic() - started))
+
+        # An unknown job has no directory, so it must fail immediately: the
+        # grace exists for a replace window, and paying it for every genuine
+        # miss would make an unknown id cost a second.
+        started = time.monotonic()
+        try:
+            registry.read_status(sb.cfg, "NEVER-EXISTED")
+            check("an unknown job fails immediately", False, "it passed")
+        except BrokerError as exc:
+            check("an unknown job fails immediately",
+                  exc.category == ErrorCategory.JOB_NOT_FOUND, exc.category.value)
+        check("and does not pay the replace-window grace",
+              time.monotonic() - started < store.ATOMIC_READ_GRACE_SECONDS * 0.5,
+              str(time.monotonic() - started))
+    finally:
+        sb.cleanup()
+
+
 def test_reporting_command() -> None:
     print("\n[peer reporting]")
     import io
@@ -3399,6 +3493,7 @@ def main() -> int:
     test_platform_boundary()
     test_reasoning_effort()
     test_reported_issues()
+    test_status_read_race()
     test_reporting_command()
     test_state_root_permissions()
     test_windows_acl_parser()

@@ -100,11 +100,26 @@ def _spawn_worker(cfg: Config, job_dir: str) -> int:
         os.chmod(log_path, 0o600)
     except OSError:
         pass
+    # start_new_session is POSIX-only. Popen accepts it on Windows and silently
+    # does nothing, so a function whose whole job is "launch detached" left the
+    # worker attached to the caller's console and process group there. A
+    # console event aimed at the caller then reached the worker too, and the
+    # worker is the process holding the conversation claim.
+    #
+    # CREATE_NEW_PROCESS_GROUP only. DETACHED_PROCESS was tried here and made
+    # things worse, not better: workers reached "running" and then hung with an
+    # empty log and no attempt started. Console-less is a bigger change than
+    # this needs, and a speculative fix that correlates with worse results is
+    # not a fix. The group is the part that matters for signal isolation.
+    if os.name == "nt":
+        detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        detach = {"start_new_session": True}
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off
             argv, cwd=cfg.repo_root, env=env,
             stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
-            start_new_session=True, shell=False, close_fds=True,
+            shell=False, close_fds=True, **detach,
         )
     except (OSError, ValueError) as exc:
         handle.close()

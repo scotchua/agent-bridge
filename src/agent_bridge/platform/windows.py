@@ -307,6 +307,31 @@ class WindowsPlatform:
         finally:
             kernel32.CloseHandle(handle)
 
+    def process_liveness(self, pid: int) -> dict[str, Any]:
+        SYNCHRONIZE_ = 0x00100000
+        QUERY_LIMITED = 0x1000
+        STILL_ACTIVE = 259
+        evidence: dict[str, Any] = {"probe": "OpenProcess+GetExitCodeProcess"}
+        ctypes.set_last_error(0)
+        handle = kernel32.OpenProcess(SYNCHRONIZE_ | QUERY_LIMITED, False, int(pid))
+        if not handle:
+            # 87 ERROR_INVALID_PARAMETER is what a genuinely gone pid gives.
+            # 5 ERROR_ACCESS_DENIED means the process EXISTS and we could not
+            # ask, which must never be read as death.
+            evidence.update(alive=False, open_process_error=ctypes.get_last_error())
+            return evidence
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                evidence.update(alive=False,
+                                get_exit_code_error=ctypes.get_last_error())
+                return evidence
+            evidence.update(alive=code.value == STILL_ACTIVE,
+                            exit_code=int(code.value))
+            return evidence
+        finally:
+            kernel32.CloseHandle(handle)
+
     def process_tree_alive(self, group_id: int) -> bool:
         members = self.process_group_members(group_id)
         if members is not None:
