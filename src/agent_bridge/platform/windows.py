@@ -221,22 +221,28 @@ class WindowsPlatform:
 
     def terminate_process_tree(self, group_id: int,
                                grace: float) -> dict[str, Any]:
+        # No console control event. os.kill with CTRL_BREAK_EVENT calls
+        # GenerateConsoleCtrlEvent, which delivers to EVERY process attached to
+        # the console, not only the target. In CI it reached the test runner
+        # itself and raised KeyboardInterrupt eleven seconds into the run,
+        # killing the suite from inside the code meant to clean up a peer.
+        #
+        # This means Windows has no safe equivalent of the POSIX polite stage.
+        # Termination here is immediate via the Job Object, which is targeted
+        # and cannot escape to the parent. That is a real behavioural
+        # difference from POSIX, so it is reported rather than papered over:
+        # a peer gets no chance to exit cleanly.
         report: dict[str, Any] = {
-            "pgid": group_id, "ctrl_break": False, "job_terminated": False,
+            "pgid": group_id,
+            "graceful_stage": "unavailable on windows",
+            "graceful_stage_reason": (
+                "a console control event cannot be targeted at one process "
+                "tree without risking delivery to this process"
+            ),
+            "job_terminated": False,
         }
-        try:
-            os.kill(group_id, signal.CTRL_BREAK_EVENT)
-            report["ctrl_break"] = True
-        except (OSError, ValueError):
-            pass
-        deadline = time.monotonic() + max(0.0, grace)
-        while time.monotonic() < deadline:
-            if not self.process_tree_alive(group_id):
-                report["group_gone_after_ctrl_break"] = True
-                self._close_job(group_id)
-                return report
-            time.sleep(0.05)
         handle = self._job_handle(group_id)
+        del grace  # no graceful stage exists on this platform to wait out
         if handle is not None and kernel32.TerminateJobObject(handle, 1):
             report["job_terminated"] = True
         time.sleep(0.05)
