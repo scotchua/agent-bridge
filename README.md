@@ -245,7 +245,7 @@ access. No consultation content is ever written into the repo.
 
 ## Checking it yourself
 
-Every push runs the offline test suite on macOS, Linux, and Windows, on two Python
+Every push runs the offline test suite on macOS and Linux, on two Python
 versions, via the badge at the top. That run uses stand-in programs in place of
 the two CLIs, so it needs no credentials and costs nothing. The live
 verification is deliberately not automated: it spends real model calls, so it
@@ -253,9 +253,21 @@ stays a decision a person makes.
 
 ## Requirements
 
-**macOS, Linux, or Windows.** Python 3.11+, the Claude Code CLI, the Codex CLI. No
+**macOS or Linux, verified. Windows in progress and not yet verified.**
+Python 3.11+, the Claude Code CLI, the Codex CLI. No
 third-party Python packages, deliberately: the audit surface is this repository
 and nothing else.
+
+**Windows has never passed its own test suite.** The implementation exists,
+the offline suite runs there, and it gets further with each fix, but it is not
+green. Nobody working on it has a Windows machine, so CI is the only oracle and
+progress is one push at a time. Its CI result is reported and does not gate the
+project. Use [WSL](INSTALL.md#windows-use-wsl) today; that path is covered by
+the Linux jobs on every push.
+
+A peer on Windows is also terminated immediately, with no graceful stage,
+because no console signal can be aimed at one process tree without risking
+delivery to the bridge itself. That difference is recorded in each job.
 
 **Windows uses a separate implementation of the same safety interface.** Its
 locks are mandatory byte-range locks rather than POSIX advisory `flock` locks.
