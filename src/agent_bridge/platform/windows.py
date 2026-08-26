@@ -232,6 +232,12 @@ class WindowsPlatform:
         # and cannot escape to the parent. That is a real behavioural
         # difference from POSIX, so it is reported rather than papered over:
         # a peer gets no chance to exit cleanly.
+        if self.is_own_process_group(group_id):
+            # The POSIX implementation refuses to signal its own group. This is
+            # the same refusal: terminating a job that contains this process
+            # would kill the broker from inside its own cleanup path.
+            return {"pgid": group_id, "refused": "would terminate this process",
+                    "job_terminated": False}
         report: dict[str, Any] = {
             "pgid": group_id,
             "graceful_stage": "unavailable on windows",
