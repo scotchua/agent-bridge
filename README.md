@@ -230,7 +230,7 @@ already listed. Porting this repository is the better option if you can.
 |---|---|
 | `bin/agent-bridge-setup` | find, check and pin your two CLIs |
 | `bin/agent-bridge-mcp` | the MCP server, needs `--caller codex` or `--caller claude` |
-| `bin/agent-bridge-admin` | `status`, `ledger`, `cleanup`, `indeterminate`, `resolve` |
+| `bin/agent-bridge-admin` | `status`, `ledger`, `reporting`, `cleanup`, `indeterminate`, `resolve` |
 | `config/broker.json` | committed defaults, machine-neutral |
 | `config/local.json` | your machine, written by setup, never committed |
 | `schema/` | the response contract both models must satisfy |

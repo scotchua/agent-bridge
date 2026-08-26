@@ -247,6 +247,22 @@ satisfied. Marker retirement is gated on a confirmed conversation release rather
 than merely ordered after it, and retention is bounded with retired markers
 excluded from in-flight discovery.
 
+### Watched, not characterised
+
+- **A peer CLI intermittently omitting its own model and cost.** Reported by
+  an outside reviewer against `claude 2.1.241` on three calls, with fresh
+  versus resume ruled out by the third. The bridge records whether the CLI
+  reported each field, so a null is attributable rather than ambiguous, but
+  three calls characterise nothing and no amount of reasoning here will fix a
+  field the CLI did not send.
+  `agent-bridge-admin reporting` is the other half: it separates records
+  written before the instrumentation from records that can actually answer the
+  question, and breaks the rest down by CLI version and by resume. Below
+  `--min-sample` it prints counts and says so, because a rate from a handful of
+  calls is a number and not a finding.
+  Entry condition: the usable sample reaching the threshold. The outcome is an
+  upstream report, not a change here; this is the CLI's envelope, not ours.
+
 ### Tabled, not abandoned
 
 Improvements the reviewer would prefer but does not require. Entry conditions

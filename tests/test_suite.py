@@ -2,6 +2,7 @@
 """Full broker test suite against fake peer executables. No live model calls."""
 from __future__ import annotations
 
+import argparse
 import inspect
 import json
 import os
@@ -3151,6 +3152,75 @@ def test_reported_issues() -> None:
         sb.cleanup()
 
 
+def test_reporting_command() -> None:
+    print("\n[peer reporting]")
+    import io
+    import contextlib
+    from agent_bridge import admin
+
+    sb = Sandbox()
+    try:
+        store.secure_mkdir(os.path.dirname(sb.cfg.ledger_path))
+
+        def record(**kw):
+            row = {"peer": "claude", "resume": False,
+                   "peer_observed_version": "2.1.229 (Claude Code)"}
+            row.update(kw)
+            with open(sb.cfg.ledger_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+
+        # Three populations that must not be conflated. Only the third can
+        # answer the question, and reporting the other two as if they could is
+        # exactly how a sample of one becomes a rate.
+        record()                                              # pre-instrumentation
+        record(peer="codex", peer_model_reported=None,
+               peer_cost_reported=None)                       # backend reports neither
+        record(peer_model_reported=True, peer_cost_reported=True)
+        record(peer_model_reported=False, peer_cost_reported=True)
+        record(peer_model_reported=True, peer_cost_reported=False, resume=True)
+
+        def run(*argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                admin.cmd_reporting(sb.cfg, argparse.Namespace(
+                    peer="claude", min_sample=argv[0] if argv else 30))
+            return buf.getvalue()
+
+        out = run()
+        check("reporting counts only the instrumented records as the sample",
+              "usable sample           3" in out, out)
+        check("reporting excludes records written before the instrumentation",
+              "before instrumentation  1" in out, out)
+        check("reporting counts absences separately for model and cost",
+              "1/3" in out, out)
+        check("reporting splits by version and by resume",
+              out.count("2.1.229 (Claude Code)") == 2, out)
+        check("a sample below the threshold is reported as counts, not a rate",
+              "below --min-sample" in out, out)
+        check("and above the threshold it names the next step",
+              "upstream report" in run(1), run(1))
+
+        # A single unreadable line must not hide every readable one: the whole
+        # point of the command is that it gets run on real, accumulated data.
+        with open(sb.cfg.ledger_path, "a", encoding="utf-8") as handle:
+            handle.write("{not json\n")
+        check("a corrupt ledger line does not take the report down with it",
+              "usable sample           3" in run(), run())
+    finally:
+        sb.cleanup()
+
+    sb = Sandbox()
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            admin.cmd_reporting(sb.cfg, argparse.Namespace(
+                peer="claude", min_sample=30))
+        check("an empty ledger says so rather than printing an empty table",
+              "Nothing to report yet" in buf.getvalue(), buf.getvalue())
+    finally:
+        sb.cleanup()
+
+
 def test_state_root_permissions() -> None:
     """State must live on a filesystem that actually keeps it private.
 
@@ -3329,6 +3399,7 @@ def main() -> int:
     test_platform_boundary()
     test_reasoning_effort()
     test_reported_issues()
+    test_reporting_command()
     test_state_root_permissions()
     test_windows_acl_parser()
     test_platform_guard()

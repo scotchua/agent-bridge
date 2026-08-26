@@ -269,6 +269,93 @@ def cmd_ledger(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+# The fields below exist because a reviewer saw peer_observed_model and
+# peer_cost_usd go missing from otherwise-successful Claude calls, on three
+# calls, with no pattern that fresh-vs-resume explained. The bridge cannot fix
+# that: it is the CLI's own envelope. What it can do is record whether the CLI
+# reported them, so a null is attributable, and then let normal use accumulate
+# enough exchanges to say something the original n=3 could not.
+#
+# This command is the "then look" half. Without it the accumulation plan
+# depends on somebody remembering, which is not a plan.
+
+def _reporting_rows(cfg: Config) -> list[dict[str, Any]]:
+    if not os.path.isfile(cfg.ledger_path):
+        return []
+    rows: list[dict[str, Any]] = []
+    with open(cfg.ledger_path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # One unreadable line must not hide every readable one.
+                    continue
+    return rows
+
+
+def cmd_reporting(cfg: Config, args: argparse.Namespace) -> int:
+    """How often a peer's CLI reports its model and cost, by version."""
+    rows = _reporting_rows(cfg)
+    peer = args.peer
+    of_peer = [r for r in rows if r.get("peer") == peer]
+    # Three distinct populations, and conflating them is the easy mistake:
+    # records written before the instrumentation existed have no key at all,
+    # records from a backend that does not report these carry an explicit
+    # null, and only the rest can answer the question.
+    pre = [r for r in of_peer if "peer_model_reported" not in r]
+    unsupported = [r for r in of_peer
+                   if "peer_model_reported" in r and r["peer_model_reported"] is None]
+    sample = [r for r in of_peer if isinstance(r.get("peer_model_reported"), bool)]
+
+    print(f"ledger records            {len(rows)}")
+    print(f"  peer={peer}             {len(of_peer)}")
+    print(f"  before instrumentation  {len(pre)}   (cannot contribute)")
+    if unsupported:
+        print(f"  backend reports neither {len(unsupported)}")
+    print(f"  usable sample           {len(sample)}")
+    if not sample:
+        print(f"\nNothing to report yet. Every {peer} exchange from here on counts.")
+        return 0
+
+    def rate(subset: list[dict[str, Any]], key: str) -> str:
+        if not subset:
+            return "-"
+        absent = sum(1 for r in subset if r.get(key) is False)
+        return f"{absent}/{len(subset)}"
+
+    print("\nabsent = the CLI did not report it. Not a bridge failure.")
+    print(f"\n{'version':<28} {'resume':<7} {'n':>4} {'model absent':>13} {'cost absent':>12}")
+    groups: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+    for row in sample:
+        key = (str(row.get("peer_observed_version")), bool(row.get("resume")))
+        groups.setdefault(key, []).append(row)
+    for (version, resumed), subset in sorted(groups.items()):
+        print(f"{version:<28} {str(resumed):<7} {len(subset):>4} "
+              f"{rate(subset, 'peer_model_reported'):>13} "
+              f"{rate(subset, 'peer_cost_reported'):>12}")
+
+    model_absent = sum(1 for r in sample if r.get("peer_model_reported") is False)
+    cost_absent = sum(1 for r in sample if r.get("peer_cost_reported") is False)
+    print(f"\n{'total':<28} {'':<7} {len(sample):>4} "
+          f"{f'{model_absent}/{len(sample)}':>13} {f'{cost_absent}/{len(sample)}':>12}")
+
+    # A rate computed from a handful of calls is a number, not a finding, and
+    # printing it without saying so is how n=3 becomes a characterisation.
+    if len(sample) < args.min_sample:
+        print(f"\nSample is {len(sample)}, below --min-sample {args.min_sample}. "
+              "Report the counts, not a rate.")
+    elif model_absent or cost_absent:
+        print(f"\n{model_absent + cost_absent} absence(s) across {len(sample)} "
+              "exchanges. This is the CLI's behaviour, not the bridge's, so the "
+              "next step is an upstream report carrying the table above, broken "
+              "down by version.")
+    else:
+        print(f"\nNo absences in {len(sample)} exchanges at or above the "
+              "threshold. Nothing to report upstream from this machine.")
+    return 0
+
+
 def cmd_resolve(cfg: Config, args: argparse.Namespace) -> int:
     """Clear an indeterminate conversation after checking the peer side."""
     record = store.read_json_or_none(cfg.conversation_path(args.conversation_id))
@@ -359,6 +446,11 @@ def main(argv: list[str] | None = None) -> int:
     ledger = sub.add_parser("ledger", help="Show recent ledger records.")
     ledger.add_argument("--tail", type=int, default=20)
     ledger.add_argument("--full", action="store_true")
+    reporting = sub.add_parser(
+        "reporting", help="How often a peer's CLI reported its model and cost.")
+    reporting.add_argument("--peer", default="claude", choices=("claude", "codex"))
+    reporting.add_argument("--min-sample", type=int, default=30,
+                           help="Below this, print counts rather than a rate.")
     sub.add_parser("indeterminate", help="List conversations held as indeterminate.")
     resolve = sub.add_parser("resolve", help="Clear an indeterminate conversation.")
     resolve.add_argument("conversation_id")
@@ -369,6 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     return {"status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
+            "reporting": cmd_reporting,
             "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
         args.command](cfg, args)
 
