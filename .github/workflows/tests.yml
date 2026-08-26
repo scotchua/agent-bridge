@@ -21,11 +21,6 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
-    # Windows support is in progress and cannot be verified by anyone on this
-    # side, so its result is reported but does not block. POSIX is the
-    # supported platform and still gates. This comes off when a Windows run is
-    # green, or sooner if someone with a Windows machine can drive it.
-    continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
     steps:
       - uses: actions/checkout@v4
 

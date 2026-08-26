@@ -253,17 +253,23 @@ stays a decision a person makes.
 
 ## Requirements
 
-**macOS or Linux, verified. Windows in progress and not yet verified.**
-Python 3.11+, the Claude Code CLI, the Codex CLI. No
-third-party Python packages, deliberately: the audit surface is this repository
-and nothing else.
+**macOS, Linux, and Windows.** Python 3.11+, the Claude Code CLI, the Codex
+CLI. No third-party Python packages, deliberately: the audit surface is this
+repository and nothing else.
 
-**Windows has never passed its own test suite.** The implementation exists,
-the offline suite runs there, and it gets further with each fix, but it is not
-green. Nobody working on it has a Windows machine, so CI is the only oracle and
-progress is one push at a time. Its CI result is reported and does not gate the
-project. Use [WSL](INSTALL.md#windows-use-wsl) today; that path is covered by
-the Linux jobs on every push.
+**Windows passes its own test suite**, 478 tests, zero failures, zero skips,
+verified by hand in a Windows 11 VM on CPython 3.12 rather than only in CI.
+That took finding several defects that no amount of POSIX testing could have
+surfaced, because the POSIX idiom and the Windows behaviour differ silently:
+`os.kill(pid, 0)` is a liveness probe on POSIX and a console interrupt on
+Windows, and a job-liveness check that only looked at the leader process
+reported a surviving descendant as contained.
+
+Verified on one configuration. An English-language `icacls`, a domain-joined
+machine, or a redirected profile are not covered by that run, and the ACL
+parser is the part most likely to need work on them. It fails closed, so an
+unrecognised ACL refuses the run rather than assuming privacy.
+[WSL](INSTALL.md#windows-use-wsl) remains supported and uses the POSIX path.
 
 A peer on Windows is also terminated immediately, with no graceful stage,
 because no console signal can be aimed at one process tree without risking
@@ -271,8 +277,10 @@ delivery to the bridge itself. That difference is recorded in each job.
 
 **Windows uses a separate implementation of the same safety interface.** Its
 locks are mandatory byte-range locks rather than POSIX advisory `flock` locks.
-It contains peers in a Win32 Job Object, sends Ctrl+Break for polite shutdown,
-then terminates the Job Object after the grace period. A process deliberately
+It contains peers in a Win32 Job Object and terminates that job, with no
+polite stage at all, for the reason given above. Whether a tree is still alive
+is answered by asking the job which processes it contains, not by inspecting
+the leader. A process deliberately
 escaping that job is outside the tree guarantee, comparable to a POSIX child
 starting a new session. Pipe output is drained with bounded reader threads
 because Windows `select` does not support anonymous pipes.
