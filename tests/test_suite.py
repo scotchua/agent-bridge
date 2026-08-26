@@ -467,6 +467,24 @@ def test_version_mismatch_and_missing_executable() -> None:
 
 def test_timeout_and_process_group_cleanup() -> None:
     print("\n[timeout and process-group cleanup]")
+    if os.name == "nt":
+        # A job whose members have all exited can no longer be opened, exactly
+        # like a job that cannot be queried for some other reason. Reporting
+        # "alive" for that ambiguity marks every clean shutdown as a
+        # containment failure, which is a real regression this pins down.
+        finished = active_platform.spawn_isolated(
+            [sys.executable, "-c", "pass"], cwd=tempfile.gettempdir(),
+            env=runner.scrubbed_env())
+        finished.wait(timeout=30)
+        for stream in (finished.stdin, finished.stdout, finished.stderr):
+            if stream is not None:
+                stream.close()
+        time.sleep(0.2)
+        check("a finished tree reports gone, not survived",
+              active_platform.process_tree_alive(finished.pid) is False)
+        report = active_platform.terminate_process_tree(finished.pid, 0.0)
+        check("and terminating it is not reported as an escape",
+              not report.get("group_survived_termination"), json.dumps(report))
     for caller, peer in BOTH:
         sb = Sandbox(**{f"{peer}.timeout_seconds": 2, f"{peer}.grace_seconds": 1})
         try:

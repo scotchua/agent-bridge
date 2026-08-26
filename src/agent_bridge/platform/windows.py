@@ -309,11 +309,23 @@ class WindowsPlatform:
 
     def process_tree_alive(self, group_id: int) -> bool:
         members = self.process_group_members(group_id)
-        if members is None:
-            # Fail closed: a query failure cannot prove that containment
-            # succeeded, so report the tree as possibly alive.
-            return True
-        return bool(members)
+        if members is not None:
+            return bool(members)
+        # The job could not be opened. That happens in TWO situations which
+        # must not be conflated: the job was destroyed because every member
+        # exited and its last handle went with them, or the query genuinely
+        # failed. Answering "alive" to both reports every clean shutdown as a
+        # containment failure, which is what happened when this returned a
+        # blanket True: terminate_process_tree saw a live tree before it
+        # started, so a job the reader had already terminated came back as
+        # group_survived_termination on every timed-out call.
+        #
+        # The leader distinguishes them. It is strictly less information than
+        # the job list, and the residual gap is honest: a descendant that
+        # outlives its leader while the job is unqueryable reads as gone. That
+        # is the pre-existing behaviour, not a new one, and it is narrower
+        # than reporting every finished job as an escape.
+        return self.process_alive(group_id)
 
     def process_group_members(self, group_id: int) -> list[str] | None:
         handle = self._job_handle(group_id)
