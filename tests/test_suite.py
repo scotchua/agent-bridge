@@ -2769,6 +2769,39 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_syntax_targets_oldest_supported_python() -> None:
+    """Every source file must parse under the oldest Python we claim to support.
+
+    Backslashes inside f-string expressions became legal in 3.12 (PEP 701). A
+    newer interpreter accepts them silently, so a test written on 3.14 broke
+    both POSIX jobs on 3.11 while passing locally and on 3.13. Checking the
+    grammar here costs milliseconds and catches it before CI does.
+    """
+    print("\n[syntax floor]")
+    minimum = (3, 11)
+    failures = []
+    for root, _, files in os.walk(os.path.join(REPO, "src")):
+        if "__pycache__" in root:
+            continue
+        for name in files:
+            if name.endswith(".py"):
+                failures.extend(_parse_under(os.path.join(root, name), minimum))
+    for extra in ("tests/test_suite.py", "tests/harness.py",
+                  "canaries/run_canaries.py"):
+        failures.extend(_parse_under(os.path.join(REPO, extra), minimum))
+    check(f"SY: every source file parses under Python {minimum[0]}.{minimum[1]}",
+          not failures, "; ".join(failures[:3]))
+
+
+def _parse_under(path: str, version: tuple) -> list:
+    import ast
+    try:
+        ast.parse(open(path, encoding="utf-8").read(), feature_version=version)
+        return []
+    except SyntaxError as exc:
+        return [f"{os.path.basename(path)}:{exc.lineno}: {exc.msg}"]
+
+
 def test_windows_acl_parser_adversarial() -> None:
     """Review-added cases for the ACL parser, beyond those it was written to.
 
@@ -2820,9 +2853,9 @@ def test_windows_acl_parser_adversarial() -> None:
     for label, text, expect in cases:
         owner = "nonsense" if "malformed" in label else sid
         if "resolved account name" in label or "same shape" in label:
-            check(f"ACL: {label}",
-                  ok(text, sid, "runnervm6iq3x\\runneradmin") is expect,
-                  f"got {ok(text, sid, 'runnervm6iq3x\\runneradmin')}")
+            ci_owner_name = "runnervm6iq3x\\runneradmin"
+            observed = ok(text, sid, ci_owner_name)
+            check(f"ACL: {label}", observed is expect, f"got {observed}")
             continue
         check(f"ACL: {label}",
               ok(text, owner, "runneradmin") is expect,
@@ -3172,6 +3205,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_syntax_targets_oldest_supported_python()
     test_windows_acl_parser_adversarial()
     test_platform_boundary()
     test_reasoning_effort()
