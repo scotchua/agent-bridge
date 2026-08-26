@@ -51,5 +51,12 @@ def icacls_listing_is_owner_only(text: str, owner_sid: str,
         if not principal or principal not in allowed or "(I)" in stripped:
             return False
         principals.append(principal)
-    return bool(principals) and bool(set(principals) & ({owner_sid.upper()}
-                                                        | _OWNER_ALIASES))
+    # The owner may appear as the SID, as OWNER RIGHTS, or as the resolved
+    # account name. icacls resolves a SID to a name for display, so granting by
+    # *SID and then reading back commonly yields the NAME, which is exactly what
+    # a file with a single owner ACE looks like. Omitting the name here rejected
+    # the strictest possible ACL: one ACE, the owner, nobody else.
+    owner_forms = {owner_sid.upper()} | _OWNER_ALIASES
+    if owner_name:
+        owner_forms.add(owner_name.upper())
+    return bool(principals) and bool(set(principals) & owner_forms)

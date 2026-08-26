@@ -2808,9 +2808,22 @@ def test_windows_acl_parser_adversarial() -> None:
          "C:\\T\\d NT AUTHORITY\\SYSTEM:(F)\n"
          "        BUILTIN\\Administrators:(F)\n", False),
         ("a malformed owner sid is refused", real, False),
+        # The exact listing windows-latest produced for a file: one ACE, the
+        # owner by resolved account name. This was rejected, which meant the
+        # strictest possible ACL failed the check.
+        ("the owner by resolved account name is accepted",
+         "C:\\T\\state\\.permission-probe runnervm6iq3x\\runneradmin:(F)\n\n"
+         "Successfully processed 1 files; Failed processing 0 files", True),
+        ("a different account with the same shape is refused",
+         "C:\\T\\state\\.permission-probe runnervm6iq3x\\someoneelse:(F)\n", False),
     ]
     for label, text, expect in cases:
         owner = "nonsense" if "malformed" in label else sid
+        if "resolved account name" in label or "same shape" in label:
+            check(f"ACL: {label}",
+                  ok(text, sid, "runnervm6iq3x\\runneradmin") is expect,
+                  f"got {ok(text, sid, 'runnervm6iq3x\\runneradmin')}")
+            continue
         check(f"ACL: {label}",
               ok(text, owner, "runneradmin") is expect,
               f"got {ok(text, owner, 'runneradmin')}, want {expect}")
