@@ -139,6 +139,15 @@ class Sandbox:
         for line in proc.stdout.decode().splitlines():
             if line.strip():
                 out.append(json.loads(line))
+        if not out:
+            # The server produced nothing, which means it refused to start.
+            # Surface why. Without this the caller sees an IndexError from an
+            # empty list and learns nothing about the actual cause.
+            raise AssertionError(
+                "MCP server produced no response.\n"
+                f"  exit code: {proc.returncode}\n"
+                f"  stderr: {proc.stderr.decode(errors='replace')[:2000]}\n"
+                f"  stdout: {proc.stdout.decode(errors='replace')[:500]}")
         return out
 
     def cleanup(self) -> None:
