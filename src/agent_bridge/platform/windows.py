@@ -252,6 +252,7 @@ class WindowsPlatform:
             # would kill the broker from inside its own cleanup path.
             return {"pgid": group_id, "refused": "would terminate this process",
                     "job_terminated": False}
+        alive_before = self.process_tree_alive(group_id)
         report: dict[str, Any] = {
             "pgid": group_id,
             "graceful_stage": "unavailable on windows",
@@ -261,12 +262,17 @@ class WindowsPlatform:
             ),
             "job_terminated": False,
         }
+        if not alive_before:
+            report["tree_already_gone"] = True
+            self._close_job(group_id)
+            return report
         handle = self._job_handle(group_id)
         del grace  # no graceful stage exists on this platform to wait out
         if handle is not None and kernel32.TerminateJobObject(handle, 1):
             report["job_terminated"] = True
         time.sleep(0.05)
         if self.process_tree_alive(group_id):
+            report["termination_failed"] = True
             report["group_survived_termination"] = True
         else:
             report["group_gone_after_termination"] = True

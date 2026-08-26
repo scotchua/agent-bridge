@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -28,6 +29,13 @@ VALID = {
 def event(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def spawn_pipe_holder(seconds: int) -> None:
+    """Spawn a real descendant that inherits and keeps stdout open."""
+    subprocess.Popen(  # noqa: S603 - fixed interpreter and script
+        [sys.executable, "-c", f"import time;time.sleep({seconds})"],
+        stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False)
 
 
 def main() -> int:
@@ -65,7 +73,7 @@ def main() -> int:
         return 4
     if mode == "hang":
         event({"type": "thread.started", "thread_id": thread_id})
-        os.system("sleep 120 &")  # noqa: S605 - deliberate orphan for group-kill test
+        spawn_pipe_holder(120)
         time.sleep(120)
         return 0
     if mode == "flood":
@@ -93,7 +101,7 @@ def main() -> int:
             with open(last_message_path, "w", encoding="utf-8") as handle:
                 json.dump(VALID, handle)
         event({"type": "turn.completed"})
-        os.system("sleep 8 &")  # noqa: S605 - deliberately holds the pipe
+        spawn_pipe_holder(8)
         return 0
     if mode == "migrate_thread":
         # Resume, but report a DIFFERENT thread id than the one requested.

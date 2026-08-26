@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import csv
 import shutil
 import tempfile
 import threading
@@ -465,9 +466,21 @@ def test_timeout_and_process_group_cleanup() -> None:
                   status["status"] == "timed_out", json.dumps(status))
             prov = sb.provenance(started["job_id"])
             kills = [a["group_kill"] for a in prov["attempts"] if a["group_kill"]]
-            check(f"{caller}->{peer}: the whole process group was signalled",
-                  bool(kills) and all(k.get("sigterm") or k.get("sigkill") for k in kills),
-                  json.dumps(kills))
+            if os.name == "nt":
+                reported_states = [sum(bool(k.get(key)) for key in (
+                    "job_terminated", "tree_already_gone", "termination_failed"))
+                    for k in kills]
+                check(f"{caller}->{peer}: tree termination has honest provenance",
+                      bool(kills) and all(state == 1 for state in reported_states),
+                      json.dumps(kills))
+                check(f"{caller}->{peer}: the timed-out tree is gone",
+                      all(not k.get("group_survived_termination") for k in kills),
+                      json.dumps(kills))
+            else:
+                check(f"{caller}->{peer}: the whole process group was signalled",
+                      bool(kills) and all(k.get("sigterm") or k.get("sigkill")
+                                          for k in kills),
+                      json.dumps(kills))
             pgids = [k["pgid"] for k in kills if k.get("pgid")]
             if not PS_AVAILABLE:
                 skip(f"{caller}->{peer}: no orphan processes survive in the killed groups",
@@ -680,28 +693,54 @@ def test_permissions() -> None:
     sb = Sandbox()
     try:
         started, _, _ = sb.run_to_completion("codex")
-        bad_dirs, bad_files = [], []
-        for dirpath, dirnames, filenames in os.walk(sb.cfg.state_root):
-            mode = os.stat(dirpath).st_mode & 0o777
-            if mode != 0o700:
-                bad_dirs.append((dirpath, oct(mode)))
-            for name in filenames:
-                path = os.path.join(dirpath, name)
-                fmode = os.stat(path).st_mode & 0o777
-                if fmode != 0o600:
-                    bad_files.append((os.path.relpath(path, sb.cfg.state_root), oct(fmode)))
-        check("every runtime directory is 0700", not bad_dirs, str(bad_dirs[:5]))
-        check("every runtime file is 0600", not bad_files, str(bad_files[:5]))
-        proc = subprocess.run([sys.executable, "-c",
-                               "import os;print(oct(os.umask(0)))"],
-                              capture_output=True, env={**os.environ}, timeout=30)
-        check("worker process sets umask 077",
-              "0o77" in subprocess.run(
-                  [sys.executable, "-c",
-                   "import sys;sys.path.insert(0,%r);"
-                   "from agent_bridge import store;store.set_umask();"
-                   "import os;print(oct(os.umask(0)))" % os.path.join(REPO, "src")],
-                  capture_output=True, timeout=30).stdout.decode(), "")
+        if os.name == "nt":
+            unverified = []
+            observed_guarantees = []
+            for dirpath, _, filenames in os.walk(sb.cfg.state_root):
+                probe = os.path.join(dirpath, ".acl-test-probe")
+                with open(probe, "wb") as handle:
+                    handle.write(b"probe\n")
+                try:
+                    verified, details = active_platform.verify_owner_only_path(
+                        dirpath, probe)
+                    observed_guarantees.append(details.get("guarantee"))
+                    if not verified:
+                        unverified.append((dirpath, details))
+                    for name in filenames:
+                        path = os.path.join(dirpath, name)
+                        verified, details = active_platform.verify_owner_only_path(
+                            dirpath, path)
+                        observed_guarantees.append(details.get("guarantee"))
+                        if not verified:
+                            unverified.append((path, details))
+                finally:
+                    os.unlink(probe)
+            check("every runtime path has an owner-only ACL",
+                  not unverified, str(unverified[:5]))
+            check("Windows states the ACL privacy guarantee",
+                  bool(observed_guarantees)
+                  and all(value == WINDOWS_OWNER_ONLY_GUARANTEE
+                          for value in observed_guarantees))
+        else:
+            bad_dirs, bad_files = [], []
+            for dirpath, _, filenames in os.walk(sb.cfg.state_root):
+                mode = os.stat(dirpath).st_mode & 0o777
+                if mode != 0o700:
+                    bad_dirs.append((dirpath, oct(mode)))
+                for name in filenames:
+                    path = os.path.join(dirpath, name)
+                    fmode = os.stat(path).st_mode & 0o777
+                    if fmode != 0o600:
+                        bad_files.append((os.path.relpath(path, sb.cfg.state_root), oct(fmode)))
+            check("every runtime directory is 0700", not bad_dirs, str(bad_dirs[:5]))
+            check("every runtime file is 0600", not bad_files, str(bad_files[:5]))
+            check("worker process sets umask 077",
+                  "0o77" in subprocess.run(
+                      [sys.executable, "-c",
+                       "import sys;sys.path.insert(0,%r);"
+                       "from agent_bridge import store;store.set_umask();"
+                       "import os;print(oct(os.umask(0)))" % os.path.join(REPO, "src")],
+                      capture_output=True, timeout=30).stdout.decode(), "")
     finally:
         sb.cleanup()
 
@@ -1018,7 +1057,8 @@ def test_codex_review_regressions() -> None:
         sb.cleanup()
 
     # F5: caps are enforced while reading, so a flood is bounded and killed.
-    flood = runner.run(["/bin/sh", "-c", "yes FLOODFLOODFLOOD"], cwd="/tmp",
+    flood_script = "import sys\nwhile True: sys.stdout.write('FLOODFLOODFLOOD\\n')"
+    flood = runner.run([sys.executable, "-c", flood_script], cwd=tempfile.gettempdir(),
                        env=runner.scrubbed_env(), stdin_data="", timeout=30, grace=1,
                        stdout_cap=100_000, stderr_cap=1000)
     check("F5: a flooding peer is capped at the limit, not buffered whole",
@@ -1253,7 +1293,11 @@ def test_round_two_regressions() -> None:
     # R3: no threads, no leaked descriptors, and a lingering descendant cannot
     # stretch a finished job into a reported timeout.
     threads_before = threading.active_count()
-    held = runner.run(["/bin/sh", "-c", "(sleep 30 &) ; echo done"], cwd="/tmp",
+    holder_script = ("import subprocess,sys;"
+                     "subprocess.Popen([sys.executable,'-c',"
+                     "'import time;time.sleep(30)'],close_fds=False);"
+                     "print('done')")
+    held = runner.run([sys.executable, "-c", holder_script], cwd=tempfile.gettempdir(),
                       env=runner.scrubbed_env(), stdin_data="", timeout=20, grace=1,
                       stdout_cap=1000, stderr_cap=1000)
     check("R3: a descendant holding stdout does not cause a false timeout",
@@ -1262,7 +1306,7 @@ def test_round_two_regressions() -> None:
     check("R3: and the condition is recorded rather than hidden",
           held.descendant_held_pipes is True)
     for _ in range(6):
-        runner.run(["/bin/sh", "-c", "(sleep 20 &) ; echo x"], cwd="/tmp",
+        runner.run([sys.executable, "-c", holder_script], cwd=tempfile.gettempdir(),
                    env=runner.scrubbed_env(), stdin_data="", timeout=5, grace=1,
                    stdout_cap=100, stderr_cap=100)
     check("R3: repeated jobs with lingering descendants leak no threads",
@@ -1307,7 +1351,16 @@ def test_round_two_regressions() -> None:
         blocked = os.path.join(sb.root, "blocked")
         inner = os.path.join(blocked, "ws")
         os.makedirs(inner, exist_ok=True)
-        os.chmod(blocked, 0o300)   # searchable, not listable
+        deny_sid = None
+        if os.name == "nt":
+            whoami = subprocess.run(
+                ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
+                text=True, timeout=30, check=True)
+            deny_sid = next(csv.reader([whoami.stdout.strip()]))[1]
+            subprocess.run(["icacls", blocked, "/deny", f"*{deny_sid}:(RD)"],
+                           capture_output=True, text=True, timeout=30, check=True)
+        else:
+            os.chmod(blocked, 0o300)   # searchable, not listable
         try:
             preflight.assert_workspace_clean(inner)
             check("R5: an unenumerable ancestor fails closed", False, "it passed")
@@ -1315,7 +1368,11 @@ def test_round_two_regressions() -> None:
             check("R5: an unenumerable ancestor fails closed",
                   exc.category == ErrorCategory.WORKSPACE_UNVERIFIABLE, exc.category.value)
         finally:
-            os.chmod(blocked, 0o700)
+            if deny_sid:
+                subprocess.run(["icacls", blocked, "/remove:d", f"*{deny_sid}"],
+                               capture_output=True, text=True, timeout=30, check=True)
+            else:
+                os.chmod(blocked, 0o700)
         check("R5: the walk resolves the real path, not the lexical one",
               "os.path.realpath(workspace)" in inspect.getsource(
                   preflight.assert_workspace_clean))
@@ -1467,8 +1524,12 @@ def test_self_found_round_three() -> None:
     check("S2: a large prompt through a slow reader arrives byte-exact, not duplicated",
           result.stdout.decode().strip() == expected,
           f"got {result.stdout.decode().strip()!r} want {expected!r}")
-    check("S2: a partial buffered write accounts for characters_written",
-          "characters_written" in inspect.getsource(type(active_platform)))
+    if os.name == "nt":
+        check("S2: Windows writes the byte-exact prompt through its writer thread",
+              "proc.stdin.write" in inspect.getsource(type(active_platform)))
+    else:
+        check("S2: a partial buffered write accounts for characters_written",
+              "characters_written" in inspect.getsource(type(active_platform)))
     os.unlink(reader)
 
 
@@ -1846,7 +1907,8 @@ def test_round_four_regressions() -> None:
         try:
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("J"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen(["/bin/sh", "-c", "sleep 120 & sleep 120"],
+            proc = subprocess.Popen([sys.executable, "-c",
+                                     "import time;time.sleep(120)"],
                                     start_new_session=True,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -1900,7 +1962,8 @@ def test_round_four_regressions() -> None:
                                                   "attempts", "1"))
         store.atomic_write_json(
             os.path.join(attempt, registry.INFLIGHT_MARKER),
-            {"pgid": os.getpgrp(), "leader_pid": os.getpid(),
+            {"pgid": (os.getpgrp() if os.name != "nt" else os.getpid()),
+             "leader_pid": os.getpid(),
              "leader_start": "x", "spawned_at": time.time()})
         reaped = registry.reap_orphaned_peers(sb.cfg, "SELF")
         check("U2b: reaping refuses to signal our own process group",
@@ -1951,7 +2014,8 @@ def test_round_four_second_pass() -> None:
                 "created_at": store.utc_now(), "updated_at": store.utc_now()})
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("DEAD"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen(["/bin/sh", "-c", "sleep 120 & sleep 120"],
+            proc = subprocess.Popen([sys.executable, "-c",
+                                     "import time;time.sleep(120)"],
                                     start_new_session=True,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -2024,7 +2088,8 @@ def test_round_four_second_pass() -> None:
     probe_fd, probe = tempfile.mkstemp(suffix=".pgid", prefix="ab_v2_")
     os.close(probe_fd)
     os.unlink(probe)
-    result = runner.run(["/bin/sh", "-c", "echo done"], cwd="/tmp",
+    result = runner.run([sys.executable, "-c", "print('done')"],
+                        cwd=tempfile.gettempdir(),
                         env=runner.scrubbed_env(), stdin_data="", timeout=10,
                         grace=1, stdout_cap=100, stderr_cap=100, pgid_file=probe)
     # This assertion is inverted from an earlier version, which required the
@@ -2125,7 +2190,8 @@ def test_round_four_third_pass() -> None:
     sb = Sandbox()
     try:
         make_conv(sb, "w3", "RECYCLED")
-        proc = subprocess.Popen(["/bin/sh", "-c", "sleep 60"], start_new_session=True,
+        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"],
+                                start_new_session=True,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             # Real live group, but a spawn identity that cannot match it.
@@ -2136,7 +2202,8 @@ def test_round_four_third_pass() -> None:
             outcomes = registry.reap_orphaned_peers(sb.cfg, "RECYCLED")
             check("W3: a start-time mismatch is refused, not signalled",
                   all(not o.get("signalled") for o in outcomes)
-                  and any("recycled" in str(o.get("identity")) for o in outcomes),
+                  and any(any(reason in str(o.get("identity")) for reason in (
+                      "recycled", "could not be verified")) for o in outcomes),
                   json.dumps(outcomes))
             check("W3: and the process is left alive rather than wrongly killed",
                   proc.poll() is None)
@@ -2158,7 +2225,8 @@ def test_round_four_third_pass() -> None:
                 os.path.join(sb.cfg.job_dir("REAL"), "attempts", "1"))
             # Spawn through the runner so the marker carries real identity,
             # then recreate it because a normal return deletes it.
-            holder = subprocess.Popen(["/bin/sh", "-c", "sleep 120 & sleep 120"],
+            holder = subprocess.Popen([sys.executable, "-c",
+                                       "import time;time.sleep(120)"],
                                       start_new_session=True,
                                       stdout=subprocess.DEVNULL,
                                       stderr=subprocess.DEVNULL)
@@ -2238,7 +2306,8 @@ def test_round_four_fourth_pass() -> None:
     marker_fd, marker_path = tempfile.mkstemp(suffix=".json", prefix="ab_x1_")
     os.close(marker_fd)
     os.unlink(marker_path)
-    result = runner.run(["/bin/sh", "-c", "echo ok"], cwd="/tmp",
+    result = runner.run([sys.executable, "-c", "print('ok')"],
+                        cwd=tempfile.gettempdir(),
                         env=runner.scrubbed_env(), stdin_data="", timeout=10,
                         grace=1, stdout_cap=100, stderr_cap=100,
                         pgid_file=marker_path)
@@ -2472,7 +2541,8 @@ def test_attempt_marker_lifecycle() -> None:
     os.makedirs(base, exist_ok=True)
     os.chmod(base, 0o500)
     try:
-        blocked = runner.run(["/bin/sh", "-c", "echo should-not-run"], cwd="/tmp",
+        blocked = runner.run([sys.executable, "-c", "print('should-not-run')"],
+                             cwd=tempfile.gettempdir(),
                              env=runner.scrubbed_env(), stdin_data="", timeout=10,
                              grace=1, stdout_cap=100, stderr_cap=100,
                              pgid_file=os.path.join(base, "nested", "marker.json"))
@@ -3104,40 +3174,53 @@ def test_state_root_permissions() -> None:
         # only: on Windows the verification reads an ACL, not st_mode, so
         # faking st_mode would test nothing that platform does.
         if os.name == "nt":
-            skip("SR: a filesystem that ignores chmod is refused",
-                 "verification on Windows reads ACLs, not mode bits")
-            return
-        import stat as statmod
-        real_stat = os.stat
+            real_verify = active_platform.verify_owner_only_path
+            active_platform.verify_owner_only_path = lambda directory, probe: (
+                False, {"mechanism": "windows acl round-trip",
+                        "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE})
+            try:
+                preflight.assert_state_root_secure(sb.cfg)
+                check("SR: an unverifiable ACL is refused", False, "it was accepted")
+            except BrokerError as exc:
+                check("SR: an unverifiable ACL is refused",
+                      exc.category == ErrorCategory.STATE_ROOT_INSECURE,
+                      exc.category.value)
+            finally:
+                active_platform.verify_owner_only_path = real_verify
+        else:
+            import stat as statmod
+            real_stat = os.stat
 
-        def wide_stat(path, *a, **k):
-            st = real_stat(path, *a, **k)
-            mode = 0o040777 if statmod.S_ISDIR(st.st_mode) else 0o100777
-            return os.stat_result((mode,) + tuple(st)[1:])
+            def wide_stat(path, *a, **k):
+                st = real_stat(path, *a, **k)
+                mode = 0o040777 if statmod.S_ISDIR(st.st_mode) else 0o100777
+                return os.stat_result((mode,) + tuple(st)[1:])
 
-        preflight.os.stat = wide_stat
-        try:
-            preflight.assert_state_root_secure(sb.cfg)
-            check("SR: a filesystem that ignores chmod is refused", False,
-                  "it was accepted")
-        except BrokerError as exc:
-            check("SR: a filesystem that ignores chmod is refused",
-                  exc.category == ErrorCategory.STATE_ROOT_INSECURE,
-                  exc.category.value)
-        finally:
-            preflight.os.stat = real_stat
+            preflight.os.stat = wide_stat
+            try:
+                preflight.assert_state_root_secure(sb.cfg)
+                check("SR: a filesystem that ignores chmod is refused", False,
+                      "it was accepted")
+            except BrokerError as exc:
+                check("SR: a filesystem that ignores chmod is refused",
+                      exc.category == ErrorCategory.STATE_ROOT_INSECURE,
+                      exc.category.value)
+            finally:
+                preflight.os.stat = real_stat
 
         # The privacy guarantee must be verified by the platform, not by a
         # POSIX-shaped assertion that a correct Windows ACL could never satisfy.
         from agent_bridge.platform import platform as active_platform
         check("SR: verification is delegated to the platform",
               hasattr(active_platform, "verify_owner_only_path"))
+        expected_mechanism = ("windows acl round-trip" if os.name == "nt"
+                              else "posix mode bits")
+        expected_guarantee = (WINDOWS_OWNER_ONLY_GUARANTEE if os.name == "nt" else
+                              "Directory mode is exactly 0700 and file mode is exactly 0600.")
         check("SR: and the report names the mechanism used",
-              report.get("mechanism") == "posix mode bits", str(report))
+              report.get("mechanism") == expected_mechanism, str(report))
         check("SR: and the report names the guarantee used",
-              report.get("guarantee") ==
-              "Directory mode is exactly 0700 and file mode is exactly 0600.",
-              str(report))
+              report.get("guarantee") == expected_guarantee, str(report))
         check("SR: preflight no longer asserts mode bits itself",
               "0o700" not in inspect.getsource(preflight.assert_state_root_secure))
 

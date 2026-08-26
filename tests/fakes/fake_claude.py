@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -50,6 +51,13 @@ def base(session_id: str, result, *, is_error=False, terminal="success") -> dict
     }
 
 
+def spawn_pipe_holder(seconds: int) -> None:
+    """Spawn a real descendant that inherits and keeps stdout open."""
+    subprocess.Popen(  # noqa: S603 - fixed interpreter and script
+        [sys.executable, "-c", f"import time;time.sleep({seconds})"],
+        stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=False)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--version" in argv:
@@ -82,7 +90,7 @@ def main() -> int:
         sys.stdout.write(json.dumps(base(session_id, valid(
             summary="looks complete but is a prefix"))))
         sys.stdout.flush()
-        os.system("sleep 8 &")  # noqa: S605 - deliberately holds the pipe
+        spawn_pipe_holder(8)
         return 0
     if mode == "migrate_session":
         # Honour --session-id on a fresh call, but on --resume report a
@@ -98,7 +106,7 @@ def main() -> int:
         sys.stderr.write("fake claude exploded\n")
         return 3
     if mode == "hang":
-        os.system("sleep 120 &")  # noqa: S605 - deliberate orphan for the group-kill test
+        spawn_pipe_holder(120)
         time.sleep(120)
         return 0
     if mode == "flood":
