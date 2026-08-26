@@ -257,18 +257,44 @@ stays a decision a person makes.
 CLI. No third-party Python packages, deliberately: the audit surface is this
 repository and nothing else.
 
-**Windows passes its own test suite**, 478 tests, zero failures, zero skips,
+**Windows passes its own test suite**, 485 tests, zero failures, six skips,
 verified by hand in a Windows 11 VM on CPython 3.12 rather than only in CI.
 That took finding several defects that no amount of POSIX testing could have
 surfaced, because the POSIX idiom and the Windows behaviour differ silently:
 `os.kill(pid, 0)` is a liveness probe on POSIX and a console interrupt on
-Windows, and a job-liveness check that only looked at the leader process
-reported a surviving descendant as contained.
+Windows; `start_new_session` is accepted and ignored; `os.replace` is not the
+clean swap that POSIX rename is, so a reader can find no file at all and a
+live job reported as `JOB_NOT_FOUND`; and a job-liveness check that looked
+only at the leader process reported a surviving descendant as contained.
 
-Verified on one configuration. An English-language `icacls`, a domain-joined
-machine, or a redirected profile are not covered by that run, and the ACL
-parser is the part most likely to need work on them. It fails closed, so an
+### If you are testing this on Windows
+
+Run the suite **as yourself**, not elevated and not as a service. Most of that
+list was invisible until it was run in an ordinary interactive session:
+`SYSTEM` holds privileges you do not, so it sails through code that stops a
+real user dead.
+
+```
+python tests\test_suite.py
+```
+
+**Six skips are expected** and are not failures. Creating a symbolic link
+needs `SeCreateSymbolicLinkPrivilege`, which an ordinary account does not hold
+unless Developer Mode is on, and three tests need a real symlink to test
+anything. Turn on Developer Mode to run them.
+
+Verified on one machine, one locale, not domain-joined. An English-language
+`icacls`, a domain account, or a redirected profile are not covered, and the
+ACL parser is the part most likely to need work on them. It fails closed, so an
 unrecognised ACL refuses the run rather than assuming privacy.
+
+**One open question.** A `worker_died` has been seen intermittently, on the
+order of one job in fifteen hundred, and it reproduces in no isolated loop. The
+machine it was seen on logs disk controller errors and 30 real-time-clock
+faults a day, so it cannot be told apart there from the platform's own
+instability. The verdict now carries its evidence: a `worker_died` record says
+whether the OS reported a real exit code or the liveness probe itself failed,
+which are different bugs. If you hit one, that record is the thing to send.
 [WSL](INSTALL.md#windows-use-wsl) remains supported and uses the POSIX path.
 
 A peer on Windows is also terminated immediately, with no graceful stage,
