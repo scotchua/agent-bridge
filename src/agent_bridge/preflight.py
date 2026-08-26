@@ -109,7 +109,11 @@ def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
     Returns a small report for diagnostics. Raises if the filesystem cannot
     hold the permissions this tool documents.
     """
+    from .platform import platform
+
     root = store.secure_mkdir(cfg.state_root)
+    if not platform.supports_owner_only_permissions:
+        raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
     observed_dir = os.stat(root).st_mode & 0o777
     probe_path = os.path.join(root, ".permission-probe")
     observed_file = None

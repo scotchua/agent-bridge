@@ -3024,25 +3024,25 @@ def test_platform_guard() -> None:
 
     check("PG: this platform is supported", pkg.platform_supported())
 
-    # Simulate a non-POSIX platform without needing one.
+    # Simulate Windows and an unsupported platform without needing either.
     real = os.name
     try:
         os.name = "nt"
+        check("PG: Windows is supported", pkg.platform_supported())
+        os.name = "unsupported"
         try:
             pkg.assert_platform_supported()
-            check("PG: a non-POSIX platform is refused", False, "it was allowed")
+            check("PG: an unknown platform is refused", False, "it was allowed")
         except RuntimeError as exc:
             message = str(exc)
-            check("PG: a non-POSIX platform is refused", True)
+            check("PG: an unknown platform is refused", True)
             check("PG: the message names the platform requirement",
-                  "POSIX" in message and "macOS or Linux" in message)
-            check("PG: it points at WSL rather than leaving them stuck",
-                  "WSL" in message)
+                  "POSIX" in message and "Windows" in message)
             check("PG: it explains that the gaps are safety machinery",
                   "safety machinery" in message)
             check("PG: and warns against stubbing the missing modules",
                   "stubbing" in message and "worse than not running" in message)
-            for requirement in ("fcntl", "killpg", "fchmod", "selectors"):
+            for requirement in ("locks", "process trees", "permissions", "pipe"):
                 check(f"PG: it names {requirement} specifically",
                       requirement in message)
     finally:

@@ -243,7 +243,7 @@ No consultation content is ever written into the repo.
 
 ## Checking it yourself
 
-Every push runs the offline test suite on macOS and Linux, on two Python
+Every push runs the offline test suite on macOS, Linux, and Windows, on two Python
 versions, via the badge at the top. That run uses stand-in programs in place of
 the two CLIs, so it needs no credentials and costs nothing. The live
 verification is deliberately not automated: it spends real model calls, so it
@@ -251,27 +251,23 @@ stays a decision a person makes.
 
 ## Requirements
 
-**macOS or Linux.** Python 3.11+, the Claude Code CLI, the Codex CLI. No
+**macOS, Linux, or Windows.** Python 3.11+, the Claude Code CLI, the Codex CLI. No
 third-party Python packages, deliberately: the audit surface is this repository
 and nothing else.
 
-**Windows is not supported, and this is a refusal rather than an omission.**
-The bridge depends on POSIX facilities that carry its guarantees: `fcntl`
-advisory locking for every lock it takes, process groups for terminating a peer
-and everything it spawned, `fchmod` for the owner-only permissions on all state,
-and `selectors` over pipes for reading peer output while enforcing size caps
-(Windows `select` supports sockets only). Importing the package on a non-POSIX
-platform raises with that explanation.
+**Windows uses a separate implementation of the same safety interface.** Its
+locks are mandatory byte-range locks rather than POSIX advisory `flock` locks.
+It contains peers in a Win32 Job Object, sends Ctrl+Break for polite shutdown,
+then terminates the Job Object after the grace period. A process deliberately
+escaping that job is outside the tree guarantee, comparable to a POSIX child
+starting a new session. Pipe output is drained with bounded reader threads
+because Windows `select` does not support anonymous pipes.
 
-Please do not work around it by stubbing the missing modules. That produces a
-build where locking silently does nothing, a runaway peer cannot be terminated,
-and state files are not owner-only, while the documentation still promises all
-three. **On Windows, use WSL** and install inside the Linux environment.
-[INSTALL.md](INSTALL.md#windows-use-wsl) has step-by-step instructions,
-including the two things people get wrong: the CLIs must be installed inside
-Linux, not on Windows, and nothing may live under `/mnt/c`, because those paths
-do not keep Linux file permissions. The tool checks the second one at startup
-and refuses rather than storing your history somewhere it cannot keep private.
+State privacy on Windows is expressed as an explicit current-user ACL rather
+than POSIX mode bits. The bridge applies that ACL with the built-in `icacls`
+tool and reads it back; if the ACL cannot be verified, it refuses to claim or
+use owner-only permissions. WSL remains supported and uses the POSIX behavior;
+[INSTALL.md](INSTALL.md#windows) explains its filesystem caveat.
 
 Built and measured against `claude 2.1.229` and `codex-cli 0.147.0` on macOS.
 Several documented behaviours are version-specific, which is why setup pins your

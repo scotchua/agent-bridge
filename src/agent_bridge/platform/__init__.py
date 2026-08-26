@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from .base import Platform
-from .posix import PosixPlatform
+import os
 
-platform: Platform = PosixPlatform()
+from .base import Platform
+
+if os.name == "nt":
+    from .windows import WindowsPlatform
+    platform: Platform = WindowsPlatform()
+else:
+    from .posix import PosixPlatform
+    platform = PosixPlatform()
 
 __all__ = ["Platform", "platform"]

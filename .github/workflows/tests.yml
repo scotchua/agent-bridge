@@ -13,48 +13,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Windows is not supported. This job proves the refusal is clean and the
-  # message is useful on a real Windows machine, rather than asserting it from
-  # a Mac. If someone later ports the platform layer, this job is where the
-  # evidence that it works would go.
-  windows-refuses-cleanly:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Importing the package raises a useful refusal, not an ImportError
-        shell: python
-        run: |
-          import sys, traceback
-          sys.path.insert(0, "src")
-          try:
-              import agent_bridge
-          except RuntimeError as exc:
-              message = str(exc)
-              print(message)
-              required = ["POSIX", "macOS or Linux", "WSL", "safety machinery",
-                          "stubbing", "fcntl", "killpg", "fchmod", "selectors"]
-              missing = [r for r in required if r not in message]
-              assert not missing, f"refusal message missing: {missing}"
-              print("\nrefusal is clean and complete")
-          except ImportError as exc:
-              print("FAILED: raised a bare ImportError instead of the guard")
-              traceback.print_exc()
-              sys.exit(1)
-          else:
-              print("FAILED: imported successfully on an unsupported platform")
-              sys.exit(1)
-
   offline-suite:
     strategy:
       fail-fast: false
       matrix:
-        # Built and measured on macOS. Linux is included because the suite
-        # inspects processes, and that is exactly the kind of code that grows
-        # silent platform assumptions.
-        os: [macos-latest, ubuntu-latest]
+        # The suite inspects processes, so every implementation runs here.
+        os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -65,6 +29,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: No third-party dependencies, by design
+        shell: bash
         run: |
           python3 -c "import sys; print(sys.version)"
           test ! -f requirements.txt || (echo "unexpected dependencies" && exit 1)
@@ -73,6 +38,7 @@ jobs:
         run: python3 tests/test_suite.py
 
       - name: Setup reports cleanly with no CLIs installed
+        shell: bash
         run: |
           # Neither CLI exists on a runner, so this must fail informatively
           # rather than crash. Exit code 1 is the documented "not ready" signal.
@@ -80,6 +46,7 @@ jobs:
           test "$rc" = "1" || (echo "expected exit 1, got $rc" && exit 1)
 
       - name: MCP server starts and lists the right tools
+        shell: bash
         run: |
           printf '%s\n%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

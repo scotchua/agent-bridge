@@ -6,9 +6,8 @@ not, that is a bug worth reporting.
 
 ## What you need first
 
-- **macOS or Linux.** Windows is not supported directly. See
-  [Windows: use WSL](#windows-use-wsl) below, which is a short detour and then
-  these same instructions.
+- **macOS, Linux, or Windows.** WSL remains an alternative on Windows; see
+  [Windows](#windows) for the differences between native Windows and WSL.
 - **Python 3.11 or newer.** Check with `python3 --version`. No packages to
   install: this uses only the standard library on purpose, so there is nothing
   to keep updated and nothing new to trust.
@@ -18,13 +17,20 @@ not, that is a bug worth reporting.
 Both CLIs are paid products on their own subscriptions. This tool does not
 change what they cost; it just lets them talk to each other.
 
-## Windows: use WSL
+## Windows
 
-The tool refuses to start on Windows, because what it would be missing there
-are the pieces that make its safety promises true rather than conveniences.
-WSL is Microsoft's official way to run Linux inside Windows, and inside it
-everything works normally. Half of this project's automated tests run on Linux
-on every change, so this is the supported path and not a workaround.
+Native Windows is supported using built-in Windows facilities only: byte-range
+locks, Job Objects for process trees, and `icacls` for state ACLs. Startup
+fails closed if an owner-only ACL cannot be applied and read back. Unlike the
+POSIX implementation, Windows uses bounded pipe-reader threads and a polite
+Ctrl+Break before forced Job Object termination. A process deliberately
+escaping its Job Object is outside the process-tree guarantee, just as a POSIX
+process deliberately starting a new session escapes its original group.
+
+Use PowerShell and run the commands below with `python` where they say
+`python3`. Install the native Windows builds of the Claude and Codex CLIs.
+
+WSL is also supported and provides the POSIX implementation. To use it:
 
 **1. Install WSL.** Open PowerShell as Administrator and run:
 
@@ -59,7 +65,8 @@ keeping owner-only permissions, this is why. Your Linux home directory, which
 is where you start, is the right place, and the default `~/agent-bridge` and
 `~/.agent-bridge` are already correct.
 
-Then continue with step 1 below, in the Ubuntu window.
+Then continue with step 1 below, in the Ubuntu window. The `/mnt/` filesystem
+warning applies to WSL only, not a native Windows installation.
 
 ## 1. Get the code
 
