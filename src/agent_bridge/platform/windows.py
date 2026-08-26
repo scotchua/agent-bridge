@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from . import base
+from .windows_acl import (
+    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_is_owner_only,
+)
 
 import contextlib
 import ctypes
@@ -127,12 +130,13 @@ class WindowsPlatform:
         """Verify the ACL, not st_mode.
 
         st_mode on Windows carries only a read-only bit, so the POSIX-shaped
-        assertion would reject a correctly protected directory. The equivalent
-        guarantee here is an explicit user-only ACL confirmed by reading it
-        back, which is what _set_and_verify_owner_acl already does.
+        assertion would reject a correctly protected directory. The Windows
+        guarantee is: no principal other than the owner, SYSTEM, and
+        Administrators has any access.
         """
         results = {
             "mechanism": "windows acl round-trip",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
             "directory_acl_verified": self._set_and_verify_owner_acl(directory),
             "file_acl_verified": self._set_and_verify_owner_acl(probe_file),
         }
@@ -420,12 +424,14 @@ class WindowsPlatform:
         return False
 
     def _set_and_verify_owner_acl(self, path: str) -> bool:
-        user = subprocess.run(
+        identity = subprocess.run(
             ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
             timeout=10, check=False, shell=False,
-        ).stdout.decode("utf-8", "replace").strip().split(",")[-1].strip('"')
+        ).stdout.decode("utf-8", "replace").strip().split(",")
+        user = identity[-1].strip('"')
         if not user.startswith("S-1-"):
             return False
+        owner_name = identity[0].strip('"') if len(identity) > 1 else ""
         try:
             applied = subprocess.run(
                 ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(F)"],
@@ -440,11 +446,5 @@ class WindowsPlatform:
         except (OSError, subprocess.SubprocessError):
             return False
         text = observed.stdout.decode("utf-8", "replace")
-        acl_text = "\n".join(text.splitlines()[:-1])
-        allowed = {user, "S-1-5-18", "S-1-5-32-544"}
-        principals = {
-            line.rsplit(":(", 1)[0].strip().split()[-1]
-            for line in acl_text.splitlines() if ":(" in line
-        }
-        return (observed.returncode == 0 and user in principals
-                and principals <= allowed and "(I)" not in acl_text)
+        return (observed.returncode == 0
+                and icacls_listing_is_owner_only(text, user, owner_name))

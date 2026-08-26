@@ -26,6 +26,9 @@ from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
 from agent_bridge.platform import platform as active_platform  # noqa: E402
+from agent_bridge.platform.windows_acl import (  # noqa: E402
+    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_is_owner_only,
+)
 
 BOTH = [("codex", "claude"), ("claude", "codex")]
 
@@ -3016,6 +3019,10 @@ def test_state_root_permissions() -> None:
               hasattr(active_platform, "verify_owner_only_path"))
         check("SR: and the report names the mechanism used",
               report.get("mechanism") == "posix mode bits", str(report))
+        check("SR: and the report names the guarantee used",
+              report.get("guarantee") ==
+              "Directory mode is exactly 0700 and file mode is exactly 0600.",
+              str(report))
         check("SR: preflight no longer asserts mode bits itself",
               "0o700" not in inspect.getsource(preflight.assert_state_root_secure))
 
@@ -3025,6 +3032,37 @@ def test_state_root_permissions() -> None:
               "WSL" in message and "/mnt/c" in message, message)
     finally:
         sb.cleanup()
+
+
+def test_windows_acl_parser() -> None:
+    """The Windows ACL decision is pure text so it can be tested on POSIX."""
+    print("\n[Windows ACL parser]")
+    owner = "S-1-5-21-1-2-3-1001"
+    listing = """C:\\state NT AUTHORITY\\SYSTEM:(OI)(CI)(F)
+              BUILTIN\\Administrators:(OI)(CI)(F)
+              OWNER RIGHTS:(OI)(CI)(F)
+Successfully processed 1 files; Failed processing 0 files
+"""
+    check("WA: the observed OWNER RIGHTS ACL is safe",
+          icacls_listing_is_owner_only(listing, owner, "runneradmin"))
+    check("WA: BUILTIN Users access is unsafe",
+          not icacls_listing_is_owner_only(
+              listing.replace("OWNER RIGHTS", "BUILTIN\\Users:(RX)\n"
+                              "              OWNER RIGHTS"),
+              owner, "runneradmin"))
+    check("WA: Everyone access is unsafe",
+          not icacls_listing_is_owner_only(
+              listing.replace("OWNER RIGHTS", "Everyone:(F)\n"
+                              "              OWNER RIGHTS"),
+              owner, "runneradmin"))
+    check("WA: empty output fails closed",
+          not icacls_listing_is_owner_only("", owner, "runneradmin"))
+    check("WA: unparseable output fails closed",
+          not icacls_listing_is_owner_only(
+              "Successfully processed 1 files", owner, "runneradmin"))
+    check("WA: Windows reports its distinct guarantee",
+          WINDOWS_OWNER_ONLY_GUARANTEE ==
+          "No principal other than the owner, SYSTEM, and Administrators has any access.")
 
 
 def test_platform_guard() -> None:
@@ -3078,6 +3116,7 @@ def main() -> int:
     test_reasoning_effort()
     test_reported_issues()
     test_state_root_permissions()
+    test_windows_acl_parser()
     test_platform_guard()
     test_external_review_findings()
     test_per_peer_classification_limits()

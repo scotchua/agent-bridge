@@ -128,6 +128,10 @@ def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
         "honours_permissions": verified,
         **detail,
     }
+    report.setdefault(
+        "guarantee",
+        "Directory mode is exactly 0700 and file mode is exactly 0600.",
+    )
     if not report["honours_permissions"]:
         raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
     return report

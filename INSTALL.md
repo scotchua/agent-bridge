@@ -21,11 +21,14 @@ change what they cost; it just lets them talk to each other.
 
 Native Windows is supported using built-in Windows facilities only: byte-range
 locks, Job Objects for process trees, and `icacls` for state ACLs. Startup
-fails closed if an owner-only ACL cannot be applied and read back. Unlike the
-POSIX implementation, Windows uses bounded pipe-reader threads and a polite
-Ctrl+Break before forced Job Object termination. A process deliberately
-escaping its Job Object is outside the process-tree guarantee, just as a POSIX
-process deliberately starting a new session escapes its original group.
+fails closed unless the ACL proves that no principal other than the owner,
+SYSTEM, and Administrators has any access. Separately, the POSIX guarantee is
+that state directories have mode exactly `0700` and files exactly `0600`.
+Unlike the POSIX implementation, Windows uses bounded pipe-reader threads and
+a polite Ctrl+Break before forced Job Object termination. A process
+deliberately escaping its Job Object is outside the process-tree guarantee,
+just as a POSIX process deliberately starting a new session escapes its
+original group.
 
 Use PowerShell and run the commands below with `python` where they say
 `python3`. Install the native Windows builds of the Claude and Codex CLIs.

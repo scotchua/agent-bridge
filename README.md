@@ -238,8 +238,10 @@ already listed. Porting this repository is the better option if you can.
 | `tests/test_suite.py` | full offline suite against stand-in CLIs |
 | `canaries/run_canaries.py` | live verification |
 
-State lives in `~/.agent-bridge`, outside this repository, readable only by you.
-No consultation content is ever written into the repo.
+State lives in `~/.agent-bridge`, outside this repository. On POSIX systems,
+state directories have mode exactly `0700` and files exactly `0600`. On
+Windows, no principal other than the owner, SYSTEM, and Administrators has any
+access. No consultation content is ever written into the repo.
 
 ## Checking it yourself
 
@@ -263,10 +265,11 @@ escaping that job is outside the tree guarantee, comparable to a POSIX child
 starting a new session. Pipe output is drained with bounded reader threads
 because Windows `select` does not support anonymous pipes.
 
-State privacy on Windows is expressed as an explicit current-user ACL rather
-than POSIX mode bits. The bridge applies that ACL with the built-in `icacls`
-tool and reads it back; if the ACL cannot be verified, it refuses to claim or
-use owner-only permissions. WSL remains supported and uses the POSIX behavior;
+State privacy on Windows guarantees that no principal other than the owner,
+SYSTEM, and Administrators has any access; it does not claim POSIX mode-bit
+semantics. The bridge applies that ACL with the built-in `icacls` tool and
+reads it back; if the ACL cannot be verified, it refuses to claim or use
+owner-only permissions. WSL remains supported and uses the POSIX behavior;
 [INSTALL.md](INSTALL.md#windows) explains its filesystem caveat.
 
 Built and measured against `claude 2.1.229` and `codex-cli 0.147.0` on macOS.
