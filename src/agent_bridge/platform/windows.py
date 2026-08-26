@@ -104,10 +104,22 @@ class WindowsPlatform:
         os.umask(0o077)
 
     def enforce_owner_only_file(self, fd: int) -> None:
+        """Apply an owner-only ACL, and record whether it could be verified.
+
+        Deliberately does not raise. The capability flag is how a platform says
+        "I cannot guarantee this", and preflight then refuses to start with an
+        explanation. Raising here instead made every atomic write fail, so the
+        bridge could not write any state at all, turning a documented refusal
+        into a crash during ordinary file writes.
+
+        The guarantee is not weakened by this: an unverified ACL sets the flag
+        false, and assert_state_root_secure refuses before any consultation
+        runs.
+        """
         path = self._path_from_fd(fd)
         if not self._set_and_verify_owner_acl(path):
             self.supports_owner_only_permissions = False
-            raise OSError(f"owner-only ACL could not be verified for {path}")
+            return
         self.supports_owner_only_permissions = True
 
     def verify_owner_only_path(self, directory: str,

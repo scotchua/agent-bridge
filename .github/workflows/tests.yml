@@ -43,14 +43,27 @@ jobs:
           print("implementation:", type(platform).__name__)
           print("supports_owner_only_permissions:",
                 platform.supports_owner_only_permissions)
-          d = tempfile.mkdtemp()
+          from agent_bridge import store
+          store.set_umask()
+          d = store.secure_mkdir(tempfile.mkdtemp())
           probe = os.path.join(d, "probe")
-          open(probe, "w").close()
+          # Use the real writer, not a bare open(): a bare open gets default
+          # permissions and produces a false negative.
+          store.atomic_write_bytes(probe, b"probe\n")
           try:
               verified, detail = platform.verify_owner_only_path(d, probe)
               print("verify_owner_only_path:", verified, json.dumps(detail))
           except Exception as exc:
               print("verify_owner_only_path raised:", type(exc).__name__, exc)
+          if os.name == "nt":
+              import subprocess
+              for target in (d, probe):
+                  r = subprocess.run(["icacls", target], capture_output=True)
+                  print(f"icacls {target} rc={r.returncode}")
+                  print(r.stdout.decode(errors="replace"))
+                  print(r.stderr.decode(errors="replace"))
+              import getpass
+              print("user:", getpass.getuser())
 
       - name: Offline test suite
         run: python3 tests/test_suite.py
