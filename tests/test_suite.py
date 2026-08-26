@@ -87,22 +87,10 @@ def cfg_contract_version() -> str:
     return json.load(open(os.path.join(REPO, "config", "broker.json")))["contract_version"]
 
 
-def ps_available() -> bool:
-    """Whether `ps` can be executed here.
-
-    A reviewer running this suite inside a restrictive sandbox had `ps` denied,
-    which aborted the whole run and made the result unreproducible. Orphan
-    checks now skip explicitly and say so, rather than taking the suite down
-    with them.
-    """
-    try:
-        proc = subprocess.run(["ps", "-o", "pid="], capture_output=True, timeout=10)
-        return proc.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-PS_AVAILABLE = ps_available()
+PROCESS_GROUP_ENUMERATION_AVAILABLE = (
+    os.name == "nt" or active_platform.process_group_members(
+        os.getpgrp() if os.name != "nt" else os.getpid()) is not None
+)
 SKIPPED: list[str] = []
 
 
@@ -112,33 +100,8 @@ def skip(name: str, reason: str) -> None:
 
 
 def group_survivors(pgid: int) -> list[str]:
-    """Pids still alive in a process group. Portable across macOS and Linux.
-
-    Uses `ps -A -o pid=,pgid=` and filters, rather than `ps -g <pgid>`: the
-    latter selects a process group on macOS but a session or effective group
-    NAME on Linux, so the obvious form was a silent platform assumption inside
-    a test that guards process cleanup.
-
-    Callers must reap their own direct child first. Anything still listed after
-    that is genuinely alive: a grandchild orphaned by the kill is reparented and
-    reaped by init, so it does not linger here as a zombie.
-    """
-    try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,pgid="],
-                             capture_output=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    alive: list[str] = []
-    for line in out.stdout.decode("utf-8", "replace").splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        try:
-            if int(parts[1]) == int(pgid) and int(parts[0]) != os.getpid():
-                alive.append(parts[0])
-        except ValueError:
-            continue
-    return alive
+    """Pids still alive in a process group or Job Object."""
+    return active_platform.process_group_members(pgid) or []
 
 
 def test_tool_exposure() -> None:
@@ -530,9 +493,9 @@ def test_timeout_and_process_group_cleanup() -> None:
                                           for k in kills),
                       json.dumps(kills))
             pgids = [k["pgid"] for k in kills if k.get("pgid")]
-            if not PS_AVAILABLE:
+            if not PROCESS_GROUP_ENUMERATION_AVAILABLE:
                 skip(f"{caller}->{peer}: no orphan processes survive in the killed groups",
-                     "ps is not executable in this environment")
+                     "this platform cannot enumerate isolated process groups")
             else:
                 time.sleep(0.5)
                 survivors = [(p, group_survivors(p)) for p in pgids]
@@ -1935,20 +1898,18 @@ def test_round_four_regressions() -> None:
 
     # U2: a dead worker's peer must be reaped, not left running against a
     # session a later continuation is about to reuse.
-    if not PS_AVAILABLE:
-        skip("U2: a dead worker's orphaned peer is reaped", "ps is not executable")
+    if not PROCESS_GROUP_ENUMERATION_AVAILABLE:
+        skip("U2: a dead worker's orphaned peer is reaped",
+             "this platform cannot enumerate isolated process groups")
     else:
         sb = Sandbox()
         try:
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("J"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
-                                    start_new_session=True,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-            pgid = os.getpgid(proc.pid)
-            lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(proc.pid)],
-                                    capture_output=True).stdout.decode().strip()
+            proc = active_platform.spawn_isolated(
+                [sys.executable, "-c", GROUP_OF_TWO], cwd=REPO, env=os.environ.copy())
+            pgid = active_platform.isolated_process_group(proc.pid)
+            lstart = active_platform.process_identity(proc.pid)
             store.atomic_write_json(
                 os.path.join(attempt, registry.INFLIGHT_MARKER),
                 {"pgid": pgid, "leader_pid": proc.pid, "leader_start": lstart,
@@ -2033,9 +1994,9 @@ def test_round_four_second_pass() -> None:
     """Codex's second-pass findings: reaping must be on the admission path."""
     print("\n[round four, second pass]")
 
-    if not PS_AVAILABLE:
+    if not PROCESS_GROUP_ENUMERATION_AVAILABLE:
         skip("V1: admission reaps an orphaned peer before displacing a claim",
-             "ps is not executable")
+             "this platform cannot enumerate isolated process groups")
     else:
         sb = Sandbox()
         try:
@@ -2048,17 +2009,14 @@ def test_round_four_second_pass() -> None:
                 "created_at": store.utc_now(), "updated_at": store.utc_now()})
             attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("DEAD"),
                                                       "attempts", "1"))
-            proc = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
-                                    start_new_session=True,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-            pgid = os.getpgid(proc.pid)
+            proc = active_platform.spawn_isolated(
+                [sys.executable, "-c", GROUP_OF_TWO], cwd=REPO, env=os.environ.copy())
+            pgid = active_platform.isolated_process_group(proc.pid)
             # A full identity marker, so the reaper can verify the group is
             # genuinely ours and will actually signal it. A marker without
             # verifiable identity now correctly holds admission WITHOUT
             # signalling, which U2c covers separately.
-            lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(proc.pid)],
-                                    capture_output=True).stdout.decode().strip()
+            lstart = active_platform.process_identity(proc.pid)
             store.atomic_write_json(
                 os.path.join(attempt, registry.INFLIGHT_MARKER),
                 {"pgid": pgid, "leader_pid": proc.pid, "leader_start": lstart,
@@ -2253,8 +2211,9 @@ def test_round_four_third_pass() -> None:
         sb.cleanup()
 
     # W4: a genuine, identity-verified orphan IS reaped.
-    if not PS_AVAILABLE:
-        skip("W4: an identity-verified orphan is reaped", "ps is not executable")
+    if not PROCESS_GROUP_ENUMERATION_AVAILABLE:
+        skip("W4: an identity-verified orphan is reaped",
+             "this platform cannot enumerate isolated process groups")
     else:
         sb = Sandbox()
         try:
@@ -2263,20 +2222,17 @@ def test_round_four_third_pass() -> None:
                 os.path.join(sb.cfg.job_dir("REAL"), "attempts", "1"))
             # Spawn through the runner so the marker carries real identity,
             # then recreate it because a normal return deletes it.
-            holder = subprocess.Popen([sys.executable, "-c", GROUP_OF_TWO],
-                                      start_new_session=True,
-                                      stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL)
-            lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(holder.pid)],
-                                    capture_output=True).stdout.decode().strip()
+            holder = active_platform.spawn_isolated(
+                [sys.executable, "-c", GROUP_OF_TWO], cwd=REPO, env=os.environ.copy())
+            lstart = active_platform.process_identity(holder.pid)
+            pgid = active_platform.isolated_process_group(holder.pid)
             store.atomic_write_json(
                 os.path.join(attempt_dir, registry.INFLIGHT_MARKER),
-                {"pgid": os.getpgid(holder.pid), "leader_pid": holder.pid,
+                {"pgid": pgid, "leader_pid": holder.pid,
                  "leader_start": lstart, "spawned_at": time.time()})
 
             live = group_survivors
 
-            pgid = os.getpgid(holder.pid)
             check("W4: the orphan is alive before admission", len(live(pgid)) >= 1)
             try:
                 registry.claim_conversation_slot(sb.cfg, "w4", "codex", "NEW", 99)

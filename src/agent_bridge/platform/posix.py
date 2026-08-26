@@ -131,6 +131,30 @@ class PosixPlatform:
         except (ProcessLookupError, OSError):
             return False
 
+    def process_group_members(self, group_id: int) -> list[str] | None:
+        """Enumerate a group without relying on incompatible `ps -g` meanings.
+
+        `ps -g <pgid>` selects a process group on macOS but a session or
+        effective group name on Linux, so list every process and filter.
+        """
+        try:
+            probe = subprocess.run(  # noqa: S603 - fixed argv, shell off
+                ["ps", "-A", "-o", "pid=,pgid="], capture_output=True,
+                timeout=10, check=False, shell=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        members: list[str] = []
+        for line in probe.stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                if int(parts[1]) == int(group_id) and int(parts[0]) != os.getpid():
+                    members.append(parts[0])
+            except ValueError:
+                continue
+        return members
+
     def process_identity(self, pid: int) -> str:
         try:
             probe = subprocess.run(  # noqa: S603 - fixed argv, shell off

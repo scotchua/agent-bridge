@@ -28,6 +28,8 @@ PROCESS_TERMINATE = 0x0001
 SYNCHRONIZE = 0x00100000
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+ERROR_MORE_DATA = 234
 WAIT_TIMEOUT = 258
 
 
@@ -73,6 +75,11 @@ kernel32.SetInformationJobObject.argtypes = [
     wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
 ]
 kernel32.SetInformationJobObject.restype = wintypes.BOOL
+kernel32.QueryInformationJobObject.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.QueryInformationJobObject.restype = wintypes.BOOL
 kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
 kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
 kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -301,13 +308,39 @@ class WindowsPlatform:
             kernel32.CloseHandle(handle)
 
     def process_tree_alive(self, group_id: int) -> bool:
-        process = kernel32.OpenProcess(SYNCHRONIZE, False, group_id)
-        if not process:
-            return False
-        try:
-            return kernel32.WaitForSingleObject(process, 0) == WAIT_TIMEOUT
-        finally:
-            kernel32.CloseHandle(process)
+        members = self.process_group_members(group_id)
+        if members is None:
+            # Fail closed: a query failure cannot prove that containment
+            # succeeded, so report the tree as possibly alive.
+            return True
+        return bool(members)
+
+    def process_group_members(self, group_id: int) -> list[str] | None:
+        handle = self._job_handle(group_id)
+        if handle is None:
+            return None
+        capacity = 1
+        header_size = ctypes.sizeof(wintypes.DWORD) * 2
+        while True:
+            buffer_size = header_size + capacity * ctypes.sizeof(ctypes.c_size_t)
+            buffer = ctypes.create_string_buffer(buffer_size)
+            returned = wintypes.DWORD()
+            if kernel32.QueryInformationJobObject(
+                    handle, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buffer,
+                    buffer_size, ctypes.byref(returned)):
+                assigned = wintypes.DWORD.from_buffer(buffer, 0).value
+                listed = wintypes.DWORD.from_buffer(
+                    buffer, ctypes.sizeof(wintypes.DWORD)).value
+                ids_type = ctypes.c_size_t * listed
+                ids = ids_type.from_buffer(buffer, header_size)
+                return [str(ids[index]) for index in range(listed)]
+            error = ctypes.get_last_error()
+            if error != ERROR_MORE_DATA:
+                return None
+            assigned = wintypes.DWORD.from_buffer(buffer, 0).value
+            if assigned <= capacity:
+                return None
+            capacity = assigned
 
     def process_identity(self, pid: int) -> str:
         return self._process_creation_time(pid)
