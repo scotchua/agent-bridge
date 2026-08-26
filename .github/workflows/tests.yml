@@ -55,6 +55,9 @@ jobs:
               print("verify_owner_only_path:", verified, json.dumps(detail))
           except Exception as exc:
               print("verify_owner_only_path raised:", type(exc).__name__, exc)
+          if os.name == "nt" and hasattr(platform, "acl_diagnostics"):
+              print("acl_diagnostics:", json.dumps(platform.acl_diagnostics(d),
+                                                   indent=2))
           if os.name == "nt":
               import subprocess
               for target in (d, probe):

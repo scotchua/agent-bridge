@@ -338,7 +338,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         preflight.assert_state_root_secure(cfg)
     except BrokerError as exc:
+        # The constant hint is written for the POSIX case, where this failure
+        # is almost always a state root under /mnt/c on WSL. On Windows that
+        # advice is nonsense, so the platform's own report is appended and the
+        # caller can see which guarantee was actually being checked.
         sys.stderr.write(f"agent-bridge: {hint(exc.category)}\n")
+        try:
+            from . import preflight as _preflight
+            from .platform import platform as _platform
+            sys.stderr.write(
+                f"agent-bridge: platform={type(_platform).__name__} "
+                f"owner_only_supported={_platform.supports_owner_only_permissions}\n")
+        except Exception:  # noqa: BLE001 - diagnostics must not mask the refusal
+            pass
         return 2
     return Server(args.caller, cfg).serve()
 

@@ -421,7 +421,55 @@ class WindowsPlatform:
         return path[4:] if path.startswith("\\\\?\\") else path
 
     def _acl_round_trip_supported(self) -> bool:
-        return False
+        """Actually probe, rather than assuming an answer.
+
+        This was a stub returning False, which pinned
+        supports_owner_only_permissions to False no matter how well the ACL
+        machinery worked, so the bridge refused to start on every Windows
+        machine for a reason unrelated to any ACL.
+
+        Probes in a temporary directory that is discarded, so a failure here
+        costs nothing and a success is evidence rather than an assumption.
+        """
+        import shutil
+        import tempfile
+        probe_dir = tempfile.mkdtemp(prefix="agent-bridge-acl-probe-")
+        probe_file = os.path.join(probe_dir, "probe")
+        try:
+            with open(probe_file, "wb") as handle:
+                handle.write(b"probe\n")
+            return bool(self._set_and_verify_owner_acl(probe_dir)
+                        and self._set_and_verify_owner_acl(probe_file))
+        except OSError:
+            return False
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+    def acl_diagnostics(self, path: str) -> dict[str, Any]:
+        """Why an ACL attempt succeeded or failed. For operators and CI only."""
+        identity = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
+            timeout=10, check=False, shell=False)
+        raw = identity.stdout.decode("utf-8", "replace").strip()
+        fields = raw.split(",")
+        user = fields[-1].strip('"') if fields else ""
+        applied = subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(F)"],
+            capture_output=True, timeout=15, check=False, shell=False)
+        observed = subprocess.run(
+            ["icacls", path], capture_output=True, timeout=15,
+            check=False, shell=False)
+        return {
+            "whoami_rc": identity.returncode,
+            "whoami_raw": raw,
+            "parsed_sid": user,
+            "sid_looks_valid": user.startswith("S-1-"),
+            "grant_rc": applied.returncode,
+            "grant_stdout": applied.stdout.decode("utf-8", "replace").strip(),
+            "grant_stderr": applied.stderr.decode("utf-8", "replace").strip(),
+            "observed_rc": observed.returncode,
+            "observed": observed.stdout.decode("utf-8", "replace").strip(),
+        }
 
     def _set_and_verify_owner_acl(self, path: str) -> bool:
         identity = subprocess.run(
