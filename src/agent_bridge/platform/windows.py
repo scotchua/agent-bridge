@@ -110,6 +110,25 @@ class WindowsPlatform:
             raise OSError(f"owner-only ACL could not be verified for {path}")
         self.supports_owner_only_permissions = True
 
+    def verify_owner_only_path(self, directory: str,
+                               probe_file: str) -> tuple[bool, dict[str, Any]]:
+        """Verify the ACL, not st_mode.
+
+        st_mode on Windows carries only a read-only bit, so the POSIX-shaped
+        assertion would reject a correctly protected directory. The equivalent
+        guarantee here is an explicit user-only ACL confirmed by reading it
+        back, which is what _set_and_verify_owner_acl already does.
+        """
+        results = {
+            "mechanism": "windows acl round-trip",
+            "directory_acl_verified": self._set_and_verify_owner_acl(directory),
+            "file_acl_verified": self._set_and_verify_owner_acl(probe_file),
+        }
+        verified = bool(results["directory_acl_verified"]
+                        and results["file_acl_verified"])
+        self.supports_owner_only_permissions = verified
+        return verified, results
+
     @contextlib.contextmanager
     def lock_exclusive(self, fd: int, lock_path: str,
                        timeout: float) -> Iterator[None]:

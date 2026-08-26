@@ -111,15 +111,13 @@ def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
     """
     from .platform import platform
 
+    from .platform import platform
+
     root = store.secure_mkdir(cfg.state_root)
-    if not platform.supports_owner_only_permissions:
-        raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
-    observed_dir = os.stat(root).st_mode & 0o777
     probe_path = os.path.join(root, ".permission-probe")
-    observed_file = None
     try:
         store.atomic_write_bytes(probe_path, b"probe\n")
-        observed_file = os.stat(probe_path).st_mode & 0o777
+        verified, detail = platform.verify_owner_only_path(root, probe_path)
     finally:
         try:
             os.unlink(probe_path)
@@ -127,9 +125,8 @@ def assert_state_root_secure(cfg: Config) -> dict[str, Any]:
             pass
     report = {
         "state_root": root,
-        "directory_mode": oct(observed_dir),
-        "file_mode": oct(observed_file) if observed_file is not None else None,
-        "honours_permissions": observed_dir == 0o700 and observed_file == 0o600,
+        "honours_permissions": verified,
+        **detail,
     }
     if not report["honours_permissions"]:
         raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)

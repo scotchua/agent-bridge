@@ -41,6 +41,21 @@ class PosixPlatform:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
 
+    def verify_owner_only_path(self, directory: str,
+                               probe_file: str) -> tuple[bool, dict[str, Any]]:
+        """Read the modes back. Unchanged from the original inline check.
+
+        Catches a filesystem that accepts chmod without keeping it, which is
+        what WSL's DrvFs does when state lands under /mnt/c.
+        """
+        observed_dir = os.stat(directory).st_mode & 0o777
+        observed_file = os.stat(probe_file).st_mode & 0o777
+        return (observed_dir == 0o700 and observed_file == 0o600, {
+            "mechanism": "posix mode bits",
+            "directory_mode": oct(observed_dir),
+            "file_mode": oct(observed_file),
+        })
+
     def spawn_isolated(self, argv: list[str], *, cwd: str,
                        env: dict[str, str]) -> subprocess.Popen[bytes]:
         return subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off

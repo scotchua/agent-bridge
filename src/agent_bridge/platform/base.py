@@ -42,6 +42,22 @@ class Platform(Protocol):
 
     def enforce_owner_only_file(self, fd: int) -> None: ...
 
+    def verify_owner_only_path(self, directory: str,
+                               probe_file: str) -> tuple[bool, dict[str, Any]]:
+        """Confirm this filesystem actually keeps the state private.
+
+        The guarantee is "state is readable only by its owner, and that was
+        confirmed by reading it back". How you confirm it is platform business:
+        POSIX reads mode bits, Windows reads the ACL. Comparing st_mode against
+        0o700 works on one and is meaningless on the other, where st_mode
+        carries only a read-only bit, so a correct Windows ACL would still have
+        failed a POSIX-shaped assertion.
+
+        Returns (verified, report). The report is diagnostic detail for an
+        operator and its keys are platform-specific by design.
+        """
+        ...
+
     @contextlib.contextmanager
     def lock_exclusive(self, fd: int, lock_path: str,
                        timeout: float) -> Iterator[None]: ...

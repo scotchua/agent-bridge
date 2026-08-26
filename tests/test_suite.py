@@ -3009,6 +3009,16 @@ def test_state_root_permissions() -> None:
         finally:
             preflight.os.stat = real_stat
 
+        # The privacy guarantee must be verified by the platform, not by a
+        # POSIX-shaped assertion that a correct Windows ACL could never satisfy.
+        from agent_bridge.platform import platform as active_platform
+        check("SR: verification is delegated to the platform",
+              hasattr(active_platform, "verify_owner_only_path"))
+        check("SR: and the report names the mechanism used",
+              report.get("mechanism") == "posix mode bits", str(report))
+        check("SR: preflight no longer asserts mode bits itself",
+              "0o700" not in inspect.getsource(preflight.assert_state_root_secure))
+
         from agent_bridge.errors import hint as error_hint
         message = error_hint(ErrorCategory.STATE_ROOT_INSECURE)
         check("SR: the hint tells a WSL user exactly what went wrong",
