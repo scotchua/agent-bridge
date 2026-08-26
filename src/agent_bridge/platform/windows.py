@@ -454,7 +454,7 @@ class WindowsPlatform:
         fields = raw.split(",")
         user = fields[-1].strip('"') if fields else ""
         applied = subprocess.run(
-            ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(F)"],
+            ["icacls", path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
             capture_output=True, timeout=15, check=False, shell=False)
         observed = subprocess.run(
             ["icacls", path], capture_output=True, timeout=15,
@@ -481,8 +481,12 @@ class WindowsPlatform:
             return False
         owner_name = identity[0].strip('"') if len(identity) > 1 else ""
         try:
+            # The SID must be written *SID. icacls treats a bare SID as an
+            # account name and fails with 1332, "No mapping between account
+            # names and security IDs was done", so the grant silently never
+            # applied and the capability could never be verified.
             applied = subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(F)"],
+                ["icacls", path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
                 capture_output=True, timeout=15, check=False, shell=False,
             )
             if applied.returncode != 0:
