@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import os
-import subprocess
 import time
 from typing import Any
 
 from . import store
 from .config import Config
 from .errors import BrokerError, ErrorCategory
+from .platform import platform
 
 TERMINAL_STATUSES = ("complete", "failed", "timed_out", "cancelled")
 ALL_STATUSES = ("queued", "running", *TERMINAL_STATUSES)
@@ -480,23 +480,18 @@ def _group_identity_matches(marker: dict[str, Any]) -> tuple[bool, str]:
     leader_pid = marker.get("leader_pid")
     if not isinstance(pgid, int) or pgid <= 1:
         return False, "no usable pgid recorded"
-    if pgid == os.getpgrp():
+    if platform.is_own_process_group(pgid):
         return False, "refuses to signal the broker's own group"
     if not isinstance(leader_pid, int):
         return False, "no leader pid recorded"
-    try:
-        probe = subprocess.run(  # noqa: S603 - fixed argv, shell off
-            ["ps", "-o", "lstart=,pgid=", "-p", str(leader_pid)],
-            capture_output=True, timeout=10, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError):
+    identity = platform.process_group_identity(leader_pid)
+    if identity is None:
         return False, "process identity could not be verified"
-    text = probe.stdout.decode("utf-8", "replace").strip()
-    if not text:
+    observed_start, observed_pgid = identity
+    if not observed_start and not observed_pgid:
         return False, "group leader is gone"
-    parts = text.rsplit(None, 1)
-    if len(parts) != 2:
+    if not observed_pgid:
         return False, "unreadable ps output"
-    observed_start, observed_pgid = parts[0].strip(), parts[1].strip()
     if observed_pgid != str(pgid):
         return False, "leader pid no longer belongs to the recorded group"
     recorded_start = str(marker.get("leader_start") or "").strip()
@@ -520,7 +515,6 @@ def reap_orphaned_peers(cfg: Config, job_id: str) -> list[dict[str, Any]]:
     therefore only be signalled if a crash left the file behind, which bounds
     the reuse exposure to genuinely interrupted attempts.
     """
-    from . import runner
     outcomes: list[dict[str, Any]] = []
     for marker in inflight_attempts(cfg, job_id):
         safe, reason = _group_identity_matches(marker)
@@ -537,7 +531,7 @@ def reap_orphaned_peers(cfg: Config, job_id: str) -> list[dict[str, Any]]:
                 "group leader is gone", "refuses to signal the broker's own group")
             outcomes.append(record)
             continue
-        record.update(runner._kill_group(int(marker["pgid"]), 2.0))
+        record.update(platform.terminate_process_tree(int(marker["pgid"]), 2.0))
         record["signalled"] = True
         outcomes.append(record)
     return outcomes

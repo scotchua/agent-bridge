@@ -8,7 +8,6 @@ a poll after an MCP restart, always reads a complete document.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -16,12 +15,14 @@ import tempfile
 import time
 from typing import Any, Iterator
 
+from .platform import platform
+
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
 
 def set_umask() -> None:
-    os.umask(0o077)
+    platform.set_owner_only_umask()
 
 
 def secure_mkdir(path: str) -> str:
@@ -71,7 +72,7 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
     secure_mkdir(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
-        os.fchmod(fd, FILE_MODE)
+        platform.enforce_owner_only_file(fd)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -114,19 +115,9 @@ def file_lock(lock_path: str, timeout: float = 10.0) -> Iterator[None]:
     secure_mkdir(os.path.dirname(os.path.abspath(lock_path)))
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, FILE_MODE)
     try:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"could not lock {lock_path}")
-                time.sleep(0.02)
-        yield
+        with platform.lock_exclusive(fd, lock_path, timeout):
+            yield
     finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 

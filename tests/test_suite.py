@@ -25,6 +25,7 @@ from agent_bridge.backends import base  # noqa: E402
 from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
+from agent_bridge.platform import posix as platform_posix  # noqa: E402
 
 BOTH = [("codex", "claude"), ("claude", "codex")]
 
@@ -1458,7 +1459,7 @@ def test_self_found_round_three() -> None:
           result.stdout.decode().strip() == expected,
           f"got {result.stdout.decode().strip()!r} want {expected!r}")
     check("S2: a partial buffered write accounts for characters_written",
-          "characters_written" in inspect.getsource(runner))
+          "characters_written" in inspect.getsource(platform_posix))
     os.unlink(reader)
 
 
@@ -2221,7 +2222,7 @@ def test_round_four_fourth_pass() -> None:
     # process creation cannot leave an invisible orphan.
     source = inspect.getsource(runner.run)
     pre = source.index('"phase": "pre_spawn"')
-    spawn = source.index("subprocess.Popen(")
+    spawn = source.index("platform.spawn_isolated(")
     check("X1: the in-flight marker is written before the peer is spawned",
           pre < spawn, f"marker at {pre}, Popen at {spawn}")
 

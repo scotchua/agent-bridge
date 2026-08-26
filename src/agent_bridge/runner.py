@@ -9,7 +9,7 @@ signalled, given a grace period, then killed.
 
 The limit of that guarantee, stated precisely: it covers descendants that
 remain in the peer's process group.  A descendant that calls setsid() and
-creates its own session leaves the group and will survive killpg.  Nothing
+creates its own session leaves the group and will survive group termination. Nothing
 here is an OS-level containment mechanism, and no such claim is made.  Closing
 that gap would need a supervisor outside this process, which version 1 does
 not have.  Group kill is measured to work on a forked child in the normal
@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
-import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from .platform import platform
 
 
 #: How long to keep draining after the peer process itself has exited, when a
@@ -53,40 +53,6 @@ class RunResult:
     def sanitized_argv(self) -> list[str]:
         """argv shape for provenance. Paths kept, no secrets are ever in argv."""
         return list(self.argv)
-
-
-def _kill_group(pgid: int, grace: float) -> dict[str, Any]:
-    """SIGTERM the group, wait out the grace period, then SIGKILL. Report both."""
-    report: dict[str, Any] = {"pgid": pgid, "sigterm": False, "sigkill": False}
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-        report["sigterm"] = True
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    deadline = time.monotonic() + max(0.0, grace)
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            report["group_gone_after_sigterm"] = True
-            return report
-        except OSError:
-            break
-        time.sleep(0.05)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-        report["sigkill"] = True
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    time.sleep(0.05)
-    try:
-        os.killpg(pgid, 0)
-        report["group_survived_sigkill"] = True
-    except ProcessLookupError:
-        report["group_gone_after_sigkill"] = True
-    except OSError:
-        pass
-    return report
 
 
 def run(
@@ -132,17 +98,7 @@ def run(
             )
 
     try:
-        proc = subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,   # own process group, killable as a unit
-            shell=False,
-            close_fds=True,
-        )
+        proc = platform.spawn_isolated(argv, cwd=cwd, env=env)
     except (OSError, ValueError):
         # A confirmed spawn failure proves no child was created, so the
         # pre_spawn marker is retired: holding a conversation for a peer that
@@ -159,24 +115,13 @@ def run(
             duration_seconds=time.monotonic() - started, pgid=None, spawn_failed=True,
         )
 
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = None
+    pgid = platform.isolated_process_group(proc.pid)
     if pgid_file:
         # Enrich the pre-spawn marker with spawn identity. A bare PGID is not
         # identity: it can be recycled, and signalling a recycled group would be
         # worse than leaving an orphan. The leader pid plus its ps start time is
         # what lets a later reaper prove the group is still ours.
-        leader_start = ""
-        if pgid is not None:
-            try:
-                probe = subprocess.run(  # noqa: S603 - fixed argv, shell off
-                    ["ps", "-o", "lstart=", "-p", str(proc.pid)],
-                    capture_output=True, timeout=10, check=False, shell=False)
-                leader_start = probe.stdout.decode("utf-8", "replace").strip()
-            except (OSError, subprocess.SubprocessError):
-                leader_start = ""
+        leader_start = platform.process_identity(proc.pid) if pgid is not None else ""
         _write_marker(pgid_file, {
             "phase": "spawned",
             "pgid": pgid,
@@ -186,149 +131,19 @@ def run(
             "spawned_at": time.time(),
         })
 
-    timed_out = False
-    cap_exceeded = False
-    descendant_held_pipes = False
     group_kill: dict[str, Any] = {}
-
-    # Non-blocking selector loop, no reader threads.
-    #
-    # The previous version used three daemon threads and joined them with a
-    # timeout. When a descendant inherited stdout or stderr and outlived the
-    # peer, an expired join abandoned a thread still blocked on a pipe, so a
-    # long-lived MCP process could accumulate threads and descriptors across
-    # jobs. Here the parent owns every descriptor and closes all of them in a
-    # finally, whatever the peer or its descendants do.
-    buffers: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
-    caps = {"stdout": max(0, stdout_cap), "stderr": max(0, stderr_cap)}
-    pending = stdin_data.encode("utf-8")
-    selector = selectors.DefaultSelector()
-    registered: set[Any] = set()
-
-    def register(stream: Any, events: int, name: str) -> None:
-        if stream is None:
-            return
-        try:
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, events, name)
-            registered.add(stream)
-        except (OSError, ValueError, KeyError):
-            pass
-
-    def unregister(stream: Any) -> None:
-        try:
-            selector.unregister(stream)
-        except (KeyError, ValueError, OSError):
-            pass
-        registered.discard(stream)
-        try:
-            stream.close()
-        except (OSError, ValueError):
-            pass
-
-    try:
-        register(proc.stdout, selectors.EVENT_READ, "stdout")
-        register(proc.stderr, selectors.EVENT_READ, "stderr")
-        if pending:
-            register(proc.stdin, selectors.EVENT_WRITE, "stdin")
-        elif proc.stdin is not None:
+    stdout, stderr, timed_out, cap_exceeded, descendant_held_pipes = \
+        platform.read_streams_with_caps(
+            proc, stdin_data, timeout, stdout_cap, stderr_cap,
+            POST_EXIT_DRAIN_SECONDS)
+    if timed_out or cap_exceeded:
+        if pgid is not None:
+            group_kill = platform.terminate_process_tree(pgid, grace)
+        else:
             try:
-                proc.stdin.close()
-            except (OSError, ValueError):
+                proc.kill()
+            except OSError:
                 pass
-
-        deadline = time.monotonic() + timeout
-        exited_at: float | None = None
-        while True:
-            if time.monotonic() >= deadline:
-                timed_out = True
-                break
-            reading = any(
-                key.data in ("stdout", "stderr") for key in selector.get_map().values()
-            ) if selector.get_map() else False
-            if proc.poll() is not None:
-                if exited_at is None:
-                    exited_at = time.monotonic()
-                if not reading:
-                    break
-                # The peer has exited but a pipe is still open, which means a
-                # descendant inherited it. Drain briefly for output written just
-                # before exit, then stop. Waiting for EOF would let an unrelated
-                # descendant stretch a finished job to the full timeout and get
-                # it reported as a timeout, which is simply wrong.
-                if time.monotonic() - exited_at > POST_EXIT_DRAIN_SECONDS:
-                    descendant_held_pipes = True
-                    break
-            for key, _events in selector.select(timeout=0.05):
-                name = key.data
-                stream = key.fileobj
-                if name == "stdin":
-                    try:
-                        # Prefer the raw stream: its write returns a count, or
-                        # None when it would block, so a partial write is
-                        # always accounted for.
-                        raw = getattr(stream, "raw", None)
-                        written = raw.write(pending) if raw is not None \
-                            else stream.write(pending)
-                    except BlockingIOError as exc:
-                        # A buffered writer reports the partial count here.
-                        # Dropping it would resend bytes the peer already read
-                        # and duplicate part of the prompt.
-                        written = getattr(exc, "characters_written", 0) or 0
-                    except InterruptedError:
-                        continue
-                    except (BrokenPipeError, OSError, ValueError):
-                        pending = b""
-                        unregister(stream)
-                        continue
-                    pending = pending[(written or 0):]
-                    if not pending:
-                        unregister(stream)
-                    continue
-                try:
-                    chunk = stream.read(65536)
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except (OSError, ValueError):
-                    unregister(stream)
-                    continue
-                if not chunk:          # EOF on this pipe
-                    unregister(stream)
-                    continue
-                buffer = buffers[name]
-                room = caps[name] - len(buffer)
-                if room > 0:
-                    buffer.extend(chunk[:room])
-                if len(buffer) >= caps[name]:
-                    cap_exceeded = True
-                    break
-            if cap_exceeded:
-                break
-            if not selector.get_map() and proc.poll() is not None:
-                break
-
-        if timed_out or cap_exceeded:
-            if pgid is not None:
-                group_kill = _kill_group(pgid, grace)
-            else:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
-    finally:
-        # Every descriptor this process opened is closed here, including ones a
-        # descendant still holds open on its own end.
-        for stream in list(registered):
-            unregister(stream)
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
-        selector.close()
-
-    stdout, stderr = bytes(buffers["stdout"]), bytes(buffers["stderr"])
 
     # Reap and confirm the group is gone even on the normal path, so a peer
     # that forked a lingering child is recorded rather than silently leaked.
@@ -338,15 +153,12 @@ def run(
             returncode = proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             if pgid is not None:
-                group_kill = _kill_group(pgid, grace)
+                group_kill = platform.terminate_process_tree(pgid, grace)
             returncode = proc.poll()
     if pgid is not None and not group_kill:
-        try:
-            os.killpg(pgid, 0)
-            group_kill = _kill_group(pgid, grace)
+        if platform.process_tree_alive(pgid):
+            group_kill = platform.terminate_process_tree(pgid, grace)
             group_kill["killed_lingering_group"] = True
-        except (ProcessLookupError, OSError):
-            pass
 
     # The local process is done, but the ATTEMPT is not: the worker has yet to
     # durably commit the peer's session id, the turn increment and the claim
@@ -394,7 +206,7 @@ def _write_marker(path: str, payload: dict[str, Any]) -> bool:
         if directory and not os.path.isdir(directory):
             os.makedirs(directory, mode=0o700, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
+            platform.enforce_owner_only_file(handle.fileno())
             handle.write(json.dumps(payload, sort_keys=True))
             handle.flush()
             os.fsync(handle.fileno())
