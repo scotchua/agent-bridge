@@ -33,6 +33,21 @@ original group.
 Use PowerShell and run the commands below with `python` where they say
 `python3`. Install the native Windows builds of the Claude and Codex CLIs.
 
+**What has actually been run on Windows, and what has not.** Step 3, the test
+suite, is verified: 485 pass, 0 fail, 6 skip, by hand on Windows 11 with
+CPython 3.12, as an ordinary interactive user. That covers the parts of this
+tool that are hardest to get right on Windows, because the suite drives the
+process-tree, locking and ACL code directly with stand-in CLIs.
+
+Steps 2, 4, 5 and 6 have not been run on Windows. They need both vendors' CLIs
+installed and signed in, which the test machine did not have. Nothing there is
+expected to fail, but "not expected to fail" is not the same claim as step 3's,
+and you should know which one you are relying on. If you are the first person
+to walk the whole install on Windows, the steps most worth watching are pinning
+the CLIs in step 2, which shells out to find them, and registering the MCP
+servers in step 5, which must use the `.cmd` launchers shown there rather than
+the extensionless ones. Please report what you find either way.
+
 WSL is also supported and provides the POSIX implementation. To use it:
 
 **1. Install WSL.** Open PowerShell as Administrator and run:
@@ -128,6 +143,12 @@ python3 tests/test_suite.py
 Expect `passed: N  failed: 0`. This uses stand-in programs pretending to be the
 two CLIs, so it makes no network calls and costs nothing. Some checks may report
 `skipped` if your system restricts `ps`; that is fine.
+
+On native Windows, expect `passed: 485  failed: 0  skipped: 6`, and run it as
+yourself rather than elevated. The six skips are expected: creating a symbolic
+link needs a privilege an ordinary account does not hold unless Developer Mode
+is on. See "If you are testing this on Windows" in the README before you read
+anything there as a failure.
 
 ## 4. Check it works for real
 

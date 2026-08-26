@@ -295,7 +295,7 @@ faults a day, so it cannot be told apart there from the platform's own
 instability. The verdict now carries its evidence: a `worker_died` record says
 whether the OS reported a real exit code or the liveness probe itself failed,
 which are different bugs. If you hit one, that record is the thing to send.
-[WSL](INSTALL.md#windows-use-wsl) remains supported and uses the POSIX path.
+[WSL](INSTALL.md#windows) remains supported and uses the POSIX path.
 
 A peer on Windows is also terminated immediately, with no graceful stage,
 because no console signal can be aimed at one process tree without risking
