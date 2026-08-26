@@ -42,13 +42,20 @@ class Sandbox:
         os.makedirs(self.state, mode=0o700, exist_ok=True)
         base = json.load(open(os.path.join(REPO, "config", "broker.json")))
         base["state_root"] = self.state
+        # The fakes are .py files with a shebang. Windows cannot execute those
+        # directly, so a peer invocation would fail with WinError 193 before
+        # any bridge logic ran. Wrap them in .cmd shims there. This is a test
+        # fixture concern only: a real peer is a native executable, so no
+        # production code needs to know about it.
+        fake_claude = self._executable_for(os.path.join(FAKES, "fake_claude.py"))
+        fake_codex = self._executable_for(os.path.join(FAKES, "fake_codex.py"))
         base["peers"]["claude"].update({
-            "executable": os.path.join(FAKES, "fake_claude.py"),
+            "executable": fake_claude,
             "allowed_versions": ["2.1.229 (Claude Code)"],
             "timeout_seconds": 20, "grace_seconds": 1,
         })
         base["peers"]["codex"].update({
-            "executable": os.path.join(FAKES, "fake_codex.py"),
+            "executable": fake_codex,
             "allowed_versions": ["codex-cli 0.147.0"],
             "codex_home": os.path.join(self.state, "codex-home"),
             "timeout_seconds": 20, "grace_seconds": 1,
@@ -70,6 +77,17 @@ class Sandbox:
         with open(self.config_path, "w", encoding="utf-8") as handle:
             json.dump(base, handle, indent=2)
         self.cfg = config.load(self.config_path)
+
+    def _executable_for(self, script: str) -> str:
+        """A path this OS can actually execute for a Python test fake."""
+        if os.name != "nt":
+            return script
+        shim = os.path.join(self.root, os.path.basename(script) + ".cmd")
+        with open(shim, "w", encoding="utf-8") as handle:
+            handle.write(
+                "@echo off\r\n"
+                f'"{sys.executable}" "{script}" %*\r\n')
+        return shim
 
     def env(self, **extra: str) -> None:
         """Route FAKE_* control vars to the peer's declared extra_env.
