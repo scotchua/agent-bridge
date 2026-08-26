@@ -206,6 +206,17 @@ would hand the consulted model this very bridge, and it would be able to consult
 back in a loop. The tool refuses to run at all if it detects that, but the
 simplest protection is not to create it.
 
+On **Windows**, use the `.cmd` launcher instead, because a `/bin/sh` script
+cannot be executed there:
+
+```
+codex mcp add claude-peer -- %USERPROFILE%\agent-bridge\bin\agent-bridge-mcp.cmd --caller codex
+```
+
+```
+claude mcp add --scope user codex-peer -- %USERPROFILE%\agent-bridge\bin\agent-bridge-mcp.cmd --caller claude
+```
+
 **Restart the Codex desktop app** after adding it, or the new tools will not
 appear in a new task.
 

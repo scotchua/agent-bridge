@@ -111,12 +111,18 @@ def test_tool_exposure() -> None:
                                 "params": {"name": "codex_start", "arguments": {}}}])
         check("calling the peer's own name in the wrong mode is refused",
               out[0]["result"]["isError"] is True)
-        proc = subprocess.run([os.path.join(REPO, "bin", "agent-bridge-mcp")],
-                              capture_output=True, timeout=30)
+        # Use the platform's own launcher. The POSIX one is a /bin/sh script,
+        # which Windows cannot execute at all, so testing it there proves
+        # nothing about the tool and everything about shebangs.
+        launcher = [os.path.join(REPO, "bin", "agent-bridge-mcp.cmd")] \
+            if os.name == "nt" else [os.path.join(REPO, "bin", "agent-bridge-mcp")]
+        proc = subprocess.run(launcher, capture_output=True, timeout=60)
         check("--caller is required", proc.returncode != 0)
-        proc = subprocess.run([os.path.join(REPO, "bin", "agent-bridge-mcp"), "--caller", "gpt"],
-                              capture_output=True, timeout=30)
+        proc = subprocess.run(launcher + ["--caller", "gpt"],
+                              capture_output=True, timeout=60)
         check("--caller rejects an unknown value", proc.returncode != 0)
+        check("a launcher exists for this platform",
+              os.path.isfile(launcher[0]), launcher[0])
     finally:
         sb.cleanup()
 
