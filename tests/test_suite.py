@@ -2769,6 +2769,53 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_windows_acl_parser_adversarial() -> None:
+    """Review-added cases for the ACL parser, beyond those it was written to.
+
+    The parser is the whole Windows privacy guarantee and it is pure text, so
+    it can be attacked from here even though nothing else Windows can be. Every
+    case below must fail closed; none was named in the brief that produced it.
+    """
+    print("\n[windows acl parser, adversarial]")
+    from agent_bridge.platform.windows_acl import icacls_listing_is_owner_only as ok
+
+    sid = "S-1-5-21-1-2-3-1001"
+    real = ("C:\\T\\d NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
+            "        BUILTIN\\Administrators:(OI)(CI)(F)\n"
+            "        OWNER RIGHTS:(OI)(CI)(F)\n"
+            "Successfully processed 1 files; Failed processing 0 files\n")
+
+    cases = [
+        ("a second named account is refused",
+         real.replace("OWNER RIGHTS:(OI)(CI)(F)\n",
+                      "OWNER RIGHTS:(OI)(CI)(F)\n        MACHINE\\other:(F)\n"),
+         False),
+        ("an inherited ACE is refused",
+         real.replace("OWNER RIGHTS:(OI)(CI)(F)", "OWNER RIGHTS:(I)(OI)(CI)(F)"),
+         False),
+        ("a directory named like a principal cannot smuggle one in",
+         "C:\\T\\NT AUTHORITY\\SYSTEM Everyone:(F)\n", False),
+        ("a path ending in the owner name does not launder an unsafe ACE",
+         "C:\\T\\runneradmin Everyone:(F)\n", False),
+        ("the owner named by SID rather than OWNER RIGHTS is accepted",
+         f"C:\\T\\d {sid}:(F)\n        NT AUTHORITY\\SYSTEM:(F)\n", True),
+        ("case is not significant",
+         real.lower(), True),
+        ("a localized listing fails closed rather than guessing",
+         "C:\\T\\d VORDEFINIERT\\Administratoren:(F)\n"
+         "        OWNER RIGHTS:(F)\n", False),
+        ("SYSTEM and Administrators without the owner is refused",
+         "C:\\T\\d NT AUTHORITY\\SYSTEM:(F)\n"
+         "        BUILTIN\\Administrators:(F)\n", False),
+        ("a malformed owner sid is refused", real, False),
+    ]
+    for label, text, expect in cases:
+        owner = "nonsense" if "malformed" in label else sid
+        check(f"ACL: {label}",
+              ok(text, owner, "runneradmin") is expect,
+              f"got {ok(text, owner, 'runneradmin')}, want {expect}")
+
+
 def test_platform_boundary() -> None:
     """The platform boundary must not carry meaning positionally."""
     print("\n[platform boundary]")
@@ -3112,6 +3159,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_windows_acl_parser_adversarial()
     test_platform_boundary()
     test_reasoning_effort()
     test_reported_issues()
