@@ -144,6 +144,13 @@ class WindowsPlatform:
             "directory_acl_verified": self._set_and_verify_owner_acl(directory),
             "file_acl_verified": self._set_and_verify_owner_acl(probe_file),
         }
+        # Whichever target failed carries its own evidence. Reporting only a
+        # boolean has already cost several diagnostic round trips: knowing that
+        # something failed, without knowing which target or what the OS said,
+        # is barely better than knowing nothing.
+        for label, target in (("directory", directory), ("file", probe_file)):
+            if not results[f"{label}_acl_verified"]:
+                results[f"{label}_evidence"] = self.acl_diagnostics(target)
         verified = bool(results["directory_acl_verified"]
                         and results["file_acl_verified"])
         self.supports_owner_only_permissions = verified
