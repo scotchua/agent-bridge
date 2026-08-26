@@ -181,7 +181,23 @@ class WindowsPlatform:
 
     def spawn_isolated(self, argv: list[str], *, cwd: str,
                        env: dict[str, str]) -> subprocess.Popen[bytes]:
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_SUSPENDED
+        # Not CREATE_SUSPENDED. The intent was right: start suspended, assign to
+        # the Job Object, then resume, so a child cannot spawn descendants
+        # before it joins the job. It is not reachable through subprocess.
+        # subprocess.CREATE_SUSPENDED does not exist, and Popen closes the
+        # thread handle immediately after CreateProcess, so there is nothing to
+        # resume: proc._thread is not a real attribute.
+        #
+        # Reaching it would mean calling CreateProcess through ctypes and
+        # reimplementing pipe and handle-inheritance setup, which is a large
+        # amount of security-relevant code to write blind.
+        #
+        # So the child is assigned to the job immediately after it starts. The
+        # residual race is a child that spawns a descendant in the interval
+        # between CreateProcess returning and AssignProcessToJobObject, which is
+        # microseconds against a CLI that has not finished loading. Descendants
+        # created after assignment are covered.
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         try:
             proc = subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off
                 argv,
@@ -203,8 +219,6 @@ class WindowsPlatform:
                 raise ctypes.WinError(ctypes.get_last_error())
             with self._jobs_lock:
                 self._jobs[proc.pid] = int(job)
-            if kernel32.ResumeThread(wintypes.HANDLE(int(proc._thread))) == 0xFFFFFFFF:
-                raise ctypes.WinError(ctypes.get_last_error())
             return proc
         except BaseException:
             if "job" in locals():
@@ -258,6 +272,27 @@ class WindowsPlatform:
             report["group_gone_after_termination"] = True
             self._close_job(group_id)
         return report
+
+    def process_alive(self, pid: int) -> bool:
+        """Ask the OS, without sending anything.
+
+        os.kill(pid, 0) must never be used here: on Windows signal 0 is
+        CTRL_C_EVENT, so it delivers a console interrupt instead of probing.
+        """
+        SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = kernel32.OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
 
     def process_tree_alive(self, group_id: int) -> bool:
         process = kernel32.OpenProcess(SYNCHRONIZE, False, group_id)
@@ -362,6 +397,32 @@ class WindowsPlatform:
                     continue
         finally:
             stop.set()
+            # Kill the child BEFORE closing the pipes. On Windows, close() on a
+            # handle with a pending ReadFile blocks until that read completes,
+            # and a reader thread blocked on a live child's pipe never
+            # completes: the main thread waits on the reader, the reader waits
+            # on the child, and the run hangs forever. Confirmed by stack dump,
+            # two readers blocked in read() and the main thread blocked in
+            # close().
+            #
+            # Ending the child makes the pending reads return EOF, so the close
+            # completes. This only fires when the loop exited while the child
+            # was still running, meaning a timeout, a cap breach, or a
+            # descendant holding a pipe. A peer that finished normally is
+            # already gone and is not touched. Killing the wider process tree
+            # remains the caller's job.
+            if proc.poll() is None:
+                # The whole TREE, not just the child. Killing only the direct
+                # child leaves grandchildren holding the same pipe handles, so
+                # the pending reads still never return and the close still
+                # blocks. A shell wrapper around a peer is the ordinary case,
+                # not an exotic one.
+                with contextlib.suppress(Exception):
+                    self.terminate_process_tree(proc.pid, 0.0)
+                with contextlib.suppress(OSError, ValueError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=5)
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is not None:
                     with contextlib.suppress(OSError, ValueError):

@@ -410,13 +410,9 @@ def read_result(cfg: Config, job_id: str) -> dict[str, Any] | None:
 def pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
+    from .platform import platform
     try:
-        os.kill(int(pid), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        return platform.process_alive(int(pid))
     except (OSError, ValueError):
         return False
 

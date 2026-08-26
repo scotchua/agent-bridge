@@ -3083,14 +3083,30 @@ def test_state_root_permissions() -> None:
     try:
         report = preflight.assert_state_root_secure(sb.cfg)
         check("SR: a POSIX filesystem passes", report["honours_permissions"])
-        check("SR: and the report names the observed modes",
-              report["directory_mode"] == "0o700"
-              and report["file_mode"] == "0o600", json.dumps(report))
+        # Assert the guarantee and the mechanism, not POSIX keys. A Windows
+        # report verifies an ACL and correctly has no mode bits; requiring them
+        # is the same POSIX-shaped assumption this interface exists to remove.
+        check("SR: the report names the mechanism that verified it",
+              isinstance(report.get("mechanism"), str) and report["mechanism"],
+              json.dumps(report))
+        if os.name == "nt":
+            check("SR: on Windows the mechanism is the ACL round-trip",
+                  "acl" in report["mechanism"], report["mechanism"])
+        else:
+            check("SR: on POSIX the observed modes are 0700 and 0600",
+                  report["directory_mode"] == "0o700"
+                  and report["file_mode"] == "0o600", json.dumps(report))
         check("SR: the probe file does not linger",
               not os.path.exists(os.path.join(sb.cfg.state_root,
                                               ".permission-probe")))
 
-        # Simulate a filesystem that reports a permissive mode back.
+        # Simulate a filesystem that reports a permissive mode back. POSIX
+        # only: on Windows the verification reads an ACL, not st_mode, so
+        # faking st_mode would test nothing that platform does.
+        if os.name == "nt":
+            skip("SR: a filesystem that ignores chmod is refused",
+                 "verification on Windows reads ACLs, not mode bits")
+            return
         import stat as statmod
         real_stat = os.stat
 

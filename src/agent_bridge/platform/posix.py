@@ -112,6 +112,18 @@ class PosixPlatform:
             pass
         return report
 
+    def process_alive(self, pid: int) -> bool:
+        """Signal 0 asks whether the process exists, and sends nothing."""
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # exists, owned by someone else
+        except (OSError, ValueError):
+            return False
+
     def process_tree_alive(self, group_id: int) -> bool:
         try:
             os.killpg(group_id, 0)

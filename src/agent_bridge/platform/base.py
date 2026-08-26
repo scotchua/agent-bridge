@@ -70,6 +70,16 @@ class Platform(Protocol):
     def terminate_process_tree(self, group_id: int,
                                grace: float) -> dict[str, Any]: ...
 
+    def process_alive(self, pid: int) -> bool:
+        """Whether one process is still running.
+
+        Deliberately part of the interface. `os.kill(pid, 0)` reads as a
+        harmless POSIX liveness probe and is not portable at all: on Windows
+        signal 0 IS CTRL_C_EVENT, so the same line sends a console interrupt to
+        the target's console rather than asking a question about it.
+        """
+        ...
+
     def process_tree_alive(self, group_id: int) -> bool: ...
 
     def process_identity(self, pid: int) -> str: ...
