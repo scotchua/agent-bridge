@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import base
+
 import contextlib
 import fcntl
 import os
@@ -253,5 +255,10 @@ class PosixPlatform:
                         pass
             selector.close()
 
-        return (bytes(buffers["stdout"]), bytes(buffers["stderr"]), timed_out,
-                cap_exceeded, descendant_held_pipes)
+        return base.StreamReadResult(
+            stdout=bytes(buffers["stdout"]),
+            stderr=bytes(buffers["stderr"]),
+            timed_out=timed_out,
+            cap_exceeded=cap_exceeded,
+            descendant_held_pipes=descendant_held_pipes,
+        )

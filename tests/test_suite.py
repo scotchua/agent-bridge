@@ -2766,6 +2766,33 @@ def test_external_review_findings() -> None:
                          fromlist=["x"])))
 
 
+def test_platform_boundary() -> None:
+    """The platform boundary must not carry meaning positionally."""
+    print("\n[platform boundary]")
+    from agent_bridge.platform import base as platform_base
+
+    check("PB: the capped-read result is named, not a bare tuple",
+          hasattr(platform_base, "StreamReadResult")
+          and hasattr(platform_base.StreamReadResult, "_fields"))
+    check("PB: and names every flag that decides classification",
+          platform_base.StreamReadResult._fields ==
+          ("stdout", "stderr", "timed_out", "cap_exceeded",
+           "descendant_held_pipes"),
+          str(platform_base.StreamReadResult._fields))
+    # A second implementation getting the order wrong must fail loudly rather
+    # than silently inverting timed_out and cap_exceeded.
+    try:
+        platform_base.StreamReadResult(b"", b"", True)
+        check("PB: a short result is refused at the boundary", False, "accepted")
+    except TypeError:
+        check("PB: a short result is refused at the boundary", True)
+    check("PB: the runner reads the flags by name",
+          "read.cap_exceeded" in inspect.getsource(runner)
+          and "read.timed_out" in inspect.getsource(runner))
+    check("PB: the interface is a Protocol, so an implementation is checkable",
+          hasattr(platform_base, "Platform"))
+
+
 def test_reasoning_effort() -> None:
     """Effort must be a deliberate setting, and recorded either way.
 
@@ -3037,6 +3064,7 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_platform_boundary()
     test_reasoning_effort()
     test_reported_issues()
     test_state_root_permissions()

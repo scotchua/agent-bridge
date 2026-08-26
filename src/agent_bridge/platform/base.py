@@ -9,7 +9,28 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, NamedTuple, Protocol
+
+
+class StreamReadResult(NamedTuple):
+    """Result of a capped read, named rather than positional.
+
+    This deliberately is not a bare tuple. The three flags decide how a run is
+    classified, and `timed_out` versus `cap_exceeded` is precisely the
+    distinction that was got wrong once before: a cap breach is why the bridge
+    kills a peer, so reporting it as the peer exiting nonzero made a flooding
+    peer look transient and get retried.
+
+    A second implementation returning these in a different order would pass
+    every structural test while silently inverting that classification. Naming
+    them makes such a mistake a TypeError at the boundary instead.
+    """
+
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+    cap_exceeded: bool
+    descendant_held_pipes: bool
 
 
 class Platform(Protocol):
@@ -49,4 +70,4 @@ class Platform(Protocol):
         stdout_cap: int,
         stderr_cap: int,
         post_exit_drain_seconds: float,
-    ) -> tuple[bytes, bytes, bool, bool, bool]: ...
+    ) -> StreamReadResult: ...

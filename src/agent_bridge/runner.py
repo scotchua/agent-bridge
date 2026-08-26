@@ -132,10 +132,14 @@ def run(
         })
 
     group_kill: dict[str, Any] = {}
-    stdout, stderr, timed_out, cap_exceeded, descendant_held_pipes = \
-        platform.read_streams_with_caps(
-            proc, stdin_data, timeout, stdout_cap, stderr_cap,
-            POST_EXIT_DRAIN_SECONDS)
+    # Named fields, not positional unpacking: see StreamReadResult for why.
+    read = platform.read_streams_with_caps(
+        proc, stdin_data, timeout, stdout_cap, stderr_cap,
+        POST_EXIT_DRAIN_SECONDS)
+    stdout, stderr = read.stdout, read.stderr
+    timed_out = read.timed_out
+    cap_exceeded = read.cap_exceeded
+    descendant_held_pipes = read.descendant_held_pipes
     if timed_out or cap_exceeded:
         if pgid is not None:
             group_kill = platform.terminate_process_tree(pgid, grace)
