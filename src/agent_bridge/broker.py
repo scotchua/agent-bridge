@@ -81,10 +81,14 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
 def _spawn_worker(cfg: Config, job_dir: str) -> int:
     """Launch the worker detached, in its own session. Fixed argv, no shell."""
     src_root = os.path.join(cfg.repo_root, "src")
-    env = {
-        k: v for k, v in os.environ.items()
-        if k in ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL")
-    }
+    # Same reasoning as runner.scrubbed_env: the worker is a Python child and
+    # on Windows it needs SYSTEMROOT and friends to start at all.
+    keep = {"PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL"}
+    if os.name == "nt":
+        keep |= {"SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR",
+                 "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                 "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"}
+    env = {k: v for k, v in os.environ.items() if k in keep}
     env["PYTHONPATH"] = src_root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     snapshot = os.path.join(job_dir, "config.snapshot.json")

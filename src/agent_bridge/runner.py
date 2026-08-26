@@ -221,7 +221,14 @@ def _write_marker(path: str, payload: dict[str, Any]) -> bool:
 
 def scrubbed_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Minimal environment for a peer. No inherited API keys, no TMPDIR."""
-    keep = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "SHELL", "USER", "LOGNAME")
+    keep = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "SHELL", "USER", "LOGNAME"]
+    if os.name == "nt":
+        # Windows essentials. A Python child without SYSTEMROOT frequently fails
+        # to initialise at all, and without PATHEXT it cannot resolve a command
+        # by name. Scrubbing is about credentials, not about breaking the OS.
+        keep += ["SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR",
+                 "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                 "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]
     env = {k: os.environ[k] for k in keep if k in os.environ}
     env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     env["AGENT_BRIDGE_PEER"] = "1"

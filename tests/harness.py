@@ -120,7 +120,24 @@ class Sandbox:
             if status.get("status") in registry.TERMINAL_STATUSES:
                 return status
             time.sleep(0.1)
-        return registry.reconcile(self.cfg, job_id)
+        # Timed out. A bare "never reached terminal" costs a whole CI cycle to
+        # diagnose, so surface what the worker actually did.
+        final = registry.reconcile(self.cfg, job_id)
+        log_path = os.path.join(self.cfg.job_dir(job_id), "worker.log")
+        log = ""
+        if os.path.isfile(log_path):
+            with open(log_path, "rb") as handle:
+                log = handle.read().decode("utf-8", "replace")[-1500:]
+        trace_path = os.path.join(self.cfg.job_dir(job_id), "worker_traceback.txt")
+        trace = ""
+        if os.path.isfile(trace_path):
+            with open(trace_path, "rb") as handle:
+                trace = handle.read().decode("utf-8", "replace")[-1500:]
+        raise AssertionError(
+            f"job {job_id} never reached a terminal state in {timeout}s\n"
+            f"  status: {json.dumps(final)}\n"
+            f"  worker.log: {log or '(empty)'}\n"
+            f"  traceback: {trace or '(none)'}")
 
     def consult(self, caller: str, prompt: str = "Is this design sound?",
                 classification: str = "internal", **extra: Any) -> dict[str, Any]:
