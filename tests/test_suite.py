@@ -3255,14 +3255,22 @@ def test_windows_atomic_replace_retry() -> None:
     real_grace = store.ATOMIC_REPLACE_GRACE_SECONDS
     reader_open = threading.Event()
     release_reader = threading.Event()
+    transient_reader_phase = threading.Event()
     attempts = 0
 
     def counted_replace(source, destination):
         nonlocal attempts
         attempts += 1
         if os.name != "nt" and not release_reader.is_set():
+            if transient_reader_phase.is_set():
+                release_reader.set()
             raise PermissionError("destination reader still holds the file")
-        real_replace(source, destination)
+        try:
+            real_replace(source, destination)
+        except PermissionError:
+            if transient_reader_phase.is_set():
+                release_reader.set()
+            raise
 
     def transient_reader():
         with open(path, "rb"):
@@ -3276,10 +3284,10 @@ def test_windows_atomic_replace_retry() -> None:
             store.WINDOWS = True
         store.REPLACE = counted_replace
         store.ATOMIC_REPLACE_GRACE_SECONDS = 0.5
+        transient_reader_phase.set()
         reader = threading.Thread(target=transient_reader)
         reader.start()
         reader_open.wait()
-        threading.Timer(0.05, release_reader.set).start()
         store.atomic_write_bytes(path, b"new")
         reader.join()
         with open(path, "rb") as handle:
@@ -3292,6 +3300,7 @@ def test_windows_atomic_replace_retry() -> None:
               sorted(os.listdir(root)) == ["status.json"], str(os.listdir(root)))
 
         attempts = 0
+        transient_reader_phase.clear()
         release_reader.clear()
         reader_open.clear()
         with open(path, "wb") as handle:
