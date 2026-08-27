@@ -257,8 +257,11 @@ stays a decision a person makes.
 CLI. No third-party Python packages, deliberately: the audit surface is this
 repository and nothing else.
 
-**Windows passes its own test suite**, 485 tests, zero failures, six skips,
-verified by hand in a Windows 11 VM on CPython 3.12 rather than only in CI.
+**Windows passes its own test suite**, 491 passing with six skips as an
+ordinary interactive user on CPython 3.12, and 497 passing with none skipped on
+CPython 3.11 and 3.13 in CI. Verified by hand in a Windows 11 VM as well as in
+CI, because the two answer different questions: CI runs with a privilege an
+ordinary account does not have.
 That took finding several defects that no amount of POSIX testing could have
 surfaced, because the POSIX idiom and the Windows behaviour differ silently:
 `os.kill(pid, 0)` is a liveness probe on POSIX and a console interrupt on
@@ -280,7 +283,7 @@ real user dead.
 python tests\test_suite.py
 ```
 
-**Six skips are expected** and are not failures. Creating a symbolic link
+**Expect `passed: 491  failed: 0  skipped: 6`.** The six skips are expected and are not failures. Creating a symbolic link
 needs `SeCreateSymbolicLinkPrivilege`, which an ordinary account does not hold
 unless Developer Mode is on, and three tests need a real symlink to test
 anything. Turn on Developer Mode to run them.

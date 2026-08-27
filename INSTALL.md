@@ -34,8 +34,10 @@ Use PowerShell and run the commands below with `python` where they say
 `python3`. Install the native Windows builds of the Claude and Codex CLIs.
 
 **What has actually been run on Windows, and what has not.** Step 3, the test
-suite, is verified: 485 pass, 0 fail, 6 skip, by hand on Windows 11 with
-CPython 3.12, as an ordinary interactive user. That covers the parts of this
+suite, is verified: 491 pass, 0 fail, 6 skip, by hand on Windows 11 with
+CPython 3.12 as an ordinary interactive user, and 497 pass, 0 fail, 0 skip on
+CPython 3.11 and 3.13 in CI, where the runner holds the privilege the six
+skips need. That covers the parts of this
 tool that are hardest to get right on Windows, because the suite drives the
 process-tree, locking and ACL code directly with stand-in CLIs.
 
@@ -144,7 +146,7 @@ Expect `passed: N  failed: 0`. This uses stand-in programs pretending to be the
 two CLIs, so it makes no network calls and costs nothing. Some checks may report
 `skipped` if your system restricts `ps`; that is fine.
 
-On native Windows, expect `passed: 485  failed: 0  skipped: 6`, and run it as
+On native Windows, expect `passed: 491  failed: 0  skipped: 6`, and run it as
 yourself rather than elevated. The six skips are expected: creating a symbolic
 link needs a privilege an ordinary account does not hold unless Developer Mode
 is on. See "If you are testing this on Windows" in the README before you read
