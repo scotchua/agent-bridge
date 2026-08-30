@@ -208,16 +208,48 @@ def assert_workspace_empty(workspace: str) -> None:
         pass
 
 
+#: Top-level config.toml tables the isolated home may contain and still run.
+#: `projects` holds the per-directory trust entries the Codex CLI writes for
+#: itself, unprompted, the first time it works in a directory. Nothing else is
+#: allowed: an unrecognised table fails the job closed, because this guard
+#: cannot reason about a key it has never seen.
+PEER_HOME_ALLOWED_CONFIG_TABLES = frozenset({"projects"})
+
+
 def assert_peer_home_has_no_config(codex_home: str) -> None:
-    """Refuse to run if the isolated Codex home has a config.toml.
+    """Refuse to run if the isolated Codex home's config.toml carries anything
+    beyond the trust entries Codex writes for itself.
 
     `--ignore-user-config` already stops that file from being read, so this is
     belt and braces on the specific recursion vector: `codex mcp add` writes
-    the bridge's own registration into $CODEX_HOME/config.toml, and a future
-    operator who ran it against the isolated home (rather than the default one)
-    would otherwise create a loop that no other control here would catch.
+    the bridge's own registration into $CODEX_HOME/config.toml under
+    `[mcp_servers.*]`, and a future operator who ran it against the isolated
+    home (rather than the default one) would otherwise create a loop that no
+    other control here would catch.
+
+    This used to refuse on the file EXISTING. Measured 2026-08-30: the Codex
+    CLI writes `[projects."<dir>"] trust_level = "trusted"` into that file on
+    its own, so the guard disabled the whole bridge the first time Codex
+    recorded trust for any directory, with no operator action and nothing
+    unsafe present. A control that fires on its own tool's routine bookkeeping
+    gets removed by whoever it blocks, which is worse than a narrower one.
+
+    So the check is now on CONTENTS, and it still fails closed: unparseable
+    refuses, and any table outside the allowlist refuses, `mcp_servers` most
+    of all.
     """
-    if os.path.isfile(os.path.join(os.path.expanduser(codex_home), "config.toml")):
+    path = os.path.join(os.path.expanduser(codex_home), "config.toml")
+    if not os.path.isfile(path):
+        return
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            parsed = tomllib.load(handle)
+    except Exception:
+        # Cannot prove it is safe, so it is not. Includes a malformed file, a
+        # file we lack permission to read, and any parser error.
+        raise BrokerError(ErrorCategory.PEER_HOME_CONFIG_PRESENT) from None
+    if set(parsed) - PEER_HOME_ALLOWED_CONFIG_TABLES:
         raise BrokerError(ErrorCategory.PEER_HOME_CONFIG_PRESENT)
 
 

@@ -3618,3 +3618,47 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_peer_home_config_guard_is_contents_based() -> None:
+    """The isolated home's config.toml is judged by contents, not existence.
+
+    Measured 2026-08-30: the Codex CLI writes a `[projects."<dir>"]` trust
+    entry into that file on its own, so an existence check disabled the bridge
+    the first time Codex recorded trust for any directory. The guard must still
+    refuse the actual recursion vector, `[mcp_servers.*]`, which is what
+    `codex mcp add` writes, and must fail closed on anything it cannot parse or
+    does not recognise.
+    """
+    from agent_bridge.errors import BrokerError
+    from agent_bridge.preflight import assert_peer_home_has_no_config
+
+    cases = [
+        ("absent", None, False),
+        ("codex's own trust entry",
+         '[projects."/Users/x/repo"]\ntrust_level = "trusted"\n', False),
+        ("several trust entries",
+         '[projects."/a"]\ntrust_level="trusted"\n[projects."/b"]\ntrust_level="trusted"\n', False),
+        ("empty file", "", False),
+        ("mcp_servers, the recursion vector",
+         '[mcp_servers.codex-peer]\ncommand = "agent-bridge-mcp"\n', True),
+        ("mcp_servers hidden beside trust entries",
+         '[projects."/a"]\ntrust_level="trusted"\n[mcp_servers.x]\ncommand="y"\n', True),
+        ("unrecognised top-level key", 'model = "gpt-5.6-sol"\n', True),
+        ("unparseable", "this is not = = toml [[[\n", True),
+    ]
+    for name, content, should_raise in cases:
+        home = tempfile.mkdtemp()
+        try:
+            if content is not None:
+                with open(os.path.join(home, "config.toml"), "w") as handle:
+                    handle.write(content)
+            raised = False
+            try:
+                assert_peer_home_has_no_config(home)
+            except BrokerError:
+                raised = True
+            assert raised == should_raise, (
+                f"{name}: guard raised={raised}, expected {should_raise}")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
