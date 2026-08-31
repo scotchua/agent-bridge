@@ -2918,6 +2918,82 @@ def test_syntax_targets_oldest_supported_python() -> None:
           not failures, "; ".join(failures[:3]))
 
 
+def test_timeout_canary_effective_config_and_verdict() -> None:
+    print("\n[timeout canary effective config and verdict]")
+    import contextlib
+    import importlib.util
+    import io
+
+    spec = importlib.util.spec_from_file_location(
+        "run_canaries", os.path.join(REPO, "canaries", "run_canaries.py"))
+    assert spec and spec.loader
+    run_canaries = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_canaries)
+
+    with tempfile.TemporaryDirectory() as root:
+        raw = json.load(open(os.path.join(REPO, "config", "broker.json")))
+        raw["state_root"] = os.path.join(root, "state")
+        raw["peers"]["codex"]["allowed_versions"] = ["codex-cli 0.151.0"]
+        raw["peers"]["codex"]["extra_env"] = {"EXISTING": "kept"}
+        cfg = config_module.Config(raw, os.path.join(root, "effective.json"))
+        built = run_canaries.timeout_canary_config(cfg, "claude")
+        env = built["peers"]["codex"]["extra_env"]
+
+        check("TC: the effective in-memory version pin reaches the stub config",
+              env["FAKE_CODEX_VERSION"] == "codex-cli 0.151.0", str(env))
+        check("TC: the timeout mode is merged with existing extra_env",
+              env["FAKE_CODEX_MODE"] == "hang" and env["EXISTING"] == "kept",
+              str(env))
+        check("TC: building the stub config does not mutate the caller's config",
+              cfg.raw["peers"]["codex"]["extra_env"] == {"EXISTING": "kept"}
+              and cfg.raw["peers"]["codex"]["executable"] !=
+              built["peers"]["codex"]["executable"])
+        stub_cfg = config_module.Config(built, os.path.join(root, "stub.json"))
+        observed = preflight.check_peer(stub_cfg, "codex")
+        check("TC: the active version gate accepts the pinned stub version",
+              observed["version_pinned"]
+              and observed["observed_version"] == "codex-cli 0.151.0",
+              str(observed))
+
+        raw["peers"]["codex"]["allowed_versions"] = ["second", "first"]
+        cfg = config_module.Config(raw, os.path.join(root, "multi.json"))
+        multi = run_canaries.timeout_canary_config(cfg, "claude")
+        check("TC: several pins select the first declared version",
+              multi["peers"]["codex"]["extra_env"]["FAKE_CODEX_VERSION"] ==
+              "second")
+
+        raw["peers"]["codex"]["allowed_versions"] = []
+        raw["peers"]["codex"]["extra_env"]["FAKE_CODEX_VERSION"] = "stale"
+        cfg = config_module.Config(raw, os.path.join(root, "unpinned.json"))
+        unpinned = run_canaries.timeout_canary_config(cfg, "claude")
+        check("TC: no pin deliberately leaves the stub version unset",
+              "FAKE_CODEX_VERSION" not in
+              unpinned["peers"]["codex"]["extra_env"])
+
+    passing_rows = [{"direction": "claude->codex", "kind": "one-turn 1",
+                     "contract_valid": True, "first_attempt_ok": True,
+                     "latency_seconds": 0.1}]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = run_canaries.report(passing_rows, [], timeout_skipped=True)
+    output = buf.getvalue()
+    check("TC: a skipped timeout control reports INCOMPLETE, never PASS",
+          result == 0 and output.rstrip().endswith("INCOMPLETE")
+          and "\nPASS\n" not in output, output)
+    check("TC: the incomplete report names the unexercised control",
+          "timeout and orphan cleanup control was not exercised" in output, output)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = run_canaries.report(
+            passing_rows,
+            [{"direction": "claude->codex", "status": "failed", "orphans": 0}],
+            timeout_skipped=True)
+    check("TC: a genuine timeout failure remains FAIL, not INCOMPLETE",
+          result == 1 and buf.getvalue().rstrip().endswith("FAIL: see above"),
+          buf.getvalue())
+
+
 def _parse_under(path: str, version: tuple) -> list:
     import ast
     try:
@@ -3569,6 +3645,7 @@ def test_platform_guard() -> None:
 
 def main() -> int:
     test_contract_accepted_by_both_peers()
+    test_timeout_canary_effective_config_and_verdict()
     test_tool_exposure()
     test_happy_path_both_directions()
     test_continuation_uses_exact_session_id()

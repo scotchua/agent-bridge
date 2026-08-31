@@ -16,6 +16,7 @@ intended session ID.  A single success proves nothing; the rates are the point.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import statistics
@@ -168,17 +169,37 @@ class Canary:
                 ErrorCategory.RETRY_EXHAUSTED.value)
 
 
-def timeout_canary(cfg_path: str, caller: str) -> dict[str, Any]:
-    """Timeout canary against a controlled stub, never a live expensive hang."""
+def timeout_canary_config(cfg: config.Config, caller: str) -> dict[str, Any]:
+    """Build an isolated effective config for the controlled timeout stub."""
     peer = broker.PEER_OF[caller]
-    base = json.load(open(cfg_path))
+    base = copy.deepcopy(cfg.raw)
     stub = os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py")
-    base["peers"][peer].update({
+    peer_config = base["peers"][peer]
+    extra_env = dict(peer_config.get("extra_env") or {})
+    extra_env[f"FAKE_{peer.upper()}_MODE"] = "hang"
+    allowed = list(peer_config.get("allowed_versions") or [])
+    if len(allowed) == 1:
+        # One pin: make the stub report it so the active version gate passes.
+        extra_env[f"FAKE_{peer.upper()}_VERSION"] = allowed[0]
+    elif len(allowed) > 1:
+        # Several pins: choose the first, matching the config's declared order.
+        extra_env[f"FAKE_{peer.upper()}_VERSION"] = allowed[0]
+    else:
+        # No pin: leave the stub default; deliberately, the version check does not run.
+        extra_env.pop(f"FAKE_{peer.upper()}_VERSION", None)
+    peer_config.update({
         "executable": stub, "timeout_seconds": 3, "grace_seconds": 1,
-        "extra_env": {f"FAKE_{peer.upper()}_MODE": "hang"},
+        "extra_env": extra_env,
     })
     base["state_root"] = os.path.join(
         os.path.expanduser(base["state_root"]), "canary-timeout", caller)
+    return base
+
+
+def timeout_canary(cfg: config.Config, caller: str) -> dict[str, Any]:
+    """Timeout canary against a controlled stub, never a live expensive hang."""
+    peer = broker.PEER_OF[caller]
+    base = timeout_canary_config(cfg, caller)
     path = os.path.join(REPO, "canaries", f".timeout-{caller}.json")
     store.atomic_write_json(path, base)
     cfg = config.load(path)
@@ -252,7 +273,8 @@ def reachability_probe(cfg: config.Config, caller: str, timeout: float) -> str |
 
 
 def report(rows: list[dict[str, Any]], timeouts: list[dict[str, Any]],
-           blocked: dict[str, str] | None = None) -> int:
+           blocked: dict[str, str] | None = None,
+           timeout_skipped: bool = False) -> int:
     print("\n" + "=" * 72)
     print("CANARY REPORT")
     print("=" * 72)
@@ -308,8 +330,16 @@ def report(rows: list[dict[str, Any]], timeouts: list[dict[str, Any]],
               f"orphans={row['orphans']}  {'ok' if ok else 'FAIL'}")
         if not ok:
             exit_code = 1
+    if timeout_skipped:
+        print("\nINCOMPLETE: timeout and orphan cleanup control was not exercised "
+              "(--skip-timeout-canary).")
     print("\n" + "=" * 72)
-    print("PASS" if exit_code == 0 else "FAIL: see above")
+    if exit_code != 0:
+        print("FAIL: see above")
+    elif timeout_skipped:
+        print("INCOMPLETE")
+    else:
+        print("PASS")
     return exit_code
 
 
@@ -352,13 +382,14 @@ def main() -> int:
     if not args.skip_timeout_canary:
         print("\n### timeout canaries (controlled stub)")
         for caller in callers:
-            timeouts.append(timeout_canary(cfg.path, caller))
+            timeouts.append(timeout_canary(cfg, caller))
             print(f"  {timeouts[-1]}")
 
     if args.out:
         store.atomic_write_json(
             args.out, {"rows": rows, "timeouts": timeouts, "blocked": blocked})
-    return report(rows, timeouts, blocked)
+    return report(rows, timeouts, blocked,
+                  timeout_skipped=args.skip_timeout_canary)
 
 
 if __name__ == "__main__":
