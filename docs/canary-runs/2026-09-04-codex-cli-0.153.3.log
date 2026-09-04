@@ -1,0 +1,53 @@
+
+### codex -> claude
+  probing claude reachability... UNUSABLE (peer_auth_failure)
+  SKIPPING the codex->claude matrix: claude is not usable (peer_auth_failure). Authenticate it, then re-run.
+
+### claude -> codex
+  probing codex reachability... ok
+  [ok ] one-turn 1              35.82s  attempts=1  ok
+  [ok ] one-turn 2              41.36s  attempts=1  ok
+  [ok ] one-turn 3              26.23s  attempts=1  ok
+  [ok ] one-turn 4              69.05s  attempts=1  ok
+  [ok ] one-turn 5              12.13s  attempts=1  ok
+  [ok ] one-turn 6              17.16s  attempts=1  ok
+  [ok ] one-turn 7              44.65s  attempts=1  ok
+  [ok ] one-turn 8              37.57s  attempts=1  ok
+  [ok ] one-turn 9              42.06s  attempts=1  ok
+  [ok ] one-turn 10             22.88s  attempts=1  ok
+  [ok ] 3-turn 1 t1             55.31s  attempts=1  ok
+  [ok ] 3-turn 1 t2             53.27s  attempts=1  ok
+  [ok ] 3-turn 1 t3             30.47s  attempts=1  ok
+  [ok ] 3-turn 2 t1             20.83s  attempts=1  ok
+  [ok ] 3-turn 2 t2             20.23s  attempts=1  ok
+  [ok ] 3-turn 2 t3             15.16s  attempts=1  ok
+  [ok ] 3-turn 3 t1             29.28s  attempts=1  ok
+  [ok ] 3-turn 3 t2             28.75s  attempts=1  ok
+  [ok ] 3-turn 3 t3             26.76s  attempts=1  ok
+  [ok ] schema-pressure         19.20s  attempts=1  ok
+
+### timeout canaries (controlled stub)
+  {'direction': 'codex->claude', 'status': 'timed_out', 'error_category': 'peer_timeout', 'orphans': 0}
+  {'direction': 'claude->codex', 'status': 'timed_out', 'error_category': 'peer_timeout', 'orphans': 0}
+
+========================================================================
+CANARY REPORT
+========================================================================
+
+claude->codex
+  calls graded              19
+  contract-valid rate       19/19 (100%)
+  first-attempt success     19/19 (100%)
+  latency p50 / p95         29.28s / 55.31s
+  continuations correct     6/6
+  failures by category      none
+  schema-pressure outcome   complete / ok
+
+BLOCKED codex->claude: peer_auth_failure. No live calls were made in this direction, so nothing about it is verified.
+
+timeout canary codex->claude: timed_out orphans=0  ok
+
+timeout canary claude->codex: timed_out orphans=0  ok
+
+========================================================================
+FAIL: see above

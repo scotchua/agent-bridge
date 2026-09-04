@@ -1,0 +1,362 @@
+{
+  "blocked": {
+    "codex->claude": "peer_auth_failure"
+  },
+  "rows": [
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "91366ed3-bcdd-40d6-95bb-a917eb27eafe",
+      "kind": "one-turn 1",
+      "latency_seconds": 35.82,
+      "peer_session_id": "01a06e42-d19a-73d1-a4a9-e83593d3720e",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "14a9e333-b9e3-4043-b5d4-e108706687d9",
+      "kind": "one-turn 2",
+      "latency_seconds": 41.36,
+      "peer_session_id": "01a06e43-5d7f-7140-b8a0-4849c9005a15",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "7bf85545-6bf9-4614-a968-3dd139a7d3f2",
+      "kind": "one-turn 3",
+      "latency_seconds": 26.23,
+      "peer_session_id": "01a06e43-ff22-7fb0-9dc7-1b97d7e1fde6",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "ce63d16d-9295-4b93-9879-fbcb826082b1",
+      "kind": "one-turn 4",
+      "latency_seconds": 69.05,
+      "peer_session_id": "01a06e44-6595-7953-a1f6-da228fbd65ad",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "98d34d9f-5354-4184-b4ee-f7071ef85bc2",
+      "kind": "one-turn 5",
+      "latency_seconds": 12.13,
+      "peer_session_id": "01a06e45-7341-7990-96f4-95069afa9bba",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "f7a757ac-68d0-4976-a8b7-0928dd2a69df",
+      "kind": "one-turn 6",
+      "latency_seconds": 17.16,
+      "peer_session_id": "01a06e45-a29b-70a3-a18c-a93c810d328b",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "9d536e98-f63b-40de-a718-c3bebf06909c",
+      "kind": "one-turn 7",
+      "latency_seconds": 44.65,
+      "peer_session_id": "01a06e45-e5b7-7e30-8334-52c16a6dea9f",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "aa2a41a3-3413-4a6b-a74f-0725b2eaf33b",
+      "kind": "one-turn 8",
+      "latency_seconds": 37.57,
+      "peer_session_id": "01a06e46-942a-7f51-bf8f-4ea580391a1a",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "b1d0e30c-ae1e-4607-bc1a-e0235c206537",
+      "kind": "one-turn 9",
+      "latency_seconds": 42.06,
+      "peer_session_id": "01a06e47-26f0-7c60-ab04-edc2123fff15",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "bf872f39-62a2-49ae-b78e-24874e62e233",
+      "kind": "one-turn 10",
+      "latency_seconds": 22.88,
+      "peer_session_id": "01a06e47-cb2c-7270-aaae-1506908a86cd",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "bb68cfb5-d940-447b-b1d3-c95a0c1f674b",
+      "kind": "3-turn 1 t1",
+      "latency_seconds": 55.31,
+      "peer_session_id": "01a06e48-2494-7a41-8fb7-1d2a97d8eccd",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "8ba1c55b-fa3c-42fd-bb15-96a9fd6344d0",
+      "kind": "3-turn 1 t2",
+      "latency_seconds": 53.27,
+      "peer_session_id": "01a06e48-2494-7a41-8fb7-1d2a97d8eccd",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "9dfa87f1-1862-46b7-aa57-750bfaef2f5d",
+      "kind": "3-turn 1 t3",
+      "latency_seconds": 30.47,
+      "peer_session_id": "01a06e48-2494-7a41-8fb7-1d2a97d8eccd",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "5d8c2a33-1bf0-4309-b01a-3ce3b57caa9b",
+      "kind": "3-turn 2 t1",
+      "latency_seconds": 20.83,
+      "peer_session_id": "01a06e4a-43d4-79f2-bb8b-6b18d5416af5",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "7d4b2a85-3441-44bd-8291-85b7eb8c43c7",
+      "kind": "3-turn 2 t2",
+      "latency_seconds": 20.23,
+      "peer_session_id": "01a06e4a-43d4-79f2-bb8b-6b18d5416af5",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "667ccaa0-6d1f-48b9-a0f6-bb6b8a65f0dc",
+      "kind": "3-turn 2 t3",
+      "latency_seconds": 15.16,
+      "peer_session_id": "01a06e4a-43d4-79f2-bb8b-6b18d5416af5",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "fa4e66ea-f644-4ff0-92bc-73e94ce3e1b5",
+      "kind": "3-turn 3 t1",
+      "latency_seconds": 29.28,
+      "peer_session_id": "01a06e4b-1fd8-7280-b50d-0f8646a888b5",
+      "session_id_as_intended": null,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "c61a3fc3-d605-45dc-82af-15823114fcfb",
+      "kind": "3-turn 3 t2",
+      "latency_seconds": 28.75,
+      "peer_session_id": "01a06e4b-1fd8-7280-b50d-0f8646a888b5",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "0b84c913-1806-4707-8e9d-c56b274a8480",
+      "kind": "3-turn 3 t3",
+      "latency_seconds": 26.76,
+      "peer_session_id": "01a06e4b-1fd8-7280-b50d-0f8646a888b5",
+      "session_id_as_intended": true,
+      "status": "complete"
+    },
+    {
+      "acceptable": true,
+      "attempts": 1,
+      "contract_valid": true,
+      "cost_usd": null,
+      "direction": "claude->codex",
+      "error_category": "ok",
+      "extraction_paths": [
+        "output_last_message:json"
+      ],
+      "first_attempt_ok": true,
+      "job_id": "79bf6800-5e1c-48c6-ad97-4403f813d2f3",
+      "kind": "schema-pressure",
+      "latency_seconds": 19.2,
+      "peer_session_id": "01a06e4c-6b17-71a2-804a-59df4cab797c",
+      "session_id_as_intended": null,
+      "status": "complete"
+    }
+  ],
+  "timeouts": [
+    {
+      "direction": "codex->claude",
+      "error_category": "peer_timeout",
+      "orphans": 0,
+      "status": "timed_out"
+    },
+    {
+      "direction": "claude->codex",
+      "error_category": "peer_timeout",
+      "orphans": 0,
+      "status": "timed_out"
+    }
+  ]
+}
