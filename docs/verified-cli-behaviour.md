@@ -285,22 +285,16 @@ excluded from in-flight discovery.
   Entry condition: the usable sample reaching the threshold. The outcome is an
   upstream report, not a change here; this is the CLI's envelope, not ours.
 
-### Tabled, not abandoned
+### Completed follow-ups
 
-Improvements the reviewer would prefer but does not require. Entry conditions
-noted so they are picked up on a trigger rather than forgotten.
-
-- **Crash-injection testing at lifecycle boundaries.** Currently the boundaries
-  are tested by placing marker states directly; genuine fault injection would
-  kill a worker at each point. Entry condition: any future change to the marker
-  lifecycle, or the first real mid-call worker death observed in the ledger.
-- **Monitoring aged indeterminate holds.** `status` warns that holds exist but
-  does not track their age. Entry condition: the first hold that occurs in
-  practice, or more than one hold outstanding at once.
-- **Asserting on diagnostic reasons, not only outcomes.** This round produced a
-  patch that silently failed to match its target; the behaviour stayed safe and
-  only a reason-string assertion caught it. Entry condition: apply to new tests
-  as written, rather than retrofitting.
+- **Crash-injection testing at lifecycle boundaries.** A fake-backed worker is
+  now killed after every marker transition defined by the implementation, and
+  each test asserts the documented recovery state.
+- **Monitoring aged indeterminate holds.** `status` reports every held
+  conversation's age in both its warning and its structured output.
+- **Asserting on diagnostic reasons, not only outcomes.** Existing tests that
+  asserted only a refusal, exception, or failed terminal state now also pin the
+  closed error category or diagnostic text that caused it.
 
 ## Assumptions still outstanding
 

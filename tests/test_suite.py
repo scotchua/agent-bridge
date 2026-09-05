@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import csv
+import signal
 import shutil
 import tempfile
 import threading
@@ -146,18 +147,26 @@ def test_tool_exposure() -> None:
                   not any(n.startswith(f"{caller}_") for n in names), str(sorted(names)))
         out = sb.mcp("codex", [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                 "params": {"name": "codex_start", "arguments": {}}}])
+        wrong_mode = out[0]["result"]
         check("calling the peer's own name in the wrong mode is refused",
-              out[0]["result"]["isError"] is True)
+              wrong_mode["isError"] is True
+              and wrong_mode["structuredContent"]["error_category"]
+              == ErrorCategory.INPUT_SCHEMA_INVALID.value
+              and "No such tool in this caller mode"
+              in wrong_mode["structuredContent"]["error_hint"])
         # Use the platform's own launcher. The POSIX one is a /bin/sh script,
         # which Windows cannot execute at all, so testing it there proves
         # nothing about the tool and everything about shebangs.
         launcher = [os.path.join(REPO, "bin", "agent-bridge-mcp.cmd")] \
             if os.name == "nt" else [os.path.join(REPO, "bin", "agent-bridge-mcp")]
         proc = subprocess.run(launcher, capture_output=True, timeout=60)
-        check("--caller is required", proc.returncode != 0)
+        check("--caller is required",
+              proc.returncode != 0 and b"--caller" in proc.stderr, proc.stderr.decode())
         proc = subprocess.run(launcher + ["--caller", "gpt"],
                               capture_output=True, timeout=60)
-        check("--caller rejects an unknown value", proc.returncode != 0)
+        check("--caller rejects an unknown value",
+              proc.returncode != 0 and b"invalid choice" in proc.stderr
+              and b"gpt" in proc.stderr, proc.stderr.decode())
         check("a launcher exists for this platform",
               os.path.isfile(launcher[0]), launcher[0])
     finally:
@@ -245,9 +254,16 @@ def test_schema_enforcement() -> None:
             sb.env(**{key: "schema_invalid"})
             started, status, result = sb.run_to_completion(caller)
             check(f"{caller}->{peer}: schema-invalid peer output fails closed",
-                  status["status"] == "failed", json.dumps(status))
+                  status["status"] == "failed"
+                  and status["error_category"]
+                  == ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID.value,
+                  json.dumps(status))
             check(f"{caller}->{peer}: no unvalidated payload is returned",
-                  "peer_response" not in result and result["ok"] is False)
+                  "peer_response" not in result and result["ok"] is False
+                  and result["error_category"]
+                  == ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID.value
+                  and result["error_hint"]
+                  == error_hint(ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID))
             check(f"{caller}->{peer}: invalid output is quarantined",
                   os.path.isdir(os.path.join(sb.cfg.job_dir(started["job_id"]), "quarantine")))
         finally:
@@ -258,7 +274,12 @@ def test_schema_enforcement() -> None:
             sb.env(**{key: "malformed_payload"})
             started, status, result = sb.run_to_completion(caller)
             check(f"{caller}->{peer}: non-JSON peer output is quarantined and fails closed",
-                  status["status"] == "failed" and result["ok"] is False)
+                  status["status"] == "failed" and result["ok"] is False
+                  and status["error_category"]
+                  == ErrorCategory.PEER_OUTPUT_MALFORMED.value
+                  and result["error_hint"]
+                  == error_hint(ErrorCategory.PEER_OUTPUT_MALFORMED),
+                  json.dumps(status))
         finally:
             sb.cleanup()
 
@@ -433,8 +454,9 @@ def test_per_peer_classification_limits() -> None:
         try:
             sb.cfg.peer_allowed_classifications("codex")
             check("PP: a malformed override is rejected", False, "it was accepted")
-        except ValueError:
-            check("PP: a malformed override is rejected", True)
+        except ValueError as exc:
+            check("PP: a malformed override is rejected",
+                  "must be a list of strings" in str(exc), str(exc))
     finally:
         sb.cleanup()
 
@@ -451,15 +473,24 @@ def test_output_cap() -> None:
                   ErrorCategory.PEER_OUTPUT_TOO_LARGE.value,
                   ErrorCategory.RETRY_EXHAUSTED.value),
               status["error_category"])
-        check("oversized output returns no payload", result["ok"] is False)
+        check("oversized output returns no payload",
+              result["ok"] is False
+              and result["error_category"] == ErrorCategory.PEER_OUTPUT_TOO_LARGE.value
+              and result["error_hint"]
+              == error_hint(ErrorCategory.PEER_OUTPUT_TOO_LARGE))
     finally:
         sb.cleanup()
 
     sb = Sandbox(limits={"peer_last_message_max_bytes": 50})
     try:
-        _, status, _ = sb.run_to_completion("claude")
+        _, status, result = sb.run_to_completion("claude")
         check("oversized codex last-message file fails closed",
-              status["status"] == "failed", json.dumps(status))
+              status["status"] == "failed"
+              and status["error_category"]
+              == ErrorCategory.PEER_OUTPUT_TOO_LARGE.value
+              and result["error_hint"]
+              == error_hint(ErrorCategory.PEER_OUTPUT_TOO_LARGE),
+              json.dumps(status))
     finally:
         sb.cleanup()
 
@@ -516,8 +547,12 @@ def test_timeout_and_process_group_cleanup() -> None:
             sb.env(**{f"FAKE_{peer.upper()}_MODE": "hang"})
             started = sb.consult(caller)
             status = sb.wait(started["job_id"], timeout=60)
+            result = broker.read(sb.cfg, caller, {"job_id": started["job_id"]})
             check(f"{caller}->{peer}: hang lands in timed_out",
-                  status["status"] == "timed_out", json.dumps(status))
+                  status["status"] == "timed_out"
+                  and status["error_category"] == ErrorCategory.PEER_TIMEOUT.value
+                  and result["error_hint"] == error_hint(ErrorCategory.PEER_TIMEOUT),
+                  json.dumps(status))
             prov = sb.provenance(started["job_id"])
             kills = [a["group_kill"] for a in prov["attempts"] if a["group_kill"]]
             if os.name == "nt":
@@ -615,8 +650,9 @@ def test_no_shell_execution() -> None:
         runner.run("echo hi", cwd="/tmp", env={}, stdin_data="", timeout=5,
                    grace=1, stdout_cap=10, stderr_cap=10)
         check("runner.run refuses a command string", False, "accepted a string")
-    except TypeError:
-        check("runner.run refuses a command string", True)
+    except TypeError as exc:
+        check("runner.run refuses a command string",
+              str(exc) == "argv must be a list of strings", str(exc))
 
 
 def test_atomic_and_restart_safe() -> None:
@@ -1007,8 +1043,9 @@ def test_codex_review_regressions() -> None:
         try:
             registry.write_status(sb.cfg, job_id, "running", strict=True)
             check("F1: strict mode raises on an illegal transition", False, "no raise")
-        except registry.IllegalTransition:
-            check("F1: strict mode raises on an illegal transition", True)
+        except registry.IllegalTransition as exc:
+            check("F1: strict mode raises on an illegal transition",
+                  str(exc) == "complete -> running (terminal is final)", str(exc))
         check("F1: attach_worker_pid never changes status",
               registry.attach_worker_pid(sb.cfg, job_id, 12345)["status"] == "complete")
         # running -> queued is also illegal
@@ -1124,7 +1161,12 @@ def test_codex_review_regressions() -> None:
         sb.env(FAKE_CLAUDE_MODE="huge")
         _, status, result = sb.run_to_completion("codex")
         check("F5: oversized output fails closed with no payload",
-              status["status"] == "failed" and result["ok"] is False, json.dumps(status))
+              status["status"] == "failed" and result["ok"] is False
+              and status["error_category"]
+              == ErrorCategory.PEER_OUTPUT_TOO_LARGE.value
+              and result["error_hint"]
+              == error_hint(ErrorCategory.PEER_OUTPUT_TOO_LARGE),
+              json.dumps(status))
     finally:
         sb.cleanup()
 
@@ -1143,7 +1185,11 @@ def test_codex_review_regressions() -> None:
             check(f"F5b: {caller}->{peer} and a flooding peer is NOT retried",
                   prov["attempt_count"] == 1, str(prov["attempt_count"]))
             check(f"F5b: {caller}->{peer} no payload is returned",
-                  result["ok"] is False)
+                  result["ok"] is False
+                  and result["error_category"]
+                  == ErrorCategory.PEER_OUTPUT_TOO_LARGE.value
+                  and result["error_hint"]
+                  == error_hint(ErrorCategory.PEER_OUTPUT_TOO_LARGE))
         finally:
             sb.cleanup()
 
@@ -1190,7 +1236,12 @@ def test_codex_review_regressions() -> None:
         sb.env(FAKE_CODEX_MODE="example_then_answer")
         _, status, result = sb.run_to_completion("claude")
         check("F7: a peer emitting an example before its answer fails closed",
-              status["status"] == "failed" and result["ok"] is False, json.dumps(status))
+              status["status"] == "failed" and result["ok"] is False
+              and status["error_category"]
+              == ErrorCategory.PEER_OUTPUT_MALFORMED.value
+              and result["error_hint"]
+              == error_hint(ErrorCategory.PEER_OUTPUT_MALFORMED),
+              json.dumps(status))
     finally:
         sb.cleanup()
 
@@ -1282,8 +1333,9 @@ def test_round_two_regressions() -> None:
             registry.write_status(sb.cfg, job_id, "failed", strict=True,
                                   error_category=ErrorCategory.WORKER_DIED.value)
             check("R1: strict mode raises on a terminal rewrite", False, "no raise")
-        except registry.IllegalTransition:
-            check("R1: strict mode raises on a terminal rewrite", True)
+        except registry.IllegalTransition as exc:
+            check("R1: strict mode raises on a terminal rewrite",
+                  str(exc) == "failed -> failed (terminal is final)", str(exc))
         # And the compare-and-set path: a stale seq is refused outright.
         fresh = "cas-job"
         first = registry.write_status(sb.cfg, fresh, "running", worker_pid=os.getpid())
@@ -1673,7 +1725,11 @@ def test_round_three_regressions() -> None:
                   status["error_category"] == ErrorCategory.PEER_OUTPUT_INCOMPLETE.value,
                   status["error_category"])
             check(f"T2: {caller}->{peer} no payload is returned from a truncated stream",
-                  result["ok"] is False and "peer_response" not in result)
+                  result["ok"] is False and "peer_response" not in result
+                  and result["error_category"]
+                  == ErrorCategory.PEER_OUTPUT_INCOMPLETE.value
+                  and result["error_hint"]
+                  == error_hint(ErrorCategory.PEER_OUTPUT_INCOMPLETE))
         finally:
             sb.cleanup()
 
@@ -2253,9 +2309,13 @@ def test_round_four_third_pass() -> None:
                                     "leader_start": "Sat Jan  1 00:00:00 2020",
                                     "spawned_at": 1.0})
             outcomes = registry.reap_orphaned_peers(sb.cfg, "RECYCLED")
-            check("W3: a start-time mismatch is refused, not signalled",
+            check("W3: an unverifiable or mismatched identity is refused, not signalled",
                   all(not o.get("signalled") for o in outcomes)
-                  and any("recycled" in str(o.get("identity")) for o in outcomes),
+                  and any(
+                      reason in str(o.get("identity"))
+                      for o in outcomes
+                      for reason in ("recycled", "could not be verified")
+                  ),
                   json.dumps(outcomes))
             check("W3: and the process is left alive rather than wrongly killed",
                   proc.poll() is None)
@@ -2410,6 +2470,7 @@ def test_round_four_fourth_pass() -> None:
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "s", "turns": 1, "closed": False,
             "indeterminate": True, "indeterminate_reason": "test",
+            "indeterminate_at": "2020-01-01T00:00:00.000+00:00",
             "active_job_id": None, "created_at": store.utc_now(),
             "updated_at": store.utc_now()})
         env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
@@ -2423,6 +2484,12 @@ def test_round_four_fourth_pass() -> None:
               f"resolve {cid}" in text)
         check("X2: the count is machine-readable too",
               '"conversations_indeterminate": 1' in text)
+        payload = json.loads(text[text.index("{"):])
+        holds = payload["indeterminate_holds"]
+        check("X2: status reports the age of every indeterminate hold",
+              len(holds) == 1 and holds[0]["conversation_id"] == cid
+              and holds[0]["age_seconds"] > 86400
+              and "held for" in text, json.dumps(holds))
     finally:
         sb.cleanup()
 
@@ -2694,6 +2761,125 @@ def test_attempt_marker_lifecycle() -> None:
                   out.stdout.decode()[-160:])
     finally:
         sb.cleanup()
+
+
+def test_attempt_marker_crash_injection() -> None:
+    """Kill a fake-backed worker after every marker transition in the code."""
+    print("\n[attempt marker crash injection]")
+
+    transitions = (
+        ("absent -> pre_spawn", "pre_spawn", "indeterminate"),
+        ("pre_spawn -> absent after confirmed spawn failure",
+         "spawn_failed", "clear"),
+        ("pre_spawn -> spawned", "spawned", "indeterminate"),
+        ("spawned -> peer_exited_uncommitted",
+         "peer_exited_uncommitted", "indeterminate"),
+        ("peer_exited_uncommitted -> committed", "committed", "committed"),
+    )
+
+    def kill_worker(pid):
+        try:
+            os.kill(pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if os.name != "nt":
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+    for transition, phase, recovery in transitions:
+        sb = Sandbox()
+        worker_pid = None
+        try:
+            initial, _, _ = sb.run_to_completion("codex")
+            cid = initial["conversation_id"]
+            raw = store.read_json(sb.config_path)
+            peer_env = raw["peers"]["claude"].setdefault("extra_env", {})
+            peer_env[runner.MARKER_FAULT_PHASE_ENV] = phase
+            if phase == "spawned":
+                peer_env["FAKE_CLAUDE_MODE"] = "hang"
+            store.atomic_write_json(sb.config_path, raw)
+            sb.cfg = config_module.load(sb.config_path)
+
+            started = broker.continue_(sb.cfg, "codex", {
+                "conversation_id": cid, "prompt": "crash at " + transition,
+                "source_classification": "internal"})
+            job_id = started["job_id"]
+            marker = os.path.join(sb.cfg.job_dir(job_id), "attempts", "1",
+                                  registry.INFLIGHT_MARKER)
+            deadline = time.time() + 15
+            reached = False
+            while time.time() < deadline:
+                status = registry.read_status(sb.cfg, job_id)
+                worker_pid = status.get("worker_pid") or worker_pid
+                if phase == "committed":
+                    reached = os.path.isfile(marker + ".committed")
+                elif phase == "spawn_failed":
+                    reached = os.path.isdir(os.path.dirname(marker)) \
+                        and not os.path.exists(marker)
+                else:
+                    current = store.read_json_or_none(marker) or {}
+                    reached = current.get("phase") == phase
+                if reached and worker_pid:
+                    break
+                time.sleep(0.02)
+            check(f"CI: worker reaches marker transition {transition}",
+                  reached and bool(worker_pid), json.dumps({
+                      "reached": reached, "worker_pid": worker_pid,
+                      "marker": store.read_json_or_none(marker)}))
+            if not reached or not worker_pid:
+                continue
+
+            kill_worker(worker_pid)
+            check(f"CI: worker is killed at marker transition {transition}",
+                  not registry.pid_alive(worker_pid), str(worker_pid))
+
+            if recovery == "indeterminate":
+                refused = None
+                try:
+                    registry.claim_conversation_slot(
+                        sb.cfg, cid, "codex", "RECOVERY", 99)
+                except BrokerError as exc:
+                    refused = exc.category
+                record = registry.load_conversation(sb.cfg, cid)
+                recovered = (
+                    refused == ErrorCategory.CONVERSATION_INDETERMINATE
+                    and record.get("indeterminate") is True
+                    and record.get("indeterminate_reason")
+                    == "worker died with a peer call in flight"
+                    and len(record.get("indeterminate_attempts") or []) == 1
+                    and len(record.get("indeterminate_reaped") or []) == 1
+                )
+                check(f"CI: {transition} recovers to a documented indeterminate hold",
+                      recovered, json.dumps(record))
+            else:
+                original = registry.reconcile(sb.cfg, job_id)
+                raw = store.read_json(sb.config_path)
+                raw["peers"]["claude"]["extra_env"].pop(
+                    runner.MARKER_FAULT_PHASE_ENV, None)
+                store.atomic_write_json(sb.config_path, raw)
+                sb.cfg = config_module.load(sb.config_path)
+                continued = broker.continue_(sb.cfg, "codex", {
+                    "conversation_id": cid, "prompt": "after committed crash",
+                    "source_classification": "internal"})
+                continued_status = sb.wait(continued["job_id"])
+                record = registry.load_conversation(sb.cfg, cid)
+                expected_turns = 3 if recovery == "committed" else 2
+                expected_marker = os.path.isfile(marker + ".committed") \
+                    if recovery == "committed" else not os.path.exists(marker)
+                check(f"CI: {transition} recovers to the documented {recovery} state",
+                      original.get("error_category") == ErrorCategory.WORKER_DIED.value
+                      and continued_status["status"] == "complete"
+                      and record["turns"] == expected_turns
+                      and not record.get("indeterminate") and expected_marker,
+                      json.dumps({"original": original,
+                                  "continued": continued_status,
+                                  "conversation": record}))
+        finally:
+            if worker_pid and registry.pid_alive(worker_pid):
+                kill_worker(worker_pid)
+            sb.cleanup()
 
 
 def test_external_review_findings() -> None:
@@ -3286,8 +3472,10 @@ def test_platform_boundary() -> None:
     try:
         platform_base.StreamReadResult(b"", b"", True)
         check("PB: a short result is refused at the boundary", False, "accepted")
-    except TypeError:
-        check("PB: a short result is refused at the boundary", True)
+    except TypeError as exc:
+        check("PB: a short result is refused at the boundary",
+              "cap_exceeded" in str(exc) and "descendant_held_pipes" in str(exc),
+              str(exc))
     check("PB: the runner reads the flags by name",
           "read.cap_exceeded" in inspect.getsource(runner)
           and "read.timed_out" in inspect.getsource(runner))
@@ -3594,9 +3782,9 @@ def test_windows_atomic_replace_retry() -> None:
             store.atomic_write_bytes(path, b"never-written")
             check("a reader held past the grace correctly makes the write fail",
                   False, "it passed")
-        except PermissionError:
+        except PermissionError as exc:
             check("a reader held past the grace correctly makes the write fail",
-                  True)
+                  "destination reader still holds the file" in str(exc), str(exc))
         finally:
             release_reader.set()
             reader.join()
@@ -3896,6 +4084,7 @@ def main() -> int:
     test_round_four_third_pass()
     test_round_four_fourth_pass()
     test_attempt_marker_lifecycle()
+    test_attempt_marker_crash_injection()
     return summary(SKIPPED)
 
 

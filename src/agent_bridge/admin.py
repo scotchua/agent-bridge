@@ -85,6 +85,23 @@ def _age_days(path: str, fallback: str | None = None) -> float:
     return 0.0
 
 
+def _hold_age_seconds(record: dict[str, Any], path: str, now: float) -> float:
+    """Age of an indeterminate hold, with file age for legacy records."""
+    raw = record.get("indeterminate_at")
+    if raw:
+        try:
+            stamp = dt.datetime.fromisoformat(str(raw))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=dt.timezone.utc)
+            return max(0.0, now - stamp.timestamp())
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0.0, now - os.path.getmtime(path))
+    except OSError:
+        return 0.0
+
+
 def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
     jobs_root = cfg.state("jobs")
     counts: dict[str, int] = {}
@@ -110,13 +127,20 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
     if os.path.isfile(cfg.ledger_path):
         with open(cfg.ledger_path, encoding="utf-8") as handle:
             ledger_lines = sum(1 for line in handle if line.strip())
-    indeterminate: list[str] = []
+    indeterminate: list[dict[str, Any]] = []
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
     if os.path.isdir(conversations_root):
         for entry in os.scandir(conversations_root):
             if entry.name.endswith(".json"):
                 rec = store.read_json_or_none(entry.path) or {}
                 if rec.get("indeterminate"):
-                    indeterminate.append(str(rec.get("conversation_id")))
+                    age_seconds = _hold_age_seconds(rec, entry.path, now)
+                    indeterminate.append({
+                        "conversation_id": str(rec.get("conversation_id")),
+                        "indeterminate_at": rec.get("indeterminate_at"),
+                        "age_seconds": round(age_seconds, 1),
+                        "age_days": round(age_seconds / 86400.0, 1),
+                    })
     contamination = store.read_json_or_none(cfg.state("last-contamination.json"))
     if contamination:
         print("WARNING: a consultation was refused because instruction files "
@@ -135,9 +159,11 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
         # would otherwise sit unnoticed until somebody happened to retry it.
         print(f"WARNING: {len(indeterminate)} conversation(s) HELD as "
               f"indeterminate and awaiting operator resolution.")
-        for cid in indeterminate:
-            print(f"  agent-bridge-admin resolve {cid}")
+        for hold in indeterminate:
+            print(f"  agent-bridge-admin resolve {hold['conversation_id']} "
+                  f"(held for {hold['age_days']}d)")
         print()
+    indeterminate_ids = [hold["conversation_id"] for hold in indeterminate]
     print(json.dumps({
         "state_root": cfg.state_root,
         "config": cfg.path,
@@ -150,7 +176,8 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
         "conversations_open": open_conversations,
         "conversations_indeterminate": len(indeterminate),
         "last_contamination": contamination,
-        "indeterminate_conversation_ids": indeterminate,
+        "indeterminate_conversation_ids": indeterminate_ids,
+        "indeterminate_holds": indeterminate,
         "ledger_records": ledger_lines,
         "retention_days": cfg.raw["retention"],
     }, indent=2, sort_keys=True))

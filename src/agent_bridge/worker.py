@@ -357,7 +357,9 @@ def execute(job_dir: str) -> int:
     # and marking its evidence committed would be a lie in the one direction
     # that matters.
     if commit_succeeded:
-        registry.retire_attempt_markers(cfg, job_id)
+        retired = registry.retire_attempt_markers(cfg, job_id)
+        if retired:
+            runner.pause_after_marker_transition(cfg.peer_extra_env(peer), "committed")
     else:
         record["markers_retained"] = "conversation release did not succeed"
     registry.write_status(

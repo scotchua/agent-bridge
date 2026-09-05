@@ -32,6 +32,12 @@ from .platform import platform
 #: descendant still holds a pipe open.
 POST_EXIT_DRAIN_SECONDS = 0.5
 
+# Test-only rendezvous used to kill a real worker immediately after a marker
+# transition. It is carried in the fake peer's declared environment, never
+# inherited from the broker process.
+MARKER_FAULT_PHASE_ENV = "AGENT_BRIDGE_TEST_PAUSE_AFTER_MARKER_PHASE"
+MARKER_FAULT_PAUSE_SECONDS = 30.0
+
 
 @dataclass
 class RunResult:
@@ -96,8 +102,11 @@ def run(
                 timed_out=False, duration_seconds=time.monotonic() - started,
                 pgid=None, spawn_failed=True, marker_write_failed=True,
             )
+        pause_after_marker_transition(env, "pre_spawn")
 
     try:
+        if env.get(MARKER_FAULT_PHASE_ENV) == "spawn_failed":
+            raise OSError("injected peer spawn failure")
         proc = platform.spawn_isolated(argv, cwd=cwd, env=env)
     except (OSError, ValueError):
         # A confirmed spawn failure proves no child was created, so the
@@ -110,6 +119,7 @@ def run(
                 os.unlink(pgid_file)
             except OSError:
                 pass
+            pause_after_marker_transition(env, "spawn_failed")
         return RunResult(
             argv=argv, returncode=None, stdout=b"", stderr=b"", timed_out=False,
             duration_seconds=time.monotonic() - started, pgid=None, spawn_failed=True,
@@ -130,6 +140,7 @@ def run(
             "argv0": argv[0],
             "spawned_at": time.time(),
         })
+        pause_after_marker_transition(env, "spawned")
 
     group_kill: dict[str, Any] = {}
     # Named fields, not positional unpacking: see StreamReadResult for why.
@@ -182,6 +193,7 @@ def run(
             "returncode": returncode,
             "peer_exited_at": time.time(),
         })
+        pause_after_marker_transition(env, "peer_exited_uncommitted")
 
     return RunResult(
         argv=argv,
@@ -217,6 +229,12 @@ def _write_marker(path: str, payload: dict[str, Any]) -> bool:
         return True
     except OSError:
         return False
+
+
+def pause_after_marker_transition(env: dict[str, str], phase: str) -> None:
+    """Pause a fake-backed run so the suite can kill its worker at a boundary."""
+    if env.get(MARKER_FAULT_PHASE_ENV) == phase:
+        time.sleep(MARKER_FAULT_PAUSE_SECONDS)
 
 
 def scrubbed_env(extra: dict[str, str] | None = None) -> dict[str, str]:
