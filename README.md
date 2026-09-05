@@ -41,12 +41,17 @@ judgement, for the reason in [Honest limits](#honest-limits).
 See **[INSTALL.md](INSTALL.md)**. Short version:
 
 ```
-./bin/agent-bridge-setup          # find and check your CLIs
-python3 tests/test_suite.py       # offline, costs nothing
-./canaries/run_canaries.py --direction both   # live, costs a few dollars
+./bin/agent-bridge-setup --candidate ~/.agent-bridge/candidates/effective.json
+python3 tests/test_suite.py
+./canaries/run_canaries.py --config ~/.agent-bridge/candidates/effective.json \
+  --direction both --out ~/.agent-bridge/canary-results/latest.json
+./bin/agent-bridge-setup --promote ~/.agent-bridge/candidates/effective.json \
+  --results ~/.agent-bridge/canary-results/latest.json
 ```
 
-Then two `mcp add` commands, which INSTALL.md spells out.
+The live step costs a few dollars. It writes a version-bound result before the
+candidate can be promoted. Then two `mcp add` commands, which INSTALL.md spells
+out.
 
 ## What you get
 
@@ -228,15 +233,15 @@ already listed. Porting this repository is the better option if you can.
 
 | Path | What |
 |---|---|
-| `bin/agent-bridge-setup` | find, check and pin your two CLIs |
+| `bin/agent-bridge-setup` | stage and promote verified CLI pins |
 | `bin/agent-bridge-mcp` | the MCP server, needs `--caller codex` or `--caller claude` |
 | `bin/agent-bridge-admin` | `status`, `ledger`, `reporting`, `cleanup`, `indeterminate`, `resolve` |
 | `config/broker.json` | committed defaults, machine-neutral |
-| `config/local.json` | your machine, written by setup, never committed |
+| `config/local.json` | active machine-local overlay fragment, promoted by setup, never committed |
 | `schema/` | the response contract both models must satisfy |
 | `src/agent_bridge/` | the implementation, standard library only |
 | `tests/test_suite.py` | full offline suite against stand-in CLIs |
-| `canaries/run_canaries.py` | live verification |
+| `canaries/run_canaries.py` | live verification with a mandatory durable result |
 
 State lives in `~/.agent-bridge`, outside this repository. On POSIX systems,
 state directories have mode exactly `0700` and files exactly `0600`. On

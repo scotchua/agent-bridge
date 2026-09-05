@@ -27,6 +27,28 @@ A second Claude install exists at `claude`, on
 from `2.1.234`. The bridge pins by absolute path **and** asserts the version, so
 whichever install is first on `$PATH` cannot silently become the peer.
 
+## Re-verifying a new peer version
+
+Never replace the active pin before measuring its replacement. Setup first
+writes a non-activating, complete effective candidate; the canary runner loads
+that artifact verbatim and writes mandatory durable evidence; setup promotes
+only evidence whose hash, observed versions, control counts, and `PASS` verdict
+match the candidate:
+
+```
+./bin/agent-bridge-setup --candidate ~/.agent-bridge/candidates/effective.json
+./canaries/run_canaries.py \
+  --config ~/.agent-bridge/candidates/effective.json \
+  --direction both --out ~/.agent-bridge/canary-results/latest.json
+./bin/agent-bridge-setup --promote ~/.agent-bridge/candidates/effective.json \
+  --results ~/.agent-bridge/canary-results/latest.json
+```
+
+Run any additional version-specific probes for claims in this document before
+the promotion step. `config/local.json` is an overlay fragment, not a complete
+config; when supplied explicitly it is merged with committed defaults. A setup
+candidate is already complete and is therefore consumed without re-layering.
+
 ## Corrections to the original build brief
 
 The brief asserted four things that do not hold. All four are handled.

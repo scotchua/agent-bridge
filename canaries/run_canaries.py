@@ -28,7 +28,7 @@ from typing import Any
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-from agent_bridge import broker, config, registry, store  # noqa: E402
+from agent_bridge import broker, config, registry, setup_cmd, store  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
 
 # Synthetic, non-sensitive prompts. No client data, no firm-specific detail.
@@ -102,6 +102,7 @@ class Canary:
             "contract_valid": status.get("status") == "complete",
             "latency_seconds": round(elapsed, 2),
             "peer_session_id": prov.get("peer_session_id"),
+            "peer_observed_version": prov.get("peer_observed_version"),
             "session_id_as_intended": (
                 None if expected_session is None
                 else prov.get("peer_session_id") == expected_session
@@ -191,6 +192,12 @@ def timeout_canary_config(cfg: config.Config, caller: str) -> dict[str, Any]:
         "executable": stub, "timeout_seconds": 3, "grace_seconds": 1,
         "extra_env": extra_env,
     })
+    # The worker snapshots the full config, and a peer has a read boundary only
+    # by instruction. The other peer is unused here, so do not leave its real
+    # executable path in a file the controlled stub could inspect.
+    for other in config.PEERS:
+        if other != peer:
+            base["peers"][other]["executable"] = None
     base["state_root"] = os.path.join(
         os.path.expanduser(base["state_root"]), "canary-timeout", caller)
     return base
@@ -343,27 +350,136 @@ def report(rows: list[dict[str, Any]], timeouts: list[dict[str, Any]],
     return exit_code
 
 
+def configured_versions(cfg: config.Config) -> dict[str, list[str]]:
+    return {peer: list(cfg.peer(peer).get("allowed_versions") or [])
+            for peer in config.PEERS}
+
+
+def observed_versions(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    observed = {peer: set() for peer in config.PEERS}
+    for row in rows:
+        direction = str(row.get("direction") or "")
+        peer = direction.rsplit("->", 1)[-1]
+        version = row.get("peer_observed_version")
+        if peer in observed and isinstance(version, str) and version:
+            observed[peer].add(version)
+    return {peer: sorted(versions) for peer, versions in observed.items()}
+
+
+def requested_controls(callers: list[str], one_turn: int,
+                       three_turn: int) -> dict[str, int]:
+    directions = len(callers)
+    return {
+        "reachability_probes": directions,
+        "one_turn_calls": directions * one_turn,
+        "three_turn_conversations": directions * three_turn,
+        "three_turn_calls": directions * three_turn * 3,
+        "schema_pressure_calls": directions,
+        "timeout_canaries": directions,
+    }
+
+
+def executed_controls(rows: list[dict[str, Any]],
+                      timeouts: list[dict[str, Any]],
+                      reachability_probes: int) -> dict[str, int]:
+    return {
+        "reachability_probes": reachability_probes,
+        "one_turn_calls": sum(
+            1 for row in rows if str(row.get("kind", "")).startswith("one-turn")),
+        "three_turn_conversations": sum(
+            1 for row in rows if str(row.get("kind", "")).startswith("3-turn ")
+            and str(row.get("kind", "")).endswith(" t1")),
+        "three_turn_calls": sum(
+            1 for row in rows if str(row.get("kind", "")).startswith("3-turn ")),
+        "schema_pressure_calls": sum(
+            1 for row in rows if row.get("kind") == "schema-pressure"),
+        "timeout_canaries": len(timeouts),
+    }
+
+
+def result_verdict(exit_code: int, timeout_skipped: bool,
+                   requested: dict[str, int], executed: dict[str, int]) -> str:
+    if exit_code != 0:
+        return "FAIL"
+    if timeout_skipped:
+        return "INCOMPLETE"
+    if executed != requested:
+        return "FAIL"
+    return "PASS"
+
+
+def result_record(cfg: config.Config, args: argparse.Namespace,
+                  callers: list[str], rows: list[dict[str, Any]],
+                  timeouts: list[dict[str, Any]], blocked: dict[str, str],
+                  reachability_probes: int, exit_code: int) -> dict[str, Any]:
+    requested = requested_controls(callers, args.one_turn, args.three_turn)
+    executed = executed_controls(rows, timeouts, reachability_probes)
+    skipped = ["timeout_canary"] if args.skip_timeout_canary else []
+    return {
+        "created_at": store.utc_now(),
+        "effective_config_sha256": config.effective_config_sha256(cfg.raw),
+        "configured_versions": configured_versions(cfg),
+        "observed_versions": observed_versions(rows),
+        "controls_requested": requested,
+        "controls_executed": executed,
+        "skipped_controls": skipped,
+        "verdict": result_verdict(
+            exit_code, args.skip_timeout_canary, requested, executed),
+        "runner_arguments": {
+            "direction": args.direction,
+            "one_turn": args.one_turn,
+            "three_turn": args.three_turn,
+            "job_timeout": args.job_timeout,
+            "skip_timeout_canary": args.skip_timeout_canary,
+        },
+        "rows": rows,
+        "timeouts": timeouts,
+        "blocked": blocked,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--direction", default="both",
                         choices=["both", "codex-to-claude", "claude-to-codex"])
-    parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--config", default=None,
+        help="Complete effective config or local overlay to merge with defaults.")
     parser.add_argument("--one-turn", type=int, default=10)
     parser.add_argument("--three-turn", type=int, default=3)
     parser.add_argument("--job-timeout", type=float, default=600.0)
     parser.add_argument("--skip-timeout-canary", action="store_true")
-    parser.add_argument("--out", default=None, help="Write the raw rows to this JSON file.")
+    parser.add_argument(
+        "--out", required=True,
+        help="Required durable path for the version-bound result artifact.")
     args = parser.parse_args()
     store.set_umask()
+    if not setup_cmd.is_durable(args.out):
+        parser.error("--out must be outside temporary directories")
+    output = os.path.realpath(os.path.abspath(args.out))
+    config_paths = [config.DEFAULT_CONFIG_PATH, config.local_config_path()]
+    if args.config:
+        config_paths.append(args.config)
+    if output in {os.path.realpath(os.path.abspath(path)) for path in config_paths}:
+        parser.error("--out must not overwrite a config input or active config")
     cfg = config.load(args.config)
 
     callers = {"both": ["codex", "claude"], "codex-to-claude": ["codex"],
                "claude-to-codex": ["claude"]}[args.direction]
     rows: list[dict[str, Any]] = []
     blocked: dict[str, str] = {}
+    probes_executed = 0
+    # Establish the mandatory artifact before making any peer calls. If the
+    # runner is interrupted, it remains explicitly INCOMPLETE rather than
+    # leaving an absent record that could be mistaken for an unrecorded pass.
+    initial = result_record(
+        cfg, args, callers, rows, [], blocked, probes_executed, 0)
+    initial["verdict"] = "INCOMPLETE"
+    store.atomic_write_json(args.out, initial)
     for caller in callers:
         peer = broker.PEER_OF[caller]
         print(f"\n### {caller} -> {peer}")
+        probes_executed += 1
         problem = reachability_probe(cfg, caller, args.job_timeout)
         if problem:
             blocked[f"{caller}->{peer}"] = problem
@@ -385,11 +501,12 @@ def main() -> int:
             timeouts.append(timeout_canary(cfg, caller))
             print(f"  {timeouts[-1]}")
 
-    if args.out:
-        store.atomic_write_json(
-            args.out, {"rows": rows, "timeouts": timeouts, "blocked": blocked})
-    return report(rows, timeouts, blocked,
-                  timeout_skipped=args.skip_timeout_canary)
+    exit_code = report(rows, timeouts, blocked,
+                       timeout_skipped=args.skip_timeout_canary)
+    store.atomic_write_json(
+        args.out, result_record(cfg, args, callers, rows, timeouts, blocked,
+                                probes_executed, exit_code))
+    return exit_code
 
 
 if __name__ == "__main__":

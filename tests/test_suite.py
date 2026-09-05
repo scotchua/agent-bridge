@@ -2769,11 +2769,11 @@ def test_external_review_findings() -> None:
     finally:
         sb.cleanup()
 
-    # F1c: layering itself works when no explicit path is given. This is the
-    # path the suite never exercised, which is why the bug survived.
-    check("F1c: load() layers local.json only when no explicit path is given",
-          "local = local_config_path()" in inspect.getsource(config_module.load)
-          and "explicit" in inspect.getsource(config_module.load))
+    # F1c: both the implicit local path and an explicit overlay use the same
+    # effective-config build. Candidate and snapshot files remain verbatim.
+    check("F1c: load() distinguishes overlay fragments from complete configs",
+          "build_effective(explicit)" in inspect.getsource(config_module.load)
+          and "_is_complete(raw)" in inspect.getsource(config_module.load))
 
     # F2: no retention knob that implies a rotation which does not happen.
     committed = json.load(open(os.path.join(REPO, "config", "broker.json")))
@@ -2933,6 +2933,8 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
     with tempfile.TemporaryDirectory() as root:
         raw = json.load(open(os.path.join(REPO, "config", "broker.json")))
         raw["state_root"] = os.path.join(root, "state")
+        raw["peers"]["claude"]["executable"] = os.path.join(root, "real-claude")
+        raw["peers"]["codex"]["executable"] = os.path.join(root, "real-codex")
         raw["peers"]["codex"]["allowed_versions"] = ["codex-cli 0.151.0"]
         raw["peers"]["codex"]["extra_env"] = {"EXISTING": "kept"}
         cfg = config_module.Config(raw, os.path.join(root, "effective.json"))
@@ -2948,6 +2950,9 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
               cfg.raw["peers"]["codex"]["extra_env"] == {"EXISTING": "kept"}
               and cfg.raw["peers"]["codex"]["executable"] !=
               built["peers"]["codex"]["executable"])
+        real_paths = [cfg.peer(peer).get("executable") for peer in config_module.PEERS]
+        check("TC: the stub config exposes no real peer executable path",
+              all(not path or path not in json.dumps(built) for path in real_paths))
         stub_cfg = config_module.Config(built, os.path.join(root, "stub.json"))
         observed = preflight.check_peer(stub_cfg, "codex")
         check("TC: the active version gate accepts the pinned stub version",
@@ -2992,6 +2997,206 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
     check("TC: a genuine timeout failure remains FAIL, not INCOMPLETE",
           result == 1 and buf.getvalue().rstrip().endswith("FAIL: see above"),
           buf.getvalue())
+
+
+def test_candidate_verification_path() -> None:
+    print("\n[candidate verification path]")
+    import importlib.util
+    from unittest import mock
+    from agent_bridge import setup_cmd
+
+    peer_fixture = Sandbox()
+    root = tempfile.mkdtemp(prefix=".candidate-test-", dir=REPO)
+    local_path = config_module.local_config_path()
+    local_existed = os.path.isfile(local_path)
+    local_before = open(local_path, "rb").read() if local_existed else None
+    try:
+        overlay_path = os.path.join(root, "local-overlay.json")
+        overlay = {
+            "state_root": peer_fixture.state,
+            "peers": {
+                "claude": {
+                    "executable": peer_fixture.cfg.peer("claude")["executable"],
+                    "allowed_versions": ["2.1.229 (Claude Code)"],
+                },
+                "codex": {
+                    "executable": peer_fixture.cfg.peer("codex")["executable"],
+                    "allowed_versions": ["codex-cli 0.147.0"],
+                    "codex_home": peer_fixture.cfg.peer("codex")["codex_home"],
+                },
+            },
+        }
+        store.atomic_write_json(overlay_path, overlay)
+        with mock.patch.object(config_module, "local_config_path",
+                               return_value=overlay_path):
+            runtime = config_module.load()
+        explicit = config_module.load(overlay_path)
+        check("VP1: explicit --config overlay builds the runtime effective config",
+              explicit.raw == runtime.raw)
+        check("VP1: explicit and runtime-layered effective hashes are equal",
+              config_module.effective_config_sha256(explicit.raw)
+              == config_module.effective_config_sha256(runtime.raw))
+
+        candidate_path = os.path.join(root, "candidate.json")
+        with mock.patch.object(config_module, "load", return_value=runtime), \
+                mock.patch.object(setup_cmd.preflight, "assert_state_root_secure",
+                                  return_value={"state_root": peer_fixture.state,
+                                                "directory_mode": "test",
+                                                "file_mode": "test"}), \
+                mock.patch.object(setup_cmd, "claude_signed_in", return_value=True), \
+                mock.patch.object(setup_cmd, "codex_signed_in", return_value=True):
+            result = setup_cmd.main([
+                "--candidate", candidate_path,
+                "--claude", overlay["peers"]["claude"]["executable"],
+                "--codex", overlay["peers"]["codex"]["executable"],
+            ])
+        candidate = config_module.load_effective(candidate_path)
+        check("VP2: --candidate writes one complete validated effective config",
+              result == 0 and candidate.raw == runtime.raw
+              and store.sha256_file(candidate_path)
+              == config_module.effective_config_sha256(candidate.raw), str(result))
+        local_after = open(local_path, "rb").read() if os.path.isfile(local_path) else None
+        check("VP2: --candidate does not change the active local overlay",
+              os.path.isfile(local_path) == local_existed
+              and local_after == local_before)
+        try:
+            setup_cmd.write_candidate(local_path, {}, runtime)
+            protected = False
+        except ValueError:
+            protected = True
+        protected_after = (open(local_path, "rb").read()
+                           if os.path.isfile(local_path) else None)
+        check("VP2: --candidate refuses an active config as its output path",
+              protected and os.path.isfile(local_path) == local_existed
+              and protected_after == local_before)
+        check("VP2: a complete candidate is consumed without changing its contents",
+              config_module.load(candidate_path).raw == candidate.raw)
+
+        spec = importlib.util.spec_from_file_location(
+            "candidate_run_canaries",
+            os.path.join(REPO, "canaries", "run_canaries.py"))
+        assert spec and spec.loader
+        run_canaries = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run_canaries)
+
+        incomplete_path = os.path.join(root, "incomplete-results.json")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.join(REPO, "src")
+        proc = subprocess.run([
+            sys.executable, os.path.join(REPO, "canaries", "run_canaries.py"),
+            "--config", candidate_path,
+            "--direction", "claude-to-codex",
+            "--one-turn", "1", "--three-turn", "0",
+            "--skip-timeout-canary", "--out", incomplete_path,
+        ], capture_output=True, cwd=REPO, env=env, timeout=90)
+        incomplete = store.read_json(incomplete_path)
+        required_fields = {
+            "effective_config_sha256", "configured_versions",
+            "observed_versions", "controls_requested", "controls_executed",
+            "verdict",
+        }
+        check("VP3: the runner always writes every required result field",
+              proc.returncode == 0 and required_fields <= set(incomplete),
+              proc.stderr.decode("utf-8", "replace")[-500:])
+        check("VP3: --skip-timeout-canary has a durable INCOMPLETE verdict",
+              incomplete["verdict"] == "INCOMPLETE"
+              and incomplete["controls_requested"]["timeout_canaries"] == 1
+              and incomplete["controls_executed"]["timeout_canaries"] == 0,
+              json.dumps(incomplete))
+        check("VP3: results bind the effective hash and configured/observed versions",
+              incomplete["effective_config_sha256"]
+              == config_module.effective_config_sha256(candidate.raw)
+              and incomplete["configured_versions"]["codex"]
+              == ["codex-cli 0.147.0"]
+              and incomplete["observed_versions"]["codex"]
+              == ["codex-cli 0.147.0"], json.dumps(incomplete))
+
+        no_out = subprocess.run([
+            sys.executable, os.path.join(REPO, "canaries", "run_canaries.py"),
+            "--config", candidate_path, "--skip-timeout-canary",
+        ], capture_output=True, cwd=REPO, env=env, timeout=30)
+        check("VP3: the canary runner requires a result path",
+              no_out.returncode == 2 and b"--out" in no_out.stderr,
+              no_out.stderr.decode("utf-8", "replace"))
+        temporary_out = os.path.join(
+            tempfile.gettempdir(),
+            f"agent-bridge-disallowed-{os.path.basename(root)}.json")
+        temp_result = subprocess.run([
+            sys.executable, os.path.join(REPO, "canaries", "run_canaries.py"),
+            "--config", candidate_path, "--skip-timeout-canary",
+            "--out", temporary_out,
+        ], capture_output=True, cwd=REPO, env=env, timeout=30)
+        check("VP3: the canary runner refuses a temporary result path",
+              temp_result.returncode == 2 and not os.path.exists(temporary_out),
+              temp_result.stderr.decode("utf-8", "replace"))
+
+        rows = []
+        for caller, peer, version in (
+            ("codex", "claude", "2.1.229 (Claude Code)"),
+            ("claude", "codex", "codex-cli 0.147.0"),
+        ):
+            for kind in ("one-turn 1", "schema-pressure"):
+                rows.append({
+                    "direction": f"{caller}->{peer}", "kind": kind,
+                    "contract_valid": True, "first_attempt_ok": True,
+                    "latency_seconds": 0.1,
+                    "peer_observed_version": version,
+                })
+        args = argparse.Namespace(
+            direction="both", one_turn=1, three_turn=0, job_timeout=30.0,
+            skip_timeout_canary=False)
+        timeouts = [
+            {"direction": "codex->claude", "status": "timed_out", "orphans": 0},
+            {"direction": "claude->codex", "status": "timed_out", "orphans": 0},
+        ]
+        passing = run_canaries.result_record(
+            candidate, args, ["codex", "claude"], rows, timeouts, {}, 2, 0)
+        check("VP3: complete requested/executed controls produce PASS",
+              passing["verdict"] == "PASS"
+              and passing["controls_requested"] == passing["controls_executed"],
+              json.dumps(passing))
+
+        results_path = os.path.join(root, "canary-results.json")
+        destination = os.path.join(root, "promoted-local.json")
+        store.atomic_write_json(destination, {"sentinel": "unchanged"})
+        refused_before = open(destination, "rb").read()
+        direct = setup_cmd.main(["--write"])
+        direct_after = (open(local_path, "rb").read()
+                        if os.path.isfile(local_path) else None)
+        check("VP4: legacy direct activation is refused without PASS evidence",
+              direct == 2 and os.path.isfile(local_path) == local_existed
+              and direct_after == local_before)
+        store.atomic_write_json(results_path, incomplete)
+        try:
+            setup_cmd.promote_candidate(candidate_path, results_path, destination)
+            refused = False
+        except ValueError:
+            refused = True
+        check("VP4: promotion refuses an INCOMPLETE result without changing overlay",
+              refused and open(destination, "rb").read() == refused_before)
+
+        wrong_version = dict(passing)
+        wrong_version["observed_versions"] = dict(passing["observed_versions"])
+        wrong_version["observed_versions"]["claude"] = ["unmeasured version"]
+        store.atomic_write_json(results_path, wrong_version)
+        try:
+            setup_cmd.promote_candidate(candidate_path, results_path, destination)
+            refused = False
+        except ValueError:
+            refused = True
+        check("VP4: promotion refuses PASS evidence bound to another version",
+              refused and open(destination, "rb").read() == refused_before)
+
+        store.atomic_write_json(results_path, passing)
+        promoted = setup_cmd.promote_candidate(
+            candidate_path, results_path, destination)
+        base_config = store.read_json(config_module.DEFAULT_CONFIG_PATH)
+        check("VP4: version-bound PASS promotes only a reproducing overlay",
+              store.read_json(destination) == promoted
+              and config_module.merge(base_config, promoted) == candidate.raw)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        peer_fixture.cleanup()
 
 
 def _parse_under(path: str, version: tuple) -> list:
@@ -3646,6 +3851,7 @@ def test_platform_guard() -> None:
 def main() -> int:
     test_contract_accepted_by_both_peers()
     test_timeout_canary_effective_config_and_verdict()
+    test_candidate_verification_path()
     test_tool_exposure()
     test_happy_path_both_directions()
     test_continuation_uses_exact_session_id()

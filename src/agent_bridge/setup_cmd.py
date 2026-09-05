@@ -4,8 +4,8 @@ Written for someone who has not read the rest of this repository. It answers the
 three questions that actually stop a first run: where are the two CLIs, are they
 signed in, and what versions am I pinning.
 
-It writes config/local.json, which is gitignored, so nobody has to edit a
-tracked file to run this on their own machine.
+It stages a complete effective candidate without activating it, then promotes
+only the machine-local overlay after version-bound canary evidence passes.
 """
 
 from __future__ import annotations
@@ -136,19 +136,142 @@ def codex_signed_in(path: str, codex_home: str) -> bool | None:
     return True if proc.returncode == 0 else None
 
 
+def write_candidate(path: str, proposed_overlay: dict[str, Any],
+                    active: config.Config | None = None) -> config.Config:
+    """Write one complete candidate without changing the active overlay."""
+    target = os.path.realpath(os.path.abspath(path))
+    protected = {
+        os.path.realpath(config.DEFAULT_CONFIG_PATH),
+        os.path.realpath(config.local_config_path()),
+    }
+    if target in protected:
+        raise ValueError("candidate path must not be an active config path")
+    current = active or config.load()
+    raw = config.merge(current.raw, proposed_overlay)
+    candidate = config.Config(raw, path)
+    store.atomic_write_json(path, candidate.raw)
+    return candidate
+
+
+def _overlay_from_effective(base: dict[str, Any],
+                            effective: dict[str, Any]) -> dict[str, Any]:
+    """Return the deep-merge overlay that reproduces an effective config."""
+    missing = [key for key in base if key not in effective]
+    if missing:
+        raise ValueError(
+            "candidate cannot remove committed config keys: " + ", ".join(missing))
+    overlay: dict[str, Any] = {}
+    for key, value in effective.items():
+        if key not in base:
+            overlay[key] = value
+        elif isinstance(value, dict) and isinstance(base[key], dict):
+            child = _overlay_from_effective(base[key], value)
+            if child:
+                overlay[key] = child
+        elif value != base[key]:
+            overlay[key] = value
+    return overlay
+
+
+def _configured_versions(cfg: config.Config) -> dict[str, list[str]]:
+    return {peer: list(cfg.peer(peer).get("allowed_versions") or [])
+            for peer in config.PEERS}
+
+
+def validate_promotion(candidate: config.Config, results: dict[str, Any]) -> None:
+    """Refuse evidence that is not a complete, version-bound PASS."""
+    if results.get("verdict") != "PASS":
+        raise ValueError("canary results verdict is not PASS")
+    expected_hash = config.effective_config_sha256(candidate.raw)
+    if results.get("effective_config_sha256") != expected_hash:
+        raise ValueError("canary results do not match the candidate config hash")
+
+    configured = _configured_versions(candidate)
+    if results.get("configured_versions") != configured:
+        raise ValueError("canary results configured versions do not match the candidate")
+    observed = results.get("observed_versions")
+    if not isinstance(observed, dict):
+        raise ValueError("canary results have no observed versions")
+    for peer, allowed in configured.items():
+        values = observed.get(peer)
+        if len(allowed) != 1 or not isinstance(allowed[0], str):
+            raise ValueError(f"candidate must pin exactly one {peer} version")
+        if (not isinstance(values, list)
+                or not all(isinstance(value, str) for value in values)
+                or sorted(set(values)) != allowed):
+            raise ValueError(f"canary results are not bound to the {peer} version")
+
+    requested = results.get("controls_requested")
+    executed = results.get("controls_executed")
+    if not isinstance(requested, dict) or not isinstance(executed, dict):
+        raise ValueError("canary results have no requested/executed control counts")
+    if results.get("skipped_controls"):
+        raise ValueError("canary results contain skipped controls")
+    if requested.get("timeout_canaries", 0) < 1:
+        raise ValueError("canary results did not request the timeout control")
+    for name, count in requested.items():
+        if not isinstance(count, int) or executed.get(name) != count:
+            raise ValueError(f"canary control {name!r} was not fully executed")
+
+
+def promote_candidate(candidate_path: str, results_path: str,
+                      destination: str | None = None) -> dict[str, Any]:
+    """Atomically activate only the overlay from a version-bound candidate."""
+    if not is_durable(results_path):
+        raise ValueError("canary results must be stored outside temporary directories")
+    candidate = config.load_effective(candidate_path)
+    results = store.read_json(results_path)
+    if not isinstance(results, dict):
+        raise ValueError("canary results must be an object")
+    validate_promotion(candidate, results)
+
+    base = store.read_json(config.DEFAULT_CONFIG_PATH)
+    overlay = _overlay_from_effective(base, candidate.raw)
+    if config.merge(base, overlay) != candidate.raw:
+        raise ValueError("candidate cannot be represented by a local overlay")
+    store.atomic_write_json(destination or config.local_config_path(), overlay)
+    return overlay
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-bridge-setup",
         description="Find the Claude and Codex CLIs, check them, and pin them.")
-    parser.add_argument("--write", action="store_true",
-                        help="Write config/local.json. Without this, only report.")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--write", action="store_true",
+                         help="Deprecated direct activation mode (always refused).")
+    actions.add_argument("--candidate", metavar="PATH",
+                         help="Write a complete candidate config without activating it.")
+    actions.add_argument("--promote", metavar="PATH",
+                         help="Promote this candidate after a version-bound PASS.")
+    parser.add_argument("--results",
+                        help="Durable canary results required with --promote.")
     parser.add_argument("--claude", help="Force a specific claude binary.")
     parser.add_argument("--codex", help="Force a specific codex binary.")
     args = parser.parse_args(argv)
     store.set_umask()
 
-    defaults = store.read_json(config.DEFAULT_CONFIG_PATH)
-    codex_home = os.path.expanduser(defaults["peers"]["codex"]["codex_home"])
+    if args.write:
+        print("Direct --write activation is disabled. Emit a --candidate, run "
+              "the full canaries, then use --promote with --results.")
+        return 2
+    if args.promote:
+        if not args.results:
+            print("--promote requires --results from the full canary run.")
+            return 2
+        try:
+            promote_candidate(args.promote, args.results)
+        except (OSError, ValueError) as exc:
+            print(f"Promotion refused: {exc}")
+            return 1
+        print(f"Promoted the candidate overlay to {config.local_config_path()}")
+        return 0
+    if args.results:
+        print("--results is only valid with --promote.")
+        return 2
+
+    active = config.load()
+    codex_home = os.path.expanduser(active.raw["peers"]["codex"]["codex_home"])
     # Codex refuses to start when CODEX_HOME names a directory that does not
     # exist, and it will not create one. Until this ran here, the only thing
     # that created it was the first consultation, which needs a signed-in home,
@@ -166,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     # written to it. On WSL this is the /mnt/c mistake.
     from .errors import BrokerError, hint as error_hint
     try:
-        perms = preflight.assert_state_root_secure(config.Config(defaults, "setup"))
+        perms = preflight.assert_state_root_secure(active)
         print(f"\nstate root: {perms['state_root']}  "
               f"(dir {perms['directory_mode']}, files {perms['file_mode']})")
     except BrokerError as exc:
@@ -240,13 +363,20 @@ def main(argv: list[str] | None = None) -> int:
         print("\n  claude:  <path> auth login")
         print(f"  codex:   CODEX_HOME={codex_home} <path> login")
 
-    if args.write:
-        store.atomic_write_json(config.local_config_path(), overlay)
-        print(f"\nWrote {config.local_config_path()}")
-        print("This file is gitignored. Re-run setup after a CLI update, "
-              "because the pinned version will no longer match.")
+    if args.candidate and not problems:
+        try:
+            candidate = write_candidate(args.candidate, overlay, active)
+        except (OSError, ValueError) as exc:
+            print(f"\nCandidate refused: {exc}")
+            return 1
+        print(f"\nWrote complete candidate config to {args.candidate}")
+        print(f"Effective config sha256: "
+              f"{config.effective_config_sha256(candidate.raw)}")
+        print("The active config/local.json was not changed.")
+    elif args.candidate:
+        print(f"\nCandidate not written because setup found {len(problems)} problem(s).")
     else:
-        print("\nNothing written. Re-run with --write to save it.")
+        print("\nNothing written. Re-run with --candidate PATH to stage it.")
     return 1 if problems else 0
 
 

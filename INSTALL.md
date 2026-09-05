@@ -124,17 +124,17 @@ and for Codex, signing in to the **isolated** home this tool uses:
 CODEX_HOME=~/.agent-bridge/codex-home <the path it printed> login
 ```
 
-Then, when both are signed in:
+Then, when both are signed in, stage a complete effective configuration:
 
 ```
-./bin/agent-bridge-setup --write
+./bin/agent-bridge-setup --candidate ~/.agent-bridge/candidates/effective.json
 ```
 
-That writes `config/local.json`, which stays on your machine and is never
-committed. Re-run this after either CLI updates, because the pinned version will
-no longer match and jobs will refuse to run. That refusal is deliberate: these
-tools change behaviour between versions, and this one is built against measured
-behaviour rather than guesses.
+This does not change the active `config/local.json`. The candidate is one
+complete, validated effective config: committed defaults plus the current local
+overlay and the proposed executable/version pins. Re-run this after either CLI
+updates, because the active pin will refuse the new version until its candidate
+has passed verification.
 
 ## 3. Check it works without spending anything
 
@@ -155,7 +155,10 @@ anything there as a failure.
 ## 4. Check it works for real
 
 ```
-./canaries/run_canaries.py --direction both --out /tmp/canary.json
+./canaries/run_canaries.py \
+  --config ~/.agent-bridge/candidates/effective.json \
+  --direction both \
+  --out ~/.agent-bridge/canary-results/latest.json
 ```
 
 This makes real calls to both models and costs real money: roughly 40
@@ -166,6 +169,24 @@ into a wall.
 Read the four numbers it prints: how many replies were valid, how many worked
 first time, how long they took, and whether every follow-up landed on the
 intended conversation. One success proves nothing, which is why it runs forty.
+
+The result file records the effective-config hash, configured and observed
+versions, requested and executed controls, and the final verdict. It must be on
+durable storage, not under a temporary directory. Skipping the timeout canary
+records `INCOMPLETE`, never `PASS`.
+
+Only promote the candidate after reviewing a `PASS` result:
+
+```
+./bin/agent-bridge-setup \
+  --promote ~/.agent-bridge/candidates/effective.json \
+  --results ~/.agent-bridge/canary-results/latest.json
+```
+
+Promotion rechecks the candidate hash, both configured/observed version
+bindings, and the control counts. It then atomically writes only the derived
+overlay fragment to `config/local.json`; a missing, incomplete, failed, or
+version-mismatched result is refused.
 
 ## 4b. Decide what each side is allowed to receive
 

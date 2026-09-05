@@ -7,6 +7,7 @@ hard-codes them.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -26,6 +27,8 @@ CONFIG_ENV = "AGENT_BRIDGE_CONFIG"
 #: file to run this on their own machine.
 LOCAL_CONFIG_NAME = "local.json"
 
+REQUIRED_KEYS = ("state_root", "schema_path", "limits", "retention", "peers")
+
 
 class Config:
     def __init__(self, raw: dict[str, Any], path: str):
@@ -35,7 +38,7 @@ class Config:
         version = raw.get("config_version")
         if version not in SUPPORTED_CONFIG_VERSIONS:
             raise ValueError(f"unsupported config_version {version!r}")
-        for key in ("state_root", "schema_path", "limits", "retention", "peers"):
+        for key in REQUIRED_KEYS:
             if key not in raw:
                 raise ValueError(f"config missing required key {key!r}")
         for peer in PEERS:
@@ -193,23 +196,67 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Return defaults with an overlay applied, without mutating either input."""
+    return _deep_merge(base, overlay)
+
+
+def effective_config_sha256(raw: dict[str, Any]) -> str:
+    """Hash the canonical file representation used for effective configs."""
+    payload = json.dumps(raw, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return store.sha256_bytes(payload.encode("utf-8"))
+
+
+def _is_complete(raw: Any) -> bool:
+    # Overlay fragments deliberately carry no config_version. Once a document
+    # declares one, treat it as a full config and let Config reject omissions;
+    # silently filling a damaged snapshot or candidate from defaults would
+    # change the artifact that was meant to be measured.
+    return isinstance(raw, dict) and raw.get("config_version") is not None
+
+
+def load_effective(path: str) -> Config:
+    """Load a complete effective-config artifact without applying an overlay."""
+    raw = store.read_json(path)
+    if not _is_complete(raw):
+        raise ValueError(f"effective config {path!r} is not complete")
+    return Config(raw, path)
+
+
+def build_effective(overlay_path: str | None = None,
+                    base_path: str | None = None) -> Config:
+    """Build and validate defaults plus one selected machine-local overlay."""
+    base = base_path or DEFAULT_CONFIG_PATH
+    raw = store.read_json(base)
+    if overlay_path:
+        overlay = store.read_json(overlay_path)
+        if not isinstance(overlay, dict):
+            raise ValueError(f"config overlay {overlay_path!r} must be an object")
+        raw = _deep_merge(raw, overlay)
+    return Config(raw, overlay_path or base)
+
+
 def local_config_path() -> str:
     return os.path.join(REPO_ROOT, "config", LOCAL_CONFIG_NAME)
 
 
 def load(path: str | None = None) -> Config:
-    """Load the committed defaults, then layer machine-local overrides.
+    """Load one complete config, or build defaults plus a selected overlay.
 
-    An explicit path or AGENT_BRIDGE_CONFIG is used verbatim and is NOT layered,
-    so the test suite and the canary runner stay fully deterministic.
+    Complete explicit configs, including setup candidate artifacts and job
+    snapshots, are consumed verbatim. An explicit fragment such as local.json
+    is treated as the selected overlay, matching the normal runtime build.
     """
     explicit = path or os.environ.get(CONFIG_ENV)
     if explicit:
-        return Config(store.read_json(explicit), explicit)
-    raw = store.read_json(DEFAULT_CONFIG_PATH)
+        raw = store.read_json(explicit)
+        if _is_complete(raw):
+            return Config(raw, explicit)
+        return build_effective(explicit)
     local = local_config_path()
     if os.path.isfile(local):
         overlay = store.read_json_or_none(local)
         if isinstance(overlay, dict):
-            raw = _deep_merge(raw, overlay)
-    return Config(raw, DEFAULT_CONFIG_PATH)
+            return Config(_deep_merge(store.read_json(DEFAULT_CONFIG_PATH), overlay),
+                          DEFAULT_CONFIG_PATH)
+    return build_effective()

@@ -248,13 +248,11 @@ def _prepare_job(
     # Snapshot the MERGED config the request was admitted under, and point the
     # worker at that file rather than at the path this process was loaded from.
     #
-    # config.load() layers config/local.json only when given no explicit path,
-    # for test determinism. The broker handed the worker its own cfg.path, which
-    # in the normal install IS the default path, so the worker re-loaded the
-    # committed defaults and silently lost the overlay: no pinned executable, so
-    # it PATH-discovered one, and an empty allowed_versions, so the per-job
-    # version check verified nothing. The binary executed could differ from the
-    # binary admission validated.
+    # An earlier config.load() layered config/local.json only when given no
+    # explicit path. The broker handed the worker its own cfg.path, which in the
+    # normal install was the default path, so the worker silently lost the
+    # overlay. Keep the snapshot even though explicit fragments now layer: a
+    # worker must use the exact config admitted, not mutable source files.
     #
     # The snapshot also makes the config auditable: a job records exactly what
     # it ran under, not a path whose contents may since have changed.
