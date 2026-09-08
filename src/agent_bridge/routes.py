@@ -44,12 +44,77 @@ def rank(classification: str) -> int:
         raise KeyError(f"unknown classification {classification!r}") from exc
 
 
-#: No destination may receive client-derived material until counsel answers the
-#: IRC 7216 questions in the work-product lane plan. Flipping a peer's ceiling
-#: to "client-derived" is not enough on its own; this gate must be lifted too,
-#: deliberately, in a reviewed change. Two locks on the same door, because the
-#: cost of being wrong here is a federal criminal exposure rather than a bug.
+#: No destination may receive client-derived material yet. Flipping a peer's
+#: ceiling is not enough on its own; this gate must be lifted too, in a
+#: reviewed change. Two locks on the same door, because IRC 7216 makes a
+#: knowing or reckless unauthorized disclosure a crime, not a bug.
 CLIENT_DERIVED_GATE = False
+
+# ---------------------------------------------------------------- IRC 7216
+# Framing by Scott Edwards, CPA, 2026-09-08, assuming the inputs are tax
+# return information obtained in a return-preparation engagement. Recorded
+# here because it decides the ceilings above, and because an earlier draft of
+# this file asked counsel the wrong question.
+#
+# CLOUD destinations. Treat transmission to a third-party LLM API as a
+# DISCLOSURE. Reg. 301.7216-1 defines disclosure broadly as making tax return
+# information known to any person in any manner, and tax return information
+# includes both client-furnished information and preparer-derived
+# computations, worksheets and workpapers. So the correct default is not
+# "cloud is capped because no disclosure occurs"; it is "cloud may receive
+# only non-client-derived material unless a specific exception applies or the
+# taxpayer has given a Reg. 301.7216-3 consent."
+#
+# A third-party technology provider is not automatically prohibited. Non-
+# substantive processing, software and equipment services can be permissible,
+# subject to the regulatory conditions: limit the disclosure to what is
+# necessary, and give written notice of the 7216 and 6713 obligations where
+# required. But if the provider makes substantive determinations or gives tax
+# advice affecting liability, taxpayer consent is required first.
+#
+# LOCAL destinations. Inference on the firm's own hardware, with no network
+# call and no access by anyone outside the same U.S. tax return preparer, is
+# much more plausibly an internal USE than a disclosure to a third party.
+# Reg. 301.7216-2 permits an officer, employee or member of the same U.S.
+# preparer to use or disclose return information internally to assist in
+# preparing the return or providing auxiliary services. That is why a local
+# ceiling can sit ABOVE a cloud ceiling. It is not automatic: it holds only
+# while every condition in LOCAL_INTERNAL_USE_CONDITIONS below is true.
+#
+# The questions worth putting to counsel are therefore NOT "is the API a
+# disclosure", which the regulation makes a hard position to hold. They are:
+#   1. Does any specific exception apply to the contemplated API use, and if
+#      not, must the cloud ceiling stay below client-derived absent a
+#      301.7216-3 consent?
+#   2. Does this architecture genuinely keep the activity inside the same
+#      U.S. preparer and within permitted return-preparation or auxiliary
+#      uses?
+
+#: Every one of these must hold before a local ceiling may exceed a cloud
+#: ceiling. They are stated as claims about the deployment, not the code,
+#: because that is what they are: no test in this repo can prove them. They
+#: are written down so that raising a ceiling forces someone to re-read them.
+LOCAL_INTERNAL_USE_CONDITIONS = (
+    "access to the model and its inputs stays within the same U.S. tax return "
+    "preparer",
+    "logging and stored artifacts stay within the same U.S. preparer",
+    "model operation stays within the same U.S. preparer (no hosted inference, "
+    "no telemetry carrying return information)",
+    "administration of the machine stays within the same U.S. preparer",
+    "the use is return preparation, an auxiliary service, or another use "
+    "permitted under IRC 7216 and Reg. 301.7216-1 through -3",
+)
+
+#: The regulatory line that decides whether taxpayer consent is needed:
+#: non-substantive processing may be permissible without it, while substantive
+#: determinations or tax advice affecting liability require consent first.
+#:
+#: The five tasks the local peer is certified for are all non-substantive
+#: processing. That was chosen for a capability reason, because the model can
+#: silently omit content, and it happens to land on the same side of the
+#: regulatory line. The two arguments are independent and agree, which is why
+#: the envelope is worth keeping even if one of them later changes.
+SUBSTANTIVE_WORK_REQUIRES_CONSENT = True
 
 
 @dataclass(frozen=True)
@@ -102,9 +167,11 @@ PEERS: dict[str, Peer] = {
     "local": Peer(
         name="local",
         locality="local",
-        # Same ceiling as the cloud peers TODAY. Locality is what would justify
-        # raising it, and counsel has not answered that yet. Recorded here so
-        # the reason is visible at the point of change.
+        # Same ceiling as the cloud peers TODAY. The 7216 basis for raising it
+        # above them is real (internal use by the same preparer, Reg.
+        # 301.7216-2) but conditional: see LOCAL_INTERNAL_USE_CONDITIONS. No
+        # test here can prove those conditions, so the ceiling stays put until
+        # someone asserts them deliberately.
         max_classification="internal",
         tasks=("summarize", "triage", "classify", "extract", "redact"),
         requires_certificate=True,
@@ -173,8 +240,11 @@ def authorize(caller: str, destination: str, classification: str,
         raise RouteDenied(f"unknown classification {classification!r}")
     if classification == "client-derived" and not CLIENT_DERIVED_GATE:
         raise RouteDenied(
-            "client-derived material is refused to every destination until the "
-            "IRC 7216 determination is answered; see WORK-PRODUCT-LANE-PLAN.md")
+            "client-derived material is refused to every destination. For a "
+            "cloud peer this is a disclosure under Reg. 301.7216-1 and needs a "
+            "specific exception or a 301.7216-3 consent; for a local peer it "
+            "needs every condition in LOCAL_INTERNAL_USE_CONDITIONS to hold. "
+            "Neither is established.")
     if rank(classification) > rank(dest.max_classification):
         raise RouteDenied(
             f"{destination} may receive at most {dest.max_classification!r}, "

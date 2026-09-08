@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Print the data-flow matrix, generated from the route registry.
 
-The document counsel reviews and the code that enforces it are the same
-thing. A hand-maintained matrix beside the registry would drift, and the
-drift would be invisible until someone relied on it.
+The document counsel reviews and the code that enforces it are the same thing.
+A hand-maintained matrix beside the registry would drift, and the drift would
+be invisible until someone relied on it.
 
     bin/agent-bridge-flow-matrix            markdown, for review
     bin/agent-bridge-flow-matrix --json     machine-readable
@@ -12,12 +12,88 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from agent_bridge import routes  # noqa: E402
 
 
+COUNSEL = """## What counsel is being asked
+
+Framing by Scott Edwards, CPA, 2026-09-08, assuming the inputs are tax return
+information obtained in a return-preparation engagement.
+
+**Cloud destinations: treat this as a disclosure.** Reg. 301.7216-1 defines
+disclosure broadly as making tax return information known to any person in any
+manner, and tax return information includes both client-furnished information
+and preparer-derived computations, worksheets and workpapers. So the default is
+not "cloud is capped because no disclosure occurs". It is **cloud may receive
+only non-client-derived material unless a specific exception applies or the
+taxpayer has given a Reg. 301.7216-3 consent.**
+
+A third-party technology provider is not automatically prohibited.
+Non-substantive processing, software and equipment services can be permissible
+subject to the regulatory conditions, including limiting the disclosure to what
+is necessary and giving written notice of the 7216 and 6713 obligations where
+required. But a provider making substantive determinations or giving tax advice
+affecting liability requires taxpayer consent first.
+
+**Local destinations: more plausibly internal use than disclosure.** Inference
+on the firm's own hardware, with no network call and no access by anyone
+outside the same U.S. tax return preparer, fits Reg. 301.7216-2, which permits
+an officer, employee or member of the same U.S. preparer to use or disclose
+return information internally to assist in preparing the return or providing
+auxiliary services. **That is why a local ceiling can sit above a cloud
+ceiling.** It is conditional, not automatic.
+
+### The two questions
+
+Deliberately not phrased as "is the API a disclosure", which the regulation
+makes a hard position to hold.
+
+1. Does any specific exception apply to the contemplated API use? If not, must
+   the cloud ceiling stay below client-derived absent a Reg. 301.7216-3
+   consent?
+2. Does this architecture genuinely keep the activity inside the same U.S.
+   preparer, and within permitted return-preparation or auxiliary uses?
+
+A third question if de-identification is ever contemplated: does removing names
+remove identifiability when figures, dates and jurisdictions remain? Inside a
+two-office practice, a deliverable carrying exact revenue and a Ketchikan
+borough filing may still identify its client.
+
+### Conditions the local answer depends on
+
+Every one must hold before a local ceiling may exceed a cloud ceiling. No test
+in this repository can prove any of them. They are claims about the deployment,
+written down so that raising a ceiling forces someone to re-read them.
+"""
+
+ENFORCED = """## What is enforced regardless of the answers
+
+- Consultation only. No peer can edit files, run commands, or start a
+  consultation of its own.
+- Replies are schema-validated. Raw peer text is quarantined and never reaches
+  a caller.
+- Every exchange is ledgered.
+- The local peer is restricted to certified tasks and cannot be asked an open
+  question, because it can omit content while returning well-formed output.
+
+### Why the task envelope has two independent justifications
+
+The five certified local tasks (summarize, triage, classify, extract, redact)
+are all non-substantive processing. They were chosen for a capability reason:
+the firm measured a local model returning 59 or 60 lines from a 61-line input
+on every run, while looking perfect on an 11-line fixture, so a reply can be
+well-formed and quietly incomplete.
+
+They also land on the permissive side of the regulatory line, which separates
+non-substantive processing from substantive determinations and tax advice
+affecting liability. The two arguments are independent and agree. The envelope
+is worth keeping even if one of them later changes.
+"""
+
+
 def markdown() -> str:
-    rows = routes.flow_matrix()
     gate = "OPEN" if routes.CLIENT_DERIVED_GATE else "SHUT"
     out = [
         "# Data-flow matrix: agent-bridge",
@@ -35,63 +111,43 @@ def markdown() -> str:
         "",
     ]
     for name, p in routes.PEERS.items():
-        out += [f"**{name}** ({p.locality}) — ceiling `{p.max_classification}`"
-                + (f", tasks: {', '.join(p.tasks)}" if p.tasks else ", general consultation")
-                + (", route certificate required" if p.requires_certificate else ""),
-                "", f"> {p.disclosure}", ""]
+        line = f"**{name}** ({p.locality}). Ceiling `{p.max_classification}`"
+        line += (f", tasks: {', '.join(p.tasks)}" if p.tasks
+                 else ", general consultation")
+        if p.requires_certificate:
+            line += ", route certificate required"
+        out += [line, "", f"> {p.disclosure}", ""]
+
     out += [
         "## Permitted flows",
         "",
         "| From | To | Leaves this machine | May receive | For | Certificate |",
         "|---|---|---|---|---|---|",
     ]
-    for r in rows:
+    for r in routes.flow_matrix():
         out.append(
             f"| {r['source']} | {r['destination']} "
             f"| {'**yes**' if r['leaves_hardware'] else 'no'} "
             f"| {', '.join(r['classifications_permitted'])} "
             f"| {', '.join(r['tasks'])} "
             f"| {'required' if r['certificate_required'] else 'n/a'} |")
-    out += [
-        "",
-        "Any pair absent from this table is denied. Absence is the default.",
-        "",
-        "## What counsel is being asked",
-        "",
-        "Nothing in the table above sends client-derived material anywhere; the",
-        "gate is shut and every ceiling sits at `internal`. Two questions decide",
-        "whether that can change, and neither is answered:",
-        "",
-        "1. Is transmission to a third-party LLM API a disclosure of tax return",
-        "   information under IRC 7216, and if so does any exception apply? A",
-        "   negative answer permanently fixes the two cloud rows at `internal`.",
-        "2. Does execution on the firm's own hardware, with no network call,",
-        "   fall outside 7216's disclosure concept entirely? If yes, the `local`",
-        "   rows could carry client-derived material that the cloud rows never",
-        "   can, which is the whole privacy argument for running locally.",
-        "",
-        "A third question if de-identification is contemplated: does removing",
-        "names remove identifiability when figures, dates and jurisdictions",
-        "remain? Inside a two-office practice, a deliverable carrying exact",
-        "revenue and a Ketchikan borough filing may still identify its client.",
-        "",
-        "## What is enforced regardless of the answers",
-        "",
-        "- Consultation only. No peer can edit files, run commands, or start a",
-        "  consultation of its own.",
-        "- Replies are schema-validated; raw peer text is quarantined and never",
-        "  reaches a caller.",
-        "- Every exchange is ledgered.",
-        "- The local peer is restricted to certified tasks and cannot be asked an",
-        "  open question, because it can omit content while returning well-formed",
-        "  output.",
-    ]
+    out += ["", "Any pair absent from this table is denied. Absence is the default.", ""]
+
+    out += COUNSEL.strip().split("\n")
+    out += [""]
+    out += [f"- {c}" for c in routes.LOCAL_INTERNAL_USE_CONDITIONS]
+    out += [""]
+    out += ENFORCED.strip().split("\n")
     return "\n".join(out) + "\n"
 
 
 if __name__ == "__main__":
     if "--json" in sys.argv:
-        print(json.dumps({"client_derived_gate": routes.CLIENT_DERIVED_GATE,
-                          "flows": routes.flow_matrix()}, indent=2))
+        print(json.dumps({
+            "client_derived_gate": routes.CLIENT_DERIVED_GATE,
+            "local_internal_use_conditions": list(routes.LOCAL_INTERNAL_USE_CONDITIONS),
+            "substantive_work_requires_consent": routes.SUBSTANTIVE_WORK_REQUIRES_CONSENT,
+            "flows": routes.flow_matrix(),
+        }, indent=2))
     else:
         sys.stdout.write(markdown())

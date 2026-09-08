@@ -11,15 +11,15 @@ peer's ceiling, in a reviewed change.
 
 ## What each destination is
 
-**claude** (cloud) — ceiling `internal`, general consultation
+**claude** (cloud). Ceiling `internal`, general consultation
 
 > Runs with customizations, MCP servers and built-in tools disabled, in an empty working directory, under a hard spend ceiling. Sent only your question. Third-party API: never send client-derived material.
 
-**codex** (cloud) — ceiling `internal`, general consultation
+**codex** (cloud). Ceiling `internal`, general consultation
 
 > Runs with no user config and no rules files, in an empty working directory, sandboxed against writes. The sandbox restricts writes, not reads, so treat the prompt itself as the confidentiality boundary. Third-party API: never send client-derived material.
 
-**local** (local) — ceiling `internal`, tasks: summarize, triage, classify, extract, redact, route certificate required
+**local** (local). Ceiling `internal`, tasks: summarize, triage, classify, extract, redact, route certificate required
 
 > Runs on this machine via Ollama and makes no network call, so nothing leaves the hardware. It is a small model restricted to five certified tasks. It can silently omit content while returning well-formed output: treat every reply as a draft to be checked, never as a complete account of the input.
 
@@ -36,30 +36,79 @@ Any pair absent from this table is denied. Absence is the default.
 
 ## What counsel is being asked
 
-Nothing in the table above sends client-derived material anywhere; the
-gate is shut and every ceiling sits at `internal`. Two questions decide
-whether that can change, and neither is answered:
+Framing by Scott Edwards, CPA, 2026-09-08, assuming the inputs are tax return
+information obtained in a return-preparation engagement.
 
-1. Is transmission to a third-party LLM API a disclosure of tax return
-   information under IRC 7216, and if so does any exception apply? A
-   negative answer permanently fixes the two cloud rows at `internal`.
-2. Does execution on the firm's own hardware, with no network call,
-   fall outside 7216's disclosure concept entirely? If yes, the `local`
-   rows could carry client-derived material that the cloud rows never
-   can, which is the whole privacy argument for running locally.
+**Cloud destinations: treat this as a disclosure.** Reg. 301.7216-1 defines
+disclosure broadly as making tax return information known to any person in any
+manner, and tax return information includes both client-furnished information
+and preparer-derived computations, worksheets and workpapers. So the default is
+not "cloud is capped because no disclosure occurs". It is **cloud may receive
+only non-client-derived material unless a specific exception applies or the
+taxpayer has given a Reg. 301.7216-3 consent.**
 
-A third question if de-identification is contemplated: does removing
-names remove identifiability when figures, dates and jurisdictions
-remain? Inside a two-office practice, a deliverable carrying exact
-revenue and a Ketchikan borough filing may still identify its client.
+A third-party technology provider is not automatically prohibited.
+Non-substantive processing, software and equipment services can be permissible
+subject to the regulatory conditions, including limiting the disclosure to what
+is necessary and giving written notice of the 7216 and 6713 obligations where
+required. But a provider making substantive determinations or giving tax advice
+affecting liability requires taxpayer consent first.
+
+**Local destinations: more plausibly internal use than disclosure.** Inference
+on the firm's own hardware, with no network call and no access by anyone
+outside the same U.S. tax return preparer, fits Reg. 301.7216-2, which permits
+an officer, employee or member of the same U.S. preparer to use or disclose
+return information internally to assist in preparing the return or providing
+auxiliary services. **That is why a local ceiling can sit above a cloud
+ceiling.** It is conditional, not automatic.
+
+### The two questions
+
+Deliberately not phrased as "is the API a disclosure", which the regulation
+makes a hard position to hold.
+
+1. Does any specific exception apply to the contemplated API use? If not, must
+   the cloud ceiling stay below client-derived absent a Reg. 301.7216-3
+   consent?
+2. Does this architecture genuinely keep the activity inside the same U.S.
+   preparer, and within permitted return-preparation or auxiliary uses?
+
+A third question if de-identification is ever contemplated: does removing names
+remove identifiability when figures, dates and jurisdictions remain? Inside a
+two-office practice, a deliverable carrying exact revenue and a Ketchikan
+borough filing may still identify its client.
+
+### Conditions the local answer depends on
+
+Every one must hold before a local ceiling may exceed a cloud ceiling. No test
+in this repository can prove any of them. They are claims about the deployment,
+written down so that raising a ceiling forces someone to re-read them.
+
+- access to the model and its inputs stays within the same U.S. tax return preparer
+- logging and stored artifacts stay within the same U.S. preparer
+- model operation stays within the same U.S. preparer (no hosted inference, no telemetry carrying return information)
+- administration of the machine stays within the same U.S. preparer
+- the use is return preparation, an auxiliary service, or another use permitted under IRC 7216 and Reg. 301.7216-1 through -3
 
 ## What is enforced regardless of the answers
 
 - Consultation only. No peer can edit files, run commands, or start a
   consultation of its own.
-- Replies are schema-validated; raw peer text is quarantined and never
-  reaches a caller.
+- Replies are schema-validated. Raw peer text is quarantined and never reaches
+  a caller.
 - Every exchange is ledgered.
-- The local peer is restricted to certified tasks and cannot be asked an
-  open question, because it can omit content while returning well-formed
-  output.
+- The local peer is restricted to certified tasks and cannot be asked an open
+  question, because it can omit content while returning well-formed output.
+
+### Why the task envelope has two independent justifications
+
+The five certified local tasks (summarize, triage, classify, extract, redact)
+are all non-substantive processing. They were chosen for a capability reason:
+the firm measured a local model returning 59 or 60 lines from a 61-line input
+on every run, while looking perfect on an 11-line fixture, so a reply can be
+well-formed and quietly incomplete.
+
+They also land on the permissive side of the regulatory line, which separates
+non-substantive processing from substantive determinations and tax advice
+affecting liability. The two arguments are independent and agree. The envelope
+is worth keeping even if one of them later changes.
