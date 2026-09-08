@@ -9,6 +9,13 @@ tax return information or any client-derived material, whatever a peer's
 own ceiling says. Opening it requires both lifting the gate and raising a
 peer's ceiling, in a reviewed change.
 
+**Status: the registry describes, it does not yet enforce.** Seven call
+sites still resolve peers directly and never consult it. Until one
+dispatch gateway owns backend access and every call passes through it,
+the flows below are intended policy, not a boundary the code imposes.
+Wiring those sites is a separate reviewed change. Read this document as
+what is being proposed for approval, not as a description of what runs.
+
 ## What each destination is
 
 **claude** (cloud). Ceiling `internal`, general consultation
@@ -62,27 +69,30 @@ return information internally to assist in preparing the return or providing
 auxiliary services. **That is why a local ceiling can sit above a cloud
 ceiling.** It is conditional, not automatic.
 
-### The two questions
+### The three questions
 
 Deliberately not phrased as "is the API a disclosure", which the regulation
 makes a hard position to hold.
 
-1. Does any specific exception apply to the contemplated API use? If not, must
-   the cloud ceiling stay below client-derived absent a Reg. 301.7216-3
-   consent?
-2. Does this architecture genuinely keep the activity inside the same U.S.
-   preparer, and within permitted return-preparation or auxiliary uses?
-
-A third question if de-identification is ever contemplated: does removing names
-remove identifiability when figures, dates and jurisdictions remain? Inside a
-two-office practice, a deliverable carrying exact revenue and a Ketchikan
-borough filing may still identify its client.
+1. Does any specific IRC § 7216 / Reg. § 301.7216-2 exception apply to the
+   contemplated cloud API use? If not, must the cloud ceiling remain below
+   client-derived tax return information absent taxpayer consent under
+   Reg. § 301.7216-3?
+2. Does the architecture genuinely keep local inference inside the same U.S.
+   tax return preparer, with no disclosure to a separate person or non-U.S.
+   personnel, and only for permitted return-preparation, auxiliary-service,
+   or other authorized uses?
+3. If de-identification is later relied on, does removing names and direct
+   identifiers sufficiently remove identifiability where amounts, dates,
+   jurisdictions, entity facts, or filing details may still point to a
+   specific client?
 
 ### Conditions the local answer depends on
 
-Every one must hold before a local ceiling may exceed a cloud ceiling. No test
-in this repository can prove any of them. They are claims about the deployment,
-written down so that raising a ceiling forces someone to re-read them.
+The five local internal-use conditions are stated as deployment claims, not
+test-proven facts. Raising a ceiling requires re-reading and affirming those
+claims. The code can enforce the registry; it cannot prove the legal
+predicates behind the registry.
 
 - access to the model and its inputs stays within the same U.S. tax return preparer
 - logging and stored artifacts stay within the same U.S. preparer

@@ -83,17 +83,23 @@ CLIENT_DERIVED_GATE = False
 #
 # The questions worth putting to counsel are therefore NOT "is the API a
 # disclosure", which the regulation makes a hard position to hold. They are:
-#   1. Does any specific exception apply to the contemplated API use, and if
-#      not, must the cloud ceiling stay below client-derived absent a
-#      301.7216-3 consent?
-#   2. Does this architecture genuinely keep the activity inside the same
-#      U.S. preparer and within permitted return-preparation or auxiliary
-#      uses?
+#   1. Does any specific IRC 7216 / Reg. 301.7216-2 exception apply to the
+#      contemplated cloud API use? If not, must the cloud ceiling remain
+#      below client-derived tax return information absent taxpayer consent
+#      under Reg. 301.7216-3?
+#   2. Does the architecture genuinely keep local inference inside the same
+#      U.S. tax return preparer, with no disclosure to a separate person or
+#      non-U.S. personnel, and only for permitted return-preparation,
+#      auxiliary-service, or other authorized uses?
+#   3. If de-identification is later relied on, does removing names and
+#      direct identifiers sufficiently remove identifiability where amounts,
+#      dates, jurisdictions, entity facts, or filing details may still point
+#      to a specific client?
 
 #: Every one of these must hold before a local ceiling may exceed a cloud
-#: ceiling. They are stated as claims about the deployment, not the code,
-#: because that is what they are: no test in this repo can prove them. They
-#: are written down so that raising a ceiling forces someone to re-read them.
+#: ceiling. They are stated as deployment claims, not test-proven facts.
+#: Raising a ceiling requires re-reading and affirming those claims. The code
+#: can enforce the registry; it cannot prove the legal predicates behind it.
 LOCAL_INTERNAL_USE_CONDITIONS = (
     "access to the model and its inputs stays within the same U.S. tax return "
     "preparer",
@@ -105,6 +111,11 @@ LOCAL_INTERNAL_USE_CONDITIONS = (
     "permitted under IRC 7216 and Reg. 301.7216-1 through -3",
 )
 
+#: NOT A CHECK. Nothing reads this constant. authorize() never sees the work,
+#: only a task label from an allowlist, so it cannot establish that the actual
+#: work is non-substantive. Recorded here because it is the line the task
+#: envelope was drawn against.
+#:
 #: The regulatory line that decides whether taxpayer consent is needed:
 #: non-substantive processing may be permissible without it, while substantive
 #: determinations or tax advice affecting liability require consent first.
@@ -223,10 +234,17 @@ def authorize(caller: str, destination: str, classification: str,
               task: str | None = None) -> Peer:
     """Return the destination Peer, or raise RouteDenied.
 
-    Every check that can deny is here, in one place, so no call path can reach
-    a backend having skipped one. Certificate verification is NOT here: it
-    happens at dispatch against the resolved model, because that is the only
-    point where the digest is known.
+    Every check this registry makes is here, in one place. That is not the
+    same as complete mediation, and this docstring said it was: seven call
+    sites still resolve peers directly and never reach this function, so
+    today the registry is a description, not a boundary. Until one dispatch
+    gateway owns backend access and every call goes through it, calling
+    authorize() is a convention that a new caller can silently skip.
+
+    Success here is deliberately NOT sufficient permission to execute.
+    Certificate verification happens at dispatch against the resolved model,
+    because that is the only point where the digest is known, and the model
+    identity that was verified must be the one invoked.
     """
     if caller not in PEERS:
         raise RouteDenied(f"unknown caller {caller!r}")
@@ -264,19 +282,43 @@ def authorize(caller: str, destination: str, classification: str,
     return dest
 
 
+def _permits(caller: str, destination: str, classification: str,
+             task: str | None) -> bool:
+    try:
+        authorize(caller, destination, classification, task)
+    except RouteDenied:
+        return False
+    return True
+
+
 def flow_matrix() -> list[dict[str, object]]:
     """Every permitted route as data, for the counsel-facing matrix.
 
-    Generated from the registry above rather than maintained beside it, so the
-    document counsel approves and the code that enforces it cannot drift.
+    Derived by ASKING authorize() rather than by recomputing its rules. The
+    first version reimplemented the classification filter, which let the
+    published matrix and the enforced behaviour disagree: a peer with
+    `tasks=()` was advertised as general consultation at three classifications
+    while authorize() refused every call to it, and a self-route added to
+    ROUTES was published while authorize() denied it. A matrix counsel has
+    approved that does not match the code is worse than no matrix, because it
+    is a control everyone believes in.
     """
     rows: list[dict[str, object]] = []
     for source in PEERS:
         for dest_name in destinations_for(source):
             dest = PEERS[dest_name]
+            probes: tuple[str | None, ...] = (
+                dest.tasks if dest.tasks is not None else (None,))
+            grid = {(c, t): _permits(source, dest_name, c, t)
+                    for c in CLASSIFICATIONS for t in probes}
             allowed = [c for c in CLASSIFICATIONS
-                       if rank(c) <= rank(dest.max_classification)
-                       and not (c == "client-derived" and not CLIENT_DERIVED_GATE)]
+                       if any(grid[(c, t)] for t in probes)]
+            if not allowed:
+                # authorize() refuses this pair outright. Publishing it would
+                # advertise access the code does not grant.
+                continue
+            tasks = [t for t in probes
+                     if any(grid[(c, t)] for c in CLASSIFICATIONS)]
             rows.append({
                 "source": source,
                 "destination": dest_name,
@@ -284,7 +326,8 @@ def flow_matrix() -> list[dict[str, object]]:
                 "leaves_hardware": dest.locality == "cloud",
                 "max_classification": dest.max_classification,
                 "classifications_permitted": allowed,
-                "tasks": list(dest.tasks) if dest.tasks else ["(general consultation)"],
+                "tasks": tasks if dest.tasks is not None
+                         else ["(general consultation)"],
                 "certificate_required": dest.requires_certificate,
             })
     return rows

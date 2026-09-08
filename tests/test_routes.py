@@ -187,3 +187,55 @@ class TestMatrixDocumentIsCurrent(unittest.TestCase):
             fresh, doc.read_text(),
             "docs/data-flow-matrix.md is stale; regenerate with "
             "bin/agent-bridge-flow-matrix > docs/data-flow-matrix.md")
+
+
+class TestMatrixCannotDisagreeWithEnforcement(unittest.TestCase):
+    """Regression guards from Codex job 690278e1, which constructed both cases.
+
+    The matrix is the document counsel approves. If it can advertise a route
+    authorize() refuses, or hide one authorize() allows, then approval was
+    given to something other than what runs.
+    """
+
+    def test_everything_the_matrix_publishes_is_actually_authorized(self):
+        for row in routes.flow_matrix():
+            src, dst = row["source"], row["destination"]
+            tasks = ([None] if row["tasks"] == ["(general consultation)"]
+                     else row["tasks"])
+            for c in row["classifications_permitted"]:
+                self.assertTrue(
+                    any(routes._permits(src, dst, c, t) for t in tasks),
+                    f"matrix advertises {src}->{dst} at {c}, authorize() denies it")
+
+    def test_a_peer_with_no_certified_tasks_is_not_advertised(self):
+        """authorize() refuses every call to it, so the matrix must not list it.
+
+        The earlier version tested `dest.tasks` for truthiness and published
+        an empty envelope as "(general consultation)", the widest label there
+        is, for a peer nothing could reach.
+        """
+        mute = routes.PEERS["local"].__class__(
+            name="local", locality="local", max_classification="internal",
+            tasks=(), requires_certificate=True, disclosure="x")
+        with mock.patch.dict(routes.PEERS, {"local": mute}):
+            published = {(r["source"], r["destination"])
+                         for r in routes.flow_matrix()}
+            self.assertNotIn(("claude", "local"), published)
+            self.assertNotIn(("codex", "local"), published)
+
+    def test_a_self_route_in_the_table_is_not_advertised(self):
+        with mock.patch.object(routes, "ROUTES",
+                               routes.ROUTES | {("claude", "claude")}):
+            published = {(r["source"], r["destination"])
+                         for r in routes.flow_matrix()}
+            self.assertNotIn(("claude", "claude"), published)
+
+    def test_the_matrix_hides_nothing_authorize_would_allow(self):
+        published = {(r["source"], r["destination"]) for r in routes.flow_matrix()}
+        for src, dst in routes.ROUTES:
+            reachable = any(
+                routes._permits(src, dst, c, t)
+                for c in routes.CLASSIFICATIONS
+                for t in (routes.PEERS[dst].tasks or (None,)))
+            self.assertEqual(reachable, (src, dst) in published,
+                             f"{src}->{dst}: reachable={reachable}, published={(src, dst) in published}")
