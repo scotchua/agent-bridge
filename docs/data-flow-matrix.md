@@ -145,6 +145,29 @@ classification, and there is deliberately no de-identified tier in the
 classification ladder. Adding one would be a consequential change requiring
 its own approval, not a convenience.
 
+### The one-line version, and the two places it is too short
+
+Working summary: **local work kept entirely inside the firm does not require a
+7216 consent; sending client tax return information to either cloud API does.**
+That is the right instinct for day-to-day routing. Two refinements before it
+becomes the rule anyone quotes.
+
+**Local is not outside 7216, it is permitted under it.** IRC 7216 governs USE
+as well as disclosure. Internal use is permitted because Reg. 301.7216-2
+allows officers, employees and members of the same U.S. preparer to use return
+information for return preparation and auxiliary services, not because the
+statute stops at the firm door. The purpose limit therefore still binds: using
+client return information locally for something other than that engagement,
+training or fine-tuning a model on it being the obvious temptation, is a
+different use and may require consent even though nothing left the building.
+
+**Cloud may not always need a consent.** Consent under Reg. 301.7216-3 is one
+route. An applicable exception is the other, and whether a cloud LLM provider
+can sit inside one as a provider of auxiliary services, subject to the
+conditions and to the non-U.S. limits, is exactly open question 1. Treating
+consent as the only path would be safe but would also concede the question
+before counsel answers it.
+
 Sources: Thomson Reuters Checkpoint, Key Issue 33J; RIA ¶ V-3316; ¶ V-3310.3;
 ¶ S-6207. Primary authority: IRC 7216, IRC 6713, Reg. 301.7216-1, -2, -2(o),
 -3.
