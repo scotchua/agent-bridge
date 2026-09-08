@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Print the data-flow matrix, generated from the route registry.
+
+The document counsel reviews and the code that enforces it are the same
+thing. A hand-maintained matrix beside the registry would drift, and the
+drift would be invisible until someone relied on it.
+
+    bin/agent-bridge-flow-matrix            markdown, for review
+    bin/agent-bridge-flow-matrix --json     machine-readable
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+from agent_bridge import routes  # noqa: E402
+
+
+def markdown() -> str:
+    rows = routes.flow_matrix()
+    gate = "OPEN" if routes.CLIENT_DERIVED_GATE else "SHUT"
+    out = [
+        "# Data-flow matrix: agent-bridge",
+        "",
+        "Generated from `src/agent_bridge/routes.py`. Do not edit by hand; edit",
+        "the registry and regenerate, so what is approved and what is enforced",
+        "stay the same thing.",
+        "",
+        f"**Client-derived gate: {gate}.** While shut, no destination may receive",
+        "tax return information or any client-derived material, whatever a peer's",
+        "own ceiling says. Opening it requires both lifting the gate and raising a",
+        "peer's ceiling, in a reviewed change.",
+        "",
+        "## What each destination is",
+        "",
+    ]
+    for name, p in routes.PEERS.items():
+        out += [f"**{name}** ({p.locality}) — ceiling `{p.max_classification}`"
+                + (f", tasks: {', '.join(p.tasks)}" if p.tasks else ", general consultation")
+                + (", route certificate required" if p.requires_certificate else ""),
+                "", f"> {p.disclosure}", ""]
+    out += [
+        "## Permitted flows",
+        "",
+        "| From | To | Leaves this machine | May receive | For | Certificate |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        out.append(
+            f"| {r['source']} | {r['destination']} "
+            f"| {'**yes**' if r['leaves_hardware'] else 'no'} "
+            f"| {', '.join(r['classifications_permitted'])} "
+            f"| {', '.join(r['tasks'])} "
+            f"| {'required' if r['certificate_required'] else 'n/a'} |")
+    out += [
+        "",
+        "Any pair absent from this table is denied. Absence is the default.",
+        "",
+        "## What counsel is being asked",
+        "",
+        "Nothing in the table above sends client-derived material anywhere; the",
+        "gate is shut and every ceiling sits at `internal`. Two questions decide",
+        "whether that can change, and neither is answered:",
+        "",
+        "1. Is transmission to a third-party LLM API a disclosure of tax return",
+        "   information under IRC 7216, and if so does any exception apply? A",
+        "   negative answer permanently fixes the two cloud rows at `internal`.",
+        "2. Does execution on the firm's own hardware, with no network call,",
+        "   fall outside 7216's disclosure concept entirely? If yes, the `local`",
+        "   rows could carry client-derived material that the cloud rows never",
+        "   can, which is the whole privacy argument for running locally.",
+        "",
+        "A third question if de-identification is contemplated: does removing",
+        "names remove identifiability when figures, dates and jurisdictions",
+        "remain? Inside a two-office practice, a deliverable carrying exact",
+        "revenue and a Ketchikan borough filing may still identify its client.",
+        "",
+        "## What is enforced regardless of the answers",
+        "",
+        "- Consultation only. No peer can edit files, run commands, or start a",
+        "  consultation of its own.",
+        "- Replies are schema-validated; raw peer text is quarantined and never",
+        "  reaches a caller.",
+        "- Every exchange is ledgered.",
+        "- The local peer is restricted to certified tasks and cannot be asked an",
+        "  open question, because it can omit content while returning well-formed",
+        "  output.",
+    ]
+    return "\n".join(out) + "\n"
+
+
+if __name__ == "__main__":
+    if "--json" in sys.argv:
+        print(json.dumps({"client_derived_gate": routes.CLIENT_DERIVED_GATE,
+                          "flows": routes.flow_matrix()}, indent=2))
+    else:
+        sys.stdout.write(markdown())
