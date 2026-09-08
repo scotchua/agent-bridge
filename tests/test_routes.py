@@ -239,3 +239,47 @@ class TestMatrixCannotDisagreeWithEnforcement(unittest.TestCase):
                 for t in (routes.PEERS[dst].tasks or (None,)))
             self.assertEqual(reachable, (src, dst) in published,
                              f"{src}->{dst}: reachable={reachable}, published={(src, dst) in published}")
+
+
+class TestTheGovernanceSentenceSurvives(unittest.TestCase):
+    """Scott asked for one sentence kept verbatim, for a reason worth guarding.
+
+    It is the sentence that stops a reader treating the registry as proof of
+    the legal predicates underneath it. A future edit that softens or drops it
+    would make the document more reassuring and less true.
+    """
+
+    def _doc(self):
+        import pathlib
+        return (pathlib.Path(__file__).resolve().parents[1]
+                / "docs" / "data-flow-matrix.md").read_text()
+
+    def test_the_sentence_is_present_verbatim(self):
+        text = " ".join(self._doc().split())
+        self.assertIn(
+            "local internal-use conditions are stated as deployment claims, "
+            "not test-proven facts. Raising a ceiling requires re-reading and "
+            "affirming those claims.", text)
+
+    def test_the_count_in_the_sentence_matches_the_tuple(self):
+        """The number is generated, so it cannot drift from what it counts."""
+        words = {3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+                 8: "eight", 9: "nine", 10: "ten"}
+        n = len(routes.LOCAL_INTERNAL_USE_CONDITIONS)
+        text = " ".join(self._doc().split())
+        self.assertIn(f"The {words[n]} local internal-use conditions", text)
+
+    def test_every_condition_is_reprinted_in_the_document(self):
+        text = " ".join(self._doc().split())
+        for c in routes.LOCAL_INTERNAL_USE_CONDITIONS:
+            self.assertIn(" ".join(c.split()), text)
+
+    def test_no_de_identified_tier_exists_in_the_ladder(self):
+        """Reg. 301.7216-2(o) sets a bar stripping names does not clear.
+
+        Redaction is a task the local peer performs. It is not a downgrade,
+        so there is no classification below client-derived to downgrade into.
+        """
+        self.assertNotIn("de-identified", routes.CLASSIFICATIONS)
+        self.assertNotIn("anonymized", routes.CLASSIFICATIONS)
+        self.assertIn("redact", routes.PEERS["local"].tasks)

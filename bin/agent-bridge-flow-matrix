@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.join(
 from agent_bridge import routes  # noqa: E402
 
 
+NUMBERS = {3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+           8: "eight", 9: "nine", 10: "ten"}
+
 COUNSEL = """## What counsel is being asked
 
 Framing by Scott Edwards, CPA, 2026-09-08, assuming the inputs are tax return
@@ -65,11 +68,60 @@ makes a hard position to hold.
 
 ### Conditions the local answer depends on
 
-The five local internal-use conditions are stated as deployment claims, not
-test-proven facts. Raising a ceiling requires re-reading and affirming those
-claims. The code can enforce the registry; it cannot prove the legal
-predicates behind the registry.
+%CONDITIONS_SENTENCE%
+
+The registry can enforce approved routing. It cannot prove the legal
+predicates behind that routing: same-preparer status, U.S.-only access, no
+third-party disclosure, permitted purpose, and non-identifiability.
 """
+
+EXPECTED = """## The firm's expected answers
+
+Position of Scott Edwards, CPA, 2026-09-08, from Thomson Reuters Checkpoint
+research. A draft for licensed review, not final authority. Counsel is being
+asked to confirm or correct each one.
+
+**1. Cloud rows.** Treat transmission of client-derived tax return information
+to a third-party LLM API as a **disclosure**, unless counsel identifies a
+specific IRC 7216 / Reg. 301.7216-2 exception or the firm obtains valid
+taxpayer consent under Reg. 301.7216-3. Reg. 301.7216-1 defines disclosure
+broadly as making tax return information known to any person in any manner,
+and tax return information includes client-furnished information as well as
+preparer-derived computations, worksheets and workpapers. Absent an applicable
+exception or consent, **the cloud ceiling stays below client-derived tax
+return information.** That is the ceiling the registry ships with.
+
+**2. Local rows.** Local inference can support a higher ceiling **only if** the
+deployment truly remains inside the same U.S. tax return preparer and is used
+only for permitted return-preparation, auxiliary-service or other authorized
+purposes. Reg. 301.7216-2 permits use or disclosure among officers, employees
+or members of the same U.S. preparer for those purposes, but disclosure to
+personnel outside the United States requires consent.
+
+This makes the question factual as much as legal: who can reach prompts,
+outputs, logs, model state, telemetry, backups, admin consoles and support
+channels. Those are the surfaces the conditions above enumerate, and none of
+them is something this repository can verify.
+
+**3. De-identification.** Removing names and direct identifiers is **not
+enough** if the remaining facts can indirectly identify the client. Reg.
+301.7216-2(o) requires anonymized or statistical information to be in a form
+that cannot be associated with, or otherwise identify, directly or indirectly,
+a particular taxpayer. Exact amounts, dates, jurisdictions, entity facts,
+filing details and unique high-net-worth transactions can each function as a
+cell-of-one identifier without a name attached.
+
+Consequence for this registry: **redaction is a task, not a downgrade.** The
+local peer may be asked to redact. Its output does not thereby become a lower
+classification, and there is deliberately no de-identified tier in the
+classification ladder. Adding one would be a consequential change requiring
+its own approval, not a convenience.
+
+Sources: Thomson Reuters Checkpoint, Key Issue 33J; RIA ¶ V-3316; ¶ V-3310.3;
+¶ S-6207. Primary authority: IRC 7216, IRC 6713, Reg. 301.7216-1, -2, -2(o),
+-3.
+"""
+
 
 ENFORCED = """## What is enforced regardless of the answers
 
@@ -143,9 +195,18 @@ def markdown() -> str:
             f"| {'required' if r['certificate_required'] else 'n/a'} |")
     out += ["", "Any pair absent from this table is denied. Absence is the default.", ""]
 
-    out += COUNSEL.strip().split("\n")
+    n = len(routes.LOCAL_INTERNAL_USE_CONDITIONS)
+    # Scott asked for this sentence kept verbatim. The count is generated so
+    # that editing the tuple cannot leave the sentence quietly miscounting it.
+    sentence = (
+        f"The {NUMBERS.get(n, str(n))} local internal-use conditions are stated "
+        "as deployment claims, not\ntest-proven facts. Raising a ceiling "
+        "requires re-reading and affirming those\nclaims.")
+    out += COUNSEL.strip().replace("%CONDITIONS_SENTENCE%", sentence).split("\n")
     out += [""]
     out += [f"- {c}" for c in routes.LOCAL_INTERNAL_USE_CONDITIONS]
+    out += [""]
+    out += EXPECTED.strip().split("\n")
     out += [""]
     out += ENFORCED.strip().split("\n")
     return "\n".join(out) + "\n"

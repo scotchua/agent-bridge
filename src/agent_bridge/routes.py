@@ -101,15 +101,33 @@ CLIENT_DERIVED_GATE = False
 #: Raising a ceiling requires re-reading and affirming those claims. The code
 #: can enforce the registry; it cannot prove the legal predicates behind it.
 LOCAL_INTERNAL_USE_CONDITIONS = (
-    "access to the model and its inputs stays within the same U.S. tax return "
-    "preparer",
-    "logging and stored artifacts stay within the same U.S. preparer",
-    "model operation stays within the same U.S. preparer (no hosted inference, "
-    "no telemetry carrying return information)",
+    "every access surface stays within the same U.S. tax return preparer: "
+    "prompts, outputs, logs, model state, telemetry, backups, admin consoles "
+    "and support channels",
+    "no access by personnel outside the United States, because Reg. "
+    "301.7216-2 requires consent for disclosure to non-U.S. personnel even "
+    "within the same firm",
+    "model operation stays within the same U.S. preparer: no hosted "
+    "inference, no telemetry or crash reporting carrying return information",
     "administration of the machine stays within the same U.S. preparer",
     "the use is return preparation, an auxiliary service, or another use "
     "permitted under IRC 7216 and Reg. 301.7216-1 through -3",
 )
+
+#: Why there is no "de-identified" tier in CLASSIFICATIONS, and why adding one
+#: would be a consequential change rather than a convenience.
+#:
+#: Reg. 301.7216-2(o) requires anonymized or statistical information to be in
+#: a form that cannot be associated with, or otherwise identify, DIRECTLY OR
+#: INDIRECTLY, a particular taxpayer. Stripping names does not meet that.
+#: Exact amounts, dates, jurisdictions, entity facts, filing details and
+#: unique transactions can each function as a cell-of-one identifier. In a
+#: two-office practice the population is small enough that a single Ketchikan
+#: borough filing with exact revenue may identify its client on its own.
+#:
+#: So redaction is a certified TASK the local peer may perform. It is not a
+#: downgrade: its output does not become a lower classification.
+DEIDENTIFICATION_IS_NOT_A_DOWNGRADE = True
 
 #: NOT A CHECK. Nothing reads this constant. authorize() never sees the work,
 #: only a task label from an allowlist, so it cannot establish that the actual

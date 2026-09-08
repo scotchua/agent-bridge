@@ -91,14 +91,63 @@ makes a hard position to hold.
 
 The five local internal-use conditions are stated as deployment claims, not
 test-proven facts. Raising a ceiling requires re-reading and affirming those
-claims. The code can enforce the registry; it cannot prove the legal
-predicates behind the registry.
+claims.
 
-- access to the model and its inputs stays within the same U.S. tax return preparer
-- logging and stored artifacts stay within the same U.S. preparer
-- model operation stays within the same U.S. preparer (no hosted inference, no telemetry carrying return information)
+The registry can enforce approved routing. It cannot prove the legal
+predicates behind that routing: same-preparer status, U.S.-only access, no
+third-party disclosure, permitted purpose, and non-identifiability.
+
+- every access surface stays within the same U.S. tax return preparer: prompts, outputs, logs, model state, telemetry, backups, admin consoles and support channels
+- no access by personnel outside the United States, because Reg. 301.7216-2 requires consent for disclosure to non-U.S. personnel even within the same firm
+- model operation stays within the same U.S. preparer: no hosted inference, no telemetry or crash reporting carrying return information
 - administration of the machine stays within the same U.S. preparer
 - the use is return preparation, an auxiliary service, or another use permitted under IRC 7216 and Reg. 301.7216-1 through -3
+
+## The firm's expected answers
+
+Position of Scott Edwards, CPA, 2026-09-08, from Thomson Reuters Checkpoint
+research. A draft for licensed review, not final authority. Counsel is being
+asked to confirm or correct each one.
+
+**1. Cloud rows.** Treat transmission of client-derived tax return information
+to a third-party LLM API as a **disclosure**, unless counsel identifies a
+specific IRC 7216 / Reg. 301.7216-2 exception or the firm obtains valid
+taxpayer consent under Reg. 301.7216-3. Reg. 301.7216-1 defines disclosure
+broadly as making tax return information known to any person in any manner,
+and tax return information includes client-furnished information as well as
+preparer-derived computations, worksheets and workpapers. Absent an applicable
+exception or consent, **the cloud ceiling stays below client-derived tax
+return information.** That is the ceiling the registry ships with.
+
+**2. Local rows.** Local inference can support a higher ceiling **only if** the
+deployment truly remains inside the same U.S. tax return preparer and is used
+only for permitted return-preparation, auxiliary-service or other authorized
+purposes. Reg. 301.7216-2 permits use or disclosure among officers, employees
+or members of the same U.S. preparer for those purposes, but disclosure to
+personnel outside the United States requires consent.
+
+This makes the question factual as much as legal: who can reach prompts,
+outputs, logs, model state, telemetry, backups, admin consoles and support
+channels. Those are the surfaces the conditions above enumerate, and none of
+them is something this repository can verify.
+
+**3. De-identification.** Removing names and direct identifiers is **not
+enough** if the remaining facts can indirectly identify the client. Reg.
+301.7216-2(o) requires anonymized or statistical information to be in a form
+that cannot be associated with, or otherwise identify, directly or indirectly,
+a particular taxpayer. Exact amounts, dates, jurisdictions, entity facts,
+filing details and unique high-net-worth transactions can each function as a
+cell-of-one identifier without a name attached.
+
+Consequence for this registry: **redaction is a task, not a downgrade.** The
+local peer may be asked to redact. Its output does not thereby become a lower
+classification, and there is deliberately no de-identified tier in the
+classification ladder. Adding one would be a consequential change requiring
+its own approval, not a convenience.
+
+Sources: Thomson Reuters Checkpoint, Key Issue 33J; RIA ¶ V-3316; ¶ V-3310.3;
+¶ S-6207. Primary authority: IRC 7216, IRC 6713, Reg. 301.7216-1, -2, -2(o),
+-3.
 
 ## What is enforced regardless of the answers
 
