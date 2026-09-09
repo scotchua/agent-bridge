@@ -481,13 +481,12 @@ class WindowsPlatform:
             # two readers blocked in read() and the main thread blocked in
             # close().
             #
-            # Ending the child makes the pending reads return EOF, so the close
-            # completes. This only fires when the loop exited while the child
-            # was still running, meaning a timeout, a cap breach, or a
-            # descendant holding a pipe. A peer that finished normally is
-            # already gone and is not touched. Killing the wider process tree
-            # remains the caller's job.
-            if proc.poll() is None:
+            # Ending the tree makes the pending reads return EOF, so the close
+            # completes. This only fires when the loop exited with a pipe still
+            # open, meaning a timeout, a cap breach, or a descendant holding a
+            # pipe. A peer that finished normally has closed both pipes and is
+            # not touched.
+            if open_streams:
                 # The whole TREE, not just the child. Killing only the direct
                 # child leaves grandchildren holding the same pipe handles, so
                 # the pending reads still never return and the close still
@@ -495,10 +494,11 @@ class WindowsPlatform:
                 # not an exotic one.
                 with contextlib.suppress(Exception):
                     self.terminate_process_tree(proc.pid, 0.0)
-                with contextlib.suppress(OSError, ValueError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=5)
+                if proc.poll() is None:
+                    with contextlib.suppress(OSError, ValueError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=5)
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is not None:
                     with contextlib.suppress(OSError, ValueError):

@@ -1411,10 +1411,19 @@ def test_round_two_regressions() -> None:
           f"timed_out={held.timed_out} out={held.stdout!r}")
     check("R3: and the condition is recorded rather than hidden",
           held.descendant_held_pipes is True)
-    for _ in range(6):
-        runner.run([sys.executable, "-c", holder_script], cwd=tempfile.gettempdir(),
-                   env=runner.scrubbed_env(), stdin_data="", timeout=5, grace=1,
-                   stdout_cap=100, stderr_cap=100)
+    loop_script = ("import os,sys;sys.path.insert(0,%r);"
+                   "from agent_bridge import runner;"
+                   "holder=%r;"
+                   "[(runner.run([sys.executable,'-c',holder],cwd=%r,"
+                   "env=runner.scrubbed_env(),stdin_data='',timeout=5,grace=1,"
+                   "stdout_cap=100,stderr_cap=100)) for _ in range(6)]"
+                   % (os.path.join(REPO, "src"), holder_script,
+                      tempfile.gettempdir()))
+    # Six timeout=5/grace=1 calls have a 6 * (5 + 1) = 36 second configured
+    # budget. These children exit immediately, so allow a generous four seconds
+    # per call while staying below the unfixed grandchild's 30 second sleep.
+    subprocess.run([sys.executable, "-c", loop_script], cwd=REPO,
+                   env=runner.scrubbed_env(), timeout=24, check=True)
     check("R3: repeated jobs with lingering descendants leak no threads",
           threading.active_count() <= threads_before, 
           f"{threads_before} -> {threading.active_count()}")
