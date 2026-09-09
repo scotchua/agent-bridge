@@ -9,3 +9,8 @@ config/local.json
 # machine-local, and never meant to be shared. Untracked was not enough: one
 # `git add -A` in a dirty tree would have committed and pushed it.
 .claude-codex-relay/
+
+# Windows .cmd shims for the Python test fakes, generated on demand by
+# tests/fakes/shim.py. Machine-specific: each embeds an absolute
+# sys.executable path.
+tests/fakes/*.cmd

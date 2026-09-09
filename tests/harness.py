@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 
 from agent_bridge import broker, config, registry, store  # noqa: E402
 
+sys.path.insert(0, os.path.join(REPO, "tests", "fakes"))
+import shim as fake_shim  # noqa: E402
+
 FAKES = os.path.join(REPO, "tests", "fakes")
 
 # Mirror production: the MCP server and worker both set this.
@@ -79,15 +82,15 @@ class Sandbox:
         self.cfg = config.load(self.config_path)
 
     def _executable_for(self, script: str) -> str:
-        """A path this OS can actually execute for a Python test fake."""
-        if os.name != "nt":
-            return script
-        shim = os.path.join(self.root, os.path.basename(script) + ".cmd")
-        with open(shim, "w", encoding="utf-8") as handle:
-            handle.write(
-                "@echo off\r\n"
-                f'"{sys.executable}" "{script}" %*\r\n')
-        return shim
+        """A path this OS can actually execute for a Python test fake.
+
+        Delegates to tests/fakes/shim.py, which the canary runner also uses.
+        This wrote its shim into self.root, a TemporaryDirectory, which
+        setup_cmd.is_durable() then correctly refused as a path that will not
+        survive: test_candidate_verification_path failed on Windows for that
+        reason alone. The shim now lives beside the fake, inside the checkout.
+        """
+        return fake_shim.executable_for(script)
 
     def env(self, **extra: str) -> None:
         """Route FAKE_* control vars to the peer's declared extra_env.

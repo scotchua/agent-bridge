@@ -26,6 +26,8 @@ import time
 from typing import Any
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "tests", "fakes"))
+import shim as fake_shim  # noqa: E402
 sys.path.insert(0, os.path.join(REPO, "src"))
 
 from agent_bridge import broker, config, registry, setup_cmd, store  # noqa: E402
@@ -174,7 +176,10 @@ def timeout_canary_config(cfg: config.Config, caller: str) -> dict[str, Any]:
     """Build an isolated effective config for the controlled timeout stub."""
     peer = broker.PEER_OF[caller]
     base = copy.deepcopy(cfg.raw)
-    stub = os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py")
+    # Windows cannot execute a .py: CreateProcess raises WinError 193, and
+    # the canary suite is the evidence gate, so it has to run there too.
+    stub = fake_shim.executable_for(
+        os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py"))
     peer_config = base["peers"][peer]
     extra_env = dict(peer_config.get("extra_env") or {})
     extra_env[f"FAKE_{peer.upper()}_MODE"] = "hang"
