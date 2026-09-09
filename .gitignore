@@ -4,3 +4,8 @@ __pycache__/
 canaries/.timeout-*.json
 .DS_Store
 config/local.json
+
+# Live relay state: state.json, locks, auth-repair working dirs. Mode 0600,
+# machine-local, and never meant to be shared. Untracked was not enough: one
+# `git add -A` in a dirty tree would have committed and pushed it.
+.claude-codex-relay/
