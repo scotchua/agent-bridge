@@ -1398,7 +1398,6 @@ def test_round_two_regressions() -> None:
 
     # R3: no threads, no leaked descriptors, and a lingering descendant cannot
     # stretch a finished job into a reported timeout.
-    threads_before = threading.active_count()
     holder_script = ("import subprocess,sys;"
                      "subprocess.Popen([sys.executable,'-c',"
                      "'import time;time.sleep(30)'],close_fds=False);"
@@ -1411,22 +1410,28 @@ def test_round_two_regressions() -> None:
           f"timed_out={held.timed_out} out={held.stdout!r}")
     check("R3: and the condition is recorded rather than hidden",
           held.descendant_held_pipes is True)
-    loop_script = ("import os,sys;sys.path.insert(0,%r);"
+    loop_script = ("import os,sys,threading;sys.path.insert(0,%r);"
                    "from agent_bridge import runner;"
+                   "before=threading.active_count();"
                    "holder=%r;"
                    "[(runner.run([sys.executable,'-c',holder],cwd=%r,"
                    "env=runner.scrubbed_env(),stdin_data='',timeout=5,grace=1,"
-                   "stdout_cap=100,stderr_cap=100)) for _ in range(6)]"
+                   "stdout_cap=100,stderr_cap=100)) for _ in range(6)];"
+                   "after=threading.active_count();"
+                   "sys.stderr.write('thread leak: %%d -> %%d\\n' %% (before,after)) "
+                   "if after > before else None;"
+                   "sys.exit(after > before)"
                    % (os.path.join(REPO, "src"), holder_script,
                       tempfile.gettempdir()))
     # Six timeout=5/grace=1 calls have a 6 * (5 + 1) = 36 second configured
     # budget. These children exit immediately, so allow a generous four seconds
     # per call while staying below the unfixed grandchild's 30 second sleep.
-    subprocess.run([sys.executable, "-c", loop_script], cwd=REPO,
-                   env=runner.scrubbed_env(), timeout=24, check=True)
+    loop_result = subprocess.run([sys.executable, "-c", loop_script], cwd=REPO,
+                                 env=runner.scrubbed_env(), timeout=24,
+                                 capture_output=True)
     check("R3: repeated jobs with lingering descendants leak no threads",
-          threading.active_count() <= threads_before, 
-          f"{threads_before} -> {threading.active_count()}")
+          loop_result.returncode == 0,
+          loop_result.stderr.decode(errors="replace"))
     check("R3: the runner uses no reader threads at all",
           "threading" not in inspect.getsource(runner))
 
