@@ -12,6 +12,9 @@ written for an AI assistant to execute, not for a human to follow by hand.
 
 Read the two sections above that line first. They will save you money.
 
+Once it is built, [consulting-a-peer.md](consulting-a-peer.md) covers getting findings
+out of it instead of agreement.
+
 ## Read this before you start
 
 **The traps in this are version-specific.** Every measured fact below was

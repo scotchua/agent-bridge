@@ -66,6 +66,15 @@ a model thinks. The work happens in a separate process that writes its progress
 to disk, so you can restart your editor mid-consultation and still collect the
 answer.
 
+### Asking well is most of it
+
+A peer asked "does this look right?" will usually say yes, and that costs a
+round trip to learn nothing. [Getting findings instead of
+agreement](docs/consulting-a-peer.md) is a short page on how to ask so the
+reply is worth reading: a brief template, two worked examples of real defects
+this repository found that way, and the verification step that separates a
+finding from a plausible guess.
+
 ## Honest limits
 
 Read these before you trust it with anything that matters.
