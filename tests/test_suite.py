@@ -2805,11 +2805,33 @@ def test_attempt_marker_crash_injection() -> None:
     )
 
     def kill_worker(pid):
+        permission_error = None
         try:
             os.kill(pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
         except ProcessLookupError:
-            pass
-        if os.name != "nt":
+            return
+        except PermissionError as exc:
+            if os.name != "nt":
+                raise
+            permission_error = exc
+        if os.name == "nt":
+            # TerminateProcess is asynchronous. Wait for the process handle to
+            # become signalled before treating a successful SIGTERM as a dead
+            # worker; exit code 259 is a legal process exit status and is not
+            # evidence of liveness. A second SIGTERM can race an already
+            # terminating process and return ACCESS_DENIED, which is accepted
+            # only once this bounded probe confirms the exit.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not registry.pid_alive(pid):
+                    return
+                time.sleep(0.02)
+            if not registry.pid_alive(pid):
+                return
+            if permission_error is not None:
+                raise permission_error
+            raise AssertionError(f"worker {pid} remained alive after SIGTERM")
+        else:
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:

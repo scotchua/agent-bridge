@@ -170,15 +170,36 @@ class WindowsDrainSecurityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.method = source_method()
 
+    def call_with_held_pipe(self, platform: RecordingPlatform, pipe: ObservedPipe):
+        # Assert the security invariant before releasing the pipe. A tight
+        # wall-clock threshold mostly measures CI scheduling. Run in a daemon
+        # so a regression cannot hang the suite; the caller's finally releases
+        # the pipe even when this bounded wait fails.
+        completed = threading.Event()
+        outcomes: list[Any] = []
+        failures: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                outcomes.append(self.method(platform, ExitedLeader(pipe), "", 0.08,
+                                            1024, 1024, 0.01))
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                completed.set()
+
+        threading.Thread(target=invoke, daemon=True).start()
+        self.assertTrue(completed.wait(2), "drain blocked while descendant held pipe")
+        if failures:
+            raise failures[0]
+        self.assertFalse(pipe.read_returned.is_set(), "pipe was released before assertion")
+        return outcomes[0]
+
     def test_exited_leader_pipe_holder_is_terminated_without_blocking_close(self) -> None:
         pipe = ObservedPipe()
         platform = RecordingPlatform()
-        started = time.monotonic()
         try:
-            result = self.method(platform, ExitedLeader(pipe), "", 0.08,
-                                 1024, 1024, 0.01)
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 0.25)
+            result = self.call_with_held_pipe(platform, pipe)
             self.assertEqual(platform.terminations, [ExitedLeader.pid])
             self.assertTrue(result.descendant_held_pipes)
             self.assertEqual(pipe.close_calls, 0)
@@ -189,12 +210,8 @@ class WindowsDrainSecurityTests(unittest.TestCase):
     def test_failed_tree_termination_leaves_blocked_reader_daemon_and_returns(self) -> None:
         pipe = ObservedPipe()
         platform = RecordingPlatform(fail_termination=True)
-        started = time.monotonic()
         try:
-            result = self.method(platform, ExitedLeader(pipe), "", 0.08,
-                                 1024, 1024, 0.01)
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 0.25)
+            result = self.call_with_held_pipe(platform, pipe)
             self.assertEqual(platform.terminations, [ExitedLeader.pid])
             self.assertTrue(result.descendant_held_pipes)
             self.assertEqual(pipe.close_calls, 0)
