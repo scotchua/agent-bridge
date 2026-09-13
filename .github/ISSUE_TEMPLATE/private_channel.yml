@@ -1,0 +1,15 @@
+name: Request a private reporting channel
+description: Ask the maintainer to enable private reporting without disclosing a vulnerability
+title: "Please enable private vulnerability reporting"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Do not include vulnerability details, affected components, attachments, logs, or personal information. Submit only the checkbox below. Wait for the maintainer to enable GitHub private vulnerability reporting before sharing a report.
+  - type: checkboxes
+    id: request
+    attributes:
+      label: Private channel request
+      options:
+        - label: Please enable GitHub private vulnerability reporting so I can send a report privately.
+          required: true

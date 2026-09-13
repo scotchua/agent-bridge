@@ -15,7 +15,9 @@ import sys
 from typing import Any
 
 from . import registry, store
+from .broker import error_response
 from .config import Config, load as load_config
+from .errors import BrokerError
 
 
 def _inside(root: str, candidate: str) -> bool:
@@ -486,11 +488,15 @@ def main(argv: list[str] | None = None) -> int:
                          help="Required when an unverifiable peer process may "
                               "still be alive.")
     args = parser.parse_args(argv)
-    cfg = load_config(args.config)
-    return {"status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
-            "reporting": cmd_reporting,
-            "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
-        args.command](cfg, args)
+    try:
+        cfg = load_config(args.config)
+        return {"status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
+                "reporting": cmd_reporting,
+                "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
+            args.command](cfg, args)
+    except BrokerError as exc:
+        print(json.dumps(error_response(exc.category), sort_keys=True))
+        return 2
 
 
 if __name__ == "__main__":

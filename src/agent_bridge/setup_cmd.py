@@ -201,17 +201,104 @@ def validate_promotion(candidate: config.Config, results: dict[str, Any]) -> Non
                 or sorted(set(values)) != allowed):
             raise ValueError(f"canary results are not bound to the {peer} version")
 
+    validate_canary_evidence(results)
+
+
+CANARY_VERIFICATION_PROFILE = "full-both-peers-v1"
+
+MINIMUM_CANARY_CONTROLS = {
+    "reachability_probes": 2,
+    "one_turn_calls": 20,
+    "three_turn_conversations": 6,
+    "three_turn_calls": 18,
+    "schema_pressure_calls": 2,
+    "timeout_canaries": 2,
+}
+
+
+def validate_canary_evidence(results: dict[str, Any]) -> None:
+    """Require full both-peer controls and successful underlying evidence.
+
+    This checks a local report for completeness, not authenticity against a
+    malicious local user who can manufacture the report or edit this program.
+    """
+    if results.get("verification_profile") != CANARY_VERIFICATION_PROFILE:
+        raise ValueError("canary results use an unsupported verification profile")
     requested = results.get("controls_requested")
     executed = results.get("controls_executed")
     if not isinstance(requested, dict) or not isinstance(executed, dict):
         raise ValueError("canary results have no requested/executed control counts")
-    if results.get("skipped_controls"):
-        raise ValueError("canary results contain skipped controls")
-    if requested.get("timeout_canaries", 0) < 1:
-        raise ValueError("canary results did not request the timeout control")
-    for name, count in requested.items():
-        if not isinstance(count, int) or executed.get(name) != count:
+    if results.get("skipped_controls") or results.get("blocked"):
+        raise ValueError("canary results contain skipped or blocked controls")
+    if set(requested) != set(MINIMUM_CANARY_CONTROLS) or set(executed) != set(requested):
+        raise ValueError("canary results do not name every required control")
+    for name, minimum in MINIMUM_CANARY_CONTROLS.items():
+        count = requested[name]
+        if type(count) is not int or count < minimum or type(executed[name]) is not int or executed[name] != count:
             raise ValueError(f"canary control {name!r} was not fully executed")
+    rows, timeouts = results.get("rows"), results.get("timeouts")
+    if not isinstance(rows, list) or not isinstance(timeouts, list):
+        raise ValueError("canary results omit underlying evidence")
+    totals = {name: 0 for name in MINIMUM_CANARY_CONTROLS}
+    totals["reachability_probes"] = 2
+    directions = ("codex->claude", "claude->codex")
+    if any(not isinstance(r, dict) or r.get("direction") not in directions for r in rows + timeouts):
+        raise ValueError("canary evidence has an invalid direction")
+    import re
+    for direction in directions:
+        subset = [r for r in rows if r["direction"] == direction]
+        singles, conversations, pressures = set(), {}, []
+        for row in subset:
+            kind = row.get("kind", "")
+            if not isinstance(kind, str):
+                raise ValueError("canary evidence has an invalid kind")
+            single = re.fullmatch(r"one-turn ([1-9][0-9]*)", kind)
+            turn = re.fullmatch(r"3-turn ([1-9][0-9]*) t([123])", kind)
+            if kind == "schema-pressure":
+                pressures.append(row)
+                schema_rejections = {"peer_output_schema_invalid", "peer_output_malformed", "retry_exhausted"}
+                accepted_success = row.get("status") == "complete" and row.get("contract_valid") is True
+                accepted_rejection = row.get("status") == "failed" and row.get("error_category") in schema_rejections
+                if row.get("acceptable") is not True or not (accepted_success or accepted_rejection):
+                    raise ValueError("schema-pressure control was not acceptable")
+                continue
+            if row.get("status") != "complete" or row.get("contract_valid") is not True:
+                raise ValueError("canary evidence contains an unsuccessful ordinary call")
+            if single:
+                if single[1] in singles:
+                    raise ValueError("duplicate one-turn control")
+                singles.add(single[1])
+            elif turn:
+                turns = conversations.setdefault(turn[1], {})
+                if turn[2] in turns:
+                    raise ValueError("duplicate continuation control")
+                turns[turn[2]] = row
+            else:
+                raise ValueError("unknown canary control kind")
+        if len(singles) < 10 or len(conversations) < 3 or len(pressures) != 1:
+            raise ValueError("canary evidence does not cover both peers fully")
+        for turns in conversations.values():
+            if set(turns) != {"1", "2", "3"}:
+                raise ValueError("canary continuation sequence is incomplete")
+            session = turns["1"].get("peer_session_id")
+            if not isinstance(session, str) or not session or any(
+                turns[t].get("session_id_as_intended") is not True
+                or turns[t].get("peer_session_id") != session for t in ("2", "3")
+            ):
+                raise ValueError("canary continuation did not preserve its peer session")
+        timeout_rows = [r for r in timeouts if r["direction"] == direction]
+        if len(timeout_rows) != 1 or any(
+            r.get("status") != "timed_out" or type(r.get("orphans")) is not int
+            or r["orphans"] != 0 or r.get("cleanup_errors") for r in timeout_rows
+        ):
+            raise ValueError("timeout containment control did not pass")
+        totals["one_turn_calls"] += len(singles)
+        totals["three_turn_conversations"] += len(conversations)
+        totals["three_turn_calls"] += len(conversations) * 3
+        totals["schema_pressure_calls"] += len(pressures)
+        totals["timeout_canaries"] += len(timeout_rows)
+    if totals != executed:
+        raise ValueError("canary counts disagree with the underlying evidence")
 
 
 def promote_candidate(candidate_path: str, results_path: str,

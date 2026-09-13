@@ -349,19 +349,19 @@ def execute(job_dir: str) -> int:
             store.atomic_write_bytes(
                 os.path.join(job_dir, "release_error.txt"),
                 exc.category.value.encode("utf-8"))
-    store.append_ledger(cfg.ledger_path, record)
     # Retirement is gated on the release actually SUCCEEDING, not merely on
     # having been attempted. Source order alone is not the invariant: if the
     # release was refused, for instance because a rival owns the conversation,
     # then from the conversation's point of view this attempt never committed,
     # and marking its evidence committed would be a lie in the one direction
     # that matters.
+    if not commit_succeeded:
+        record["markers_retained"] = "conversation release did not succeed"
+    store.append_ledger(cfg.ledger_path, record)
     if commit_succeeded:
         retired = registry.retire_attempt_markers(cfg, job_id)
         if retired:
             runner.pause_after_marker_transition(cfg.peer_extra_env(peer), "committed")
-    else:
-        record["markers_retained"] = "conversation release did not succeed"
     registry.write_status(
         cfg, job_id, status, error_category=category.value,
         retries_exhausted=retries_exhausted,

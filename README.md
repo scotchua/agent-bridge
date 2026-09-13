@@ -2,6 +2,11 @@
 
 ![tests](https://github.com/scotchua/agent-bridge/actions/workflows/tests.yml/badge.svg)
 
+> **Experimental:** agent-bridge is ready for early testers, but its interfaces
+> and setup may change as real-world feedback arrives. Review the privacy and
+> platform limits below before using it. This early release is intended to find
+> problems on fresh installations; it does not depend on a tester-count gate.
+
 Connect Claude and Codex so you can say **“ask the other assistant”** without
 copying messages between them. Either assistant can coordinate the work, ask
 its teammate for help, and bring the answer back into your conversation.
@@ -41,8 +46,8 @@ it this request:
 > verification, preserve my current settings, and explain any remaining
 > limitations. Ask before live tests that use my provider allowance or money.
 
-You need access to this repository while it is private. A website-only chat
-cannot install the bridge on your computer.
+A website-only chat cannot install the bridge on your computer.
+If the repository is still private, request access before starting setup.
 
 [The guided setup](docs/SETUP-WITH-AN-AGENT.md) takes the assistant through:
 
@@ -114,6 +119,9 @@ permissions or provider agreements. Each provider processes consultations under
 your own account's terms. Local bridge records are separate from any records
 retained by the providers.
 
+See [Data retention](docs/DATA-RETENTION.md) for what is stored locally, how the
+30-day defaults work, and what cleanup and uninstall leave behind.
+
 ## Optional local model
 
 If you already have a model installed in Ollama, setup can connect it using its
@@ -150,7 +158,8 @@ sandbox around an arbitrary Ollama server.
 
 - **Filesystem read isolation is incomplete on the Codex peer.** It is instructed
   not to inspect files and runs with a write sandbox, but reads are not fully
-  confined. Built-in assets can remain available. Privacy labels do not repair
+  confined. File content read this way can reach the provider and appear in
+  replies, regardless of the request label. Built-in assets can remain available. Privacy labels do not repair
   this boundary; do not use this setup where enforced read confinement is required.
   The Claude peer runs with tools and customizations disabled.
 - **Model and effort settings are separate from your interactive session.**
@@ -208,6 +217,7 @@ configuration are retained separately.
 | --- | --- |
 | `AGENTS.md` / `CLAUDE.md` | Entry point for an assistant working with this repo. |
 | `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
+| `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
 | `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
 | `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
 | `src/agent_bridge/` | Broker, MCP servers, onboarding and local worker. |
@@ -224,6 +234,10 @@ For the engineering background, see the historical
 [review history](docs/REVIEW-HISTORY.md), and
 [build-your-own brief](docs/BUILD-YOUR-OWN.md). Use the guided setup above to
 install the current implementation.
+
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report
+security issues through the private path in [SECURITY.md](SECURITY.md), not in a
+public issue.
 
 ## Licence
 

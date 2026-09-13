@@ -37,22 +37,19 @@ original group.
 Use PowerShell and run the commands below with `python` where they say
 `python3`. Install the native Windows builds of the Claude and Codex CLIs.
 
-**What has actually been run on Windows, and what has not.** Step 3, the test
-suite, is verified: 491 pass, 0 fail, 6 skip, by hand on Windows 11 with
-CPython 3.12 as an ordinary interactive user, and 497 pass, 0 fail, 0 skip on
-CPython 3.11 and 3.13 in CI, where the runner holds the privilege the six
-skips need. That covers the parts of this
-tool that are hardest to get right on Windows, because the suite drives the
-process-tree, locking and ACL code directly with stand-in CLIs.
+**What has actually been run on Windows, and what has not.** The offline suite
+has been run by hand on Windows 11 with CPython 3.12 as an ordinary interactive
+user, and CI runs it on Windows with CPython 3.11 and 3.13. An ordinary Windows
+account without symlink privileges skips the checks that require them.
+Use the summary printed by your checkout as the authority: every
+executed check must pass, and only explicitly explained skips are acceptable.
+This covers the process-tree, locking and ACL code directly with stand-in CLIs.
 
-Steps 2, 4, 5 and 6 have not been run on Windows. They need both vendors' CLIs
-installed and signed in, which the test machine did not have. Nothing there is
-expected to fail, but "not expected to fail" is not the same claim as step 3's,
-and you should know which one you are relying on. If you are the first person
-to walk the whole install on Windows, the steps most worth watching are pinning
-the CLIs in step 2, which shells out to find them, and registering the MCP
-servers in step 5, which must use the `.cmd` launchers shown there rather than
-the extensionless ones. Please report what you find either way.
+The full live native-Windows setup remains unverified. Steps 2, 4, 5 and 6 need
+both vendors' CLIs installed and signed in, which the test machine did not
+have. If you walk the whole install on Windows, watch CLI discovery and pinning
+in step 2 and use the `.cmd` launchers shown in step 5. Please report what you
+find either way.
 
 WSL is also supported and provides the POSIX implementation. To use it:
 
@@ -150,11 +147,10 @@ Expect `passed: N  failed: 0`. This uses stand-in programs pretending to be the
 two CLIs, so it makes no network calls and costs nothing. Some checks may report
 `skipped` if your system restricts `ps`; that is fine.
 
-On native Windows, expect `passed: 491  failed: 0  skipped: 6`, and run it as
-yourself rather than elevated. The six skips are expected: creating a symbolic
-link needs a privilege an ordinary account does not hold unless Developer Mode
-is on. See "If you are testing this on Windows" in the README before you read
-anything there as a failure.
+On native Windows, run it as yourself rather than elevated. Expect every
+executed check to pass. Symlink checks may be skipped when an ordinary account
+cannot create symlinks unless Developer Mode is on; read the printed skip
+reasons rather than expecting a fixed count.
 
 ## 4. Check it works for real
 
@@ -194,7 +190,7 @@ version-mismatched result is refused.
 
 ## 4b. Decide what each side is allowed to receive
 
-Before you turn it on, read the **Data policy** section of the README. The short
+Before you turn it on, read the **Privacy choices** section of the README. The short
 version: this sends your text to two different companies under two different
 agreements, and it was built assuming both of your plans protect data equally.
 If yours do not, you can allow one side less than the other by adding this to

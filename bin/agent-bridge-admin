@@ -3,6 +3,6 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(dirname -- "$HERE")
 PY=${AGENT_BRIDGE_PYTHON:-python3}
-export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
-exec "$PY" -m agent_bridge.admin "$@"
+exec "$PY" -P -m agent_bridge.admin "$@"

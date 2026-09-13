@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any
 
 from . import store
@@ -28,6 +29,25 @@ CONFIG_ENV = "AGENT_BRIDGE_CONFIG"
 LOCAL_CONFIG_NAME = "local.json"
 
 REQUIRED_KEYS = ("state_root", "schema_path", "limits", "retention", "peers")
+
+
+def canonical_uuid(identifier: Any) -> str:
+    """Return a caller-visible identifier only when it has UUID's canonical form.
+
+    Job and conversation identifiers become path components.  Keeping this
+    check adjacent to the derived-path helpers makes every caller, including
+    operator commands, reject traversal and absolute paths before joining them
+    to the state root.
+    """
+    if not isinstance(identifier, str):
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    try:
+        parsed = uuid.UUID(identifier)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID) from exc
+    if str(parsed) != identifier:
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    return identifier
 
 
 class Config:
@@ -158,15 +178,30 @@ class Config:
     def state(self, *parts: str) -> str:
         return os.path.join(self.state_root, *parts)
 
+    def _state_identifier_path(self, directory: str, identifier: Any,
+                               suffix: str = "") -> str:
+        """Build an identifier path without following an escaped state component."""
+        name = canonical_uuid(identifier) + suffix
+        candidate = self.state(directory, name)
+        root = os.path.realpath(self.state_root)
+        resolved = os.path.realpath(candidate)
+        try:
+            contained = os.path.commonpath((root, resolved)) == root
+        except ValueError:  # Different Windows volumes cannot be contained.
+            contained = False
+        if not contained:
+            raise BrokerError(ErrorCategory.STATE_ROOT_INSECURE)
+        return candidate
+
     @property
     def ledger_path(self) -> str:
         return self.state("ledger", "exchanges.jsonl")
 
     def job_dir(self, job_id: str) -> str:
-        return self.state("jobs", job_id)
+        return self._state_identifier_path("jobs", job_id)
 
     def conversation_path(self, conversation_id: str) -> str:
-        return self.state("conversations", f"{conversation_id}.json")
+        return self._state_identifier_path("conversations", conversation_id, ".json")
 
     def workspace(self, peer: str, conversation_id: str) -> str:
         return self.state("workspaces", peer, conversation_id)

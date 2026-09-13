@@ -12,6 +12,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   offline-suite:
     strategy:
@@ -22,9 +25,11 @@ jobs:
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
 
@@ -76,6 +81,9 @@ jobs:
           python3 -m unittest discover -s tests -p "test_onboard.py"
           python3 -m unittest discover -s tests -p "test_local_worker.py"
           python3 setup_bridge.py --help
+
+      - name: Security regression tests
+        run: python3 -m unittest discover -s tests -p "test_*security*.py"
 
       - name: Setup reports cleanly with no CLIs installed
         shell: bash

@@ -100,7 +100,11 @@ conversation direction will be exposed. This is a setup verification requirement
 not permission to expose the omitted direction. If that is unacceptable to the
 user, leave the setup staged and explain the limitation.
 
-Only a complete, version-bound PASS is accepted. A timeout, missing control,
+Only a complete, version-bound PASS under the current verification profile is
+accepted: both peers, at least ten one-turn calls and three three-turn
+conversations per peer, plus schema-pressure and timeout controls. Abbreviated
+diagnostic runs cannot activate the bridge. Older result files without the
+profile must be regenerated. A timeout, missing control,
 changed candidate or version drift is not success. Use INSTALL.md troubleshooting for
 login failures; do not copy another account's authentication to repair them.
 

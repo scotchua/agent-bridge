@@ -31,6 +31,13 @@ JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
 ERROR_MORE_DATA = 234
 WAIT_TIMEOUT = 258
+WAIT_OBJECT_0 = 0
+WAIT_FAILED = 0xFFFFFFFF
+# A pending ReadFile cannot be cancelled safely by closing its Python stream
+# from another thread: close() waits for that read to return.  Cleanup must
+# therefore only wait a short, fixed interval for its owning daemon thread.
+STREAM_THREAD_JOIN_SECONDS = 0.1
+PROCESS_CLEANUP_WAIT_SECONDS = 5
 
 
 class _IO_COUNTERS(ctypes.Structure):
@@ -96,6 +103,10 @@ kernel32.GetProcessTimes.argtypes = [
 kernel32.GetProcessTimes.restype = wintypes.BOOL
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetExitCodeProcess.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.GetFinalPathNameByHandleW.argtypes = [
@@ -118,22 +129,15 @@ class WindowsPlatform:
         os.umask(0o077)
 
     def enforce_owner_only_file(self, fd: int) -> None:
-        """Apply an owner-only ACL, and record whether it could be verified.
+        """Verify an owner-only ACL before the caller writes sensitive bytes.
 
-        Deliberately does not raise. The capability flag is how a platform says
-        "I cannot guarantee this", and preflight then refuses to start with an
-        explanation. Raising here instead made every atomic write fail, so the
-        bridge could not write any state at all, turning a documented refusal
-        into a crash during ordinary file writes.
-
-        The guarantee is not weakened by this: an unverified ACL sets the flag
-        false, and assert_state_root_secure refuses before any consultation
-        runs.
+        Failure clears the capability flag and raises PermissionError. The
+        caller owns the descriptor and must close it if enforcement fails.
         """
         path = self._path_from_fd(fd)
         if not self._set_and_verify_owner_acl(path):
             self.supports_owner_only_permissions = False
-            return
+            raise PermissionError(f"could not verify owner-only ACL for {path}")
         self.supports_owner_only_permissions = True
 
     def verify_owner_only_path(self, directory: str,
@@ -292,28 +296,25 @@ class WindowsPlatform:
         os.kill(pid, 0) must never be used here: on Windows signal 0 is
         CTRL_C_EVENT, so it delivers a console interrupt instead of probing.
         """
-        SYNCHRONIZE = 0x00100000
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
         handle = kernel32.OpenProcess(
             SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not handle:
             return False
         try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
+            # Exit code 259 (STILL_ACTIVE) is an ordinary user-selected exit
+            # status.  The process handle's signalled state is the liveness
+            # authority; GetExitCodeProcess is diagnostic only.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
         finally:
             kernel32.CloseHandle(handle)
 
     def process_liveness(self, pid: int) -> dict[str, Any]:
-        SYNCHRONIZE_ = 0x00100000
-        QUERY_LIMITED = 0x1000
-        STILL_ACTIVE = 259
-        evidence: dict[str, Any] = {"probe": "OpenProcess+GetExitCodeProcess"}
+        evidence: dict[str, Any] = {
+            "probe": "OpenProcess+WaitForSingleObject+GetExitCodeProcess",
+        }
         ctypes.set_last_error(0)
-        handle = kernel32.OpenProcess(SYNCHRONIZE_ | QUERY_LIMITED, False, int(pid))
+        handle = kernel32.OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not handle:
             # 87 ERROR_INVALID_PARAMETER is what a genuinely gone pid gives.
             # 5 ERROR_ACCESS_DENIED means the process EXISTS and we could not
@@ -321,13 +322,23 @@ class WindowsPlatform:
             evidence.update(alive=False, open_process_error=ctypes.get_last_error())
             return evidence
         try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                evidence.update(alive=False,
-                                get_exit_code_error=ctypes.get_last_error())
-                return evidence
-            evidence.update(alive=code.value == STILL_ACTIVE,
-                            exit_code=int(code.value))
+            wait_result = int(kernel32.WaitForSingleObject(handle, 0))
+            evidence["wait_result"] = wait_result
+            if wait_result == WAIT_TIMEOUT:
+                evidence["alive"] = True
+            elif wait_result == WAIT_OBJECT_0:
+                evidence["alive"] = False
+            elif wait_result == WAIT_FAILED:
+                evidence.update(alive=False, liveness_indeterminate=True,
+                                wait_error=ctypes.get_last_error())
+            else:
+                evidence.update(alive=False, liveness_indeterminate=True,
+                                unexpected_wait_result=True)
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                evidence["exit_code"] = int(code.value)
+            else:
+                evidence["get_exit_code_error"] = ctypes.get_last_error()
             return evidence
         finally:
             kernel32.CloseHandle(handle)
@@ -425,14 +436,25 @@ class WindowsPlatform:
                         break
             except (OSError, ValueError):
                 events.put((name, None))
+            finally:
+                # This thread owns the stream.  Closing it here is safe only
+                # after its read returned; closing it from the coordinating
+                # thread while ReadFile is pending can block forever.
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
         def writer() -> None:
             try:
                 if proc.stdin is not None:
                     proc.stdin.write(stdin_data.encode("utf-8"))
-                    proc.stdin.close()
             except (BrokenPipeError, OSError, ValueError):
                 pass
+            finally:
+                # As with the readers, this thread owns stdin while write()
+                # may be pending.  It closes stdin itself once it is done.
+                if proc.stdin is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        proc.stdin.close()
 
         open_streams = {"stdout", "stderr"}
         threads = []
@@ -473,36 +495,40 @@ class WindowsPlatform:
                     continue
         finally:
             stop.set()
-            # Kill the child BEFORE closing the pipes. On Windows, close() on a
-            # handle with a pending ReadFile blocks until that read completes,
-            # and a reader thread blocked on a live child's pipe never
-            # completes: the main thread waits on the reader, the reader waits
-            # on the child, and the run hangs forever. Confirmed by stack dump,
-            # two readers blocked in read() and the main thread blocked in
-            # close().
-            #
-            # Ending the child makes the pending reads return EOF, so the close
-            # completes. This only fires when the loop exited while the child
-            # was still running, meaning a timeout, a cap breach, or a
-            # descendant holding a pipe. A peer that finished normally is
-            # already gone and is not touched. Killing the wider process tree
-            # remains the caller's job.
-            if proc.poll() is None:
-                # The whole TREE, not just the child. Killing only the direct
-                # child leaves grandchildren holding the same pipe handles, so
-                # the pending reads still never return and the close still
-                # blocks. A shell wrapper around a peer is the ordinary case,
-                # not an exotic one.
+            io_threads = [*threads, input_thread]
+            must_terminate_tree = (
+                timed_out or cap_exceeded.is_set() or descendant_held_pipes
+            )
+            if not must_terminate_tree:
+                # An EOF event is sent just before a reader returns.  Give that
+                # normal path a bounded chance to finish before treating a
+                # still-live IO owner as a reason to terminate the tree.
+                for thread in io_threads:
+                    thread.join(timeout=STREAM_THREAD_JOIN_SECONDS)
+                must_terminate_tree = any(thread.is_alive() for thread in io_threads)
+            if must_terminate_tree:
+                # The whole TREE, not only the leader.  A leader can exit while
+                # a descendant still owns stdout or stderr, so poll() cannot
+                # decide whether the Job Object must be terminated.  Failure
+                # to terminate is intentionally not treated as containment:
+                # the daemon reader remains detached and the incomplete-output
+                # flag keeps any captured prefix from becoming a response.
                 with contextlib.suppress(Exception):
                     self.terminate_process_tree(proc.pid, 0.0)
-                with contextlib.suppress(OSError, ValueError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=5)
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream is not None:
+                if proc.poll() is None:
                     with contextlib.suppress(OSError, ValueError):
-                        stream.close()
+                        proc.kill()
+                    with contextlib.suppress(
+                            OSError, ValueError, subprocess.TimeoutExpired):
+                        proc.wait(timeout=PROCESS_CLEANUP_WAIT_SECONDS)
+
+            # Do not synchronously close proc.stdin/stdout/stderr here.  Each
+            # stream is owned and closed by its writer or reader thread.  A
+            # bounded join lets ordinary Job Object cleanup release those
+            # threads while a descendant outside the job cannot make this
+            # method, and therefore the worker's deadline, hang forever.
+            for thread in io_threads:
+                thread.join(timeout=STREAM_THREAD_JOIN_SECONDS)
 
         return base.StreamReadResult(
             stdout=bytes(buffers["stdout"]),
@@ -659,4 +685,5 @@ class WindowsPlatform:
             return False
         text = observed.stdout.decode("utf-8", "replace")
         return (observed.returncode == 0
-                and icacls_listing_is_owner_only(text, user, owner_name))
+                and icacls_listing_is_owner_only(
+                    text, user, owner_name, expected_path=path))

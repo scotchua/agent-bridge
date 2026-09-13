@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 WINDOWS_OWNER_ONLY_GUARANTEE = (
     "No principal other than the owner, SYSTEM, and Administrators has any access."
@@ -23,8 +25,16 @@ _ADMINISTRATOR_ALIASES = {
 }
 
 
+_SUMMARY = re.compile(
+    r"^Successfully processed \d+ files; Failed processing \d+ files$",
+    re.IGNORECASE,
+)
+_ACE = re.compile(r"^(?P<principal>[^:\r\n]+):(?P<rights>(?:\([^)\r\n]+\))+)$")
+
+
 def icacls_listing_is_owner_only(text: str, owner_sid: str,
-                                 owner_name: str = "") -> bool:
+                                 owner_name: str = "",
+                                 expected_path: str | None = None) -> bool:
     """Prove that only the owner, SYSTEM, and Administrators have access."""
     if not owner_sid.startswith("S-1-"):
         return False
@@ -33,24 +43,37 @@ def icacls_listing_is_owner_only(text: str, owner_sid: str,
     if owner_name:
         allowed.add(owner_name.upper())
     principals: list[str] = []
+    first_ace = True
     for line in text.splitlines():
         stripped = line.strip()
-        marker = stripped.rfind(":(")
-        if marker < 0:
+        if not stripped:
             continue
-        principal = stripped[:marker]
-        if not principals:
-            matches = [candidate for candidate in allowed
-                       if principal.upper().endswith(candidate)
-                       and len(principal) > len(candidate)
-                       and principal[-len(candidate) - 1].isspace()]
-            if not matches:
+        if _SUMMARY.fullmatch(stripped):
+            continue
+        ace_text = stripped
+        if first_ace and expected_path is not None:
+            prefix = line[:len(expected_path)]
+            remainder = line[len(expected_path):]
+            # icacls prints the target only on the first ACE line.  Match its
+            # whole prefix (case-insensitively, as Windows paths are) and the
+            # following separator; suffix matching a permitted principal lets
+            # an attacker make an untrusted account name look like SYSTEM.
+            if (prefix.casefold() != expected_path.casefold()
+                    or not remainder or not remainder[0].isspace()):
                 return False
-            principal = max(matches, key=len)
-        principal = principal.strip().upper()
-        if not principal or principal not in allowed or "(I)" in stripped:
+            ace_text = remainder.strip()
+        ace = _ACE.fullmatch(ace_text)
+        if ace is None:
+            # Every nonblank line must be either a known icacls summary or a
+            # complete ACE.  Ignoring malformed ACE-looking output turns an
+            # unverified ACL into an apparent success.
+            return False
+        principal = ace.group("principal").strip().upper()
+        rights = ace.group("rights").upper()
+        if not principal or principal not in allowed or "(I)" in rights:
             return False
         principals.append(principal)
+        first_ace = False
     # The owner may appear as the SID, as OWNER RIGHTS, or as the resolved
     # account name. icacls resolves a SID to a name for display, so granting by
     # *SID and then reading back commonly yields the NAME, which is exactly what

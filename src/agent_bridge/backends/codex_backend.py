@@ -203,7 +203,7 @@ def run_consultation(
         "observed_thread_ids": observed_ids,
         "thread_id_ambiguous": ambiguous,
         "thread_id_honoured": (
-            None if not thread_id else (parsed_thread_id in (None, thread_id))
+            None if not thread_id or not parsed_thread_id else parsed_thread_id == thread_id
         ),
         "thread_migrated": migrated,
     }

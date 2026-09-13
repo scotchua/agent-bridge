@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible problem with agent-bridge
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here. Follow SECURITY.md. Do not upload credentials, tokens, real provider configuration, raw consultation history or raw logs. Use synthetic examples and redact usernames and local paths.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic input and list the smallest set of steps that reproduces the problem.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit hash or release identifier, if known.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Python version, and relevant CLI versions. Do not include usernames or local paths.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Checks already tried
+      description: Summarize commands and results. Include only inspected, reduced, non-sensitive excerpts.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: I removed credentials, tokens, real configuration, consultation content, raw logs, usernames and private paths.
+          required: true
+        - label: This report does not describe a security vulnerability.
+          required: true

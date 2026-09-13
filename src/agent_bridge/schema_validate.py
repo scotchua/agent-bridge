@@ -63,21 +63,43 @@ MAX_VIOLATIONS = 100
 
 def validate(instance: Any, schema: Any, path: str = "$") -> list[str]:
     """Validate and return at most MAX_VIOLATIONS structural violations."""
-    errs = _validate(instance, schema, path)
-    if len(errs) > MAX_VIOLATIONS:
-        remaining = len(errs) - MAX_VIOLATIONS
-        return errs[:MAX_VIOLATIONS] + [f"and {remaining} further violations, truncated"]
-    return errs
+    state = _ValidationState()
+    _validate(instance, schema, path, state)
+    if state.truncated:
+        state.errors.append("further violations truncated")
+    return state.errors
 
 
-def _validate(instance: Any, schema: Any, path: str = "$") -> list[str]:
-    """Return a list of human-readable violations. Empty list means valid.
+class _ValidationState:
+    """Collect a fixed number of violations without building an unbounded list."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.truncated = False
+
+    def add(self, error: str) -> bool:
+        if len(self.errors) >= MAX_VIOLATIONS:
+            self.truncated = True
+            return False
+        self.errors.append(error)
+        return True
+
+    @property
+    def full(self) -> bool:
+        return len(self.errors) >= MAX_VIOLATIONS
+
+
+def _validate(instance: Any, schema: Any, path: str,
+              state: _ValidationState) -> None:
+    """Add human-readable structural violations to *state*.
 
     Violation strings describe *structure* only (paths, expected types, allowed
     enum values).  They never echo the instance's string values, so a violation
     list is safe to record in provenance without leaking peer prose.
     """
-    errs: list[str] = []
+    if state.full:
+        state.truncated = True
+        return
     t = schema.get("type")
 
     if t is not None:
@@ -95,55 +117,64 @@ def _validate(instance: Any, schema: Any, path: str = "$") -> list[str]:
             if t == "object" and isinstance(instance, bool):
                 ok = False
         if not ok:
-            errs.append(f"{path}: expected type {t}")
-            return errs  # further checks would be meaningless
+            state.add(f"{path}: expected type {t}")
+            return  # further checks would be meaningless
 
     if "const" in schema and instance != schema["const"]:
-        errs.append(f"{path}: value not equal to required const")
+        state.add(f"{path}: value not equal to required const")
     if "enum" in schema and instance not in schema["enum"]:
         allowed = ", ".join(repr(v) for v in schema["enum"])
-        errs.append(f"{path}: value not in enum [{allowed}]")
+        state.add(f"{path}: value not in enum [{allowed}]")
 
     if isinstance(instance, str):
         if "minLength" in schema and len(instance) < schema["minLength"]:
-            errs.append(f"{path}: shorter than minLength {schema['minLength']}")
+            state.add(f"{path}: shorter than minLength {schema['minLength']}")
         if "maxLength" in schema and len(instance) > schema["maxLength"]:
-            errs.append(f"{path}: longer than maxLength {schema['maxLength']}")
+            state.add(f"{path}: longer than maxLength {schema['maxLength']}")
 
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
         if "minimum" in schema and instance < schema["minimum"]:
-            errs.append(f"{path}: below minimum {schema['minimum']}")
+            state.add(f"{path}: below minimum {schema['minimum']}")
         if "maximum" in schema and instance > schema["maximum"]:
-            errs.append(f"{path}: above maximum {schema['maximum']}")
+            state.add(f"{path}: above maximum {schema['maximum']}")
 
     if isinstance(instance, list):
         if "minItems" in schema and len(instance) < schema["minItems"]:
-            errs.append(f"{path}: fewer than minItems {schema['minItems']}")
+            state.add(f"{path}: fewer than minItems {schema['minItems']}")
         if "maxItems" in schema and len(instance) > schema["maxItems"]:
-            errs.append(f"{path}: more than maxItems {schema['maxItems']}")
+            state.add(f"{path}: more than maxItems {schema['maxItems']}")
+            # The maxItems failure already rejects the document. Do not walk
+            # a peer-controlled overlong array just to accumulate redundant
+            # failures for its elements.
+            return
         item_schema = schema.get("items")
         if item_schema is not None:
-            # Stop once enough violations exist to fail the document. Walking
-            # every element of a million-item array to describe each one is
-            # pure amplification: the verdict is already decided.
             for i, item in enumerate(instance):
-                if len(errs) > MAX_VIOLATIONS:
-                    errs.append(f"{path}: further items not examined, "
-                                "violation limit reached")
+                if state.full:
+                    state.truncated = True
                     break
-                errs.extend(_validate(item, item_schema, f"{path}[{i}]"))
+                _validate(item, item_schema, f"{path}[{i}]", state)
 
     if isinstance(instance, dict):
         props: dict[str, Any] = schema.get("properties") or {}
         for name in schema.get("required") or []:
+            if state.full:
+                state.truncated = True
+                return
             if name not in instance:
-                errs.append(f"{path}: missing required property {name!r}")
+                state.add(f"{path}: missing required property {name!r}")
         if schema.get("additionalProperties", True) is False:
-            for name in sorted(instance):
+            for name in instance:
+                if state.full:
+                    state.truncated = True
+                    return
                 if name not in props:
-                    errs.append(f"{path}: unexpected property {name!r}")
+                    # Object keys come from the instance too. Do not put an
+                    # unexpected key into a corrective prompt or provenance.
+                    state.add(f"{path}: unexpected property")
         for name, sub in props.items():
+            if state.full:
+                state.truncated = True
+                return
             if name in instance:
-                errs.extend(_validate(instance[name], sub, f"{path}.{name}"))
-
-    return errs
+                _validate(instance[name], sub, f"{path}.{name}", state)

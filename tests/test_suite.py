@@ -14,6 +14,7 @@ import threading
 import subprocess
 import sys
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import REPO, Sandbox, check, summary  # noqa: E402
@@ -82,6 +83,11 @@ from agent_bridge.platform.windows_acl import (  # noqa: E402
 )
 
 BOTH = [("codex", "claude"), ("claude", "codex")]
+
+
+def fixture_id(label: str) -> str:
+    """Stable canonical UUID for a synthetic job or conversation fixture."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agent-bridge-test:{label}"))
 
 
 def cfg_contract_version() -> str:
@@ -681,7 +687,7 @@ def test_atomic_and_restart_safe() -> None:
         # A job whose worker vanished must not hang in `running` forever. Uses
         # a fresh non-terminal job: a completed one can no longer be walked
         # backwards, which is itself the F1 fix.
-        orphaned = "synthetic-dead-worker-job"
+        orphaned = "271877b1-f1dd-45aa-8da5-c77162664896"
         registry.write_status(sb.cfg, orphaned, "running", worker_pid=999999,
                               conversation_id="none", peer="claude", caller="codex")
         reconciled = registry.reconcile(sb.cfg, orphaned)
@@ -1016,7 +1022,7 @@ def test_read_before_complete() -> None:
               r["error_category"] == ErrorCategory.JOB_NOT_COMPLETE.value, json.dumps(r))
         out = sb.mcp("codex", [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                 "params": {"name": "claude_read",
-                                           "arguments": {"job_id": "no-such-job"}}}])
+                                           "arguments": {"job_id": "b3db4553-f57f-44a6-a8a7-365ee3cdefe4"}}}])
         check("read of an unknown job_id is refused",
               out[0]["result"]["structuredContent"]["error_category"]
               == ErrorCategory.JOB_NOT_FOUND.value)
@@ -1066,8 +1072,9 @@ def test_codex_review_regressions() -> None:
         check("F2: a completed job released its conversation claim",
               record.get("active_job_id") is None, str(record.get("active_job_id")))
         # Claim it, then prove a second admission is refused while held.
-        registry.claim_conversation_slot(sb.cfg, cid, "codex", "held-job", 20)
-        registry.write_status(sb.cfg, "held-job", "running", worker_pid=os.getpid(),
+        held_job = fixture_id("f2-held-job")
+        registry.claim_conversation_slot(sb.cfg, cid, "codex", held_job, 20)
+        registry.write_status(sb.cfg, held_job, "running", worker_pid=os.getpid(),
                               conversation_id=cid, caller="codex", peer="claude")
         out = sb.mcp("codex", [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                "params": {"name": "claude_continue", "arguments": {
@@ -1076,12 +1083,12 @@ def test_codex_review_regressions() -> None:
         r = out[0]["result"]["structuredContent"]
         check("F2: a held claim refuses a concurrent continuation",
               r.get("error_category") == ErrorCategory.CONVERSATION_BUSY.value, json.dumps(r))
-        registry.release_conversation_slot(sb.cfg, cid, "held-job")
+        registry.release_conversation_slot(sb.cfg, cid, held_job)
         # A non-owner must change NOTHING. The previous version of this test
         # asserted the opposite and so endorsed the hole it should have caught.
         before = registry.load_conversation(sb.cfg, cid)["turns"]
         try:
-            registry.release_conversation_slot(sb.cfg, cid, "not-the-owner",
+            registry.release_conversation_slot(sb.cfg, cid, fixture_id("f2-not-owner"),
                                                increment_turns=True)
             check("F2: a non-owner release is refused", False, "it was allowed")
         except BrokerError as exc:
@@ -1091,8 +1098,9 @@ def test_codex_review_regressions() -> None:
               registry.load_conversation(sb.cfg, cid)["turns"] == before)
         # The owner's increments are serialised inside the lock.
         for index in range(5):
-            registry.claim_conversation_slot(sb.cfg, cid, "codex", f"owned-{index}", 99)
-            registry.release_conversation_slot(sb.cfg, cid, f"owned-{index}",
+            owned = fixture_id(f"f2-owned-{index}")
+            registry.claim_conversation_slot(sb.cfg, cid, "codex", owned, 99)
+            registry.release_conversation_slot(sb.cfg, cid, owned,
                                                increment_turns=True)
         check("F2: five owned increments all land",
               registry.load_conversation(sb.cfg, cid)["turns"] - before == 5,
@@ -1337,7 +1345,7 @@ def test_round_two_regressions() -> None:
             check("R1: strict mode raises on a terminal rewrite",
                   str(exc) == "failed -> failed (terminal is final)", str(exc))
         # And the compare-and-set path: a stale seq is refused outright.
-        fresh = "cas-job"
+        fresh = fixture_id("r1-cas-job")
         first = registry.write_status(sb.cfg, fresh, "running", worker_pid=os.getpid())
         registry.write_status(sb.cfg, fresh, "running", worker_pid=os.getpid())
         stale = registry.write_status(sb.cfg, fresh, "failed",
@@ -1354,7 +1362,8 @@ def test_round_two_regressions() -> None:
         started, _, _ = sb.run_to_completion("codex")
         cid = started["conversation_id"]
         # Simulate a job that has claimed but not yet written any status.
-        registry.claim_conversation_slot(sb.cfg, cid, "codex", "claimed-not-spawned", 99)
+        registry.claim_conversation_slot(
+            sb.cfg, cid, "codex", fixture_id("r2-claimed-not-spawned"), 99)
         check("R2: a claim with no status file is live during its grace window",
               registry.conversation_has_active_job(sb.cfg, cid),
               "treated as stale immediately")
@@ -1581,13 +1590,14 @@ def test_self_found_round_three() -> None:
     try:
         started, _, _ = sb.run_to_completion("codex")
         cid = started["conversation_id"]
-        registry.claim_conversation_slot(sb.cfg, cid, "codex", "the-owner", 99)
+        owner = fixture_id("s1-owner")
+        registry.claim_conversation_slot(sb.cfg, cid, "codex", owner, 99)
         # A non-owner cleanup must be silent, not raise over the real error.
-        broker._release_quietly(sb.cfg, cid, "not-the-owner")
+        broker._release_quietly(sb.cfg, cid, fixture_id("s1-not-owner"))
         check("S1: a non-owner rollback is silent instead of masking the cause",
-              registry.load_conversation(sb.cfg, cid)["active_job_id"] == "the-owner")
+              registry.load_conversation(sb.cfg, cid)["active_job_id"] == owner)
         try:
-            registry.release_conversation_slot(sb.cfg, cid, "not-the-owner")
+            registry.release_conversation_slot(sb.cfg, cid, fixture_id("s1-not-owner"))
             check("S1: the underlying release still refuses a non-owner", False, "allowed")
         except BrokerError as exc:
             check("S1: the underlying release still refuses a non-owner",
@@ -1651,7 +1661,7 @@ def test_round_three_regressions() -> None:
         calls_before = len(open(log).readlines()) if os.path.exists(log) else 0
 
         # Job A claims and is prepared, but never dispatched.
-        job_a = "stalled-launcher-A"
+        job_a = fixture_id("t1-stalled-launcher")
         registry.claim_conversation_slot(sb.cfg, cid, "codex", job_a, 99)
         store.atomic_write_json(
             os.path.join(store.secure_mkdir(sb.cfg.job_dir(job_a)), "request.json"),
@@ -1664,7 +1674,7 @@ def test_round_three_regressions() -> None:
         # A fresh claim is correctly un-stealable, so backdate it: this is the
         # honest simulation of A stalling past its grace before dispatching.
         try:
-            registry.claim_conversation_slot(sb.cfg, cid, "codex", "rival-B", 99)
+            registry.claim_conversation_slot(sb.cfg, cid, "codex", fixture_id("t1-rival"), 99)
             check("T1: a FRESH claim cannot be stolen", False, "it was stolen")
         except BrokerError as exc:
             check("T1: a FRESH claim cannot be stolen",
@@ -1672,9 +1682,10 @@ def test_round_three_regressions() -> None:
         registry.update_conversation(sb.cfg, cid,
                                      active_job_claimed_at="2020-01-01T00:00:00.000+00:00")
         # Job B steals the slot while A is stalled past its grace.
-        registry.claim_conversation_slot(sb.cfg, cid, "codex", "rival-B", 99)
+        rival = fixture_id("t1-rival")
+        registry.claim_conversation_slot(sb.cfg, cid, "codex", rival, 99)
         check("T1: the rival now owns the conversation",
-              registry.load_conversation(sb.cfg, cid)["active_job_id"] == "rival-B")
+              registry.load_conversation(sb.cfg, cid)["active_job_id"] == rival)
 
         # A's worker finally runs. It must fail BEFORE any peer invocation.
         env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
@@ -1691,7 +1702,7 @@ def test_round_three_regressions() -> None:
         check("T1: and it made NO peer call at all", real_calls == 0,
               f"{real_calls} peer invocations were logged")
         check("T1: the rival still owns the slot, unaffected",
-              registry.load_conversation(sb.cfg, cid)["active_job_id"] == "rival-B")
+              registry.load_conversation(sb.cfg, cid)["active_job_id"] == rival)
         check("T1: the handshake runs before the peer call in source order",
               inspect.getsource(worker.execute).index("assert_conversation_ownership")
               < inspect.getsource(worker.execute).index("_run_peer("))
@@ -1705,7 +1716,8 @@ def test_round_three_regressions() -> None:
               registry.claim_grace(sb.cfg) == 1.0, str(registry.claim_grace(sb.cfg)))
         started, _, _ = sb.run_to_completion("codex")
         cid = started["conversation_id"]
-        registry.claim_conversation_slot(sb.cfg, cid, "codex", "future-claim", 99)
+        registry.claim_conversation_slot(
+            sb.cfg, cid, "codex", fixture_id("t1b-future-claim"), 99)
         registry.update_conversation(sb.cfg, cid,
                                      active_job_claimed_at="2099-01-01T00:00:00.000+00:00")
         time.sleep(1.2)
@@ -1959,23 +1971,24 @@ def test_round_four_regressions() -> None:
     # earlier rounds defeated each other.
     sb = Sandbox()
     try:
-        cid = "u1-conv"
+        cid = fixture_id("u1-conversation")
+        job_a = fixture_id("u1-job-a")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "sess-1", "turns": 1, "closed": False,
-            "active_job_id": "A", "active_job_claimed_at": store.utc_now(),
+            "active_job_id": job_a, "active_job_claimed_at": store.utc_now(),
             "workspace": sb.cfg.workspace("claude", cid),
             "created_at": store.utc_now(), "updated_at": store.utc_now()})
-        job_dir = store.secure_mkdir(sb.cfg.job_dir("A"))
+        job_dir = store.secure_mkdir(sb.cfg.job_dir(job_a))
         store.atomic_write_json(os.path.join(job_dir, "request.json"), {
-            "job_id": "A", "conversation_id": cid, "caller": "codex",
+            "job_id": job_a, "conversation_id": cid, "caller": "codex",
             "peer": "claude", "prompt": "A must never reach the peer",
             "source_classification": "internal", "label": None, "resume": True,
             "config_path": sb.config_path, "created_at": store.utc_now()})
-        registry.write_status(sb.cfg, "A", "queued", conversation_id=cid,
+        registry.write_status(sb.cfg, job_a, "queued", conversation_id=cid,
                               peer="claude", caller="codex")
         # A poll reconciles the stalled queued job to terminal.
-        registry.write_status(sb.cfg, "A", "failed",
+        registry.write_status(sb.cfg, job_a, "failed",
                               error_category=ErrorCategory.WORKER_DIED.value)
         log = sb.marker("u1-peer-calls.log")
         sb.env(FAKE_CLAUDE_ARGV_LOG=log)
@@ -1984,12 +1997,12 @@ def test_round_four_regressions() -> None:
         env = dict(os.environ); env["PYTHONPATH"] = os.path.join(REPO, "src")
         env["AGENT_BRIDGE_CONFIG"] = sb.config_path
         subprocess.run([sys.executable, "-m", "agent_bridge.worker",
-                        "--job-dir", sb.cfg.job_dir("A")],
+                        "--job-dir", sb.cfg.job_dir(job_a)],
                        capture_output=True, cwd=REPO, env=env, timeout=60)
         after = len(open(log).readlines()) if os.path.exists(log) else 0
         check("U1: a worker whose running write was swallowed makes NO peer call",
               after - before == 0, f"{after - before} peer invocations")
-        abandoned = store.read_json_or_none(os.path.join(sb.cfg.job_dir("A"),
+        abandoned = store.read_json_or_none(os.path.join(sb.cfg.job_dir(job_a),
                                                          "abandoned.json"))
         check("U1: it records why it abandoned the job",
               bool(abandoned) and abandoned["reason"]
@@ -1997,10 +2010,10 @@ def test_round_four_regressions() -> None:
         check("U1: and records explicitly that the peer was not contacted",
               abandoned.get("peer_contacted") is False)
         check("U1: the terminal record is not overwritten",
-              registry.read_status(sb.cfg, "A")["error_category"]
+              registry.read_status(sb.cfg, job_a)["error_category"]
               == ErrorCategory.WORKER_DIED.value)
         check("U1: the abandonment is in the ledger",
-              any(r.get("record_type") == "worker_abandoned" and r.get("job_id") == "A"
+              any(r.get("record_type") == "worker_abandoned" and r.get("job_id") == job_a
                   for r in sb.ledger()))
         check("U1: and it gave up the claim rather than holding it",
               registry.load_conversation(sb.cfg, cid).get("active_job_id") is None,
@@ -2016,7 +2029,8 @@ def test_round_four_regressions() -> None:
     else:
         sb = Sandbox()
         try:
-            attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("J"),
+            job = fixture_id("u2-job")
+            attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir(job),
                                                       "attempts", "1"))
             proc = active_platform.spawn_isolated(
                 [sys.executable, "-c", GROUP_OF_TWO], cwd=REPO, env=os.environ.copy())
@@ -2026,12 +2040,12 @@ def test_round_four_regressions() -> None:
                 os.path.join(attempt, registry.INFLIGHT_MARKER),
                 {"pgid": pgid, "leader_pid": proc.pid, "leader_start": lstart,
                  "spawned_at": time.time()})
-            registry.write_status(sb.cfg, "J", "running", worker_pid=999999)
+            registry.write_status(sb.cfg, job, "running", worker_pid=999999)
 
             live = group_survivors
 
             check("U2: the peer group is alive before reconcile", len(live(pgid)) >= 1)
-            status = registry.reconcile(sb.cfg, "J")
+            status = registry.reconcile(sb.cfg, job)
             time.sleep(0.5); proc.poll()
             check("U2: a dead worker's orphaned peer is reaped",
                   len(live(pgid)) == 0, str(live(pgid)))
@@ -2047,16 +2061,17 @@ def test_round_four_regressions() -> None:
     # signalled, because its identity cannot be established.
     sb = Sandbox()
     try:
-        legacy = store.secure_mkdir(os.path.join(sb.cfg.job_dir("LEGACY"),
+        legacy_job = fixture_id("u2c-legacy")
+        legacy = store.secure_mkdir(os.path.join(sb.cfg.job_dir(legacy_job),
                                                  "attempts", "1"))
         with open(os.path.join(legacy, registry.INFLIGHT_MARKER), "w",
                   encoding="utf-8") as handle:
             handle.write("12345")          # bare integer, the old format
-        found = registry.inflight_attempts(sb.cfg, "LEGACY")
+        found = registry.inflight_attempts(sb.cfg, legacy_job)
         check("U2c: a bare-integer marker is still read as evidence",
               len(found) == 1 and found[0].get("unparseable_marker") is True,
               json.dumps(found))
-        outcomes = registry.reap_orphaned_peers(sb.cfg, "LEGACY")
+        outcomes = registry.reap_orphaned_peers(sb.cfg, legacy_job)
         check("U2c: and it is never signalled, because identity is unknowable",
               all(not o.get("signalled") for o in outcomes), json.dumps(outcomes))
     finally:
@@ -2065,14 +2080,15 @@ def test_round_four_regressions() -> None:
     # U2b: reaping must never signal the broker's own process group.
     sb = Sandbox()
     try:
-        attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("SELF"),
+        self_job = fixture_id("u2b-self")
+        attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir(self_job),
                                                   "attempts", "1"))
         store.atomic_write_json(
             os.path.join(attempt, registry.INFLIGHT_MARKER),
             {"pgid": (os.getpgrp() if os.name != "nt" else os.getpid()),
              "leader_pid": os.getpid(),
              "leader_start": "x", "spawned_at": time.time()})
-        reaped = registry.reap_orphaned_peers(sb.cfg, "SELF")
+        reaped = registry.reap_orphaned_peers(sb.cfg, self_job)
         check("U2b: reaping refuses to signal our own process group",
               all(not r.get("signalled") for r in reaped)
               and any("own group" in str(r.get("identity")) for r in reaped),
@@ -2090,13 +2106,14 @@ def test_round_four_regressions() -> None:
           "claim_grace(cfg)" in inspect.getsource(registry.reconcile))
     sb = Sandbox(limits={"claim_grace_seconds": 1})
     try:
-        registry.write_status(sb.cfg, "slow", "queued", conversation_id="x",
+        slow_job = fixture_id("u4-slow")
+        registry.write_status(sb.cfg, slow_job, "queued", conversation_id=fixture_id("u4-conversation"),
                               peer="claude", caller="codex")
         check("U4: a queued job inside the grace stays queued",
-              registry.reconcile(sb.cfg, "slow")["status"] == "queued")
+              registry.reconcile(sb.cfg, slow_job)["status"] == "queued")
         time.sleep(1.3)
         check("U4: and past the configured grace it reconciles to failed",
-              registry.reconcile(sb.cfg, "slow")["error_category"]
+              registry.reconcile(sb.cfg, slow_job)["error_category"]
               == ErrorCategory.WORKER_DIED.value)
     finally:
         sb.cleanup()
@@ -2112,14 +2129,15 @@ def test_round_four_second_pass() -> None:
     else:
         sb = Sandbox()
         try:
-            cid = "v1-conv"
+            cid = fixture_id("v1-conversation")
+            dead_job = fixture_id("v1-dead")
             store.atomic_write_json(sb.cfg.conversation_path(cid), {
                 "conversation_id": cid, "caller": "codex", "peer": "claude",
                 "peer_session_id": "sess-1", "turns": 1, "closed": False,
-                "active_job_id": "DEAD", "active_job_claimed_at": store.utc_now(),
+                "active_job_id": dead_job, "active_job_claimed_at": store.utc_now(),
                 "workspace": sb.cfg.workspace("claude", cid),
                 "created_at": store.utc_now(), "updated_at": store.utc_now()})
-            attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("DEAD"),
+            attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir(dead_job),
                                                       "attempts", "1"))
             proc = active_platform.spawn_isolated(
                 [sys.executable, "-c", GROUP_OF_TWO], cwd=REPO, env=os.environ.copy())
@@ -2134,7 +2152,7 @@ def test_round_four_second_pass() -> None:
                 {"pgid": pgid, "leader_pid": proc.pid, "leader_start": lstart,
                  "spawned_at": time.time()})
             # A dead worker: non-terminal status, pid gone.
-            registry.write_status(sb.cfg, "DEAD", "running", worker_pid=999999,
+            registry.write_status(sb.cfg, dead_job, "running", worker_pid=999999,
                                   conversation_id=cid, peer="claude", caller="codex")
 
             live = group_survivors
@@ -2143,7 +2161,7 @@ def test_round_four_second_pass() -> None:
                   len(live(pgid)) >= 1)
             # Admission WITHOUT any poll or reconcile having run.
             try:
-                registry.claim_conversation_slot(sb.cfg, cid, "codex", "NEW", 99)
+                registry.claim_conversation_slot(sb.cfg, cid, "codex", fixture_id("v1-new"), 99)
                 check("V1: admission refuses to hand over a mid-call session",
                       False, "the claim was handed over")
             except BrokerError as exc:
@@ -2162,7 +2180,7 @@ def test_round_four_second_pass() -> None:
             check("V1: a further attempt is still refused while held",
                   True)
             try:
-                registry.claim_conversation_slot(sb.cfg, cid, "codex", "NEWER", 99)
+                registry.claim_conversation_slot(sb.cfg, cid, "codex", fixture_id("v1-newer"), 99)
                 check("V1: repeated admission stays refused", False, "allowed")
             except BrokerError as exc:
                 check("V1: repeated admission stays refused",
@@ -2180,9 +2198,10 @@ def test_round_four_second_pass() -> None:
                            capture_output=True, cwd=REPO, env=env, timeout=60)
             check("V1: after resolve --apply the conversation may continue",
                   registry.load_conversation(sb.cfg, cid)["indeterminate"] is False)
-            registry.claim_conversation_slot(sb.cfg, cid, "codex", "AFTER", 99)
+            after_job = fixture_id("v1-after")
+            registry.claim_conversation_slot(sb.cfg, cid, "codex", after_job, 99)
             check("V1: and admission then succeeds",
-                  registry.load_conversation(sb.cfg, cid)["active_job_id"] == "AFTER")
+                  registry.load_conversation(sb.cfg, cid)["active_job_id"] == after_job)
         finally:
             sb.cleanup()
 
@@ -2209,10 +2228,11 @@ def test_round_four_second_pass() -> None:
     os.unlink(probe)
     sb = Sandbox()
     try:
-        attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir("CLEAN"),
+        clean_job = fixture_id("v2-clean")
+        attempt = store.secure_mkdir(os.path.join(sb.cfg.job_dir(clean_job),
                                                   "attempts", "1"))
         check("V2: an attempt with no pgid file is not a reap candidate",
-              registry.reap_orphaned_peers(sb.cfg, "CLEAN") == [])
+              registry.reap_orphaned_peers(sb.cfg, clean_job) == [])
     finally:
         sb.cleanup()
 
@@ -2258,15 +2278,16 @@ def test_round_four_third_pass() -> None:
     # and would have handed the session over.
     sb = Sandbox()
     try:
-        make_conv(sb, "w1", "DEAD")
-        marker(sb, "DEAD", {"pgid": 999998, "leader_pid": 999998,
+        w1_cid, w1_job = fixture_id("w1-conversation"), fixture_id("w1-dead")
+        make_conv(sb, w1_cid, w1_job)
+        marker(sb, w1_job, {"pgid": 999998, "leader_pid": 999998,
                             "leader_start": "Sat Jan  1 00:00:00 2020",
                             "spawned_at": 1.0})
-        reaped = registry.reap_orphaned_peers(sb.cfg, "DEAD")
+        reaped = registry.reap_orphaned_peers(sb.cfg, w1_job)
         check("W1: reaping an already-gone group signals nothing",
               all(not r.get("signalled") for r in reaped), json.dumps(reaped))
         try:
-            registry.claim_conversation_slot(sb.cfg, "w1", "codex", "NEW", 99)
+            registry.claim_conversation_slot(sb.cfg, w1_cid, "codex", fixture_id("w1-new"), 99)
             check("W1: an in-flight marker holds admission even with zero kills",
                   False, "the session was handed over")
         except BrokerError as exc:
@@ -2292,7 +2313,8 @@ def test_round_four_third_pass() -> None:
     # W3: a recycled PGID must not be signalled.
     sb = Sandbox()
     try:
-        make_conv(sb, "w3", "RECYCLED")
+        w3_cid, w3_job = fixture_id("w3-conversation"), fixture_id("w3-recycled")
+        make_conv(sb, w3_cid, w3_job)
         # Spawn through the platform, not a bare Popen: the group must be one
         # the platform can identify, or the refusal comes from "no group could
         # be determined" instead of from the start-time mismatch under test.
@@ -2304,11 +2326,11 @@ def test_round_four_third_pass() -> None:
             group_id = active_platform.isolated_process_group(proc.pid)
             check("W3: the live group is identifiable before the mismatch test",
                   group_id is not None, str(group_id))
-            marker(sb, "RECYCLED", {"pgid": group_id,
+            marker(sb, w3_job, {"pgid": group_id,
                                     "leader_pid": proc.pid,
                                     "leader_start": "Sat Jan  1 00:00:00 2020",
                                     "spawned_at": 1.0})
-            outcomes = registry.reap_orphaned_peers(sb.cfg, "RECYCLED")
+            outcomes = registry.reap_orphaned_peers(sb.cfg, w3_job)
             check("W3: an unverifiable or mismatched identity is refused, not signalled",
                   all(not o.get("signalled") for o in outcomes)
                   and any(
@@ -2333,9 +2355,10 @@ def test_round_four_third_pass() -> None:
     else:
         sb = Sandbox()
         try:
-            make_conv(sb, "w4", "REAL")
+            w4_cid, w4_job = fixture_id("w4-conversation"), fixture_id("w4-real")
+            make_conv(sb, w4_cid, w4_job)
             attempt_dir = store.secure_mkdir(
-                os.path.join(sb.cfg.job_dir("REAL"), "attempts", "1"))
+                os.path.join(sb.cfg.job_dir(w4_job), "attempts", "1"))
             # Spawn through the runner so the marker carries real identity,
             # then recreate it because a normal return deletes it.
             holder = active_platform.spawn_isolated(
@@ -2351,13 +2374,13 @@ def test_round_four_third_pass() -> None:
 
             check("W4: the orphan is alive before admission", len(live(pgid)) >= 1)
             try:
-                registry.claim_conversation_slot(sb.cfg, "w4", "codex", "NEW", 99)
+                registry.claim_conversation_slot(sb.cfg, w4_cid, "codex", fixture_id("w4-new"), 99)
             except BrokerError:
                 pass
             time.sleep(0.5); holder.poll()
             check("W4: an identity-verified orphan is reaped", len(live(pgid)) == 0,
                   str(live(pgid)))
-            record = registry.load_conversation(sb.cfg, "w4")
+            record = registry.load_conversation(sb.cfg, w4_cid)
             check("W4: the reap outcome is recorded on the conversation",
                   any(r.get("signalled") for r in
                       (record.get("indeterminate_reaped") or [])),
@@ -2368,20 +2391,22 @@ def test_round_four_third_pass() -> None:
     # W5: resolve must retire the markers, or the hold returns immediately.
     sb = Sandbox()
     try:
-        make_conv(sb, "w5", "HELD")
-        marker(sb, "HELD", {"pgid": 999997, "leader_pid": 999997,
+        w5_cid, w5_job = fixture_id("w5-conversation"), fixture_id("w5-held")
+        make_conv(sb, w5_cid, w5_job)
+        marker(sb, w5_job, {"pgid": 999997, "leader_pid": 999997,
                             "leader_start": "x", "spawned_at": 1.0})
         try:
-            registry.claim_conversation_slot(sb.cfg, "w5", "codex", "N1", 99)
+            registry.claim_conversation_slot(sb.cfg, w5_cid, "codex", fixture_id("w5-n1"), 99)
         except BrokerError:
             pass
-        registry.resolve_indeterminate(sb.cfg, "w5")
+        registry.resolve_indeterminate(sb.cfg, w5_cid)
         check("W5: resolve retires the in-flight markers",
-              registry.inflight_attempts(sb.cfg, "HELD") == [],
-              str(registry.inflight_attempts(sb.cfg, "HELD")))
-        registry.claim_conversation_slot(sb.cfg, "w5", "codex", "N2", 99)
+              registry.inflight_attempts(sb.cfg, w5_job) == [],
+              str(registry.inflight_attempts(sb.cfg, w5_job)))
+        w5_next = fixture_id("w5-n2")
+        registry.claim_conversation_slot(sb.cfg, w5_cid, "codex", w5_next, 99)
         check("W5: and the hold does not immediately return after resolve",
-              registry.load_conversation(sb.cfg, "w5")["active_job_id"] == "N2")
+              registry.load_conversation(sb.cfg, w5_cid)["active_job_id"] == w5_next)
     finally:
         sb.cleanup()
 
@@ -2432,29 +2457,30 @@ def test_round_four_fourth_pass() -> None:
     # X1b: a surviving pre_spawn marker holds, and names nothing to signal.
     sb = Sandbox()
     try:
-        cid = "x1-conv"
+        cid = fixture_id("x1-conversation")
+        spawned_job = fixture_id("x1-spawn")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "s", "turns": 1, "closed": False,
-            "active_job_id": "SPAWN", "active_job_claimed_at": store.utc_now(),
+            "active_job_id": spawned_job, "active_job_claimed_at": store.utc_now(),
             "workspace": sb.cfg.workspace("claude", cid),
             "created_at": store.utc_now(), "updated_at": store.utc_now()})
-        registry.write_status(sb.cfg, "SPAWN", "running", worker_pid=999999,
+        registry.write_status(sb.cfg, spawned_job, "running", worker_pid=999999,
                               conversation_id=cid, peer="claude", caller="codex")
-        d = store.secure_mkdir(os.path.join(sb.cfg.job_dir("SPAWN"),
+        d = store.secure_mkdir(os.path.join(sb.cfg.job_dir(spawned_job),
                                             "attempts", "1"))
         store.atomic_write_json(os.path.join(d, registry.INFLIGHT_MARKER),
                                 {"phase": "pre_spawn", "argv0": "/bin/claude",
                                  "marker_written_at": 1.0})
-        found = registry.inflight_attempts(sb.cfg, "SPAWN")
+        found = registry.inflight_attempts(sb.cfg, spawned_job)
         check("X1b: a pre_spawn marker is durable evidence", len(found) == 1)
-        outcomes = registry.reap_orphaned_peers(sb.cfg, "SPAWN")
+        outcomes = registry.reap_orphaned_peers(sb.cfg, spawned_job)
         check("X1b: it is never signalled, because no process is named",
               all(not o.get("signalled") for o in outcomes)
               and any("spawn time" in str(o.get("identity")) for o in outcomes),
               json.dumps(outcomes))
         try:
-            registry.claim_conversation_slot(sb.cfg, cid, "codex", "NEW", 99)
+            registry.claim_conversation_slot(sb.cfg, cid, "codex", fixture_id("x1-new"), 99)
             check("X1b: and it still holds admission", False, "handed over")
         except BrokerError as exc:
             check("X1b: and it still holds admission",
@@ -2465,7 +2491,7 @@ def test_round_four_fourth_pass() -> None:
     # X2: a dormant hold must be visible in ordinary status output.
     sb = Sandbox()
     try:
-        cid = "x2-conv"
+        cid = fixture_id("x2-conversation")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "s", "turns": 1, "closed": False,
@@ -2496,12 +2522,12 @@ def test_round_four_fourth_pass() -> None:
     # X3: resolve must refuse while an unverifiable process may be alive.
     sb = Sandbox()
     try:
-        cid = "x3-conv"
+        cid = fixture_id("x3-conversation")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "s", "turns": 1, "closed": False,
             "indeterminate": True, "indeterminate_reason": "test",
-            "indeterminate_job_id": "GHOST",
+            "indeterminate_job_id": fixture_id("x3-ghost"),
             "indeterminate_reaped": [{"attempt": "1", "pgid": 4242,
                                       "identity": "pid was recycled: start time differs",
                                       "signalled": False,
@@ -2532,12 +2558,12 @@ def test_round_four_fourth_pass() -> None:
     # X4: a verifiable clean resolve needs no acknowledgement flag.
     sb = Sandbox()
     try:
-        cid = "x4-conv"
+        cid = fixture_id("x4-conversation")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": "s", "turns": 1, "closed": False,
             "indeterminate": True, "indeterminate_reason": "test",
-            "indeterminate_job_id": "CLEANGHOST",
+            "indeterminate_job_id": fixture_id("x4-clean-ghost"),
             "indeterminate_reaped": [{"attempt": "1", "pgid": 4242,
                                       "identity": "group leader is gone",
                                       "signalled": False,
@@ -2583,7 +2609,7 @@ def test_attempt_marker_lifecycle() -> None:
 
     def holds(sb, cid):
         try:
-            registry.claim_conversation_slot(sb.cfg, cid, "codex", "RIVAL", 99)
+            registry.claim_conversation_slot(sb.cfg, cid, "codex", fixture_id("lc-rival"), 99)
             return False
         except BrokerError as exc:
             return exc.category == ErrorCategory.CONVERSATION_INDETERMINATE
@@ -2603,7 +2629,7 @@ def test_attempt_marker_lifecycle() -> None:
     for index, (label, payload) in enumerate(boundaries):
         sb = Sandbox()
         try:
-            cid, job = f"lc{index}", f"JOB{index}"
+            cid, job = fixture_id(f"lc-{index}"), fixture_id(f"lc-job-{index}")
             conv(sb, cid, job)
             place(sb, job, payload)
             check(f"LC: an uncommitted attempt holds the conversation: {label}",
@@ -2686,9 +2712,9 @@ def test_attempt_marker_lifecycle() -> None:
         cid = started["conversation_id"]
         # Hand the conversation to a rival, then run a second worker for a job
         # that no longer owns it.
-        registry.update_conversation(sb.cfg, cid, active_job_id="RIVAL",
+        registry.update_conversation(sb.cfg, cid, active_job_id=fixture_id("lc-rival"),
                                      active_job_claimed_at=store.utc_now())
-        loser = "LOSER"
+        loser = fixture_id("lc-loser")
         ldir = store.secure_mkdir(sb.cfg.job_dir(loser))
         store.atomic_write_json(os.path.join(ldir, "request.json"), {
             "job_id": loser, "conversation_id": cid, "caller": "codex",
@@ -2719,12 +2745,13 @@ def test_attempt_marker_lifecycle() -> None:
     # Retained committed markers must never be read as live evidence.
     sb = Sandbox()
     try:
-        d = store.secure_mkdir(os.path.join(sb.cfg.job_dir("OLD"), "attempts", "1"))
+        old_job = fixture_id("lc-old")
+        d = store.secure_mkdir(os.path.join(sb.cfg.job_dir(old_job), "attempts", "1"))
         with open(os.path.join(d, registry.INFLIGHT_MARKER + ".committed"), "w",
                   encoding="utf-8") as handle:
             handle.write("{}")
         check("LC: a .committed marker is excluded from in-flight discovery",
-              registry.inflight_attempts(sb.cfg, "OLD") == [])
+              registry.inflight_attempts(sb.cfg, old_job) == [])
     finally:
         sb.cleanup()
 
@@ -2742,12 +2769,12 @@ def test_attempt_marker_lifecycle() -> None:
             ("reap outcome shorter than the attempt list",
              {"indeterminate_reaped": [{"attempt": "1", "signalled": True}]}),
         ):
-            cid = "lcres" + str(abs(hash(label)) % 1000)
+            cid = fixture_id(f"lc-resolve-{label}")
             store.atomic_write_json(sb.cfg.conversation_path(cid), {
                 "conversation_id": cid, "caller": "codex", "peer": "claude",
                 "peer_session_id": "s", "turns": 1, "closed": False,
                 "indeterminate": True, "indeterminate_reason": "test",
-                "indeterminate_job_id": "G",
+                "indeterminate_job_id": fixture_id("lc-resolve-job"),
                 "indeterminate_attempts": [{"attempt": "1", "pgid": 1},
                                            {"attempt": "2", "pgid": 2}],
                 "active_job_id": None, "created_at": store.utc_now(),
@@ -2917,7 +2944,7 @@ def test_external_review_findings() -> None:
     # directly, which is the code path the bug actually disabled.
     sb = Sandbox()
     try:
-        cid, job = "f1b-conv", "f1b-job"
+        cid, job = fixture_id("f1b-conversation"), fixture_id("f1b-job")
         store.atomic_write_json(sb.cfg.conversation_path(cid), {
             "conversation_id": cid, "caller": "codex", "peer": "claude",
             "peer_session_id": None, "turns": 0, "closed": False,
@@ -3038,10 +3065,12 @@ def test_external_review_findings() -> None:
     sb = Sandbox()
     try:
         for i in range(300):
-            registry.write_status(sb.cfg, f"retained-{i}", "queued")
-            registry.write_status(sb.cfg, f"retained-{i}", "complete",
+            retained = fixture_id(f"retained-{i}")
+            registry.write_status(sb.cfg, retained, "queued")
+            registry.write_status(sb.cfg, retained, "complete",
                                   error_category="ok")
-        registry.write_status(sb.cfg, "in-flight", "running", worker_pid=os.getpid())
+        in_flight = fixture_id("f5-in-flight")
+        registry.write_status(sb.cfg, in_flight, "running", worker_pid=os.getpid())
         t0 = time.perf_counter()
         n = registry.count_active(sb.cfg)
         elapsed = time.perf_counter() - t0
@@ -3052,10 +3081,11 @@ def test_external_review_findings() -> None:
         check("F5: the index holds only in-flight jobs",
               len(os.listdir(sb.cfg.state("active"))) == 1,
               str(os.listdir(sb.cfg.state("active"))))
-        registry.write_status(sb.cfg, "ghost", "running", worker_pid=999999)
+        ghost = fixture_id("f5-ghost")
+        registry.write_status(sb.cfg, ghost, "running", worker_pid=999999)
         registry.count_active(sb.cfg)
         check("F5: a stale index entry is self-healed rather than accumulating",
-              "ghost" not in os.listdir(sb.cfg.state("active")),
+              ghost not in os.listdir(sb.cfg.state("active")),
               str(os.listdir(sb.cfg.state("active"))))
     finally:
         sb.cleanup()
@@ -3210,7 +3240,7 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
         with mock.patch.object(run_canaries, "timeout_canary_config", return_value=cfg.raw), \
                 mock.patch.object(run_canaries.store, "atomic_write_json"), \
                 mock.patch.object(run_canaries.config, "load", return_value=cfg), \
-                mock.patch.object(run_canaries.broker, "start", return_value={"job_id": "fixture"}), \
+                mock.patch.object(run_canaries.broker, "start", return_value={"job_id": fixture_id("timeout-canary")}), \
                 mock.patch.object(run_canaries.registry, "reconcile", return_value={"status": "timed_out", "error_category": "peer_timeout"}), \
                 mock.patch.object(run_canaries.store, "read_json_or_none", return_value={}), \
                 mock.patch.object(run_canaries, "timeout_orphan_count", return_value=surviving_groups), \
@@ -3400,15 +3430,21 @@ def test_candidate_verification_path() -> None:
             ("codex", "claude", "2.1.229 (Claude Code)"),
             ("claude", "codex", "codex-cli 0.147.0"),
         ):
-            for kind in ("one-turn 1", "schema-pressure"):
+            kinds = [f"one-turn {i}" for i in range(1, 11)] + [
+                f"3-turn {i} t{t}" for i in range(1, 4) for t in range(1, 4)
+            ] + ["schema-pressure"]
+            for kind in kinds:
                 rows.append({
                     "direction": f"{caller}->{peer}", "kind": kind,
                     "contract_valid": True, "first_attempt_ok": True,
                     "latency_seconds": 0.1,
                     "peer_observed_version": version,
+                    "status": "complete", "acceptable": True,
+                    "peer_session_id": "synthetic-session",
+                    "session_id_as_intended": True,
                 })
         args = argparse.Namespace(
-            direction="both", one_turn=1, three_turn=0, job_timeout=30.0,
+            direction="both", one_turn=10, three_turn=3, job_timeout=30.0,
             skip_timeout_canary=False)
         timeouts = [
             {"direction": "codex->claude", "status": "timed_out", "orphans": 0},
@@ -3523,14 +3559,16 @@ def test_windows_acl_parser_adversarial() -> None:
     ]
     for label, text, expect in cases:
         owner = "nonsense" if "malformed" in label else sid
+        expected_path = "C:\\T\\d"
         if "resolved account name" in label or "same shape" in label:
             ci_owner_name = "runnervm6iq3x\\runneradmin"
-            observed = ok(text, sid, ci_owner_name)
+            observed = ok(text, sid, ci_owner_name,
+                          expected_path="C:\\T\\state\\.permission-probe")
             check(f"ACL: {label}", observed is expect, f"got {observed}")
             continue
         check(f"ACL: {label}",
-              ok(text, owner, "runneradmin") is expect,
-              f"got {ok(text, owner, 'runneradmin')}, want {expect}")
+              ok(text, owner, "runneradmin", expected_path=expected_path) is expect,
+              f"got {ok(text, owner, 'runneradmin', expected_path=expected_path)}, want {expect}")
 
 
 def test_platform_boundary() -> None:
@@ -3741,7 +3779,8 @@ def test_status_read_race() -> None:
     print("\n[status read across a replace window]")
     sb = Sandbox()
     try:
-        job_dir = store.secure_mkdir(sb.cfg.job_dir("RACE"))
+        job_id = "30819506-a0e3-4385-8a74-9bb92888f04c"
+        job_dir = store.secure_mkdir(sb.cfg.job_dir(job_id))
         path = os.path.join(job_dir, "status.json")
 
         # A job whose directory exists but whose status is momentarily
@@ -3750,14 +3789,14 @@ def test_status_read_race() -> None:
         # resulting OSError into None.
         def write_late():
             time.sleep(0.25)
-            store.atomic_write_json(path, {"status": "queued", "job_id": "RACE"})
+            store.atomic_write_json(path, {"status": "queued", "job_id": job_id})
 
         writer = threading.Thread(target=write_late)
         writer.start()
         try:
-            got = registry.read_status(sb.cfg, "RACE")
+            got = registry.read_status(sb.cfg, job_id)
             check("a status that appears inside the grace is returned, not denied",
-                  got.get("job_id") == "RACE", json.dumps(got))
+                  got.get("job_id") == job_id, json.dumps(got))
         except BrokerError as exc:
             check("a status that appears inside the grace is returned, not denied",
                   False, exc.category.value)
@@ -3768,7 +3807,7 @@ def test_status_read_race() -> None:
         os.unlink(path)
         started = time.monotonic()
         try:
-            registry.read_status(sb.cfg, "RACE")
+            registry.read_status(sb.cfg, job_id)
             check("a directory with no status still fails closed", False, "it passed")
         except BrokerError as exc:
             check("a directory with no status still fails closed",
@@ -3782,7 +3821,7 @@ def test_status_read_race() -> None:
         # miss would make an unknown id cost a second.
         started = time.monotonic()
         try:
-            registry.read_status(sb.cfg, "NEVER-EXISTED")
+            registry.read_status(sb.cfg, "20310990-a6d8-4b5c-89fa-101b7ee5173a")
             check("an unknown job fails immediately", False, "it passed")
         except BrokerError as exc:
             check("an unknown job fails immediately",
@@ -4060,22 +4099,25 @@ def test_windows_acl_parser() -> None:
 Successfully processed 1 files; Failed processing 0 files
 """
     check("WA: the observed OWNER RIGHTS ACL is safe",
-          icacls_listing_is_owner_only(listing, owner, "runneradmin"))
+          icacls_listing_is_owner_only(
+              listing, owner, "runneradmin", expected_path="C:\\state"))
     check("WA: BUILTIN Users access is unsafe",
           not icacls_listing_is_owner_only(
               listing.replace("OWNER RIGHTS", "BUILTIN\\Users:(RX)\n"
                               "              OWNER RIGHTS"),
-              owner, "runneradmin"))
+              owner, "runneradmin", expected_path="C:\\state"))
     check("WA: Everyone access is unsafe",
           not icacls_listing_is_owner_only(
               listing.replace("OWNER RIGHTS", "Everyone:(F)\n"
                               "              OWNER RIGHTS"),
-              owner, "runneradmin"))
+              owner, "runneradmin", expected_path="C:\\state"))
     check("WA: empty output fails closed",
-          not icacls_listing_is_owner_only("", owner, "runneradmin"))
+          not icacls_listing_is_owner_only(
+              "", owner, "runneradmin", expected_path="C:\\state"))
     check("WA: unparseable output fails closed",
           not icacls_listing_is_owner_only(
-              "Successfully processed 1 files", owner, "runneradmin"))
+              "Successfully processed 1 files", owner, "runneradmin",
+              expected_path="C:\\state"))
     check("WA: Windows reports its distinct guarantee",
           WINDOWS_OWNER_ONLY_GUARANTEE ==
           "No principal other than the owner, SYSTEM, and Administrators has any access.")

@@ -236,6 +236,12 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
             if answers["targets"][target]:
                 registrations.append({"target": label, "name": "codex-peer", **_command("claude", root)})
     local = answers["local_ollama"]
+    if local["enabled"]:
+        for target, label in (("codex", "Codex"), ("claude_code", "Claude Code"),
+                              ("claude_desktop", "Claude Desktop")):
+            if answers["targets"][target]:
+                registrations.append({"target": label, "name": "local-peer",
+                                      **_local_command(local, root)})
     return {"active_config_changed": False, "privacy": answers["privacy"],
             "limits": "Label admission only; no read confinement or whole-history synchronization.",
             "instruction_files": "Selected clients receive a managed pointer to one shared file; Desktop loading must be verified.",

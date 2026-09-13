@@ -66,6 +66,18 @@ def now() -> float:
     return time.monotonic()
 
 
+
+def continuation_identity_matches(provenance: dict[str, Any], peer: str,
+                                  expected_session: str | None) -> bool | None:
+    if expected_session is None:
+        return None
+    attempts = provenance.get("attempts") or []
+    notes = attempts[-1].get("notes", {}) if attempts and isinstance(attempts[-1], dict) else {}
+    key = "thread_id_honoured" if peer == "codex" else "session_id_honoured"
+    return (provenance.get("peer_session_id") == expected_session
+            and isinstance(notes, dict) and notes.get(key) is True)
+
+
 class Canary:
     def __init__(self, cfg: config.Config, caller: str, timeout: float):
         self.cfg = cfg
@@ -103,10 +115,8 @@ class Canary:
             "latency_seconds": round(elapsed, 2),
             "peer_session_id": prov.get("peer_session_id"),
             "peer_observed_version": prov.get("peer_observed_version"),
-            "session_id_as_intended": (
-                None if expected_session is None
-                else prov.get("peer_session_id") == expected_session
-            ),
+            "session_id_as_intended": continuation_identity_matches(
+                prov, self.peer, expected_session),
             "extraction_paths": [a.get("extraction_path") for a in prov.get("attempts", [])],
             "cost_usd": prov.get("peer_cost_usd"),
         }
@@ -351,6 +361,8 @@ def report(rows: list[dict[str, Any]], timeouts: list[dict[str, Any]],
               f"{len(continuations)}")
         print(f"  failures by category      {failures or 'none'}")
         pressure = [r for r in subset if r["kind"] == "schema-pressure"]
+        if any(r.get("acceptable") is not True for r in pressure):
+            exit_code = 1
         if pressure:
             category = pressure[0].get("error_category")
             print(f"  schema-pressure outcome   {pressure[0]['status']} "
@@ -444,6 +456,9 @@ def result_verdict(exit_code: int, timeout_skipped: bool,
         return "INCOMPLETE"
     if executed != requested:
         return "FAIL"
+    if any(type(requested.get(name)) is not int or requested[name] < minimum
+           for name, minimum in setup_cmd.MINIMUM_CANARY_CONTROLS.items()):
+        return "INCOMPLETE"
     return "PASS"
 
 
@@ -454,8 +469,9 @@ def result_record(cfg: config.Config, args: argparse.Namespace,
     requested = requested_controls(callers, args.one_turn, args.three_turn)
     executed = executed_controls(rows, timeouts, reachability_probes)
     skipped = ["timeout_canary"] if args.skip_timeout_canary else []
-    return {
+    result = {
         "created_at": store.utc_now(),
+        "verification_profile": setup_cmd.CANARY_VERIFICATION_PROFILE,
         "effective_config_sha256": config.effective_config_sha256(cfg.raw),
         "configured_versions": configured_versions(cfg),
         "observed_versions": observed_versions(rows),
@@ -475,6 +491,13 @@ def result_record(cfg: config.Config, args: argparse.Namespace,
         "timeouts": timeouts,
         "blocked": blocked,
     }
+    if result["verdict"] == "PASS":
+        try:
+            setup_cmd.validate_canary_evidence(result)
+        except ValueError as exc:
+            result["verdict"] = "FAIL"
+            result["verification_error"] = str(exc)
+    return result
 
 
 def main() -> int:

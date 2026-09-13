@@ -20,6 +20,11 @@ from .platform import platform
 TERMINAL_STATUSES = ("complete", "failed", "timed_out", "cancelled")
 ALL_STATUSES = ("queued", "running", *TERMINAL_STATUSES)
 
+# Reconciliation is a polling path. Read only a small byte tail of a worker
+# log, then bound its decoded representation before adding it to status.
+WORKER_LOG_TAIL_BYTES = 1_600
+WORKER_LOG_TAIL_CHARS = 400
+
 #: Status rank. A write may raise the rank or restate the same status; it may
 #: never lower it, and a terminal status is final.
 #:
@@ -581,7 +586,10 @@ def reconcile(cfg: Config, job_id: str) -> dict[str, Any]:
         log_tail = ""
         try:
             with open(os.path.join(cfg.job_dir(job_id), "worker.log"), "rb") as h:
-                log_tail = h.read().decode("utf-8", "replace")[-400:]
+                h.seek(0, os.SEEK_END)
+                h.seek(max(0, h.tell() - WORKER_LOG_TAIL_BYTES))
+                log_tail = h.read(WORKER_LOG_TAIL_BYTES).decode(
+                    "utf-8", "replace")[-WORKER_LOG_TAIL_CHARS:]
         except OSError:
             pass
         liveness["worker_log_tail"] = log_tail or "(empty)"

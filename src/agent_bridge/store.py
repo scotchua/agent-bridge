@@ -96,7 +96,15 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
     secure_mkdir(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
-        platform.enforce_owner_only_file(fd)
+        try:
+            platform.enforce_owner_only_file(fd)
+        except BaseException:
+            # The descriptor still belongs to this function until fdopen()
+            # succeeds.  On Windows it must be closed before unlinking the
+            # rejected temporary file, while preserving the ACL error itself.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Any, Callable
@@ -24,6 +25,13 @@ from .errors import BrokerError, ErrorCategory, hint
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agent-bridge"
 SERVER_VERSION = "1.0.0"
+
+# A 100,000-character prompt can expand to 1.2 million JSON source characters
+# when astral Unicode is escaped as surrogate pairs. Two MiB leaves room for
+# its JSON-RPC envelope while bounding each pre-parse read. Oversized frames
+# are rejected and the server closes rather than attempting an unbounded drain
+# to a newline.
+MAX_MCP_FRAME_CHARS = 2 * 1024 * 1024
 
 _CLASSIFICATION_DESCRIPTION = (
     "Provenance of the material in this prompt. Contract version 1 accepts "
@@ -200,6 +208,8 @@ class Server:
             return None
         if request_id is None:  # notification
             return None
+        if not self._valid_request_id(request_id):
+            return self._error(None, -32600, "invalid request")
         try:
             if method == "initialize":
                 result: Any = {
@@ -269,17 +279,34 @@ class Server:
     def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
+    @staticmethod
+    def _valid_request_id(request_id: Any) -> bool:
+        """JSON-RPC ids are scalar strings or finite numbers, never containers."""
+        if isinstance(request_id, str):
+            return True
+        if isinstance(request_id, bool) or not isinstance(request_id, (int, float)):
+            return False
+        return not isinstance(request_id, float) or math.isfinite(request_id)
+
     # ---- transport ------------------------------------------------------
     def serve(self, stdin: Any = None, stdout: Any = None) -> int:
         stdin = stdin or sys.stdin
         stdout = stdout or sys.stdout
-        for line in stdin:
+        while True:
+            line = stdin.readline(MAX_MCP_FRAME_CHARS + 1)
+            if not line:
+                break
+            if len(line) > MAX_MCP_FRAME_CHARS:
+                stdout.write(json.dumps(
+                    self._error(None, -32600, "request exceeds frame limit")) + "\n")
+                stdout.flush()
+                return 1
             line = line.strip()
             if not line:
                 continue
             try:
                 message = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 stdout.write(json.dumps(self._error(None, -32700, "parse error")) + "\n")
                 stdout.flush()
                 continue

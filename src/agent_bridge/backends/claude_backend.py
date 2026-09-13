@@ -224,6 +224,18 @@ def run_consultation(
             outcome.category = ErrorCategory.PEER_NONZERO_EXIT
         return outcome
 
+    # A success-shaped envelope is not evidence of a successful process.  The
+    # Claude CLI has emitted parseable result envelopes before returning a
+    # nonzero status, so accepting the payload here would make a failed run
+    # caller-visible as a completed consultation.
+    if result.returncode not in (0, None):
+        outcome.category = (
+            ErrorCategory.PEER_AUTH_FAILURE
+            if looks_like_auth_failure(result.stderr)
+            else ErrorCategory.PEER_NONZERO_EXIT
+        )
+        return outcome
+
     if session_migrated:
         outcome.category = ErrorCategory.PEER_SESSION_MIGRATED
         return outcome

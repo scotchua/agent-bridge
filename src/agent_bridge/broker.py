@@ -15,7 +15,7 @@ import uuid
 from typing import Any
 
 from . import preflight, provenance, registry, store
-from .config import Config
+from .config import Config, canonical_uuid
 from .errors import BrokerError, ErrorCategory, hint, is_retryable
 
 CALLERS = ("claude", "codex")
@@ -76,6 +76,30 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
             raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
         if len(label) > cfg.limit("label_max_chars"):
             raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+
+
+def _validate_identifier_request(args: Any, field: str) -> str:
+    """Validate a one-identifier tool request before registry or filesystem use."""
+    if not isinstance(args, dict):
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    if set(args) - {field}:
+        raise BrokerError(ErrorCategory.INPUT_UNKNOWN_FIELD)
+    return canonical_uuid(args.get(field))
+
+
+def _authorize_job_caller(cfg: Config, caller: str, job_id: str) -> None:
+    """Check immutable job ownership before reconciliation can mutate state.
+
+    reconcile() can terminalise a dead worker and reap an orphaned peer.  A
+    caller must not be able to trigger either action for another caller's job,
+    so authorization comes from the request written before the job was exposed
+    and deliberately precedes every registry operation.
+    """
+    request = store.read_json_or_none(os.path.join(cfg.job_dir(job_id), "request.json"))
+    if (not isinstance(request, dict)
+            or request.get("job_id") != job_id
+            or request.get("caller") != caller):
+        raise BrokerError(ErrorCategory.JOB_NOT_FOUND)
 
 
 def _spawn_worker(cfg: Config, job_dir: str) -> int:
@@ -186,9 +210,7 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     peer = PEER_OF[caller]
     _validate_common(cfg, args, CONTINUE_FIELDS, peer)
-    conversation_id = args.get("conversation_id")
-    if not isinstance(conversation_id, str) or not conversation_id:
-        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    conversation_id = canonical_uuid(args.get("conversation_id"))
 
     conversation = registry.load_conversation(cfg, conversation_id)
     if conversation.get("peer") != peer:
@@ -299,14 +321,10 @@ def _dispatch(cfg: Config, peer: str, conversation_id: str, job_id: str) -> dict
 
 
 def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
-    unknown = set(args) - {"job_id"}
-    if unknown:
-        raise BrokerError(ErrorCategory.INPUT_UNKNOWN_FIELD)
-    job_id = args.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    job_id = _validate_identifier_request(args, "job_id")
+    _authorize_job_caller(cfg, caller, job_id)
     status = registry.reconcile(cfg, job_id)
-    if status.get("caller") not in (None, caller):
+    if status.get("caller") != caller:
         raise BrokerError(ErrorCategory.JOB_NOT_FOUND)
     payload: dict[str, Any] = {
         "job_id": job_id,
@@ -330,14 +348,10 @@ def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
-    unknown = set(args) - {"job_id"}
-    if unknown:
-        raise BrokerError(ErrorCategory.INPUT_UNKNOWN_FIELD)
-    job_id = args.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    job_id = _validate_identifier_request(args, "job_id")
+    _authorize_job_caller(cfg, caller, job_id)
     status = registry.reconcile(cfg, job_id)
-    if status.get("caller") not in (None, caller):
+    if status.get("caller") != caller:
         raise BrokerError(ErrorCategory.JOB_NOT_FOUND)
     if status.get("status") not in registry.TERMINAL_STATUSES:
         raise BrokerError(ErrorCategory.JOB_NOT_COMPLETE)
@@ -390,12 +404,7 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def close(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
-    unknown = set(args) - {"conversation_id"}
-    if unknown:
-        raise BrokerError(ErrorCategory.INPUT_UNKNOWN_FIELD)
-    conversation_id = args.get("conversation_id")
-    if not isinstance(conversation_id, str) or not conversation_id:
-        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+    conversation_id = _validate_identifier_request(args, "conversation_id")
     conversation = registry.load_conversation(cfg, conversation_id)
     if conversation.get("caller") != caller:
         raise BrokerError(ErrorCategory.CONVERSATION_NOT_FOUND)

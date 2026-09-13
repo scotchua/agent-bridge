@@ -105,6 +105,10 @@ def main() -> int:
     if mode == "nonzero":
         sys.stderr.write("fake claude exploded\n")
         return 3
+    if mode == "success_envelope_nonzero":
+        # A parseable, contract-valid envelope cannot override a failed process
+        # status. This is the edge case the backend must reject.
+        return emit(base(session_id, valid(summary="success-shaped failure")), 7)
     if mode == "hang":
         spawn_pipe_holder(120)
         time.sleep(120)
