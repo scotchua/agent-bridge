@@ -181,7 +181,10 @@ class WindowsDrainSecurityTests(unittest.TestCase):
 
         def invoke() -> None:
             try:
-                outcomes.append(self.method(platform, ExitedLeader(pipe), "", 0.08,
+                # This test targets the post-exit drain, not the independent
+                # overall timeout. Keep that timeout beyond the 2s test guard
+                # so scheduling cannot select a different failure category.
+                outcomes.append(self.method(platform, ExitedLeader(pipe), "", 10,
                                             1024, 1024, 0.01))
             except BaseException as exc:
                 failures.append(exc)
