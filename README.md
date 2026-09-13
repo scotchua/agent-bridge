@@ -2,366 +2,228 @@
 
 ![tests](https://github.com/scotchua/agent-bridge/actions/workflows/tests.yml/badge.svg)
 
-A local bridge that lets Claude and Codex consult each other for a second
-opinion, and keeps a record of every exchange.
+Connect Claude and Codex so you can say **“ask the other assistant”** without
+copying messages between them. Either assistant can coordinate the work, ask
+its teammate for help, and bring the answer back into your conversation.
+An optional existing local Ollama model can handle routine text tasks.
 
-The bridge runs on your own machine; Claude and Codex consultations still go
-to their providers through your own accounts. An optional connector can use an
-existing local Ollama model for bounded text work.
-
-## Let your assistant set it up
-
-Tell Claude Code or Codex:
-
-> Set up https://github.com/scotchua/agent-bridge on this computer. Read
-> AGENTS.md and docs/SETUP-WITH-AN-AGENT.md, ask me about privacy restrictions
-> and an optional existing local model, then carry out setup and verification.
-> Preserve my current settings and ask before live tests that use my allowance
-> or incur charges.
-
-**Start with [the guided setup](docs/SETUP-WITH-AN-AGENT.md)** for macOS and
-Windows. It asks what may be sent to each peer, which assistant apps to connect,
-and whether to add a local model. It stages settings before activation and
-keeps the existing version-bound verification gate.
-
-The underlying connection is the same on both platforms. Your accounts, models
-and chosen restrictions remain yours; the repo does not copy its author's
-credentials, private instructions or account permissions.
+The bridge runs on your computer. Claude and Codex consultations still go to
+their providers through your own accounts.
 
 ## Why you might want this
 
-If you use both Claude and Codex, you have probably noticed they disagree, and
-that the disagreement is often the useful part. Asking one to check the other
-normally means copying text between two windows and losing the thread.
+Claude and Codex can contribute different approaches to the same problem.
+This gives them a direct way to compare plans, investigate a bug, review a
+change, or challenge an answer before you rely on it.
 
-This makes that a tool call. A Codex task can ask Claude a bounded question and
-continue that conversation across several turns. A Claude Code session can do
-the same with Codex. The reply comes back as structured data with a record of
-which model said it, on what version, at what time.
+You stay in the conversation with whichever assistant you started with. That
+assistant chooses the relevant context, consults the other through a tool, and
+uses the reply to continue your task. Follow-up questions can continue the same
+consultation. You do not have to act as the messenger.
 
-It was built for reviewing work before it goes out: designs, scripts, a piece of
-logic you are not sure about. The reason it keeps a ledger is that "the other
-model agreed" is only worth something if you can go back and see what was
-actually asked.
+For example:
 
-## What it will not do
+- “Ask Claude to review this design before you implement it.”
+- “Work with Codex to figure out why this Windows test fails.”
+- “Have the local model classify these notes, then review its results.”
 
-Version 1 is consultation only. It cannot edit your files, run commands, merge
-anything, or start consultations on its own. A consulted model can suggest you
-ask again; it cannot do it. Only the coordinating session, acting within your authorization, can.
-
-It also refuses to carry sensitive material. Every request must be labelled
-`internal`, `synthetic`, or `public`, and anything labelled as client-derived or
-confidential is rejected outright. That refusal is not a substitute for your own
-judgement, for the reason in [Honest limits](#honest-limits).
+The bridge records what was actually sent and returned, so “the other assistant
+agreed” can be checked against the exchange.
 
 ## Getting started
 
-See **[INSTALL.md](INSTALL.md)**. Short version:
+Use **Claude Code or Codex with access to local files and programs**, and give
+it this request:
 
-```
-./bin/agent-bridge-setup --candidate ~/.agent-bridge/candidates/effective.json
-python3 tests/test_suite.py
-./canaries/run_canaries.py --config ~/.agent-bridge/candidates/effective.json \
-  --direction both --out ~/.agent-bridge/canary-results/latest.json
-./bin/agent-bridge-setup --promote ~/.agent-bridge/candidates/effective.json \
-  --results ~/.agent-bridge/canary-results/latest.json
-```
+> Set up https://github.com/scotchua/agent-bridge on this computer. Read its
+> AGENTS.md and docs/SETUP-WITH-AN-AGENT.md. Ask me about privacy restrictions
+> and whether I want to connect an existing local model. Carry out setup and
+> verification, preserve my current settings, and explain any remaining
+> limitations. Ask before live tests that use my provider allowance or money.
 
-The live step consumes provider allowance or incurs charges under your accounts.
-It writes a version-bound result before the
-candidate can be promoted. Then two `mcp add` commands, which INSTALL.md spells
-out.
+You need access to this repository while it is private. A website-only chat
+cannot install the bridge on your computer.
+
+[The guided setup](docs/SETUP-WITH-AN-AGENT.md) takes the assistant through:
+
+1. Checking Python 3.11+, Git, and both providers' CLI installations and logins.
+   You complete any interactive account login yourself.
+2. Asking which apps to connect, whether consultations should work in both
+   directions, what each peer may receive, and whether to add a local model.
+3. Showing a plan and staging the configuration before activation.
+4. Running offline tests and, with authorization, live provider checks.
+5. Installing the selected connections and shared collaboration instructions,
+   preserving unrelated settings and keeping backups.
+6. Reloading the selected apps as needed and verifying a question and follow-up.
+
+The setup supports macOS and native Windows; Linux/WSL details are in
+[INSTALL.md](INSTALL.md). In WSL, keep the checkout, Python, CLIs and state on
+the Linux side. Claude Desktop can receive the MCP connection, but loading the
+shared instructions into its chats/projects requires a separate verified step.
+
+The live verification makes calls to **both providers**, even if you choose to
+expose only one direction afterward. It consumes allowance or incurs charges
+under your accounts. Activation requires a complete check tied to the chosen
+configuration and installed CLI versions.
+
+For manual setup and troubleshooting, see [INSTALL.md](INSTALL.md). For the
+portable guided commands, see [SETUP-WITH-AN-AGENT.md](docs/SETUP-WITH-AN-AGENT.md).
 
 ## What you get
 
-With `--caller codex`, a Codex task sees `claude_start`, `claude_continue`,
-`claude_poll`, `claude_read`, `claude_close`. With `--caller claude`, a Claude
-session sees the matching `codex_*` tools. Neither side can consult its own
-model: those tools simply do not exist in that session, which is a stronger
-guarantee than refusing when asked.
+| Feature | What it provides |
+| --- | --- |
+| Two-way consultation | Codex can ask Claude; Claude can ask Codex. Either direction can be omitted. |
+| Follow-up conversations | The coordinating assistant can continue a peer consultation without asking you to relay messages. |
+| Shared instructions | A generated collaboration and model-effort policy, with managed pointers for the selected Codex and Claude Code installations. |
+| Privacy choices | Baseline, strict, or custom eligibility rules for each receiving peer. |
+| Optional local worker | Bounded summarization, extraction, classification, checklists and log triage through an existing Ollama model. |
+| Exchange records | Prompts, replies, job status and available model/version/effort provenance. |
+| Guided installation and removal | Staged settings, verification, backups, conflict checks and an uninstall preview. |
 
-`start` and `continue` hand back a job id straight away, so nothing blocks while
-a model thinks. The work happens in a separate process that writes its progress
-to disk, so you can restart your editor mid-consultation and still collect the
-answer.
+Under the hood, each assistant connects to a local MCP server. The bridge
+launches the other provider's CLI, records its response, and returns it through
+the tool. Codex gets `claude_start`, `claude_continue`, `claude_poll`,
+`claude_read` and `claude_close`; Claude gets the matching `codex_*` tools.
+The bridge does not expose self-consultation tools to either caller.
+
+Jobs run separately from the initiating editor session and persist progress to
+disk. The assistant can collect a completed reply after an editor restart.
+
+## Privacy choices
+
+Setup asks what may be sent to each receiving peer:
+
+| Choice | Admitted material |
+| --- | --- |
+| Baseline | Public material, invented examples, and your own non-client internal work. |
+| Strict | Public material and invented examples only. |
+| Custom | A narrower list for each peer; synthetic examples remain necessary for full setup verification. |
+
+Client-derived/confidential material and secrets are outside this bridge's
+supported use. Removing names does not automatically make client-derived
+material eligible.
+
+**The bridge checks the supplied classification, not the contents of the text.**
+Disallowed labels are rejected before dispatch, but it does not detect a secret
+inside a request incorrectly labelled `public`, or automatically redact it.
+The coordinating assistant must select appropriate context before sending it.
+
+The repo does not copy the author's credentials, private policies, account
+permissions or provider agreements. Each provider processes consultations under
+your own account's terms. Local bridge records are separate from any records
+retained by the providers.
+
+## Optional local model
+
+If you already have a model installed in Ollama, setup can connect it using its
+exact model name and an explicit local endpoint. It asks separately whether the
+worker may receive non-client internal text.
+
+The worker accepts bounded inline text tasks. It does not read files, run shell
+commands, download models or provide a cloud fallback. Other local runtimes
+need a separately tested adapter.
+
+**Local inference does not make the surrounding conversation private.** Text
+passed by Claude or Codex, and results returned to it, are already visible in
+that cloud assistant's conversation. The worker checks for supported local
+model metadata and rejects recognized cloud routes, but it is not a network
+sandbox around an arbitrary Ollama server.
+
+## What it will not do
+
+- **Synchronize all your chats or give either assistant the other's memory.**
+  The coordinator sends selected context; a follow-up retains that consultation.
+- **Turn a consulted peer into an unrestricted remote worker.** Peer calls are
+  designed for consultation. The coordinating assistant can implement the
+  suggestions using its own tools and your authorization.
+- **Automatically grant equal permissions in every app.** Accounts, host tools
+  and platform permissions remain separate. Setup reproduces the supported
+  connection and shared guidance, not the author's entire environment.
+- **Guarantee lower subscription usage or automatically balance allowances.**
+  Consultations and live checks use capacity too. The author's separate capacity
+  collectors and workload-routing integrations are not included in this setup.
+- **Make agreement proof of correctness.** Peer replies are evidence to assess,
+  not instructions to obey or an automatic approval to publish.
 
 ## Honest limits
 
-Read these before you trust it with anything that matters.
-
-- **Your two subscriptions may not have the same data protections.** This was
-  built assuming they do. If yours differ, the weaker plan governs whatever you
-  sent in that direction, and you can restrict what each side is allowed to
-  receive. See [Data policy](#data-policy-two-vendors-two-accounts-two-sets-of-terms).
-- **The consulted model is told not to read your filesystem. On the Codex side
-  that is a rule, not a wall.** Its sandbox blocks writing, not reading. So treat
-  the question you send as the boundary: assume anything in the prompt could be
-  read, and put nothing in it you would not want read. The
-  `internal / synthetic / public` label is there to make you think about that
-  every time, not to enforce it for you.
-- **The consulted model still has its own built-in skills.** The Codex side runs
-  with your configuration and rule files disabled, but Codex ships skills of its
-  own inside the isolated directory this tool uses, and no setting existed to
-  turn those off in the version this was built against. They are inventoried on
-  every job so you can see what was there. Nobody has proven they are inert.
-- **A consulted model's answer is one opinion, not a verdict.** The tool labels
-  it as data and never treats it as an instruction. Neither should you. If it
-  matters, the person signing it is still the person signing it.
-- **Killing a runaway process is best effort.** A process that deliberately
-  detaches itself can survive.
-- **If a consultation is interrupted mid-call, that conversation is held.**
-  Stopping a local program does not prove the model on the other end stopped, so
-  rather than guess, the conversation waits for you to look at it. There is no
-  timeout, on purpose. `agent-bridge-admin status` tells you when one is waiting.
-
-## One setting worth making deliberately
-
-Neither peer inherits a reasoning-effort setting from your own configuration.
-The Codex peer runs with your personal config ignored, which is the isolation
-working correctly, and the Claude peer is started fresh. So unless you set one,
-both run at their own default rather than at whatever you have chosen for
-yourself elsewhere.
-
-That is a reasonable default and a poor accident. For review work, set
-`reasoning_effort` per peer in `config/local.json`; see
-[INSTALL.md](INSTALL.md). Whatever you pick, including nothing, is recorded on
-every consultation, so the ledger can always answer how hard the model was
-asked to think about an answer you relied on.
-
-## Data policy: two vendors, two accounts, two sets of terms
-
-This is the assumption most worth checking before you use it for anything real.
-
-### The technical shape
-
-Every consultation sends the prompt you composed to one of two **different
-companies**, through that company's own CLI, under your own account with them,
-governed by whatever plan you are on with them. The bridge adds no hosting of
-its own: there is no server in the middle, and nothing is stored anywhere except
-on your machine. But it does not change, improve, or unify what either company
-does with the text once it arrives.
-
-**This was built by someone whose Claude and Codex subscriptions have
-comparable data protections.** That is a fact about the author's accounts, not a
-property of this software. If your two plans differ, the software will happily
-send the same sentence to both, and the weaker plan governs what happens to the
-copy it received.
-
-The important consequence is that **your exposure is per direction, not an
-average of the two.** If one side retains prompts for longer, or trains on
-inputs where the other does not, then anything you send *in that direction* gets
-that treatment. Sending it once is the exposure. There is no netting.
-
-### What to check, on each plan separately
-
-Ask the same five questions of both vendors, for the specific plan you are on,
-because answers commonly differ between consumer, professional, team and
-enterprise tiers of the same product:
-
-1. Are my inputs used to train or improve models?
-2. How long is prompt and output content retained, and can I turn retention off?
-3. Who at the vendor can access content, and under what circumstances, for
-   example abuse review?
-4. Where is content processed and stored, geographically?
-5. Does a business or enterprise agreement change any of the above, and would
-   that agreement cover the CLI specifically rather than only the web product?
-
-Answers change. Check them yourself, on your own plan, rather than trusting a
-summary in a README, including this one.
-
-### Hardening one side
-
-If one side is weaker, you have three options, roughly in order of how much they
-cost you:
-
-**Narrow what the weaker peer may receive.** Each peer can be allowed a shorter
-list than the other, in `config/local.json`:
-
-```json
-{
-  "peers": {
-    "codex": { "allowed_source_classifications": ["public"] }
-  }
-}
-```
-
-That peer then refuses anything not on its list, and the refusal is enforced
-before any request leaves your machine. The tool description that peer's caller
-sees also advertises only the narrower list, so the calling model is told what
-it may send rather than discovering it by being refused.
-
-**Run only one direction.** The two directions are separate MCP servers. Skip
-the `mcp add` for the one you do not want, and that direction does not exist.
-
-**Upgrade the weaker plan**, if the vendor offers a tier with terms you are
-satisfied with.
-
-### What this means in plain language
-
-If you are an accountant, here is the whole thing without the jargon.
-
-This tool makes it very easy to send a question to two different AI companies.
-Easy enough that you will stop thinking about it, which is exactly the risk. The
-convenience is real and so is the exposure it creates.
-
-**Treat the question you type as a document you are handing to an outside firm.**
-Because that is what it is. You are handing it to two outside firms, and each one
-does what its own contract with you says, not what the other one does.
-
-Three practical rules:
-
-- **If you would not paste it into that company's public chat window, do not
-  send it through this.** The bridge is a nicer interface to the same act.
-- **Client-identifying information does not go in, ever.** Not names, not
-  account numbers, not enough surrounding detail to identify someone. If you
-  need a second opinion on a client situation, describe the *structure* of the
-  problem with the identifying facts removed. That is the same discipline you
-  would use asking a colleague at a conference.
-- **The label is a speed bump, not a lock.** Marking something `internal` does
-  not protect it. It exists to make you pause for one second and think about
-  what you are about to send. It refuses obvious mistakes; it cannot read your
-  prompt and tell you that paragraph three names a client.
-
-And the part people skip: **your obligations to clients do not change because a
-tool made something convenient.** Confidentiality rules, engagement letters, and
-any consent requirements that apply to disclosing client information apply
-exactly as they did before. A tool being on your own machine does not make the
-data local, because the whole point of it is to send the text somewhere else.
-
-None of this is legal advice, and it is not a substitute for reading your own
-vendor agreements or asking someone qualified about your own obligations.
-
-## How it was built, and why that is in the repo
-
-This started as a design that turned out to be wrong in four specific ways, all
-documented in [docs/verified-cli-behaviour.md](docs/verified-cli-behaviour.md).
-It then went through four rounds of adversarial review, where each model was
-asked to attack the other's work. That produced 40 findings, including two
-separate cases where two individually correct fixes broke each other, and five
-tests that had been quietly asserting a bug was correct behaviour.
-
-[docs/REVIEW-HISTORY.md](docs/REVIEW-HISTORY.md) is the write-up. It is in here
-because the findings are more useful than the code: if you build something like
-this yourself, that document is the part worth reading first.
-
-[docs/BUILD-YOUR-OWN.md](docs/BUILD-YOUR-OWN.md) is a brief you can paste into
-Claude or Codex to have it build an equivalent from scratch, with the traps
-already listed. Porting this repository is the better option if you can.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `bin/agent-bridge-setup` | stage and promote verified CLI pins |
-| `bin/agent-bridge-mcp` | the MCP server, needs `--caller codex` or `--caller claude` |
-| `bin/agent-bridge-admin` | `status`, `ledger`, `reporting`, `cleanup`, `indeterminate`, `resolve` |
-| `config/broker.json` | committed defaults, machine-neutral |
-| `config/local.json` | active machine-local overlay fragment, promoted by setup, never committed |
-| `schema/` | the response contract both models must satisfy |
-| `src/agent_bridge/` | the implementation, standard library only |
-| `tests/test_suite.py` | full offline suite against stand-in CLIs |
-| `canaries/run_canaries.py` | live verification with a mandatory durable result |
-
-State lives in `~/.agent-bridge`, outside this repository. On POSIX systems,
-state directories have mode exactly `0700` and files exactly `0600`. On
-Windows, no principal other than the owner, SYSTEM, and Administrators has any
-access. No consultation content is ever written into the repo.
+- **Filesystem read isolation is incomplete on the Codex peer.** It is instructed
+  not to inspect files and runs with a write sandbox, but reads are not fully
+  confined. Built-in assets can remain available. Privacy labels do not repair
+  this boundary; do not use this setup where enforced read confinement is required.
+  The Claude peer runs with tools and customizations disabled.
+- **Model and effort settings are separate from your interactive session.**
+  Choose peer settings deliberately using [INSTALL.md](INSTALL.md). Records
+  distinguish requested settings from observed information where available;
+  unavailable information remains unknown. Shared guidance is not a guarantee
+  that every host will enforce a model choice.
+- **CLI updates can invalidate verification.** Setup pins versions, and version
+  drift requires revalidation. A passing test is evidence for the configuration
+  tested, not every future CLI release.
+- **Stopping a local process does not prove a provider stopped processing.**
+  Process-tree cleanup is best effort. An interrupted call can leave a
+  conversation held as indeterminate for explicit resolution; see the admin
+  commands in [INSTALL.md](INSTALL.md).
+- **Offline CI is not a live installation test.** It uses stand-in provider
+  programs. Your accounts, login, selected models and optional Ollama service
+  still need verification on your computer.
 
 ## Checking it yourself
 
-Every push runs the offline test suite on macOS and Linux, on two Python
-versions, via the badge at the top. That run uses stand-in programs in place of
-the two CLIs, so it needs no credentials and costs nothing. The live
-verification is deliberately not automated: it spends real model calls, so it
-stays a decision a person makes.
+CI runs the offline tests on **macOS, Linux and Windows**, with Python **3.11
+and 3.13**. The badge above links to current results. Windows fixes have also
+been exercised in an ordinary interactive Windows 11 VM account.
 
-## Requirements
+From the repository, using your Python command (`python3` on many Macs,
+`python` or `py -3` on Windows):
 
-**macOS, Linux, and Windows.** Python 3.11+, the Claude Code CLI, the Codex
-CLI. No third-party Python packages, deliberately: the audit surface is this
-repository and nothing else.
-
-**Windows passes its own test suite**, 491 passing with six skips as an
-ordinary interactive user on CPython 3.12, and 497 passing with none skipped on
-CPython 3.11 and 3.13 in CI. Verified by hand in a Windows 11 VM as well as in
-CI, because the two answer different questions: CI runs with a privilege an
-ordinary account does not have.
-That took finding several defects that no amount of POSIX testing could have
-surfaced, because the POSIX idiom and the Windows behaviour differ silently:
-`os.kill(pid, 0)` is a liveness probe on POSIX and a console interrupt on
-Windows; `start_new_session` is accepted and ignored; `os.replace` is not the
-clean swap that POSIX rename is, so a reader can find no file at all and a
-live job reported as `JOB_NOT_FOUND`, while the writer on the other side of
-that same race is refused outright and takes the worker down with it; and a
-job-liveness check that looked only at the leader process reported a surviving
-descendant as contained.
-
-### If you are testing this on Windows
-
-Run the suite **as yourself**, not elevated and not as a service. Most of that
-list was invisible until it was run in an ordinary interactive session:
-`SYSTEM` holds privileges you do not, so it sails through code that stops a
-real user dead.
-
-```
-python tests\test_suite.py
+```text
+python tests/test_suite.py
+python -m unittest discover -s tests -p "test_onboard.py"
+python -m unittest discover -s tests -p "test_local_worker.py"
 ```
 
-**Expect `passed: 491  failed: 0  skipped: 6`.** The six skips are expected and are not failures. Creating a symbolic link
-needs `SeCreateSymbolicLinkPrivilege`, which an ordinary account does not hold
-unless Developer Mode is on, and three tests need a real symlink to test
-anything. Turn on Developer Mode to run them.
+These checks require no provider credentials or real model calls. Run Windows
+checks as your ordinary user: elevated/service accounts can hide permission
+problems. Symlink tests may be skipped when the account cannot create symlinks;
+read the skip reasons rather than expecting a fixed passing-test count.
 
-Verified on one machine, one locale, not domain-joined. An English-language
-`icacls`, a domain account, or a redirected profile are not covered, and the
-ACL parser is the part most likely to need work on them. It fails closed, so an
-unrecognised ACL refuses the run rather than assuming privacy.
+Live provider checks are a separate setup step. Local-worker unit tests use
+stand-in HTTP services and do not prove that your chosen Ollama model works.
+The Python implementation uses the standard library; no third-party Python
+packages are required.
 
-**The intermittent `worker_died` is fixed, and it is worth saying what it
-was.** It appeared roughly once in fifteen hundred jobs and reproduced in no
-isolated loop. The machine it was first seen on logs disk controller errors and
-30 real-time-clock faults a day, and that was allowed to stand as the
-explanation for longer than it should have been. It was wrong. Two true facts,
-a flaky machine and a rare failure, are not a causal link, and the tell was
-there to read: genuinely bad hardware does not spare a 50-run stress loop and
-then hit the full suite. A race does, because only the full suite runs a reader
-against a writer.
+## Removing it
 
-CI on a clean runner produced it with a stack trace. `os.replace` is
-`MoveFileExW` on Windows and is refused while another handle is open on the
-destination without `FILE_SHARE_DELETE`, which CPython's `open()` does not
-request. The reader side of that race had already been fixed; the writer side
-had not. Both are handled now, and the record that made it diagnosable is still
-attached to every `worker_died`: whether the OS reported a real exit code or
-the liveness probe itself failed, which are different bugs. If you hit one, that
-record is still the thing to send.
-[WSL](INSTALL.md#windows) remains supported and uses the POSIX path.
+Ask your assistant to follow the [removal instructions](docs/SETUP-WITH-AN-AGENT.md#removing-the-setup).
+Uninstall previews changes first and removes only registrations and instruction
+blocks it can still identify as its own. Edited entries are preserved and
+reported. Consultation history, provider logins, shared instructions and bridge
+configuration are retained separately.
 
-A peer on Windows is also terminated immediately, with no graceful stage,
-because no console signal can be aimed at one process tree without risking
-delivery to the bridge itself. That difference is recorded in each job.
+## Repository guide
 
-**Windows uses a separate implementation of the same safety interface.** Its
-locks are mandatory byte-range locks rather than POSIX advisory `flock` locks.
-It contains peers in a Win32 Job Object and terminates that job, with no
-polite stage at all, for the reason given above. Whether a tree is still alive
-is answered by asking the job which processes it contains, not by inspecting
-the leader. A process deliberately
-escaping that job is outside the tree guarantee, comparable to a POSIX child
-starting a new session. Pipe output is drained with bounded reader threads
-because Windows `select` does not support anonymous pipes.
+| Path | Purpose |
+| --- | --- |
+| `AGENTS.md` / `CLAUDE.md` | Entry point for an assistant working with this repo. |
+| `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
+| `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
+| `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
+| `src/agent_bridge/` | Broker, MCP servers, onboarding and local worker. |
+| `config/broker.json` | Machine-neutral defaults. |
+| `tests/` | Offline tests, including onboarding and local-worker coverage. |
+| `canaries/run_canaries.py` | Live checks required before activation. |
+| `bin/` | Setup, MCP and administration wrappers. |
 
-State privacy on Windows guarantees that no principal other than the owner,
-SYSTEM, and Administrators has any access; it does not claim POSIX mode-bit
-semantics. The bridge applies that ACL with the built-in `icacls` tool and
-reads it back; if the ACL cannot be verified, it refuses to claim or use
-owner-only permissions. WSL remains supported and uses the POSIX behavior;
-[INSTALL.md](INSTALL.md#windows) explains its filesystem caveat.
+Bridge state defaults to `~/.agent-bridge`. Keep setup answers, live results
+and consultation records in private locations outside the checkout.
 
-Built and measured against `claude 2.1.229` and `codex-cli 0.147.0` on macOS.
-Several documented behaviours are version-specific, which is why setup pins your
-versions and jobs refuse to run when they drift.
+For the engineering background, see the historical
+[CLI measurements](docs/verified-cli-behaviour.md),
+[review history](docs/REVIEW-HISTORY.md), and
+[build-your-own brief](docs/BUILD-YOUR-OWN.md). Use the guided setup above to
+install the current implementation.
 
 ## Licence
 
