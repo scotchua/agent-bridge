@@ -1,5 +1,9 @@
 # Install
 
+For the easier conversational path, start with
+[Set this up with Claude or Codex](docs/SETUP-WITH-AN-AGENT.md). The steps below
+remain the lower-level verification and troubleshooting reference.
+
 Written for someone who is comfortable in a terminal but is not a developer. If
 any step fails, the failure message is meant to tell you what to do; if it does
 not, that is a bug worth reporting.
@@ -25,7 +29,7 @@ fails closed unless the ACL proves that no principal other than the owner,
 SYSTEM, and Administrators has any access. Separately, the POSIX guarantee is
 that state directories have mode exactly `0700` and files exactly `0600`.
 Unlike the POSIX implementation, Windows uses bounded pipe-reader threads and
-a polite Ctrl+Break before forced Job Object termination. A process
+immediate Job Object termination (no graceful console signal). A process
 deliberately escaping its Job Object is outside the process-tree guarantee,
 just as a POSIX process deliberately starting a new session escapes its
 original group.
@@ -161,8 +165,8 @@ anything there as a failure.
   --out ~/.agent-bridge/canary-results/latest.json
 ```
 
-This makes real calls to both models and costs real money: roughly 40
-consultations, a few dollars on the Claude side. It tries one cheap call first
+This makes multiple real calls to both models and consumes allowance or incurs
+charges under your own provider accounts. Obtain authorization before running it. It tries one cheap call first
 and stops early if a CLI is not usable, rather than running the whole matrix
 into a wall.
 
@@ -250,15 +254,15 @@ would hand the consulted model this very bridge, and it would be able to consult
 back in a loop. The tool refuses to run at all if it detects that, but the
 simplest protection is not to create it.
 
-On **Windows**, use the `.cmd` launcher instead, because a `/bin/sh` script
+On **Windows (PowerShell)**, use the `.cmd` launcher instead, because a `/bin/sh` script
 cannot be executed there:
 
 ```
-codex mcp add claude-peer -- %USERPROFILE%\agent-bridge\bin\agent-bridge-mcp.cmd --caller codex
+codex mcp add claude-peer -- "$env:USERPROFILE\agent-bridge\bin\agent-bridge-mcp.cmd" --caller codex
 ```
 
 ```
-claude mcp add --scope user codex-peer -- %USERPROFILE%\agent-bridge\bin\agent-bridge-mcp.cmd --caller claude
+claude mcp add --scope user codex-peer -- "$env:USERPROFILE\agent-bridge\bin\agent-bridge-mcp.cmd" --caller claude
 ```
 
 **Restart the Codex desktop app** after adding it, or the new tools will not

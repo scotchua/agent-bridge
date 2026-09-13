@@ -5,9 +5,28 @@
 A local bridge that lets Claude and Codex consult each other for a second
 opinion, and keeps a record of every exchange.
 
-Everything runs on your own machine. Nothing is hosted, there is nothing to sign
-up for, and the only network calls are the ones the two CLIs already make on
-your behalf.
+The bridge runs on your own machine; Claude and Codex consultations still go
+to their providers through your own accounts. An optional connector can use an
+existing local Ollama model for bounded text work.
+
+## Let your assistant set it up
+
+Tell Claude Code or Codex:
+
+> Set up https://github.com/scotchua/agent-bridge on this computer. Read
+> AGENTS.md and docs/SETUP-WITH-AN-AGENT.md, ask me about privacy restrictions
+> and an optional existing local model, then carry out setup and verification.
+> Preserve my current settings and ask before live tests that use my allowance
+> or incur charges.
+
+**Start with [the guided setup](docs/SETUP-WITH-AN-AGENT.md)** for macOS and
+Windows. It asks what may be sent to each peer, which assistant apps to connect,
+and whether to add a local model. It stages settings before activation and
+keeps the existing version-bound verification gate.
+
+The underlying connection is the same on both platforms. Your accounts, models
+and chosen restrictions remain yours; the repo does not copy its author's
+credentials, private instructions or account permissions.
 
 ## Why you might want this
 
@@ -29,7 +48,7 @@ actually asked.
 
 Version 1 is consultation only. It cannot edit your files, run commands, merge
 anything, or start consultations on its own. A consulted model can suggest you
-ask again; it cannot do it. Only you can.
+ask again; it cannot do it. Only the coordinating session, acting within your authorization, can.
 
 It also refuses to carry sensitive material. Every request must be labelled
 `internal`, `synthetic`, or `public`, and anything labelled as client-derived or
@@ -49,7 +68,8 @@ python3 tests/test_suite.py
   --results ~/.agent-bridge/canary-results/latest.json
 ```
 
-The live step costs a few dollars. It writes a version-bound result before the
+The live step consumes provider allowance or incurs charges under your accounts.
+It writes a version-bound result before the
 candidate can be promoted. Then two `mcp add` commands, which INSTALL.md spells
 out.
 

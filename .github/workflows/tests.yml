@@ -71,6 +71,12 @@ jobs:
       - name: Offline test suite
         run: python3 tests/test_suite.py
 
+      - name: Portable onboarding and optional local worker
+        run: |
+          python3 -m unittest discover -s tests -p "test_onboard.py"
+          python3 -m unittest discover -s tests -p "test_local_worker.py"
+          python3 setup_bridge.py --help
+
       - name: Setup reports cleanly with no CLIs installed
         shell: bash
         run: |

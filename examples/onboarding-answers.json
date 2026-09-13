@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "directions": "both",
+  "targets": {
+    "codex": true,
+    "claude_code": true,
+    "claude_desktop": false
+  },
+  "privacy": {
+    "mode": "strict"
+  },
+  "local_ollama": {
+    "enabled": false
+  }
+}
