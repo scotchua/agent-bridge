@@ -20,7 +20,6 @@ import copy
 import json
 import os
 import statistics
-import subprocess
 import sys
 import time
 from typing import Any
@@ -30,6 +29,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 
 from agent_bridge import broker, config, registry, setup_cmd, store  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
+from agent_bridge.platform import platform  # noqa: E402
 
 # Synthetic, non-sensitive prompts. No client data, no firm-specific detail.
 ONE_TURN_PROMPTS = [
@@ -170,11 +170,30 @@ class Canary:
                 ErrorCategory.RETRY_EXHAUSTED.value)
 
 
-def timeout_canary_config(cfg: config.Config, caller: str) -> dict[str, Any]:
+def _timeout_stub_executable(peer: str, launcher_path: str | None) -> str:
+    """Return a directly executable controlled stub on this platform."""
+    stub = os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py")
+    if os.name != "nt":
+        return stub
+    if not launcher_path:
+        raise ValueError("Windows timeout stubs require a launcher path")
+    # A .py shebang is not a Windows executable.  Keep the shim scoped to the
+    # canary rather than teaching production peer invocation about test fakes.
+    # The fixed interpreter and script paths are quoted; %* forwards the
+    # backend's fixed argument vector to the fake for both --version and hang.
+    with open(launcher_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(
+            "@echo off\r\n"
+            f'"{sys.executable}" "{stub}" %*\r\n')
+    return launcher_path
+
+
+def timeout_canary_config(cfg: config.Config, caller: str,
+                          launcher_path: str | None = None) -> dict[str, Any]:
     """Build an isolated effective config for the controlled timeout stub."""
     peer = broker.PEER_OF[caller]
     base = copy.deepcopy(cfg.raw)
-    stub = os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py")
+    stub = _timeout_stub_executable(peer, launcher_path)
     peer_config = base["peers"][peer]
     extra_env = dict(peer_config.get("extra_env") or {})
     extra_env[f"FAKE_{peer.upper()}_MODE"] = "hang"
@@ -203,36 +222,56 @@ def timeout_canary_config(cfg: config.Config, caller: str) -> dict[str, Any]:
     return base
 
 
+def timeout_orphan_count(provenance: dict[str, Any]) -> int:
+    """Count surviving controlled peer groups with the native platform API."""
+    pgids = [attempt["group_kill"].get("pgid")
+             for attempt in provenance.get("attempts", [])
+             if attempt.get("group_kill")]
+    return sum(1 for pgid in pgids if pgid and
+               platform.process_tree_alive(int(pgid)))
+
+
 def timeout_canary(cfg: config.Config, caller: str) -> dict[str, Any]:
     """Timeout canary against a controlled stub, never a live expensive hang."""
     peer = broker.PEER_OF[caller]
-    base = timeout_canary_config(cfg, caller)
     path = os.path.join(REPO, "canaries", f".timeout-{caller}.json")
-    store.atomic_write_json(path, base)
-    cfg = config.load(path)
-    started = broker.start(cfg, caller, {
-        "prompt": "This peer is a stub that hangs on purpose.",
-        "source_classification": "synthetic", "label": "canary timeout"})
-    deadline = now() + 90
-    status: dict[str, Any] = {}
-    while now() < deadline:
-        status = registry.reconcile(cfg, started["job_id"])
-        if status.get("status") in registry.TERMINAL_STATUSES:
-            break
+    launcher_path = f"{path}.cmd" if os.name == "nt" else None
+    cleanup_errors: list[dict[str, str]] = []
+    try:
+        base = timeout_canary_config(cfg, caller, launcher_path)
+        store.atomic_write_json(path, base)
+        cfg = config.load(path)
+        started = broker.start(cfg, caller, {
+            "prompt": "This peer is a stub that hangs on purpose.",
+            "source_classification": "synthetic", "label": "canary timeout"})
+        deadline = now() + 90
+        status: dict[str, Any] = {}
+        while now() < deadline:
+            status = registry.reconcile(cfg, started["job_id"])
+            if status.get("status") in registry.TERMINAL_STATUSES:
+                break
+            time.sleep(0.5)
+        prov = store.read_json_or_none(
+            os.path.join(cfg.job_dir(started["job_id"]), "provenance.json")) or {}
         time.sleep(0.5)
-    prov = store.read_json_or_none(
-        os.path.join(cfg.job_dir(started["job_id"]), "provenance.json")) or {}
-    pgids = [a["group_kill"].get("pgid") for a in prov.get("attempts", [])
-             if a.get("group_kill")]
-    time.sleep(0.5)
-    orphans = 0
-    for pgid in [p for p in pgids if p]:
-        out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)],
-                             capture_output=True).stdout.decode().strip()
-        orphans += len([l for l in out.splitlines() if l.strip()])
-    os.unlink(path)
-    return {"direction": f"{caller}->{peer}", "status": status.get("status"),
-            "error_category": status.get("error_category"), "orphans": orphans}
+        orphans = timeout_orphan_count(prov)
+    finally:
+        for temporary in (path, launcher_path):
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    # A surviving Windows cmd.exe can still hold its shim.
+                    # Preserve the orphan finding; never turn failed cleanup
+                    # into a passing control or mask an earlier exception.
+                    cleanup_errors.append({"file": os.path.basename(temporary),
+                                           "error": type(exc).__name__})
+    return {"direction": f"{caller}->{peer}",
+            "status": "failed" if cleanup_errors else status.get("status"),
+            "error_category": status.get("error_category"), "orphans": orphans,
+            "cleanup_errors": cleanup_errors}
 
 
 ENVIRONMENT_FAILURES = frozenset({

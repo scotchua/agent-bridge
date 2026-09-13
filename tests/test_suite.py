@@ -3109,6 +3109,7 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
     import contextlib
     import importlib.util
     import io
+    from unittest import mock
 
     spec = importlib.util.spec_from_file_location(
         "run_canaries", os.path.join(REPO, "canaries", "run_canaries.py"))
@@ -3121,34 +3122,65 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
         raw["state_root"] = os.path.join(root, "state")
         raw["peers"]["claude"]["executable"] = os.path.join(root, "real-claude")
         raw["peers"]["codex"]["executable"] = os.path.join(root, "real-codex")
+        raw["peers"]["claude"]["allowed_versions"] = ["2.1.229 (Claude Code)"]
+        raw["peers"]["claude"]["extra_env"] = {"CLAUDE_EXISTING": "kept"}
         raw["peers"]["codex"]["allowed_versions"] = ["codex-cli 0.151.0"]
         raw["peers"]["codex"]["extra_env"] = {"EXISTING": "kept"}
         cfg = config_module.Config(raw, os.path.join(root, "effective.json"))
-        built = run_canaries.timeout_canary_config(cfg, "claude")
+        launcher = os.path.join(root, "timeout-codex.cmd")
+        built = run_canaries.timeout_canary_config(cfg, "claude", launcher)
+        reverse_launcher = os.path.join(root, "timeout-claude.cmd")
+        reverse = run_canaries.timeout_canary_config(
+            cfg, "codex", reverse_launcher)
         env = built["peers"]["codex"]["extra_env"]
+        reverse_env = reverse["peers"]["claude"]["extra_env"]
 
-        check("TC: the effective in-memory version pin reaches the stub config",
-              env["FAKE_CODEX_VERSION"] == "codex-cli 0.151.0", str(env))
-        check("TC: the timeout mode is merged with existing extra_env",
-              env["FAKE_CODEX_MODE"] == "hang" and env["EXISTING"] == "kept",
-              str(env))
+        check("TC: effective version pins reach both timeout stub configs",
+              env["FAKE_CODEX_VERSION"] == "codex-cli 0.151.0"
+              and reverse_env["FAKE_CLAUDE_VERSION"] == "2.1.229 (Claude Code)",
+              f"{env}; {reverse_env}")
+        check("TC: timeout modes merge both peers' existing extra_env",
+              env["FAKE_CODEX_MODE"] == "hang" and env["EXISTING"] == "kept"
+              and reverse_env["FAKE_CLAUDE_MODE"] == "hang"
+              and reverse_env["CLAUDE_EXISTING"] == "kept",
+              f"{env}; {reverse_env}")
         check("TC: building the stub config does not mutate the caller's config",
               cfg.raw["peers"]["codex"]["extra_env"] == {"EXISTING": "kept"}
               and cfg.raw["peers"]["codex"]["executable"] !=
               built["peers"]["codex"]["executable"])
         real_paths = [cfg.peer(peer).get("executable") for peer in config_module.PEERS]
-        check("TC: the stub config exposes no real peer executable path",
-              all(not path or path not in json.dumps(built) for path in real_paths))
+        check("TC: neither timeout config exposes a real peer executable path",
+              all(not path or (path not in json.dumps(built)
+                               and path not in json.dumps(reverse))
+                  for path in real_paths))
         stub_cfg = config_module.Config(built, os.path.join(root, "stub.json"))
         observed = preflight.check_peer(stub_cfg, "codex")
-        check("TC: the active version gate accepts the pinned stub version",
+        reverse_cfg = config_module.Config(reverse, os.path.join(root, "reverse.json"))
+        reverse_observed = preflight.check_peer(reverse_cfg, "claude")
+        check("TC: active version gates accept both pinned stub versions",
               observed["version_pinned"]
-              and observed["observed_version"] == "codex-cli 0.151.0",
-              str(observed))
+              and observed["observed_version"] == "codex-cli 0.151.0"
+              and reverse_observed["version_pinned"]
+              and reverse_observed["observed_version"] == "2.1.229 (Claude Code)",
+              f"{observed}; {reverse_observed}")
+
+        windows_launcher = os.path.join(root, "windows-timeout-codex.cmd")
+        with mock.patch.object(run_canaries.os, "name", "nt"):
+            windows_built = run_canaries.timeout_canary_config(
+                cfg, "claude", windows_launcher)
+        with open(windows_launcher, encoding="utf-8", newline="") as handle:
+            launcher_text = handle.read()
+        expected_stub = os.path.join(REPO, "tests", "fakes", "fake_codex.py")
+        check("TC: Windows invokes the Python timeout fake through a cmd shim",
+              windows_built["peers"]["codex"]["executable"] == windows_launcher
+              and launcher_text == (
+                  "@echo off\r\n"
+                  f'"{sys.executable}" "{expected_stub}" %*\r\n'),
+              repr(launcher_text))
 
         raw["peers"]["codex"]["allowed_versions"] = ["second", "first"]
         cfg = config_module.Config(raw, os.path.join(root, "multi.json"))
-        multi = run_canaries.timeout_canary_config(cfg, "claude")
+        multi = run_canaries.timeout_canary_config(cfg, "claude", launcher)
         check("TC: several pins select the first declared version",
               multi["peers"]["codex"]["extra_env"]["FAKE_CODEX_VERSION"] ==
               "second")
@@ -3156,10 +3188,39 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
         raw["peers"]["codex"]["allowed_versions"] = []
         raw["peers"]["codex"]["extra_env"]["FAKE_CODEX_VERSION"] = "stale"
         cfg = config_module.Config(raw, os.path.join(root, "unpinned.json"))
-        unpinned = run_canaries.timeout_canary_config(cfg, "claude")
+        unpinned = run_canaries.timeout_canary_config(cfg, "claude", launcher)
         check("TC: no pin deliberately leaves the stub version unset",
               "FAKE_CODEX_VERSION" not in
               unpinned["peers"]["codex"]["extra_env"])
+
+    with mock.patch.object(run_canaries.platform, "process_tree_alive",
+                           side_effect=lambda group_id: group_id == 22) as alive:
+        orphan_count = run_canaries.timeout_orphan_count({"attempts": [
+            {"group_kill": {"pgid": 11}}, {"group_kill": {"pgid": 22}},
+            {"group_kill": {}}, {},
+        ]})
+    check("TC: orphan verification uses the native process-group interface",
+          orphan_count == 1
+          and [call.args[0] for call in alive.call_args_list] == [11, 22],
+          str(alive.call_args_list))
+
+    # A held-open Windows shim must not hide an orphan finding or allow
+    # the timeout control to pass when cleanup could not finish.
+    for surviving_groups in (0, 1):
+        with mock.patch.object(run_canaries, "timeout_canary_config", return_value=cfg.raw), \
+                mock.patch.object(run_canaries.store, "atomic_write_json"), \
+                mock.patch.object(run_canaries.config, "load", return_value=cfg), \
+                mock.patch.object(run_canaries.broker, "start", return_value={"job_id": "fixture"}), \
+                mock.patch.object(run_canaries.registry, "reconcile", return_value={"status": "timed_out", "error_category": "peer_timeout"}), \
+                mock.patch.object(run_canaries.store, "read_json_or_none", return_value={}), \
+                mock.patch.object(run_canaries, "timeout_orphan_count", return_value=surviving_groups), \
+                mock.patch.object(run_canaries.time, "sleep"), \
+                mock.patch.object(run_canaries.os, "unlink", side_effect=PermissionError("held-open test shim")):
+            held = run_canaries.timeout_canary(cfg, "claude")
+        check(f"TC: cleanup failure preserves {surviving_groups} orphan groups and fails closed",
+              held["status"] == "failed" and held["orphans"] == surviving_groups
+              and all(item["error"] == "PermissionError" for item in held["cleanup_errors"])
+              and bool(held["cleanup_errors"]), str(held))
 
     passing_rows = [{"direction": "claude->codex", "kind": "one-turn 1",
                      "contract_valid": True, "first_attempt_ok": True,
@@ -3197,16 +3258,34 @@ def test_candidate_verification_path() -> None:
     local_existed = os.path.isfile(local_path)
     local_before = open(local_path, "rb").read() if local_existed else None
     try:
+        def candidate_executable(peer: str) -> str:
+            """Use a durable fake launcher when setup evaluates Windows paths."""
+            if os.name != "nt":
+                return peer_fixture.cfg.peer(peer)["executable"]
+            script = os.path.join(REPO, "tests", "fakes", f"fake_{peer}.py")
+            shim = os.path.join(root, f"candidate-fake-{peer}.cmd")
+            with open(shim, "w", encoding="utf-8", newline="") as handle:
+                handle.write(
+                    "@echo off\r\n"
+                    f'"{sys.executable}" "{script}" %*\r\n')
+            return shim
+
+        candidate_claude = candidate_executable("claude")
+        candidate_codex = candidate_executable("codex")
+        check("VP1: candidate setup paths are durable",
+              setup_cmd.is_durable(candidate_claude)
+              and setup_cmd.is_durable(candidate_codex),
+              f"{candidate_claude}; {candidate_codex}")
         overlay_path = os.path.join(root, "local-overlay.json")
         overlay = {
             "state_root": peer_fixture.state,
             "peers": {
                 "claude": {
-                    "executable": peer_fixture.cfg.peer("claude")["executable"],
+                    "executable": candidate_claude,
                     "allowed_versions": ["2.1.229 (Claude Code)"],
                 },
                 "codex": {
-                    "executable": peer_fixture.cfg.peer("codex")["executable"],
+                    "executable": candidate_codex,
                     "allowed_versions": ["codex-cli 0.147.0"],
                     "codex_home": peer_fixture.cfg.peer("codex")["codex_home"],
                 },
@@ -3233,8 +3312,8 @@ def test_candidate_verification_path() -> None:
                 mock.patch.object(setup_cmd, "codex_signed_in", return_value=True):
             result = setup_cmd.main([
                 "--candidate", candidate_path,
-                "--claude", overlay["peers"]["claude"]["executable"],
-                "--codex", overlay["peers"]["codex"]["executable"],
+                "--claude", candidate_claude,
+                "--codex", candidate_codex,
             ])
         candidate = config_module.load_effective(candidate_path)
         check("VP2: --candidate writes one complete validated effective config",
@@ -3783,8 +3862,13 @@ def test_windows_atomic_replace_retry() -> None:
             check("a reader held past the grace correctly makes the write fail",
                   False, "it passed")
         except PermissionError as exc:
+            # POSIX injects the reader error; Windows reports its real
+            # access-denied/sharing-violation code for the held-open file.
+            expected_error = (getattr(exc, "winerror", None) in (5, 32, 33)
+                              if os.name == "nt" else
+                              "destination reader still holds the file" in str(exc))
             check("a reader held past the grace correctly makes the write fail",
-                  "destination reader still holds the file" in str(exc), str(exc))
+                  expected_error and attempts > 1, str(exc))
         finally:
             release_reader.set()
             reader.join()
