@@ -113,6 +113,51 @@ kernel32.GetFinalPathNameByHandleW.argtypes = [
     wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
 ]
 kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+kernel32.GetSystemDirectoryW.restype = wintypes.UINT
+
+
+# Minimal environment for the ACL tools. Not a scrub for credentials (they
+# take none), but for PATH, PATHEXT and COMSPEC: a helper resolved by name
+# lets anyone who can write a directory on PATH decide what proves our ACL.
+_TOOL_ENV = {
+    "SYSTEMROOT": "C:\\Windows",
+    "SYSTEMDRIVE": "C:",
+}
+
+
+def _system_directory() -> str:
+    """Ask the OS where System32 is, rather than believing the environment.
+
+    SystemRoot is an ordinary environment variable and an attacker who can
+    set it can redirect every tool we invoke. GetSystemDirectoryW is the
+    authoritative answer and cannot be reached that way.
+
+    Fails closed. There is deliberately no fallback: a hardcoded
+    C:\\Windows\\System32 is a guess, and on a machine where the system
+    directory is somewhere else that guess either names nothing or names
+    something an attacker chose. Either way it would be used to run the
+    program whose output IS the owner-only proof, so a failed lookup must
+    stop the proof rather than substitute a default.
+    """
+    buffer = ctypes.create_unicode_buffer(260)
+    length = kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if not length or length >= len(buffer) or not buffer.value:
+        raise OSError(
+            "GetSystemDirectoryW failed; refusing to guess the system directory")
+    return buffer.value
+
+
+def _trusted_tool(name: str) -> str:
+    """Absolute path to a System32 executable. Never resolved through PATH.
+
+    subprocess with shell=False still resolves a bare name through the
+    inherited PATH, so "icacls" is an attacker-controlled choice of program
+    on any machine where a writable directory precedes System32. The ACL
+    round trip is the evidence the whole owner-only guarantee rests on, so
+    it must not be one of those choices.
+    """
+    return os.path.join(_system_directory(), name)
 
 
 class WindowsPlatform:
@@ -633,18 +678,25 @@ class WindowsPlatform:
 
     def acl_diagnostics(self, path: str) -> dict[str, Any]:
         """Why an ACL attempt succeeded or failed. For operators and CI only."""
+        try:
+            whoami = _trusted_tool("whoami.exe")
+            icacls = _trusted_tool("icacls.exe")
+        except OSError as exc:
+            return {"system_directory_error": str(exc), "tools_run": False}
         identity = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
-            timeout=10, check=False, shell=False)
+            [whoami, "/user", "/fo", "csv", "/nh"],
+            capture_output=True, timeout=10, check=False, shell=False,
+            env=dict(_TOOL_ENV))
         raw = identity.stdout.decode("utf-8", "replace").strip()
         fields = raw.split(",")
         user = fields[-1].strip('"') if fields else ""
         applied = subprocess.run(
-            ["icacls", path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
-            capture_output=True, timeout=15, check=False, shell=False)
+            [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
+            capture_output=True, timeout=15, check=False, shell=False,
+            env=dict(_TOOL_ENV))
         observed = subprocess.run(
-            ["icacls", path], capture_output=True, timeout=15,
-            check=False, shell=False)
+            [icacls, path], capture_output=True, timeout=15,
+            check=False, shell=False, env=dict(_TOOL_ENV))
         return {
             "whoami_rc": identity.returncode,
             "whoami_raw": raw,
@@ -658,9 +710,18 @@ class WindowsPlatform:
         }
 
     def _set_and_verify_owner_acl(self, path: str) -> bool:
+        try:
+            # _trusted_tool may fail closed if the OS will not say where
+            # System32 is. That must return False BEFORE any process is
+            # spawned, never fall through to a guessed path.
+            whoami = _trusted_tool("whoami.exe")
+            icacls = _trusted_tool("icacls.exe")
+        except OSError:
+            return False
         identity = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
-            timeout=10, check=False, shell=False,
+            [whoami, "/user", "/fo", "csv", "/nh"],
+            capture_output=True, timeout=10, check=False, shell=False,
+            env=dict(_TOOL_ENV),
         ).stdout.decode("utf-8", "replace").strip().split(",")
         user = identity[-1].strip('"')
         if not user.startswith("S-1-"):
@@ -672,14 +733,15 @@ class WindowsPlatform:
             # names and security IDs was done", so the grant silently never
             # applied and the capability could never be verified.
             applied = subprocess.run(
-                ["icacls", path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
+                [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
                 capture_output=True, timeout=15, check=False, shell=False,
+                env=dict(_TOOL_ENV),
             )
             if applied.returncode != 0:
                 return False
             observed = subprocess.run(
-                ["icacls", path], capture_output=True, timeout=15,
-                check=False, shell=False,
+                [icacls, path], capture_output=True,
+                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
             )
         except (OSError, subprocess.SubprocessError):
             return False
