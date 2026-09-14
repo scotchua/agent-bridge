@@ -773,6 +773,13 @@ inside a real guest. The provisioning argv, the activation argv and the runtime
 lifecycle are reviewed and tested as data. Treat "installed" and "verified" as
 separate claims, and do not report the second on the strength of the first.
 
+The work that would close this gap is the work no machine here can do.
+[WINDOWS-VALIDATION-RUNBOOK.md](WINDOWS-VALIDATION-RUNBOOK.md) lists every step
+that needs a person at a real Windows host, in order, with the command to run
+and the evidence that says it worked. The image those steps install has to be
+signed first, and [RELEASE-SIGNING.md](RELEASE-SIGNING.md) is that procedure:
+the release key never enters this repository, and nothing here can sign.
+
 ## Configuration
 
 `orchestration.json` accepts four optional Windows keys. The first three are

@@ -43,7 +43,7 @@ mean the gate is broken.
 ## Step 2. Run the validation suite on a bare machine
 
 ```bat
-python setup_bridge.py windows-setup validate --report validation-before.json
+bin\agent-bridge-windows-setup validate --report validation-before.json
 ```
 
 **Expected:** exit code 1 and a report whose `verdict` is `not_ready`. The
@@ -57,7 +57,7 @@ diff against this one.
 **Run it twice** and compare:
 
 ```bat
-python setup_bridge.py windows-setup validate --report validation-twice.json
+bin\agent-bridge-windows-setup validate --report validation-twice.json
 fc validation-before.json validation-twice.json
 ```
 
@@ -70,7 +70,7 @@ not deterministic and that is a defect worth stopping for.
 ## Step 3. Walk the ladder, read-only
 
 ```bat
-python setup_bridge.py windows-setup plan
+bin\agent-bridge-windows-setup plan
 ```
 
 **Expected:** one JSON object naming the current stage, the next stage, who may
@@ -84,7 +84,7 @@ stages. Exit code 0. Nothing is changed.
 This is the first step that changes the machine.
 
 ```bat
-python setup_bridge.py windows-setup step --admin-consent
+bin\agent-bridge-windows-setup step --admin-consent
 ```
 
 **Expected:** `status` of `ok` with the stage that was taken, or
@@ -100,21 +100,21 @@ saying a person has to do something, not a failure to retry.
 ## Step 5. The restart, and the resume
 
 ```bat
-python setup_bridge.py windows-setup status
+bin\agent-bridge-windows-setup status
 ```
 
 **Expected before consenting:** `resume_task_registered` is `false` and
 `resume` is `null`.
 
 ```bat
-python setup_bridge.py windows-setup step --admin-consent --reboot-consent
+bin\agent-bridge-windows-setup step --admin-consent --reboot-consent
 ```
 
 **Expected:** `status` of `reboot_scheduled`. Then, **before the machine
 restarts**, in another window:
 
 ```bat
-python setup_bridge.py windows-setup status
+bin\agent-bridge-windows-setup status
 schtasks /query /tn AgentBridgeProvisionResume /v /fo LIST
 ```
 
@@ -131,7 +131,7 @@ halfway through.
 After the restart, sign in and wait. The logon task runs on its own.
 
 ```bat
-python setup_bridge.py windows-setup status
+bin\agent-bridge-windows-setup status
 ```
 
 **Expected:** either the resume record is gone and the ladder has advanced (the
@@ -201,12 +201,25 @@ key-shaped reached the tree and must be removed before anything is published.
 ## Step 8. Install the image on the Windows host
 
 ```bat
-python setup_bridge.py windows-setup step --image-consent --rootfs C:\path\rootfs.tar --manifest C:\path\manifest.json
+bin\agent-bridge-windows-setup step --image-consent ^
+    --image C:\path\rootfs.tar --manifest C:\path\manifest.json
 ```
 
-**Expected:** `ok`, or a refusal naming which of the four trust conditions
-failed: no anchor for this architecture, no anchor for this release, the
-canonical digest does not match, or the signature does not verify.
+**Expected:** `ok`, or a refusal whose `reason` names exactly which trust
+condition failed, one of:
+
+- `manifest_untrusted:no_release_anchor` — nothing is anchored at all.
+- `manifest_untrusted:no_anchor_for_release` — anchored, but not this release
+  or this architecture.
+- `manifest_untrusted:digest_mismatch` — the anchor pins different canonical
+  bytes than this manifest produces.
+- `manifest_untrusted:signature_missing` or `:public_key_missing` — the anchor
+  is incomplete.
+- `manifest_untrusted:signature_invalid` — the signature does not verify.
+
+A digest match on its own is not trust. Whoever could rewrite the pinned digest
+could rewrite the manifest to match it, so the signature is the part of this an
+attacker with write access to the repository cannot forge.
 
 **A refusal here is the system working.** Until step 7 is done, this step
 refuses by design and the reason will be `manifest_untrusted:no_release_anchor`.
@@ -218,7 +231,7 @@ refuses by design and the reason will be `manifest_untrusted:no_release_anchor`.
 This is the first time any of this runs inside WSL2.
 
 ```bat
-python setup_bridge.py windows-setup validate --report validation-after-image.json
+bin\agent-bridge-windows-setup validate --report validation-after-image.json
 ```
 
 **Expected:** `distro_registered` passes and reports WSL2, then `guest_runner`,
@@ -257,7 +270,7 @@ This is the only step that costs money or subscription allowance. It runs one
 real authenticated model turn, per provider.
 
 ```bat
-python setup_bridge.py windows-setup step --provider-consent
+bin\agent-bridge-windows-setup step --provider-consent
 ```
 
 **Expected:** one of exactly these verdicts per provider, and nothing else:
@@ -290,17 +303,17 @@ jobs remain refused by name.
 ## Step 11. Record the verification
 
 ```bat
-python setup_bridge.py windows-setup step
-python setup_bridge.py onboard status
+bin\agent-bridge-windows-setup step
+python setup_bridge.py onboard status --answers answers.json
 ```
 
 **Expected:** `provision-evidence.json` exists in the runtime root, carries this
 machine's fingerprint and the rootfs and guest-runner hashes, and
-`onboard status` now reports automatic delegation as available rather than
+`onboard status --answers answers.json` now reports automatic delegation as available rather than
 refused.
 
 **Check the binding actually binds.** Copy the evidence file to another
-Windows machine and run `onboard status` there.
+Windows machine and run `onboard status --answers answers.json` there.
 
 **Expected:** delegation is refused on the second machine. The record is bound
 to the host fingerprint, and a record that travelled is not evidence about

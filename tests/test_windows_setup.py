@@ -514,3 +514,53 @@ class OnboardingPointsAtTheCommandTests(SetupTestCase):
         name = onboard.WINDOWS_SETUP_COMMAND.replace("\\", "/")
         self.assertTrue((ROOT / name).is_file())
         self.assertTrue((ROOT / (name + ".cmd")).is_file())
+
+
+class RunbookTests(unittest.TestCase):
+    """The runbook is a promise about a command line, so check the command line.
+
+    A document listing steps for a person to run on a machine nobody here has
+    is exactly the kind of prose that rots silently: a flag gets renamed, the
+    runbook keeps saying the old one, and the failure surfaces on the one
+    machine where it costs the most. These read the document and check it
+    against the parser rather than against a reviewer's memory.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (ROOT / "docs" / "WINDOWS-VALIDATION-RUNBOOK.md").read_text(
+            encoding="utf-8")
+
+    def test_every_subcommand_it_names_is_real(self):
+        import re
+
+        named = set(re.findall(r"agent-bridge-windows-setup (\w[\w-]*)", self.text))
+        self.assertTrue(named, "the runbook names no subcommand at all")
+        self.assertLessEqual(named, set(ws.COMMANDS))
+
+    def test_every_consent_flag_it_names_is_real(self):
+        import re
+
+        parser = ws.build_parser()
+        known = {action.option_strings[0] for action in parser._actions
+                 if action.option_strings}
+        named = set(re.findall(r"(--[a-z][a-z-]+)", self.text))
+        # Flags belonging to the other tools the runbook drives. Each is
+        # checked by that tool's own tests; only this parser is checked here.
+        other = {"--recipe", "--out-dir", "--out", "--release", "--architecture",
+                 "--signature", "--public-key", "--answers", "--check",
+                 "--list", "--verbose", "--exit-code", "--root"}
+        for flag in sorted(named - other):
+            self.assertIn(flag, known, f"the runbook names an unknown flag: {flag}")
+
+    def test_it_does_not_claim_any_of_it_has_been_run(self):
+        self.assertIn("nothing below has been run", self.text.lower())
+
+    def test_it_names_the_refusal_the_image_step_gives_today(self):
+        # RELEASE_TRUST_ANCHORS ships empty, so this is the reason a reader
+        # will actually see. If the constant is ever populated by default the
+        # runbook is wrong and this test says so.
+        from agent_bridge.orchestration import windows_rootfs as wr
+
+        self.assertEqual(wr.RELEASE_TRUST_ANCHORS, ())
+        self.assertIn("manifest_untrusted:no_release_anchor", self.text)

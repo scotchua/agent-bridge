@@ -159,7 +159,9 @@ class DocumentedBoundaryTests(unittest.TestCase):
             r"\b(?:not|never|no|none|nothing|neither|without|unverified)\b",
             re.IGNORECASE)
         for name in ("README.md", "INSTALL.md", "docs/WINDOWS-DELEGATION.md",
-                     "docs/WINDOWS-ROOTFS.md", "docs/SETUP-WITH-AN-AGENT.md"):
+                     "docs/WINDOWS-ROOTFS.md", "docs/SETUP-WITH-AN-AGENT.md",
+                     "docs/WINDOWS-VALIDATION-RUNBOOK.md",
+                     "docs/RELEASE-SIGNING.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
             for match in claims.finditer(text):
                 window = text[max(0, match.start() - 60):match.start()]
