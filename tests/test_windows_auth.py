@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import guest_runner as gr
 from agent_bridge.orchestration import windows_auth as wa
+from agent_bridge.orchestration import windows_delegation as wd
 
 TOKEN = "sk-ant-oat01-" + "z" * 40
 CODEX_TOKEN = "codex-access-" + "y" * 40
@@ -356,6 +357,50 @@ class OsProtectionTests(AuthTestCase):
 
     def test_each_provider_gets_its_own_entropy(self):
         self.assertNotEqual(wa._entropy("claude"), wa._entropy("codex"))
+
+
+class ExecutorWiringTests(AuthTestCase):
+    """The executor's session source is this enrolment, gated on the lane."""
+
+    def test_a_closed_lane_never_reaches_a_decryption_call(self):
+        self._enrol()
+
+        class _Closed:
+            def enabled_for(self, provider):
+                return False
+
+        source = wd.enrolled_auth_source(self.root, lane=_Closed(),
+                                         protector=self.box, platform=NT)
+        with self.assertRaises(wd.DelegationRefused) as caught:
+            source("claude")
+        self.assertEqual(caught.exception.reason, "provider_lane_unverified")
+        self.assertEqual(self.box.unprotect_calls, 0)
+
+    def test_an_open_lane_hands_over_the_enrolled_capsule(self):
+        self._enrol()
+
+        class _Open:
+            def enabled_for(self, provider):
+                return True
+
+        source = wd.enrolled_auth_source(self.root, lane=_Open(),
+                                         protector=self.box, platform=NT)
+        self.assertEqual(source("claude"),
+                         {"kind": gr.AUTH_KIND_CLAUDE_OAUTH, "token": TOKEN})
+
+    def test_a_missing_enrolment_refuses_by_name_without_the_token(self):
+        source = wd.enrolled_auth_source(self.root, protector=self.box,
+                                         platform=NT)
+        with self.assertRaises(wd.DelegationRefused) as caught:
+            source("codex")
+        self.assertEqual(caught.exception.reason, "provider_session_unavailable")
+        self.assertIn("codex", caught.exception.detail)
+        self.assertNotIn(TOKEN, caught.exception.detail)
+
+    def test_the_default_executor_source_still_refuses_by_name(self):
+        with self.assertRaises(wd.DelegationRefused) as caught:
+            wd._no_auth_source("claude")
+        self.assertEqual(caught.exception.reason, "provider_session_unavailable")
 
 
 class EnrolmentRollbackTests(AuthTestCase):
