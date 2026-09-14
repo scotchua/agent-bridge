@@ -17,12 +17,18 @@ def main(argv: list[str] | None = None) -> int:
         print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
         return 2
     if not raw or raw[0] in {"-h", "--help"}:
-        print("usage: setup_bridge.py {onboard,serve-peer,serve-local,serve-orchestration} ...")
+        print("usage: setup_bridge.py {onboard,windows-setup,serve-peer,serve-local,serve-orchestration} ...")
         return 0
     command, rest = raw[0], raw[1:]
     if command == "onboard":
         from agent_bridge import onboard
         return onboard.main(rest)
+    if command == "windows-setup":
+        # The stock-Windows provisioning command. Routed through this script
+        # rather than "-m" so the resume logon task can name an absolute
+        # script path and need no PYTHONPATH at sign-in.
+        from agent_bridge import windows_setup
+        return windows_setup.main(rest)
     if command == "serve-peer":
         import argparse
         parser = argparse.ArgumentParser(prog="setup_bridge.py serve-peer")

@@ -107,4 +107,16 @@ class VerificationQueueIsolationTests(unittest.TestCase):
         self.assertFalse(result["worktree_removed"])
 
 
+class WindowsOnboardingGateTests(unittest.TestCase):
+    def test_non_macos_plan_refuses_automatic_execution(self):
+        answers = {"version": 1, "directions": "both",
+                   "targets": {"codex": True, "claude_code": True, "claude_desktop": False},
+                   "privacy": {"mode": "strict", "peers": {}},
+                   "local_ollama": {"enabled": False},
+                   "automatic_delegation": {"enabled": True}}
+        with mock.patch.object(onboard.sys, "platform", "win32"):
+            with self.assertRaisesRegex(ValueError, "only on macOS"):
+                onboard.plan(answers, "/repo")
+
+
 if __name__ == "__main__": unittest.main()

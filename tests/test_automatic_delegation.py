@@ -708,7 +708,12 @@ class WindowsPreflightWiringTests(unittest.TestCase):
             result = onboard.status(choices)
         self.assertTrue(result["windows_preflight"]["prerequisites_ready"])
         self.assertEqual(result["execution_delegation"], "blocked")
-        self.assertIn("not implemented yet", result["execution_delegation_note"])
+        self.assertEqual(result["execution_delegation_detail"]["reason"],
+                         "windows_wsl_configuration_missing")
+        self.assertEqual(result["execution_delegation_detail"]["provider_lane"],
+                         "closed")
+        self.assertIn("verification record", result["execution_delegation_note"])
+        self.assertIn("boundary-verification", result["execution_delegation_note"])
 
 
 class WindowsPlanReportingTests(unittest.TestCase):
@@ -720,7 +725,8 @@ class WindowsPlanReportingTests(unittest.TestCase):
             result = onboard.plan(choices, str(ROOT))
         automatic = result["automatic_delegation"]
         self.assertEqual(automatic["windows_preflight"], ready_report)
-        self.assertIn("blocked", automatic["execution_delegation_note"])
+        self.assertIn("is off", automatic["execution_delegation_note"])
+        self.assertEqual(automatic["execution_delegation"]["state"], "blocked")
 
     def test_plan_omits_windows_preflight_on_non_windows(self):
         with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None):
@@ -783,6 +789,217 @@ class WindowsApplyRefusalTests(unittest.TestCase):
             self.assertEqual(report["execution_delegation"], "blocked")
             self.assertIn("remains blocked", report["execution_delegation_note"])
 
+
+class WindowsSetupLadderWiringTests(unittest.TestCase):
+    """Onboarding must describe guided setup, not assume WSL is present."""
+
+    def _summary(self, *, ready, choice=None, manifest_ok=True):
+        patches = [
+            mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                       side_effect=_fake_windows_subprocess_run(ready=ready)),
+            mock.patch.object(onboard.store, "sha256_file",
+                              return_value=("a" if manifest_ok else "b") * 64),
+            mock.patch.object(onboard.store, "read_json", return_value=dict(_GOOD_MANIFEST)),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            return onboard._windows_setup_summary(
+                choice if choice is not None else WINDOWS_DELEGATION_CHOICE,
+                platform="win32")
+
+    def test_a_machine_with_nothing_installed_starts_at_the_firmware_or_feature_stage(self):
+        summary = self._summary(ready=False)
+        self.assertIn(summary["stage"],
+                      (wp.STAGE_FIRMWARE_VIRTUALIZATION, wp.STAGE_WINDOWS_FEATURES))
+        self.assertFalse(summary["delegation_may_be_enabled"])
+
+    def test_it_names_the_next_step_in_plain_language_with_its_boundaries(self):
+        summary = self._summary(ready=False)
+        step = summary["next"]
+        self.assertTrue(step["title"])
+        self.assertTrue(step["detail"])
+        self.assertIn(step["actor"], (wp.ACTOR_INSTALLER, wp.ACTOR_INSTALLER_ELEVATED,
+                                      wp.ACTOR_USER))
+        self.assertIn("requires_admin", step)
+        self.assertIn("reboots", step)
+
+    def test_it_reports_the_admin_and_restart_boundaries_that_are_still_ahead(self):
+        summary = self._summary(ready=False)
+        self.assertTrue(summary["requires_admin_ahead"])
+        self.assertTrue(summary["requires_reboot_ahead"])
+
+    def test_the_image_and_verification_stages_are_always_ahead_of_a_ready_machine(self):
+        summary = self._summary(ready=True)
+        self.assertIn(wp.STAGE_BOUNDARY_VERIFICATION, summary["remaining_stages"])
+
+    def test_a_fully_prepared_machine_still_stops_at_boundary_verification(self):
+        summary = self._summary(ready=True)
+        self.assertEqual(summary["stage"], wp.STAGE_BOUNDARY_VERIFICATION)
+        self.assertFalse(summary["delegation_may_be_enabled"])
+        self.assertIn("boundary", summary["gate"])
+
+    def test_an_unconfigured_guest_image_is_its_own_stage_not_an_assumption(self):
+        summary = self._summary(ready=True, choice={"enabled": True})
+        self.assertEqual(summary["stage"], wp.STAGE_GUEST_IMAGE)
+        self.assertIn(wp.STAGE_GUEST_IMAGE, summary["remaining_stages"])
+
+    def test_a_mismatched_rootfs_hash_is_not_an_installed_image(self):
+        summary = self._summary(ready=True, manifest_ok=False)
+        self.assertEqual(summary["stage"], wp.STAGE_GUEST_IMAGE)
+
+    def test_it_carries_the_evidence_behind_every_conclusion(self):
+        summary = self._summary(ready=True)
+        names = {check["name"] for check in summary["evidence"]["checks"]}
+        self.assertIn("boundary_verified", names)
+        self.assertIn("guest_image", names)
+        self.assertIn("feature:VirtualMachinePlatform", names)
+        self.assertIn("feature:Microsoft-Windows-Subsystem-Linux", names)
+
+    def test_it_states_the_boundaries_it_cannot_cross(self):
+        summary = self._summary(ready=True)
+        self.assertIn("administrator", summary["limitations"])
+        self.assertIn("firmware", summary["limitations"])
+        self.assertIn("restart", summary["limitations"])
+
+    def test_it_runs_no_command_on_a_non_windows_platform(self):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("setup reporting must not spawn a process off Windows")
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                        side_effect=forbidden):
+            for platform_name in ("darwin", "linux"):
+                self.assertIsNone(onboard._windows_setup_summary(
+                    WINDOWS_DELEGATION_CHOICE, platform=platform_name))
+
+    def test_plan_and_status_both_carry_the_setup_ladder(self):
+        stub = {"stage": wp.STAGE_WINDOWS_FEATURES, "delegation_may_be_enabled": False}
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None), \
+             mock.patch.object(onboard, "_windows_setup_summary", return_value=stub), \
+             mock.patch.object(onboard.delegation, "platform_boundary_report",
+                              return_value={"platform": "windows",
+                                            "execution_worker_service": "not installed automatically",
+                                            "continuous_service_verified": False,
+                                            "resource_sampler": "n/a",
+                                            "registration_and_config": "supported"}):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            self.assertEqual(onboard.plan(choices, str(ROOT))["automatic_delegation"]["windows_setup"], stub)
+            self.assertEqual(onboard.status(choices)["windows_setup"], stub)
+
+    def test_the_plan_describes_reversible_per_user_activation_on_windows(self):
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None), \
+             mock.patch.object(onboard, "_windows_setup_summary", return_value=None), \
+             mock.patch.object(onboard.delegation, "platform_boundary_report",
+                              return_value={"platform": "windows",
+                                            "execution_worker_service": "not installed automatically",
+                                            "continuous_service_verified": False,
+                                            "resource_sampler": "n/a",
+                                            "registration_and_config": "supported"}):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            activation = onboard.plan(choices, str(ROOT))["automatic_delegation"]["windows_activation"]
+        self.assertEqual(activation["task_name"], "AgentBridgeExecutionWorker")
+        self.assertIn("no administrator", activation["scope"].replace("\n", " "))
+        self.assertIn("remove it yourself", activation["reversible"])
+        self.assertIn("live", activation["note"])
+
+    def test_the_plan_offers_no_windows_activation_on_a_mac(self):
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None), \
+             mock.patch.object(onboard, "_windows_setup_summary", return_value=None):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            plan_report = onboard.plan(choices, str(ROOT))["automatic_delegation"]
+        self.assertIsNone(plan_report["windows_activation"])
+
+    def test_the_gate_is_the_ladder_not_the_preflight(self):
+        # prerequisites_ready is about local evidence; it must never be the
+        # thing that turns delegation on.
+        summary = self._summary(ready=True)
+        self.assertFalse(summary["delegation_may_be_enabled"])
+
+
+
+class WindowsDelegationStateTests(unittest.TestCase):
+    """The verdict comes from the machine's record, never from a constant."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        from agent_bridge.orchestration import windows_delegation as wd
+        from agent_bridge.orchestration import windows_evidence as wev
+        from agent_bridge.orchestration import windows_wsl_runtime as wr
+        self.wd, self.wev, self.wr = wd, wev, wr
+        self.rootfs = self.root / "rootfs.tar"
+        self.rootfs.write_bytes(b"pinned" * 64)
+        import hashlib
+        self.rootfs_sha256 = hashlib.sha256(self.rootfs.read_bytes()).hexdigest()
+        self.manifest = self.root / "manifest.json"
+        self.manifest.write_text(json.dumps({
+            "schema_version": 1, "distro_release": "12.9",
+            "rootfs_sha256": self.rootfs_sha256, "node_version": "20.19.0",
+            "claude_version": "1.0.0", "codex_version": "0.1.0"}))
+        self.choice = {
+            "windows_wsl_runtime_root": str(self.root),
+            "windows_wsl_rootfs_path": str(self.rootfs),
+            "windows_wsl_manifest_path": str(self.manifest)}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_evidence(self, **overrides):
+        fields = dict(
+            recorded_at="2026-09-14T00:00:00Z",
+            host_fingerprint=self.wev.host_fingerprint(),
+            wsl_version="2.3.26.0", rootfs_sha256=self.rootfs_sha256,
+            guest_runner_sha256=self.wd.guest_runner_sha256(),
+            canaries=self.wr.CANARY_ORDER, boundary_verified=True,
+            provider_lane=self.wev.ProviderLane())
+        fields.update(overrides)
+        _write_private(self.wev.evidence_path(str(self.root)),
+                       json.dumps(self.wev.Evidence(**fields).as_dict()))
+
+    def test_an_unconfigured_machine_is_blocked_by_name(self):
+        verdict = onboard._windows_delegation_state({})
+        self.assertEqual(verdict["state"], "blocked")
+        self.assertEqual(verdict["reason"], "windows_wsl_configuration_missing")
+
+    def test_a_configured_machine_with_no_record_is_blocked_by_name(self):
+        verdict = onboard._windows_delegation_state(self.choice)
+        self.assertEqual(verdict["state"], "blocked")
+        self.assertEqual(verdict["reason"], "evidence_absent")
+
+    def test_a_verified_machine_is_not_reported_as_blocked(self):
+        self._write_evidence()
+        verdict = onboard._windows_delegation_state(self.choice)
+        self.assertEqual(verdict["state"], "ready")
+        self.assertEqual(verdict["verified_at"], "2026-09-14T00:00:00Z")
+
+    def test_a_verified_machine_still_has_a_closed_provider_lane(self):
+        self._write_evidence()
+        verdict = onboard._windows_delegation_state(self.choice)
+        self.assertEqual(verdict["provider_lane"], "closed")
+        self.assertEqual(verdict["provider_lane_providers"], [])
+
+    def test_the_lane_opens_only_where_the_record_says_it_was_observed(self):
+        self._write_evidence(provider_lane=self.wev.ProviderLane(
+            verified=True, providers=("claude",), portability_observed=True,
+            refresh_behaviour_observed=True))
+        verdict = onboard._windows_delegation_state(self.choice)
+        self.assertEqual(verdict["provider_lane"], "open")
+        self.assertEqual(verdict["provider_lane_providers"], ["claude"])
+
+    def test_a_replaced_image_puts_a_verified_machine_back_to_blocked(self):
+        self._write_evidence()
+        self.manifest.write_text(json.dumps({
+            "schema_version": 1, "distro_release": "12.9",
+            "rootfs_sha256": "0" * 64, "node_version": "20.19.0",
+            "claude_version": "1.0.0", "codex_version": "0.1.0"}))
+        verdict = onboard._windows_delegation_state(self.choice)
+        self.assertEqual(verdict["state"], "blocked")
+        self.assertEqual(verdict["reason"], "evidence_image_changed")
+
+    def test_an_unreadable_manifest_is_blocked_by_name(self):
+        verdict = onboard._windows_delegation_state(
+            {**self.choice, "windows_wsl_manifest_path": str(self.root / "gone")})
+        self.assertEqual(verdict["state"], "blocked")
+        self.assertEqual(verdict["reason"], "manifest_unreadable")
 
 
 

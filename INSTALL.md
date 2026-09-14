@@ -61,6 +61,43 @@ have. If you walk the whole install on Windows, watch CLI discovery and pinning
 in step 2 and use the `.cmd` launchers shown in step 5. Please report what you
 find either way.
 
+**Automatic delegation is not available on Windows.** Its persistent execution
+worker is verified on macOS only. `onboard questionnaire` does not offer it
+here and `onboard plan` and `apply` refuse it, because no Windows machine
+carries the boundary-verification record the gate requires. Everything below
+describes provisioning work in progress, not a feature you can turn on.
+
+**You do not need to install WSL.** Automatic delegation on Windows runs jobs in
+an ephemeral WSL2 guest, but that is an implementation detail: setup detects
+what is missing, enables the Windows features, installs or updates WSL, installs
+the pinned guest image, and verifies the containment boundary, asking separately
+before anything that needs an administrator and before anything that restarts
+the machine, and resuming itself after a restart. `onboard plan` and
+`onboard status` report the current stage under `windows_setup`. Delegation
+stays off until every stage is satisfied.
+
+The command that does it is `bin\agent-bridge-windows-setup` (equivalently
+`python setup_bridge.py windows-setup`). `plan` shows where you are, `step`
+does the single next thing and takes the consent flags, `status` shows the
+resume record and the logon task, and `resume` is what the logon task runs for
+you after a restart. Consents are separate flags and none of them survives a
+reboot: a resumed stage that needs one waits for you. It has not been run on a
+live Windows host.
+
+Delegation on Windows does not run Claude Code or Codex jobs yet. The mechanism
+is there: the guest is handed a memory-only session capsule for the job's
+lifetime, never an API key and never a copy of your credential store. What has
+not been observed on a real machine is whether a session minted on your host is
+accepted from inside the guest, and how one that expires mid-job behaves. Until
+a verification run on your own machine records both, provider jobs are refused
+by name. See [docs/WINDOWS-DELEGATION.md](docs/WINDOWS-DELEGATION.md) for the
+full boundary, the setup ladder and what is still open, and
+[docs/WINDOWS-ROOTFS.md](docs/WINDOWS-ROOTFS.md) for building the guest image.
+
+The guest blocks the host filesystem completely and blocks every route to your
+host and local network, but it does have outbound internet access, because the
+provider CLIs need it. None of it has been validated on a live Windows host.
+
 WSL is also supported and provides the POSIX implementation. To use it:
 
 **1. Install WSL.** Open PowerShell as Administrator and run:
@@ -319,6 +356,25 @@ execution harness signs in through the same isolated `CODEX_HOME`
 `codex login` you already ran covers this too. It never copies credentials
 and never falls back to your default `~/.codex` home.
 
+**The Claude execution lane needs its own login, once.** It uses one dedicated
+configuration directory, `~/.agent-bridge/claude-home`, and refuses to run
+against anything else. That is not a preference: the default `~/.claude` store
+is the one the desktop app and interactive sessions refresh, and a concurrent
+invalid-grant cleanup there signs the lane out. The lane refuses the shared
+store by name, refuses any link or alias that resolves to it, refuses any
+other directory, and refuses a directory other accounts can read.
+
+```
+mkdir -p ~/.agent-bridge/claude-home && chmod 700 ~/.agent-bridge/claude-home
+CLAUDE_CONFIG_DIR=~/.agent-bridge/claude-home claude /login
+```
+
+Sign in there with the same subscription. Never copy credentials into it: a
+copied session is one the provider cannot see you revoke. Onboarding writes
+`claude_config_dir` into the private config and reports
+`claude_config_dir_ready` separately from `execution_complete`, because the
+harness files ship with this checkout and the login does not.
+
 **Turn it on:**
 
 ```
@@ -390,7 +446,10 @@ instructions and `config/local.json` are retained.
 **Windows and Linux** support the same registration and private-config
 generation, but do not install a continuously-running execution-worker
 service; that has only been independently verified on macOS. `onboard plan`
-reports this boundary for your platform before you apply anything.
+reports this boundary for your platform before you apply anything. Windows can
+register the worker as a per-user logon task in your own Task Scheduler
+namespace, with no administrator rights and no other account, and you can remove
+it yourself; that path has not been exercised on a live Windows host.
 
 ## Day to day
 

@@ -32,6 +32,22 @@ user complete interactive provider login themselves. Neither tokens nor
 passwords belong in chat, answer files or the repo. Read [INSTALL.md](../INSTALL.md)
 for the separate Codex consultation home and verification details.
 
+Do **not** ask a Windows user whether they have WSL, or tell them to install it.
+WSL is an implementation detail of automatic delegation and setup handles it.
+`onboard plan` and `onboard status` report a `windows_setup` ladder: the current
+stage, the next step in plain language, whether an administrator or a restart is
+coming, and what is still ahead. Walk that ladder with them, obtain the admin and
+restart consents separately when a stage asks for them, and let setup resume
+itself after a restart. See [WINDOWS-DELEGATION.md](WINDOWS-DELEGATION.md).
+Delegation stays off until every stage including boundary verification is
+satisfied; report the stage, never assume the remainder.
+
+The ladder is walked by `bin\agent-bridge-windows-setup` (equivalently
+`python setup_bridge.py windows-setup`): `plan`, `step`, `status`, and
+`resume`, which is what the post-restart logon task runs. Ask before each
+consent flag rather than passing them together, and do not carry a consent
+across a reboot: the command will not, and neither should you.
+
 ### 2. Ask the user, do not guess
 
 Bundle these choices into a short conversation. The questionnaire is also
@@ -187,6 +203,19 @@ prerequisites for Claude and Codex to talk through the bridge.
 
 ## Optional advanced orchestration: automatic delegation
 
+> **Platform gate:** do not offer automatic cross-provider execution on native
+> Windows or Linux. The bridge itself is cross-platform, but the persistent
+> automatic execution worker is currently implemented and live-tested only on
+> macOS. On Windows, report this as unavailable, not partial, not installed
+> and not awaiting WSL. Native Windows support is still under development.
+>
+> `onboard questionnaire` does not ask the question off macOS, and `plan` and
+> `apply` both refuse. The refusal comes from `delegation_platform_blocker`,
+> which asks whether this machine carries a boundary-verification record. No
+> machine does. The Windows provisioning command described above exists so
+> that work can continue; running it does not make delegation available and
+> does not change what you should tell the user.
+
 The repository also contains an additive orchestration MCP server. The
 guided commands above never turn it on by themselves; `onboard questionnaire`
 asks a separate, explicit "Enable automatic delegation?" question, and every
@@ -234,4 +263,6 @@ identify as its own, preserves the ordinary consultation bridge, and retains
 the private orchestration config for inspection. Do not claim continuous Linux
 or Windows execution-worker service support; only macOS has been independently
 tested there, and the guided flow reports that boundary rather than assuming
-it away.
+it away. On Windows, background activation registers a per-user logon task that
+the user can see and delete in Task Scheduler, and it has not been exercised on
+a live Windows host; say that rather than reporting it as working.

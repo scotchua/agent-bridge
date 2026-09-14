@@ -202,3 +202,482 @@ produces findings whether or not any exist; asking "here is the claim, here is
 the code, try to falsify it, and tell me plainly if you cannot" produces
 verdicts. Two of the most useful answers received were "correct" and "I cannot
 identify one".
+
+## Independently reported, outside the four rounds
+
+Three defects in commit `80effae` were reported independently by **Charlie**,
+and reproduced against the baseline before any of them was fixed. The repository
+has no release-notes file with a contributor section, so the credit is recorded
+here.
+
+All three share one shape: something that looked like a check was not checking
+what its name claimed.
+
+1. **A failing verification exited zero.** Both harness CLIs print their
+   receipt and `return 0` whenever `run_task` returns normally, and `run_task`
+   returns normally when the generated patch applied cleanly but the
+   verification commands failed. The receipt said `verification_failed`; the
+   process said success; the execution queue keyed on the exit code alone and
+   recorded the job `complete`. Fixed on both sides: the CLIs now exit nonzero
+   with `ok:false` unless the receipt status is `complete`, and the queue now
+   requires the harness's own verdict as well as a zero exit
+   (`outcome_is_success`). Either check alone is insufficient, so both are
+   applied.
+
+2. **The opt-in verification drained the production queue.**
+   `delegation_verify` built an `ExecutionQueue` on the *configured* queue root
+   and called `run_once` in a loop. `run_once` claims the oldest queued job in
+   that root, not the job just submitted, so verifying the delegation opt-in
+   would execute whatever real work the user had waiting, make a live provider
+   call for it, and consume its receipt. Each synthetic direction now gets a
+   temporary queue root that is created and destroyed inside the call. The
+   local-model check had the same shape (`service.once()` runs whatever is
+   queued) and got the same treatment.
+
+3. **Source-integrity comparison could not see content changes.** Integrity was
+   `git status --porcelain=v2` text before and after. For a modified file that
+   output carries the HEAD and index hashes, never the worktree content, and
+   untracked files appear by name only. So a task that overwrote a file which
+   was *already* dirty, or rewrote an untracked one, left the status output
+   byte-identical and passed. The snapshot now hashes content, mode and link
+   targets for every path git reports as not clean. It is bounded, and exceeding
+   the bound is a refusal to run rather than a smaller snapshot, because a
+   snapshot that skipped files would report integrity it never checked.
+
+The regression tests mutate an already-modified file and assert that the status
+text is unchanged before asserting the snapshot differs, so the test would fail
+if the fixture ever stopped exercising the actual gap.
+
+## The nine blockers, after the three above were fixed
+
+Codex reviewed the fixed branch and refused the merge again, with nine further
+findings. They are recorded here because most of them are the same class of
+error as Charlie's: a check whose name promised more than it did.
+
+1. **Two executors, two contracts.** `ExecutionQueue` required
+   `returncode == 0`, `harness_ok`, and `harness_status == "complete"`.
+   `WindowsWslExecutor` returned none of those and used `status="completed"`.
+   Every Windows job would have been judged by keys it never set. There is now
+   one vocabulary (`complete`, `verification_failed`, `failed`, `aborted`), one
+   validator (`validate_outcome`) applied in `run_once`, and a real
+   queue-to-executor regression proving success becomes `complete` and a
+   semantic failure becomes `failed`. A contract violation is now a failed job
+   with a named error, not a state decided by which keys happened to exist.
+
+2. **The content snapshot could block or be swapped.** It now refuses every
+   non-regular file, opens with `O_NOFOLLOW|O_NONBLOCK`, `fstat`s the
+   descriptor it actually got, counts bytes per chunk against a per-file and a
+   cumulative cap, and re-checks identity at the end. Growth, replacement and
+   FIFOs are refusals. Testing this established that git never enumerates
+   FIFOs or sockets as untracked at all, so the real exposure was a swap
+   between enumeration and open, which is exactly what the descriptor rechecks
+   cover.
+
+3. **The Windows executor translated a request nobody submits.** Queue entries
+   carry provider, repo, brief, base and verify_argv, not tool/args/stdin. The
+   executor now packs the admitted workspace deterministically into the bounded
+   archive protocol and translates the real stored request. The tool-shaped
+   entry point survives only for live boundary verification.
+
+4. **The provider session had no host-side source.** `windows_auth` enrols one
+   token per provider into DPAPI under the current user, with recorded consent,
+   plain-language enrolment state, and revocation. Nothing reads `~/.claude`,
+   `~/.codex` or any credential directory; nothing writes a token to disk in
+   the clear; there is no fallback when OS protection is unavailable, because
+   the only thing to fall back to is a plaintext token behind a file mode.
+
+5. **There was no driver.** `windows_provision_driver` walks observe, consent,
+   elevate, restart-and-resume, WSL install/update, provenance-verified image
+   install, live boundary verification, machine-bound evidence, and per-user
+   worker activation. `delegation_verify` now selects `WindowsWslExecutor` on
+   Windows, so verification exercises the executor production uses.
+
+6. **ACLs were enforced too late.** Queue root and job directory are now
+   verified owner-only at creation and at submission, before any request
+   content is written.
+
+7. **The artifact workflow was unreleasable and did not say so.** It still is,
+   and now says so in code: `RELEASE_TRUST_ANCHORS` is empty, so
+   `verify_manifest_trust` refuses every manifest and `release_blockers()`
+   returns the reason. Downloads are pinned against values committed here
+   beforehand rather than a checksum file fetched from the same origin.
+
+8. **A ruleset canary is not a reachability proof.** Reading back nftables
+   rules shows the rules loaded. It shows nothing about whether a destination
+   is reachable. A second canary now attempts a TCP connect to each protected
+   range and to the guest's own default gateway, and a refused connection
+   counts as reachable. Public provider egress is documented as deliberately
+   allowed.
+
+9. **The evidence gate could be written unprotected.** ACL enforcement on the
+   record is mandatory, the write is atomic and never truncates the previous
+   record, and every load verifies owner-only ACLs, regular-file status, no
+   reparse ancestors and stable identity before the record is trusted.
+
+## The credential store the execution lane was sharing
+
+Integrated from `f1c731a` rather than cherry-picked, and hardened. The lane
+had no `CLAUDE_CONFIG_DIR` and signed in against `~/.claude`, the store the
+desktop app and interactive sessions also refresh; a concurrent invalid-grant
+cleanup there blanks the tokens and the lane reports a lost login.
+
+Setting a different directory is not sufficient, so `claude_config` allows
+exactly one: `~/.agent-bridge/claude-home`. It refuses the shared store by
+name, refuses any link, alias or reparse path that resolves to it, refuses an
+arbitrary configured directory, and enforces then verifies owner-only
+permissions on the directory and its contents before any authentication uses
+it. `claude_config_dir_ready` is reported separately from `execution_complete`,
+because the files ship with the checkout and the login does not.
+
+The selector is never exposed to verification subprocesses: it is a path to a
+live subscription session, and project code under test has no use for one.
+
+## The seven release blockers, from the round after the nine
+
+The external reviewer came back and the review was not clean. Seven findings,
+and the common thread in five of them is the same shape: a check that looked
+like a check and proved nothing.
+
+### A version string was standing in for authentication
+
+`observe_provider_lane` opened the provider lane on the strength of running
+`claude --version` and `codex --version`. Both print without a session. The
+gate that decides whether a long-lived subscription token can be handed into an
+ephemeral guest was satisfied by a string that prints on a machine where no
+token works at all.
+
+The replacement is an authenticated turn. `guest_runner` gained a third request
+mode, `auth_probe`, running one fixed minimal prompt through the exact guest,
+runtime and auth-capsule path a real job uses, and requiring provider-specific
+semantic success: for Claude a JSON result object with `subtype: success`,
+`is_error: false`, a `usage` block and a fixed sentinel; for Codex the same
+sentinel in the `--output-last-message` file. `API_KEY_ENV_KEYS` is checked
+after the capsule contributes, so a probe that would have passed on a billed
+API key is refused as `api_key_present` rather than counted as subscription
+auth. The response is a verdict token with `stdout` and `stderr`
+unconditionally empty: classification happens inside the guest, so no provider
+output is ever recorded.
+
+The lane needs two observations, not one. Portability is the authenticated
+turn. Refresh behaviour is the same probe with a deliberately worthless capsule,
+which must come back **rejected** rather than merely failing. That second gate
+is what makes a version-only false positive structurally impossible: a code path
+that says yes to anything has to reject a token it just accepted, and cannot.
+
+Regressions cover rejected tokens, nonexistent tokens, version-only output, an
+empty response, `is_error: true`, a missing sentinel, a missing `usage` block,
+an API key in the environment, and the absence of captured bytes.
+
+### The lane had no caller, and could not have had one
+
+`record_boundary` stored `ProviderLane` closed, `observe_provider_lane` was
+never invoked by anything, and `verified_executor` could not bootstrap itself:
+the executor refuses provider jobs until the lane is open, and the lane could
+only be opened by running a provider through the executor. Written down plainly
+it is a deadlock, and it had been sitting behind a function nobody called.
+
+The knot is cut by moving the observation out of the executor and into the
+driver, as a rung of its own. `STAGE_PROVIDER_ENROLMENT` sits between
+`STAGE_BOUNDARY_VERIFICATION` and `STAGE_READY`, so the probe runs inside a
+guest whose containment was verified live moments earlier, with a present user
+who consents to it in its own right. What justifies handing a session in before
+the lane is open is not trust, it is that the boundary was just proven and the
+probe is one fixed no-op.
+
+The evidence then has to survive being written. `record_provider_lane` amends
+the machine-bound record as a read-modify-write pinned with `expect_identity`,
+and `_reload_lane` reads it back off disk and compares before anything is
+enabled: a lane that does not survive the round trip reports
+`provider_lane_not_durable` or `provider_lane_readback_mismatch`. Nothing is
+enabled on the strength of a value still in memory.
+
+### Resume was a note, not a state machine
+
+The record could be written with `secure=None`, truncated before it was
+protected, and left behind when the task registration failed. The task itself
+could be created over whatever already held the name, and the command it ran
+was not validated.
+
+It is now owned end to end: protected atomic create with the directory verified
+first and no unprotected window, identity-pinned updates, record written before
+task so the unrecoverable ordering never occurs, ownership proven by comparing
+the registered command before `schtasks /F` takes a name, bounded attempts
+(`MAX_STAGE_ATTEMPTS`, 3) that refuse to schedule a fourth, continuation from
+the recorded stage after login, and removal of both record and task only at a
+terminal condition (`ready`, or stopped for a reason a reboot cannot change),
+reported as `still_provisioning` otherwise. A malformed record is reported
+rather than read as "nothing to resume", because tampered-with and
+never-started are different facts.
+
+### A digest match was being accepted as trust
+
+`verify_manifest_trust` would return trusted for an anchor whose
+`manifest_sha256` matched, with an empty signature field, on the reasoning that
+the standard library has no signature primitive and an unchecked signature would
+be worse. Both halves of that were true and the conclusion was still wrong: the
+digest proves the manifest is the one the anchor names, and says nothing about
+who wrote the anchor.
+
+`orchestration/signing.py` is the answer: Ed25519 per RFC 8032 §6 in pure
+standard library, verification only, signing confined to the tests because
+nothing shipped has any business holding a release key. Non-canonical `S` is
+rejected rather than accepted as malleable, and it is validated against the
+RFC's own vectors. A missing signature, a missing public key, an invalid
+signature and a raising verifier are four distinct named refusals, and the old
+`signature_unverified` outcome is gone. "The standard library cannot do this" is
+a claim worth checking before it becomes a design.
+
+### The checked file was not the read file
+
+`windows_auth` and `windows_evidence` verified a path and then reopened it,
+which makes the verification decorative: between the two calls the name can
+point somewhere else.
+
+`read_private_file` now opens once and does everything through that descriptor,
+including a second `fstat` compared to the first so a file that moved underneath
+fails as `file_changed_while_reading`, with `GetFinalPathNameByHandleW` on
+Windows rather than trusting the name. Writes take `expect_identity` so a
+read-modify-write cannot discard somebody else's write. `enrol` rolls the secret
+back when the record write fails, because two files for one logical change with
+no atomic replace across paths is a half-applied state waiting to happen.
+
+The self-inflicted version of this bug is worth recording: the first
+implementation called `enforce_owner_only_file` on the read path, which on POSIX
+`fchmod`s to `0600`. It would have silently repaired a world-readable evidence
+record and then accepted it, erasing the evidence that anyone could have read
+it. A test caught it. Reads verify and never repair; enforcement is a write-path
+concern.
+
+On zeroization the honest statement is now in the code rather than implied
+around it. Python cannot guarantee a plaintext token is erased from process
+memory. `MEMORY_LIFETIME_NOTE` says so. What is bounded is lifetime and spread,
+and that is what is claimed.
+
+### Junctions are not symlinks
+
+Host workspace packing relied on `O_NOFOLLOW`, which does not exist on Windows,
+and on `is_symlink()`, which is false for a directory junction. Both of the
+mechanisms an attacker would actually use on the target platform were
+unguarded.
+
+Packing now refuses any entry with a nonzero `st_reparse_tag` as well as
+anything `is_symlink()` reports, checks the repository root the same way, binds
+each file's approving `lstat` to the `fstat` of the descriptor it will read by
+`(st_dev, st_ino)`, and requires every resolved candidate to stay under the
+resolved root. Refusals are counted in the result rather than passing silently.
+
+The simulation boundary is stated in the test file rather than left for a reader
+to discover: the junction tests prove the packer refuses the signal Windows
+would give, not that Windows gives it.
+
+### Keep the probes, measure them
+
+The two network canaries are the slow ones, and the reviewer's point was to keep
+them rather than optimise them away before anyone has seen them run.
+`_run_canaries` now times each canary individually and records the duration
+before the verdict is known, so the egress probes' cost appears separately in the
+receipt. Whether they are worth it becomes a question with a measurement behind
+it, answered after live evidence and not before.
+
+### What is still not true
+
+The lane is connected end to end in code: probe, observation, atomic
+machine-bound persistence, re-read from disk, gated rung, activation. It has
+never been run against a real subscription on a real Windows host. The image
+step still refuses by design, because `RELEASE_TRUST_ANCHORS` is empty and both
+shipped recipes are unfilled stubs. Neither of those is a test failure, and
+neither is fixed by another round of review.
+
+## Independent public-release review
+
+Charlie independently reported three defects in public commit `80effae`: a
+failed harness verification could be recorded as successful, synthetic
+verification could consume unrelated queued work, and source-integrity checks
+could miss changes to files that were already dirty. Each report was
+reproduced and fixed with a regression test. The queue now requires both a
+zero process exit and a `complete` harness receipt; all synthetic checks use
+disposable queues; and dirty-file contents are included in bounded integrity
+snapshots.
+
+Public commit `4287429` carries those fixes. This Windows branch had reached
+the same three conclusions independently, from a different direction, so
+integrating it was mostly a matter of confirming that, and the confirmation is
+`tests/test_public_hotfix.py`: the public regression suite, copied here
+unmodified, passing against this tree's own implementations. Where the two
+differ, this tree is the stricter one and public main's tests still hold:
+
+* The harness gate here adds a closed `HARNESS_STATUSES` vocabulary and an
+  `OUTCOME_REQUIRED_KEYS` validation, so an executor that omits the verdict
+  fields is refused rather than defaulting to failure.
+* The content snapshot here re-checks the descriptor's type after opening,
+  sets the descriptor blocking after an `O_NONBLOCK` open, and folds the byte
+  count into the digest.
+* Verification isolation here is a named `_verification_queue_root` rather
+  than an inline `mkdtemp`, and the Windows lane uses the same
+  `select_executor` production uses, so verification cannot pass against an
+  executor nobody runs.
+
+One thing did not merge, and it is the one that mattered: public main refuses
+automatic delegation on any platform that is not macOS, and this branch is the
+Windows lane. Deleting the refusal to make room for the work would have been
+the wrong direction, so the refusal stayed and became computed.
+`onboard.delegation_platform_blocker` asks whether this machine carries a
+boundary-verification record. No machine does, and none can until a signed
+release manifest exists and a real Windows host passes verification, so the
+observable behaviour is identical to public main's: refused, everywhere but
+macOS. The difference is that the gate now states a fact about the machine
+instead of a platform name somebody would have to remember to delete, and it
+opens when the lane is genuinely proven rather than when someone edits a
+string.
+
+## The eleven blockers, from the round after the seven
+
+Not clean again. Two of these are the kind that make a feature structurally
+impossible rather than merely weak, and one of them is a forgery.
+
+### A verifier that accepted a signature nobody signed
+
+`signing.verify` accepted `A = R = <identity point>, S = 0`. With `A` the
+identity the verification equation collapses to `[S]B == R`; the message never
+enters the arithmetic, so one 64-byte constant verifies against every message,
+with no private key. The order-2 point does the same. This is the small-order
+forgery, and the module was checked against the RFC's vectors and passed all of
+them while accepting it, which is a useful demonstration that passing the
+published positive vectors is not coverage.
+
+The instruction was to prefer a vetted platform verifier. That was measured
+rather than assumed, and the measurement went the other way: OpenSSL, via
+`cryptography` 50.0.0, accepts the same forgery and the order-2 variant. Both
+were run. The library would have inherited the bug, and it is not present in
+the guest image or a stock Windows Python anyway, so the fallback path would be
+a trust check an attacker removes by uninstalling a package.
+
+The fix is `_is_small_order`, testing `[8]P == identity`, applied to the public
+key and the commitment. The whole torsion subgroup rather than the two
+currently exploitable points, because the exploitable set depends on the shape
+of the equation and the equation is easier to change than this file is to
+re-audit. `VERIFICATION_COVERAGE` now states the coverage in words instead of
+letting the presence of an RFC number imply an audit, and a test asserts that
+the note does not claim more than is proven.
+
+### A provider lane that could not be opened
+
+`_execute_auth_probe` deleted the Codex last-message file before
+`_codex_probe_verdict` read it. A correctly authenticated Codex session could
+only ever return `no_sentinel`. The lane was not weak, it was shut.
+
+It survived because the tests covered `_codex_probe_verdict` and not
+`_execute_auth_probe`. Helper-only coverage proves the helper; the ordering bug
+lived in the caller. The answer is now read through a protected descriptor and
+the verdict computed from bytes rather than a pathname, so the cleanup cannot
+be reordered back in front of the read, and the tests drive the full
+`_execute_auth_probe` lifecycle through a capsule double.
+
+### A driver with no caller
+
+`windows_provision_driver.step` wrote a bare resume record and never called
+`schedule_resume`, so a rebooting stage registered no logon task. Nothing would
+ever have read the record. And `windows_provision_driver` had no production
+entrypoint at all, which is why that was never noticed: the reboot path could
+not run, because nothing ran the driver.
+
+`agent_bridge.windows_setup` is the command, reachable as
+`bin\agent-bridge-windows-setup`, `setup_bridge.py windows-setup` or
+`python -m`. `step` now calls `schedule_resume`, and a rebooting stage with no
+resume command is refused as `resume_command_missing` before the restart rather
+than taken with no way back. The resume task names the launcher script rather
+than `-m`, because a logon task inherits the user's environment and a
+`PYTHONPATH` does not survive a restart. Consents do not survive one either: a
+resumed stage that needs one stops for a person, because an unattended task
+elevating on a consent given before the reboot is a standing grant nobody
+re-affirmed.
+
+### Rollback against a pathname
+
+Enrolment's rollback re-opened a name and wrote to it. Two concurrent
+enrolments could leave the secret from one beside the record from the other,
+and a rollback could overwrite an enrolment newer than the one it was undoing.
+
+Three things now hold it: an advisory exclusive lock on an open handle over the
+auth root, held across both writes and released by the kernel if the process
+dies; the previous ciphertext captured through a descriptor-bound verified
+read; and `expect_identity` on both the forward write and the rollback, so a
+rollback whose pin no longer matches writes nothing and surfaces as
+`enrolment_rollback_incomplete`. The lock is the ordinary defence and the pin
+is the independent one, because a writer that never took the lock is exactly
+what a lock cannot see.
+
+### Bounds applied after the damage
+
+`unpack_workspace` called `getmembers()`, which walks the entire archive's
+metadata into memory before any limit applies, and then extracted. `capture_diff`
+ran git with `stdout=PIPE` and checked the size afterwards, so an oversized
+diff was already in memory before anything objected.
+
+Both now bound before rather than after. Unpacking streams and claims every
+budget ahead of each write: member count, per-member and cumulative bytes,
+expansion ratio, path length and depth, case-folded duplicates, and a refusal
+of every link, device and special file. Files are written `O_EXCL | O_NOFOLLOW`
+with the measured byte count beating the header's claim. The diff streams
+through `_bounded_git`, reusing the job runner's bounded reader and
+process-group teardown, with `diff_too_large` and `diff_timed_out` as named
+outcomes.
+
+The expansion ratio is worth recording as a design correction rather than a
+choice. 100 refused a legitimate 290:1 lockfile. 1000 is above deflate's
+measured single-stream ceiling of roughly 1028:1, which makes it decorative.
+500 sits between two measurements, both of which are asserted in the tests.
+
+### Verification ran with the internet
+
+The POSIX lane runs verification commands under `(deny network*)`. The Windows
+lane ran them with the provider's public egress still open. Verification
+commands execute repository code chosen by the brief, which is the one place in
+the job where arbitrary code runs with something worth exfiltrating nearby.
+
+`enforce_verification_egress` now installs a second nftables table with a
+`policy drop` output chain, reads the ruleset back out of the kernel, compares
+it to the pinned expectation, and probes public targets. Any failure aborts the
+job rather than warning. Two tables rather than editing one, because nftables
+runs every chain on a hook, so restoring provider egress afterwards is removing
+a table rather than reconstructing one. The provider phase keeps its egress on
+purpose; the tests do not.
+
+### Two facts about one pathname
+
+The queue admitted a brief by hash, and translation read the brief by name.
+Between those, the name could point somewhere else. `read_brief` now takes the
+admitted digest, opens once, `fstat`s for type and size, reads from the
+descriptor, `fstat`s again to catch a swap, and compares the digest in constant
+time. There is no second unchecked read of the name.
+
+`request['base']` was ignored outright. A receipt recording a diff without
+saying what it was a diff against cannot be checked. `resolve_base` resolves it
+through git, requires `HEAD` to match, refuses by name (`base_missing`,
+`base_invalid`, `base_unresolvable`, `base_mismatch`), and the resolved SHA is
+recorded on the outcome.
+
+### Three budgets that disagreed
+
+The runtime allowed 1 MiB by default and 4 MiB hard for input, the packer
+permitted 32 MiB compressed before base64 expansion, and the response limits
+exceeded the outer cap. Three layers, three answers, and the smallest one is
+the one that actually applies, which means the other two were describing a
+system that does not exist.
+
+There is now one derived budget in `guest_runner`, with the arithmetic written
+out, and `windows_wsl_runtime` asserts against it at import so a change to one
+layer that the others do not follow fails to load rather than failing in
+production. The caps are measured rather than maximal, and the tests exercise
+just below and just above each cross-layer boundary.
+
+### What is still not true, after eleven more
+
+The production command exists and is tested end to end as a command, with the
+OS supplied. It has not been run on Windows. No image has been imported, no
+canary has run in a real guest, no provider lane has been observed against a
+real subscription, and `RELEASE_TRUST_ANCHORS` is still empty, so the image
+step still refuses by design. The hardened verifier is stronger than the
+library alternative that was measured against it, and it is still not an
+audited implementation, which is stated in the module rather than left to be
+inferred.

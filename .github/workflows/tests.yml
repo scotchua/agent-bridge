@@ -96,11 +96,49 @@ jobs:
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
 
       - name: Guided automatic-delegation opt-in
-        run: python3 -m unittest discover -s tests -p "test_automatic_delegation.py"
+        run: |
+          python3 -m unittest discover -s tests -p "test_automatic_delegation.py"
+          # The opt-in check must never drain the user's real queue. This runs
+          # everywhere because the defect was in pure orchestration, not in
+          # anything platform-specific.
+          python3 -m unittest discover -s tests -p "test_delegation_verify_isolation.py"
 
-      - name: POSIX execution-worker tests
-        if: runner.os != 'Windows'
-        run: python3 -m unittest discover -s tests -p "test_execution_worker.py"
+      # Every Windows delegation component is pure or takes an injected
+      # platform seam, so the whole set runs on all three runners. That is the
+      # point: a Windows-only test that only ever runs on one runner is a test
+      # that stops being read.
+      - name: Windows delegation components (portable)
+        run: |
+          python3 -m unittest discover -s tests -p "test_windows_wsl.py"
+          python3 -m unittest discover -s tests -p "test_windows_preflight.py"
+          python3 -m unittest discover -s tests -p "test_windows_wsl_runtime.py"
+          python3 -m unittest discover -s tests -p "test_windows_wsl_provision.py"
+          python3 -m unittest discover -s tests -p "test_windows_activation.py"
+          python3 -m unittest discover -s tests -p "test_windows_rootfs.py"
+          python3 -m unittest discover -s tests -p "test_windows_delegation.py"
+          python3 -m unittest discover -s tests -p "test_guest_runner.py"
+          python3 -m unittest discover -s tests -p "test_windows_evidence.py"
+          python3 -m unittest discover -s tests -p "test_windows_auth.py"
+          python3 -m unittest discover -s tests -p "test_windows_privacy.py"
+          python3 -m unittest discover -s tests -p "test_windows_provision_driver.py"
+          python3 -m unittest discover -s tests -p "test_signing.py"
+          python3 -m unittest discover -s tests -p "test_auth_probe.py"
+          python3 -m unittest discover -s tests -p "test_workspace_packing.py"
+          python3 -m unittest discover -s tests -p "test_workspace_unpacking.py"
+          python3 -m unittest discover -s tests -p "test_capture_diff.py"
+          python3 -m unittest discover -s tests -p "test_verification_egress.py"
+          python3 -m unittest discover -s tests -p "test_brief_and_base_binding.py"
+          python3 -m unittest discover -s tests -p "test_execution_outcome_contract.py"
+          python3 -m unittest discover -s tests -p "test_claude_config_dir.py"
+          # The production entrypoint. Listed here rather than left to a local
+          # run, because a regression suite for a command nobody runs in CI is
+          # the same gap this command was built to close.
+          python3 -m unittest discover -s tests -p "test_windows_setup.py"
+          # The executor-selection seam is the one place a Windows host picks
+          # the WSL2 lane, so it runs on the Windows runner too. The mode-bit
+          # assertions inside go through the platform ACL check there rather
+          # than being skipped.
+          python3 -m unittest discover -s tests -p "test_execution_worker.py"
 
       - name: macOS execution-lane tests
         if: runner.os == 'macOS'
@@ -108,6 +146,25 @@ jobs:
           python3 -m unittest discover -s tests -p "test_localq_runtime.py"
           python3 -m unittest discover -s tests -p "test_claude_task.py"
           python3 -m unittest discover -s tests -p "test_codex_task.py"
+
+      - name: Deterministic Windows validation and signing regressions
+        run: |
+          python3 -m unittest discover -s tests -p "test_windows_validation.py"
+          python3 -m unittest discover -s tests -p "test_windows_semantics.py"
+          python3 -m unittest discover -s tests -p "test_success_gate_unity.py"
+          python3 -m unittest discover -s tests -p "test_release_signing.py"
+
+      - name: The repository holds no private key
+        shell: bash
+        run: python3 tools/release_signing.py scan
+
+      - name: The signed test image is reproducible
+        shell: bash
+        run: python3 tools/make_test_image.py --check
+
+      - name: Provider-lane fixtures run the real subprocess path
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tests -p "test_provider_lane_fixtures.py"
 
       - name: Setup reports cleanly with no CLIs installed
         shell: bash

@@ -18,7 +18,9 @@ import tomllib
 from typing import Any, Callable
 
 from . import config, setup_cmd, store
-from .orchestration import delegation, windows_preflight, windows_wsl
+from .orchestration import (delegation, windows_activation,
+                            windows_preflight, windows_wsl,
+                            windows_wsl_provision)
 
 ANSWERS_VERSION = 1
 SAFE_CLASSES = ("internal", "public", "synthetic")
@@ -186,6 +188,54 @@ def _choice(prompt: str, allowed: set[str], ask: Callable[[str], str]) -> str:
     raise ValueError("no valid choice after three attempts; no answers saved")
 
 
+#: The message every refusal of automatic execution off macOS carries. One
+#: string, because three call sites refusing in three different words is how a
+#: caller ends up branching on the wording.
+DELEGATION_PLATFORM_REFUSAL = (
+    "automatic delegation is currently available only on macOS; the Windows "
+    "execution lane is under development and refuses until a boundary "
+    "verification has been recorded on this machine. The consultation bridge "
+    "remains available on this platform")
+
+
+def delegation_platform_blocker(delegation_choice: dict[str, Any] | None = None, *,
+                                platform_name: str | None = None) -> str:
+    """"" if automatic execution may be configured here, else why not.
+
+    macOS is the only platform where the persistent execution worker has been
+    independently verified, so it is the only platform where this returns "".
+
+    Windows is refused, and the refusal is *computed* rather than hard-coded
+    to the platform name. The Windows lane exists in this tree: the ladder,
+    the runtime, the evidence record and the setup command are all here. What
+    does not exist is a machine that has passed boundary verification, and
+    that is the thing the gate should depend on. Asking the record means this
+    opens when the lane is genuinely proven and not one moment earlier, and it
+    means the refusal today is a fact about this machine rather than a string
+    somebody has to remember to delete.
+
+    In practice the record cannot exist yet: it is written only by
+    ``windows_evidence.record_verification``, which refuses off native
+    Windows, and reaching it requires a signed release manifest that has not
+    been published. So the observable behaviour on Windows is a refusal,
+    exactly as on Linux.
+    """
+
+    name = platform_name if platform_name is not None else sys.platform
+    if name == "darwin":
+        return ""
+    if not windows_preflight.is_windows(name):
+        return DELEGATION_PLATFORM_REFUSAL
+    # The record, not the ladder. Reading the durable record answers the only
+    # question this gate has and spawns no process, so the questionnaire does
+    # not run a preflight sweep just to decide whether to ask something. An
+    # unconfigured machine has no record to read and is refused.
+    state = _windows_delegation_state(delegation_choice or {}, platform=name)
+    if state.get("state") == "ready":
+        return ""
+    return DELEGATION_PLATFORM_REFUSAL
+
+
 def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
     direction = _choice("Directions [both/codex_to_claude/claude_to_codex]: ", set(CALLERS), ask)
     print("Baseline: public, synthetic and your non-client internal work may go to either provider. "
@@ -212,12 +262,22 @@ def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
         local["endpoint"] = ask("Explicit loopback endpoint (for example http://127.0.0.1:11434): ").strip()
         local["model"] = ask("Installed local model name: ").strip()
         local["allow_internal"] = (_choice("May this local worker receive internal material? [yes/no]: ", {"yes", "no"}, ask) == "yes")
-    print("Automatic delegation is an advanced, separate opt-in: a private orchestration "
-          "server and, on macOS, a per-user execution worker that can queue bounded "
-          "implementation work on the opposite provider's subscription CLI and route "
-          "eligible non-client work to a local model. It never applies, commits, pushes "
-          "or merges on its own, and it stays off unless you explicitly enable it here.")
-    delegation_enabled = _choice("Enable automatic delegation? [yes/no]: ", {"yes", "no"}, ask) == "yes"
+    if delegation_platform_blocker():
+        # Not asked rather than asked and then refused. A question whose only
+        # accepted answer is "no" teaches the reader that the refusal is a
+        # formality, and this one is not.
+        print("Automatic cross-provider execution is not available on this platform. "
+              "Its persistent execution worker is verified on macOS only; the Windows "
+              "lane is under development and is neither installed nor verified here. "
+              "The consultation bridge is configured either way.")
+        delegation_enabled = False
+    else:
+        print("Automatic delegation is an advanced, separate opt-in: a private orchestration "
+              "server and a per-user execution worker that can queue bounded "
+              "implementation work on the opposite provider's subscription CLI and route "
+              "eligible non-client work to a local model. It never applies, commits, pushes "
+              "or merges on its own, and it stays off unless you explicitly enable it here.")
+        delegation_enabled = _choice("Enable automatic delegation? [yes/no]: ", {"yes", "no"}, ask) == "yes"
     automatic_delegation: dict[str, Any] = {"enabled": delegation_enabled}
     if delegation_enabled:
         has_worker = _choice(
@@ -291,16 +351,15 @@ def _local_command(local: dict[str, Any], root: str) -> dict[str, Any]:
     return {"command": _portable_python(), "args": args}
 
 
-def _windows_preflight_summary(delegation_choice: dict[str, Any], *,
-                               platform: str | None = None) -> dict[str, Any] | None:
-    """Run/read the fail-closed Windows preflight before delegation verification.
+def _windows_preflight_report(delegation_choice: dict[str, Any], *,
+                              platform: str | None = None):
+    """Run the read-only preflight once, or return ``None`` off Windows.
 
-    Returns ``None`` on any non-Windows platform without spawning any
-    process. On native Windows, this is read-only evidence about local
-    prerequisites; ``prerequisites_ready`` is never the same thing as
-    automatic delegation being enabled, and this function never claims that
-    it is.
+    Split out so the preflight summary and the setup ladder below describe the
+    same observation instead of each collecting their own, which could
+    disagree if the machine changed between them.
     """
+
     if not windows_preflight.is_windows(platform):
         return None
     manifest_path = delegation_choice.get("windows_wsl_manifest_path")
@@ -311,10 +370,166 @@ def _windows_preflight_summary(delegation_choice: dict[str, Any], *,
             expected_hash = store.sha256_file(rootfs_path)
         except OSError:
             expected_hash = None
-    report = windows_preflight.run_preflight(
+    return windows_preflight.run_preflight(
         platform=platform, manifest_path=manifest_path,
         manifest_loader=(store.read_json if manifest_path is not None else None),
         expected_rootfs_sha256=expected_hash)
+
+
+#: The command that walks the ladder this summary describes. Named here so a
+#: status report ends with something a person can do.
+WINDOWS_SETUP_COMMAND = "bin\\agent-bridge-windows-setup"
+
+
+def _windows_setup_summary(delegation_choice: dict[str, Any], *,
+                           platform: str | None = None,
+                           report: Any = None) -> dict[str, Any] | None:
+    """Describe where guided Windows setup stands, in the user's terms.
+
+    WSL is an implementation detail, so this reports a stage of *setup*, not a
+    list of Linux prerequisites: what happens next, whether it needs an
+    administrator, whether it restarts the machine, and what is still ahead.
+
+    The gate is the ladder's own: ``delegation_may_be_enabled`` is true only
+    when every rung including a real boundary verification is satisfied.
+    Onboarding cannot perform that verification, so it reports the machine as
+    not yet verified rather than assuming it would pass. Fail closed.
+    """
+
+    if report is None:
+        report = _windows_preflight_report(delegation_choice, platform=platform)
+    if report is None:
+        return None
+
+    feature_states: dict[str, str | None] = {}
+    for name in windows_wsl_provision.REQUIRED_FEATURES:
+        if (name == "VirtualMachinePlatform"
+                and report.virtual_machine_platform is not None):
+            feature_states[name] = report.virtual_machine_platform.value
+        else:
+            feature_states[name] = windows_preflight.collect_optional_feature(name).value
+
+    # The pinned guest image counts as installed only when the manifest check
+    # passed, which means the configured rootfs file exists and its hash
+    # matches the pinned manifest. An unconfigured or mismatched image is not
+    # "probably fine"; it is the image stage.
+    image_installed = (report.manifest.passed is True
+                       if report.manifest is not None else None)
+
+    state, evidence = windows_wsl_provision.observe(
+        platform_name=platform,
+        preflight=report,
+        feature_states=feature_states,
+        # Onboarding does not enable features, so it has no basis for saying a
+        # restart is pending; the installer that runs DISM records that.
+        reboot_pending=False,
+        guest_image_installed=image_installed,
+        # Never assumed. Only a live boundary-verification run can set this.
+        boundary_verified=None,
+    )
+    plan_report = windows_wsl_provision.plan(state)
+    plan_report["evidence"] = evidence.as_dict()
+    plan_report["gate"] = (
+        "Automatic delegation stays off until every setup stage is satisfied, "
+        "including a boundary verification run on this machine. Onboarding "
+        "cannot perform that run, so it reports the boundary as not verified.")
+    plan_report["limitations"] = {
+        "administrator": windows_wsl_provision.ADMIN_BOUNDARY_LIMITATION,
+        "firmware": windows_wsl_provision.FIRMWARE_LIMITATION,
+        "restart": windows_wsl_provision.REBOOT_LIMITATION,
+    }
+    # Reporting a stage without naming what advances it leaves the reader with
+    # a status and no next action. This is the command, not a suggestion that
+    # onboarding could run it: onboarding reports, the setup command acts, and
+    # each consent belongs to the person in front of the machine.
+    plan_report["command"] = WINDOWS_SETUP_COMMAND
+    return plan_report
+
+
+def _windows_delegation_state(delegation_choice: dict[str, Any], *,
+                              platform: str | None = None) -> dict[str, Any]:
+    """Read the machine's verification record. Never a hard-coded verdict.
+
+    This used to return "blocked" unconditionally, which meant a machine that
+    had genuinely completed setup and passed a boundary verification would
+    still be told it had not. The state now comes from the same record the
+    execution worker reads, so onboarding and dispatch cannot disagree, and an
+    absent or stale record produces "blocked" with the reason that refused it
+    rather than a blanket refusal.
+    """
+
+    from .orchestration import windows_auth, windows_delegation, windows_evidence
+    from .orchestration import windows_wsl_runtime
+
+    runtime_root = delegation_choice.get("windows_wsl_runtime_root")
+    manifest_path = delegation_choice.get("windows_wsl_manifest_path")
+    if runtime_root is None or manifest_path is None:
+        return {"state": "blocked", "reason": "windows_wsl_configuration_missing",
+                "provider_lane": "closed", "provider_sessions": []}
+    # Enrolment is independent of verification: somebody can save a session
+    # before the guest is verified, or verify without ever enrolling, and a
+    # setup screen that showed only one of the two would mislead in both
+    # directions.
+    sessions = windows_auth.enrolment_states(runtime_root)
+    try:
+        rootfs_sha256 = windows_delegation.load_manifest(manifest_path).rootfs_sha256
+    except windows_delegation.DelegationRefused as exc:
+        return {"state": "blocked", "reason": exc.reason,
+                "provider_lane": "closed", "provider_sessions": sessions}
+    state, evidence, reason = windows_evidence.load_verified_state(
+        windows_evidence.evidence_path(runtime_root),
+        expected_rootfs_sha256=rootfs_sha256,
+        expected_runner_sha256=windows_delegation.guest_runner_sha256(),
+        required_canaries=windows_wsl_runtime.CANARY_ORDER,
+        runtime_root=runtime_root)
+    if evidence is None:
+        return {"state": "blocked", "reason": reason, "provider_lane": "closed",
+                "provider_sessions": sessions}
+    lane = evidence.provider_lane
+    return {
+        "state": "ready",
+        "reason": "",
+        "verified_at": evidence.recorded_at,
+        "provider_sessions": windows_auth.enrolment_states(
+            runtime_root, lane=lane),
+        "provider_lane": ("open" if any(lane.enabled_for(name)
+                                        for name in ("claude", "codex"))
+                          else "closed"),
+        "provider_lane_providers": [name for name in ("claude", "codex")
+                                    if lane.enabled_for(name)],
+    }
+
+
+NOTE_BLOCKED = (
+    "Automatic execution delegation on Windows is off. Two separate things "
+    "must hold: this machine must carry a verification record written by a "
+    "real boundary-verification run here, and the provider lane needs its own "
+    "recorded proof that a subscription session minted on this host is "
+    "accepted inside the guest and that a mid-job expiry behaves predictably. "
+    "windows_preflight.prerequisites_ready is local evidence only and enables "
+    "nothing. No live Windows validation has been performed from this "
+    "worktree. Consultation (peer registrations) is unaffected.")
+
+NOTE_READY = (
+    "This machine carries a verification record for its current guest image, "
+    "so non-provider delegation is enabled. The provider lane is reported "
+    "separately and is open only where the record says a live session handoff "
+    "was actually observed.")
+
+
+def _windows_preflight_summary(delegation_choice: dict[str, Any], *,
+                               platform: str | None = None) -> dict[str, Any] | None:
+    """Run/read the fail-closed Windows preflight before delegation verification.
+
+    Returns ``None`` on any non-Windows platform without spawning any
+    process. On native Windows, this is read-only evidence about local
+    prerequisites; ``prerequisites_ready`` is never the same thing as
+    automatic delegation being enabled, and this function never claims that
+    it is.
+    """
+    report = _windows_preflight_report(delegation_choice, platform=platform)
+    if report is None:
+        return None
     named_checks = (
         ("windows_build", report.windows_build),
         ("wsl_version", report.wsl_version),
@@ -362,6 +577,10 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                                       **_local_command(local, root)})
 
     delegation_choice = answers["automatic_delegation"]
+    if delegation_choice["enabled"]:
+        blocker = delegation_platform_blocker(delegation_choice)
+        if blocker:
+            raise ValueError(blocker)
     delegation_plan: dict[str, Any] | None = None
     if delegation_choice["enabled"]:
         home = os.path.expanduser("~")
@@ -376,6 +595,7 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                                           **_orchestration_command("claude", root, delegation_config_path)})
         boundary = delegation.platform_boundary_report()
         windows_preflight_report = _windows_preflight_summary(delegation_choice)
+        windows_setup_report = _windows_setup_summary(delegation_choice)
         delegation_plan = {
             "config_path": delegation_config_path,
             "required_directions": list(delegation.required_directions_for(callers)),
@@ -384,12 +604,23 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                                  else "not configured; verification will report it as not_configured"),
             "platform": boundary,
             "windows_preflight": windows_preflight_report,
+            "windows_setup": windows_setup_report,
+            "execution_delegation": (
+                None if windows_preflight_report is None
+                else _windows_delegation_state(delegation_choice)),
             "execution_delegation_note": (
-                None if windows_preflight_report is None else
-                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
-                "when windows_preflight.prerequisites_ready is true, automatic "
-                "execution delegation on Windows remains blocked until live Windows "
-                "evidence exists; consultation (peer registrations) is unaffected."),
+                None if windows_preflight_report is None else NOTE_BLOCKED),
+            "windows_activation": None if boundary["platform"] != "windows" else {
+                "task_name": windows_activation.TASK_NAME,
+                "scope": ("a logon task in your own Task Scheduler namespace; no "
+                          "administrator rights, no other account, and nothing "
+                          "machine-wide"),
+                "reversible": ("you can remove it yourself in Task Scheduler, or "
+                               "through uninstall, and removing it needs no consent"),
+                "note": ("Registering it is a separate explicit step and requires "
+                         "your consent. It has not been exercised on a live "
+                         "Windows host."),
+            },
             "launch_agent": None if boundary["platform"] != "darwin" else {
                 "plist_path": delegation.launch_agent_path(home),
                 "note": ("Staged during apply as a private, owner-only file. Loading it into "
@@ -423,13 +654,13 @@ def status(answers: dict[str, Any]) -> dict[str, Any]:
         windows_preflight_report = _windows_preflight_summary(delegation_choice)
         result["platform"] = boundary
         result["windows_preflight"] = windows_preflight_report
+        result["windows_setup"] = _windows_setup_summary(delegation_choice)
         if windows_preflight_report is not None:
-            result["execution_delegation"] = "blocked"
+            verdict = _windows_delegation_state(delegation_choice)
+            result["execution_delegation"] = verdict["state"]
+            result["execution_delegation_detail"] = verdict
             result["execution_delegation_note"] = (
-                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
-                "when windows_preflight.prerequisites_ready is true, automatic "
-                "execution delegation on Windows remains blocked until live Windows "
-                "evidence exists; consultation (peer registrations) is unaffected.")
+                NOTE_READY if verdict["state"] == "ready" else NOTE_BLOCKED)
     return result
 
 
@@ -685,6 +916,12 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     delegation_cfg: dict[str, Any] | None = None
     delegation_status: dict[str, str] | None = None
     if delegation_choice["enabled"]:
+        # Re-checked, not inherited. A candidate plan can be written on one
+        # machine and applied on another, and this is the step that installs
+        # something.
+        blocker = delegation_platform_blocker(delegation_choice)
+        if blocker:
+            raise ValueError(blocker)
         worker_executable = delegation_choice.get("local_worker_executable")
         delegation_cfg = delegation.build_config(home, root, local_worker_executable=worker_executable)
         if not delegation_results:
@@ -868,18 +1105,24 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
                 "on this platform; registration and configuration are portable."),
         }
         if boundary["platform"] == "windows":
-            # Read/run the fail-closed preflight for reporting only. Live
-            # Windows/WSL2 execution delegation is not implemented yet, so
-            # automatic execution delegation stays blocked here regardless of
-            # the preflight outcome; consultation (peer registrations above)
+            # Read/run the fail-closed preflight and the setup ladder for
+            # reporting only. Automatic execution delegation stays blocked
+            # here regardless of either outcome: the ladder's own gate has not
+            # been satisfied on a live machine and provider authentication in
+            # the guest is unresolved. Consultation (peer registrations above)
             # is unaffected by this.
             delegation_report["windows_preflight"] = _windows_preflight_summary(delegation_choice)
+            delegation_report["windows_setup"] = _windows_setup_summary(delegation_choice)
             delegation_report["execution_delegation"] = "blocked"
             delegation_report["execution_delegation_note"] = (
-                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
-                "when windows_preflight.prerequisites_ready is true, automatic "
-                "execution delegation on Windows remains blocked until live Windows "
-                "evidence exists; consultation (peer registrations) is unaffected.")
+                "Automatic execution delegation on Windows remains blocked. Two "
+                "separate things must hold and neither is asserted here: "
+                "windows_setup must reach the ready stage on this machine, "
+                "which requires a boundary verification run, and provider CLI "
+                "authentication inside the ephemeral guest is an open blocker. "
+                "windows_preflight.prerequisites_ready is local evidence only "
+                "and enables nothing; no live Windows validation has been "
+                "performed. Consultation (peer registrations) is unaffected.")
     print(json.dumps({"backups": backups, "installed_files": sorted(updates),
                       "restore_note": "Inspect backups before restoring; whole-file restore may erase later edits.",
                       "host_loading_verified": False,
