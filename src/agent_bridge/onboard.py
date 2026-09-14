@@ -186,12 +186,18 @@ def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
         local["endpoint"] = ask("Explicit loopback endpoint (for example http://127.0.0.1:11434): ").strip()
         local["model"] = ask("Installed local model name: ").strip()
         local["allow_internal"] = (_choice("May this local worker receive internal material? [yes/no]: ", {"yes", "no"}, ask) == "yes")
-    print("Automatic delegation is an advanced, separate opt-in: a private orchestration "
-          "server and, on macOS, a per-user execution worker that can queue bounded "
-          "implementation work on the opposite provider's subscription CLI and route "
-          "eligible non-client work to a local model. It never applies, commits, pushes "
-          "or merges on its own, and it stays off unless you explicitly enable it here.")
-    delegation_enabled = _choice("Enable automatic delegation? [yes/no]: ", {"yes", "no"}, ask) == "yes"
+    if sys.platform != "darwin":
+        print("Automatic delegation is currently unavailable on this platform. "
+              "The consultation bridge will still be configured; native Windows "
+              "and Linux execution workers are not yet released.")
+        delegation_enabled = False
+    else:
+        print("Automatic delegation is an advanced, separate opt-in: a private orchestration "
+              "server and a per-user execution worker that can queue bounded implementation "
+              "work on the opposite provider's subscription CLI and route eligible non-client "
+              "work to a local model. It never applies, commits, pushes or merges on its own, "
+              "and it stays off unless you explicitly enable it here.")
+        delegation_enabled = _choice("Enable automatic delegation? [yes/no]: ", {"yes", "no"}, ask) == "yes"
     automatic_delegation: dict[str, Any] = {"enabled": delegation_enabled}
     if delegation_enabled:
         has_worker = _choice(
@@ -289,6 +295,9 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                                       **_local_command(local, root)})
 
     delegation_choice = answers["automatic_delegation"]
+    if delegation_choice["enabled"] and sys.platform != "darwin":
+        raise ValueError("automatic delegation is currently available only on macOS; "
+                         "the consultation bridge remains available on this platform")
     delegation_plan: dict[str, Any] | None = None
     if delegation_choice["enabled"]:
         home = os.path.expanduser("~")
@@ -580,6 +589,9 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     delegation_cfg: dict[str, Any] | None = None
     delegation_status: dict[str, str] | None = None
     if delegation_choice["enabled"]:
+        if sys.platform != "darwin":
+            raise ValueError("automatic delegation is currently available only on macOS; "
+                             "the consultation bridge remains available on this platform")
         worker_executable = delegation_choice.get("local_worker_executable")
         delegation_cfg = delegation.build_config(home, root, local_worker_executable=worker_executable)
         if not delegation_results:

@@ -12,19 +12,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration.execution_queue import ExecutionAdmissionError, ExecutionQueue, _atomic_json
+from agent_bridge.orchestration.execution_queue import (
+    ExecutionAdmissionError, ExecutionQueue, _atomic_json, _harness_summary,
+    outcome_is_success)
 from agent_bridge.orchestration.server import Server
 
 
 class FakeExecutor:
-    def __init__(self, returncode=0):
+    def __init__(self, returncode=0, harness_ok=True, harness_status="complete"):
         self.returncode = returncode
+        self.harness_ok = harness_ok
+        self.harness_status = harness_status
         self.requests = []
 
     def __call__(self, request, job_dir):
         self.requests.append(request)
         return {"returncode": self.returncode, "stdout_sha256": "a" * 64,
-                "stderr_sha256": "b" * 64, "stdout_bytes": 10, "stderr_bytes": 0}
+                "stderr_sha256": "b" * 64, "stdout_bytes": 10, "stderr_bytes": 0,
+                "harness_ok": self.harness_ok,
+                "harness_status": self.harness_status,
+                "harness_verdict": "read"}
 
 
 class Sampler:
@@ -120,6 +127,17 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.queue.run_once("worker-1")
         self.assertEqual(self.queue.result(job["job_id"])["state"], "failed")
         self.assertEqual(self.fake.requests, [])
+
+    def test_zero_exit_with_failed_verification_is_failed(self):
+        failed = FakeExecutor(0, False, "verification_failed")
+        queue = ExecutionQueue(self.root / "failed-queue", failed, clock=lambda: 100.0)
+        self.queue = queue
+        job = self.submit()
+        self.assertEqual(queue.run_once("worker-1")["state"], "failed")
+
+    def test_missing_or_unreadable_harness_receipt_fails_closed(self):
+        self.assertFalse(outcome_is_success({"returncode": 0, **_harness_summary(b"")}))
+        self.assertFalse(outcome_is_success({"returncode": 0, **_harness_summary(b"not json\n")}))
 
     def test_restart_blocks_interrupted_job_instead_of_resending(self):
         job = self.submit()

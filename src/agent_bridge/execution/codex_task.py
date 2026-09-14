@@ -50,7 +50,7 @@ stdin when given no prompt argument).
 """
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
     from .. import runner, preflight, store
@@ -98,10 +98,68 @@ def _git_argv(*args:str):
 def _sha(path:Path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+MAX_SNAPSHOT_FILES=2048
+MAX_SNAPSHOT_BYTES=256*1024*1024
+MAX_SNAPSHOT_FILE_BYTES=64*1024*1024
+
+def _dirty_paths(repo:Path,env)->list[str]:
+    raw=_git(repo,"status","--porcelain=v2","--untracked-files=all","-z",env=env)
+    result=[]; fields=raw.split("\0"); i=0
+    while i<len(fields):
+        entry=fields[i]; i+=1
+        if not entry: continue
+        if entry.startswith("1 "): result.append(entry.split(" ",8)[8])
+        elif entry.startswith("2 "):
+            result.append(entry.split(" ",9)[9])
+            if i<len(fields): result.append(fields[i]); i+=1
+        elif entry.startswith(("? ","! ")): result.append(entry[2:])
+        elif entry.startswith("u "): result.append(entry.split(" ",10)[-1])
+    return sorted(set(result))
+
+def _hash_regular(path:Path,digest,budget:int)->int:
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
+    try: fd=os.open(path,flags)
+    except OSError as exc: raise TaskError("source snapshot could not safely open a file") from exc
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode): raise TaskError("source snapshot found a non-regular file")
+        if before.st_size>MAX_SNAPSHOT_FILE_BYTES or before.st_size>budget:
+            raise TaskError("source snapshot exceeds its byte bound")
+        digest.update(b"file\0"); digest.update(str(before.st_mode&0o777).encode()); digest.update(b"\0")
+        count=0
+        while True:
+            chunk=os.read(fd,1024*1024)
+            if not chunk: break
+            count+=len(chunk)
+            if count>before.st_size or count>budget: raise TaskError("source file grew during snapshot")
+            digest.update(chunk)
+        after=os.fstat(fd)
+        if count!=before.st_size or (after.st_dev,after.st_ino,after.st_size)!=(before.st_dev,before.st_ino,before.st_size):
+            raise TaskError("source file changed during snapshot")
+        return count
+    finally: os.close(fd)
+
+def _content_snapshot(repo:Path,env)->dict:
+    paths=_dirty_paths(repo,env)
+    if len(paths)>MAX_SNAPSHOT_FILES: raise TaskError("source snapshot exceeds its file bound")
+    digest=hashlib.sha256(); total=0
+    for rel in paths:
+        path=repo/rel; digest.update(rel.encode("utf-8","surrogateescape")); digest.update(b"\0")
+        try: info=path.lstat()
+        except OSError: digest.update(b"absent\0"); continue
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(b"link\0"); digest.update(os.readlink(path).encode("utf-8","surrogateescape"))
+        elif stat.S_ISDIR(info.st_mode): digest.update(b"dir\0")
+        elif stat.S_ISREG(info.st_mode): total+=_hash_regular(path,digest,MAX_SNAPSHOT_BYTES-total)
+        else: raise TaskError("source snapshot found a non-regular file")
+        digest.update(b"\0")
+    return {"files":len(paths),"bytes":total,"sha256":digest.hexdigest()}
+
 def _source_state(repo:Path,env):
     return {"head":_git(repo,"rev-parse","HEAD",env=env),
             "status":_git(repo,"status","--porcelain=v2","--untracked-files=all",env=env),
-            "config_sha256":_sha(repo/".git"/"config")}
+            "config_sha256":_sha(repo/".git"/"config"),
+            "content":_content_snapshot(repo,env)}
 
 def _assert_macos():
     if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
@@ -367,6 +425,7 @@ def main(argv=None):
     try:
         checks=[json.loads(x) for x in a.verify_json]; del a.verify_json; result=run_task(**vars(a),verify_argv=checks)
     except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc: print(json.dumps({"ok":False,"error":type(exc).__name__})); return 1
-    print(json.dumps({"ok":True,**result},sort_keys=True)); return 0
+    ok=result.get("status")=="complete"
+    print(json.dumps({"ok":ok,**result},sort_keys=True)); return 0 if ok else 3
 
 if __name__=="__main__": raise SystemExit(main())

@@ -72,12 +72,16 @@ def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
     unapplied receipt, and this function does nothing to the disposable
     repository beyond removing it afterward.
     """
+    # Verification must never drain the configured production queue: run_once
+    # selects the oldest queued job, which may not be the synthetic job.
+    del queue_root
+    isolated_queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-verify-queue-"))
     repo = _disposable_repo()
     brief = repo / ".agent-bridge-verify-brief.txt"
     brief.write_text(SYNTHETIC_BRIEF, encoding="utf-8")
     verify_argv = [["git", "status"]]
     try:
-        queue = ExecutionQueue(queue_root, executor, recover_interrupted=False)
+        queue = ExecutionQueue(isolated_queue_root, executor, recover_interrupted=False)
         submitted = queue.submit(
             caller=caller, provider=provider, repo=str(repo), brief=str(brief),
             base="HEAD", classification="synthetic", model="default", effort="low",
@@ -91,13 +95,16 @@ def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
             queue.run_once(f"delegation-verify-{caller}")
         receipt = queue.result(job_id)
     except ExecutionAdmissionError as exc:
-        shutil.rmtree(repo, ignore_errors=True)
         return _empty_row(str(exc) or type(exc).__name__)
-    removed = True
-    try:
-        shutil.rmtree(repo)
-    except OSError:
-        removed = False
+    finally:
+        try:
+            shutil.rmtree(repo)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        removed = not repo.exists()
+        shutil.rmtree(isolated_queue_root, ignore_errors=True)
     harness = receipt.get("harness") or {}
     return {
         "attempted": True, "reason": None, "state": receipt.get("state"),
@@ -116,7 +123,16 @@ def _local_model_check(cfg: Any) -> dict[str, Any]:
     if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
         return {"status": "not_configured"}
     from ..localq.service import Service  # deferred: only needed on this path
-    service = Service(str(cfg.local_queue_root), str(cfg.worker_executable), str(cfg.worker_state))
+    # Use a one-off queue so this check cannot consume real local work.
+    queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-verify-localq-"))
+    service = Service(str(queue_root), str(cfg.worker_executable), str(cfg.worker_state))
+    try:
+        return _run_local_model_check(service)
+    finally:
+        shutil.rmtree(queue_root, ignore_errors=True)
+
+
+def _run_local_model_check(service: Any) -> dict[str, Any]:
     submitted = service.queue.submit(
         task_type="summarize", input=LOCAL_MODEL_INPUT,
         params={"instruction": "Summarize in one sentence.", "provider": "qwen"},

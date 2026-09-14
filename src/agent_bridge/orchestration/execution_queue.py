@@ -136,7 +136,35 @@ class SubprocessHarnessExecutor:
         return {"returncode": process.returncode,
                 "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                 "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr)}
+                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+                **_harness_summary(stdout)}
+
+
+def _harness_summary(stdout: bytes) -> dict[str, Any]:
+    """Read the harness verdict from its final JSON line, failing closed."""
+    for line in reversed(stdout.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return {"harness_ok": False, "harness_status": None,
+                    "harness_verdict": "receipt_unparseable"}
+        if not isinstance(value, dict):
+            return {"harness_ok": False, "harness_status": None,
+                    "harness_verdict": "receipt_not_an_object"}
+        return {"harness_ok": value.get("ok") is True,
+                "harness_status": value.get("status"),
+                "harness_verdict": "read"}
+    return {"harness_ok": False, "harness_status": None,
+            "harness_verdict": "receipt_absent"}
+
+
+def outcome_is_success(outcome: dict[str, Any]) -> bool:
+    """Require both process success and a verified-complete harness receipt."""
+    return (outcome.get("returncode") == 0
+            and outcome.get("harness_ok") is True
+            and outcome.get("harness_status") == "complete")
 
 
 class ExecutionQueue:
@@ -301,7 +329,7 @@ class ExecutionQueue:
             if hashlib.sha256(current).hexdigest() != request["brief_sha256"]:
                 raise ExecutionAdmissionError("brief_changed_after_admission")
             outcome = self.executor(request, selected)
-            receipt.update(state="complete" if outcome.get("returncode") == 0 else "failed",
+            receipt.update(state="complete" if outcome_is_success(outcome) else "failed",
                            harness=outcome, finished_at=self.clock())
         except Exception as exc:
             receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())

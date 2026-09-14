@@ -187,6 +187,12 @@ prerequisites for Claude and Codex to talk through the bridge.
 
 ## Optional advanced orchestration: automatic delegation
 
+> **Platform gate:** do not offer automatic cross-provider execution on native
+> Windows or Linux. The bridge itself is cross-platform, but the persistent
+> automatic execution worker is currently implemented and live-tested only on
+> macOS. On Windows, report this as unavailable—not partial, installed, or
+> awaiting WSL. Native Windows support is still under development.
+
 The repository also contains an additive orchestration MCP server. The
 guided commands above never turn it on by themselves; `onboard questionnaire`
 asks a separate, explicit "Enable automatic delegation?" question, and every

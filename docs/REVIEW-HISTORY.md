@@ -202,3 +202,13 @@ produces findings whether or not any exist; asking "here is the claim, here is
 the code, try to falsify it, and tell me plainly if you cannot" produces
 verdicts. Two of the most useful answers received were "correct" and "I cannot
 identify one".
+
+## Independent public-release review
+
+Charlie independently reported three defects in public commit `80effae`:
+a failed harness verification could be recorded as successful, synthetic
+verification could consume unrelated queued work, and source-integrity checks
+could miss changes to files that were already dirty. Each report was reproduced
+and fixed with a regression test. The queue now requires both a zero process
+exit and a `complete` harness receipt; all synthetic checks use disposable
+queues; and dirty-file contents are included in bounded integrity snapshots.

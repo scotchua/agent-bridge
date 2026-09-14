@@ -7,6 +7,11 @@
 > platform limits below before using it. This early release is intended to find
 > problems on fresh installations; it does not depend on a tester-count gate.
 
+> **Windows support boundary:** the consultation bridge and guided setup work
+> on native Windows. Automatic cross-provider execution currently does not:
+> its persistent execution worker is macOS-only. Windows automatic delegation
+> is under development and must not be presented as installed or verified.
+
 Connect Claude and Codex so you can say **“ask the other assistant”** without
 copying messages between them. Either assistant can coordinate the work, ask
 its teammate for help, and bring the answer back into your conversation.
@@ -64,7 +69,7 @@ If the repository is still private, request access before starting setup.
    preserving unrelated settings and keeping backups.
 6. Reloading the selected apps as needed and verifying a question and follow-up.
 
-The setup supports macOS and native Windows; Linux/WSL details are in
+The consultation-bridge setup supports macOS and native Windows; Linux/WSL details are in
 [INSTALL.md](INSTALL.md). In WSL, keep the checkout, Python, CLIs and state on
 the Linux side. Claude Desktop can receive the MCP connection, but loading the
 shared instructions into its chats/projects requires a separate verified step.
