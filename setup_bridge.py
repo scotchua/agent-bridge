@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
         print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
         return 2
     if not raw or raw[0] in {"-h", "--help"}:
-        print("usage: setup_bridge.py {onboard,serve-peer,serve-local} ...")
+        print("usage: setup_bridge.py {onboard,serve-peer,serve-local,serve-orchestration} ...")
         return 0
     command, rest = raw[0], raw[1:]
     if command == "onboard":
@@ -37,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     if command == "serve-local":
         from agent_bridge import local_worker
         return local_worker.main(rest)
+    if command == "serve-orchestration":
+        # Caller-bound, additive orchestration/execution-queue MCP server. Does
+        # not replace or widen serve-peer's consultation-only tool set.
+        from agent_bridge.orchestration import server as orchestration_server
+        return orchestration_server.main(rest)
     print(f"unknown command: {command}", file=sys.stderr)
     return 2
 

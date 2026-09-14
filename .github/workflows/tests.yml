@@ -95,6 +95,9 @@ jobs:
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
 
+      - name: Guided automatic-delegation opt-in
+        run: python3 -m unittest discover -s tests -p "test_automatic_delegation.py"
+
       - name: POSIX execution-worker tests
         if: runner.os != 'Windows'
         run: python3 -m unittest discover -s tests -p "test_execution_worker.py"

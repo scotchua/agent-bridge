@@ -4,11 +4,15 @@ For the easier conversational path, start with
 [Set this up with Claude or Codex](docs/SETUP-WITH-AN-AGENT.md). The steps below
 remain the lower-level verification and troubleshooting reference.
 
-The guided installer covers consultation and its optional local worker. The
-newer durable stage router and bounded cross-provider implementation lane are an
-advanced manual feature; see
-[Orchestration and local-worker MCP](docs/orchestration-mcp.md). Its persistent
-execution-worker service is currently verified on macOS.
+The guided installer covers consultation and its optional local worker. It can
+also, on explicit opt-in, enable "automatic delegation": the durable stage
+router and bounded cross-provider implementation lane described in
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md). This stays off
+unless you say yes during `onboard questionnaire` or set
+`automatic_delegation.enabled: true` in your answers file; every existing
+answers file without that key keeps working and stays disabled. See
+[Automatic delegation](#automatic-delegation-optional-opt-in) below. Its
+persistent execution-worker service is currently verified on macOS only.
 
 Written for someone who is comfortable in a terminal but is not a developer. If
 any step fails, the failure message is meant to tell you what to do; if it does
@@ -297,6 +301,88 @@ claude mcp remove --scope user codex-peer
 Restart the Codex app. Your history stays in `~/.agent-bridge` until you delete
 it, and `~/.agent-bridge/ledger/exchanges.jsonl` is the record of every
 consultation you ever ran.
+
+## Automatic delegation (optional, opt-in)
+
+The default bridge above installs consultation only: either assistant can ask
+its peer a question and get an answer back. Automatic delegation is a
+separate, advanced opt-in that adds durable stage ownership, a queue for
+bounded cross-provider implementation jobs, and automatic local routing for
+eligible non-client mechanical text. It never applies, commits, pushes, or
+merges on its own, and it never silently falls back from local processing to
+a cloud model or a paid API.
+
+**Turn it on:**
+
+```
+python setup_bridge.py onboard questionnaire --answers /absolute/private/answers.json
+```
+
+Answer yes to "Enable automatic delegation?" (or set
+`"automatic_delegation": {"enabled": true}` directly in the answers file).
+Optionally name an already-built, compliant private local-worker executable
+with `local_worker_executable` if you want the local-model lane checked too;
+omit it and that lane is honestly reported `not_configured` rather than
+guessed at.
+
+**Verify before applying.** This is a live check against your own signed-in
+CLIs; it never applies a patch, commits, pushes, merges, downloads a model, or
+enables paid fallback, and it only ever uses synthetic, disposable content:
+
+```
+./bin/agent-bridge-orchestration-verify \
+  --config ~/.agent-bridge/orchestration/orchestration.json \
+  --callers codex,claude \
+  --out ~/.agent-bridge/orchestration/delegation-verify.json
+```
+
+**Apply with the evidence:**
+
+```
+python setup_bridge.py onboard apply \
+  --answers /absolute/private/answers.json \
+  --candidate /absolute/private/candidate.json \
+  --results /absolute/private/canaries.json \
+  --delegation-results ~/.agent-bridge/orchestration/delegation-verify.json
+```
+
+Apply refuses to enable automatic delegation without valid, matching evidence,
+and refuses outright if nothing required was actually proven. Otherwise the
+completion report says exactly `"Automatic delegation: enabled"`,
+`"...: partial"`, or `"...: blocked"`, matching what the evidence showed. A
+`"partial"` result commonly means the local-model lane was not configured, or
+one execution direction is unavailable in this checkout (see the honest
+limitation in the README about the missing Codex execution harness).
+
+**On macOS**, apply stages a private, owner-only LaunchAgent template for the
+execution worker but does not silently load it. Load it into the login GUI
+domain yourself, never as root:
+
+```
+python setup_bridge.py onboard activate-launch-agent --apply
+```
+
+Without `--apply` this only prints the exact command it would run. Loading is
+idempotent: an already-active agent is reported as such and never re-loaded.
+
+**Check, disable, or remove it:**
+
+```
+python setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only
+python setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only --apply
+python setup_bridge.py onboard deactivate-launch-agent --apply
+```
+
+Uninstall removes only the orchestration MCP registrations and LaunchAgent
+file it can still identify as its own, leaving the ordinary consultation
+bridge installed and untouched. The private orchestration configuration and
+its receipt are retained for inspection, matching how consultation's shared
+instructions and `config/local.json` are retained.
+
+**Windows and Linux** support the same registration and private-config
+generation, but do not install a continuously-running execution-worker
+service; that has only been independently verified on macOS. `onboard plan`
+reports this boundary for your platform before you apply anything.
 
 ## Day to day
 

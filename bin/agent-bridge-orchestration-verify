@@ -1,0 +1,11 @@
+#!/bin/sh
+# Live synthetic verification for the automatic-delegation opt-in.
+# Never applies, commits, pushes, or merges. Requires this machine's own
+# signed-in provider CLIs; not exercised by the offline test suite.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+PY=${AGENT_BRIDGE_PYTHON:-python3}
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$PY" -P -m agent_bridge.orchestration.delegation_verify "$@"

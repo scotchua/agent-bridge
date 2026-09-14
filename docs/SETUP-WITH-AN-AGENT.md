@@ -61,6 +61,10 @@ checkout, normally under `~/.agent-bridge/`.
   Ollama model's exact name and local endpoint, and whether non-client internal
   text is allowed. No automatic model download. Other local runtimes need a
   separately tested adapter; do not quietly treat them as Ollama.
+- **Do you want automatic delegation?** This is a separate, advanced opt-in,
+  off by default. Only raise it if the user is asking for more than
+  consultation. See [Optional advanced orchestration](#optional-advanced-orchestration-automatic-delegation)
+  below before saying yes on the user's behalf.
 
 The same baseline does not copy the author's contracts or professional data
 permissions. The user must be comfortable with each provider's own terms.
@@ -181,17 +185,48 @@ legacy summarizer, accounting connectors and account-specific approvals are not
 silently installed by this connection setup. They are separate workflows, not
 prerequisites for Claude and Codex to talk through the bridge.
 
-## Optional advanced orchestration
+## Optional advanced orchestration: automatic delegation
 
-The repository also contains an additive orchestration MCP server that is not
-installed by the guided onboarding commands above. It provides durable stage
-ownership, time-bounded capacity routing, automatic local admission for eligible
-mechanical text, and a queue for bounded implementation work on the opposite
-provider. Returned patches are never applied automatically.
+The repository also contains an additive orchestration MCP server. The
+guided commands above never turn it on by themselves; `onboard questionnaire`
+asks a separate, explicit "Enable automatic delegation?" question, and every
+existing answers file without that key stays disabled. Only proceed here when
+the user explicitly wants this advanced path, and explain what it adds before
+asking: durable stage ownership, time-bounded capacity routing, automatic
+local admission for eligible mechanical text, and a queue for bounded
+implementation work on the opposite provider. Returned patches are never
+applied automatically, and there is no silent local-to-cloud or paid fallback.
 
-Use [orchestration-mcp.md](orchestration-mcp.md) only when the user explicitly
-wants this advanced path. Keep its configuration and state outside the checkout.
-On macOS, install its separate per-user execution worker so provider calls do
-not inherit a desktop app's MCP sandbox. Do not claim continuous Linux or
-Windows execution-worker service support until it has been independently
-tested there.
+If the user says yes:
+
+1. Run `onboard plan` and read its `automatic_delegation` section: the
+   required directions, the private config path (outside the checkout), the
+   platform's real support boundary, and whether a local-model worker was
+   named.
+2. Run `bin/agent-bridge-orchestration-verify` with authorization, the same
+   way the ordinary canaries need it: it makes live calls through this
+   machine's signed-in CLIs, using only synthetic, disposable content, and
+   never applies, commits, pushes, merges, downloads a model, or enables paid
+   fallback.
+3. Pass its result to `onboard apply --delegation-results`. Apply refuses to
+   enable anything the evidence does not actually prove, and reports exactly
+   `enabled`, `partial`, or `blocked` per direction and overall. Report that
+   distinction to the user; do not round a `partial` or `blocked` result up to
+   "it's on."
+4. On macOS only, guide (or with explicit `--apply`, install) the per-user
+   execution-worker LaunchAgent with `onboard activate-launch-agent`. Never
+   run it as root, and never claim it is active without checking; loading is
+   idempotent.
+5. Explain the honest current limitation: this checkout ships the Claude
+   execution harness but not yet a Codex one, so the Claude-to-Codex direction
+   (and the whole execution lane, since both harnesses are validated together)
+   will report blocked until that harness exists. Do not claim it works
+   around this.
+
+Uninstall follows the same pattern as ordinary removal: `onboard uninstall --delegation-only`
+removes only the orchestration MCP entries and LaunchAgent file it can still
+identify as its own, preserves the ordinary consultation bridge, and retains
+the private orchestration config for inspection. Do not claim continuous Linux
+or Windows execution-worker service support; only macOS has been independently
+tested there, and the guided flow reports that boundary rather than assuming
+it away.

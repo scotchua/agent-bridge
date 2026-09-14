@@ -162,10 +162,36 @@ sandboxes so the provider CLIs can use their existing subscription logins. A
 crash after a possible provider send blocks the job for reconciliation instead
 of silently sending it again.
 
-This advanced path is currently configured manually and is not installed by the
-guided onboarding flow. See [Orchestration and local-worker MCP](docs/orchestration-mcp.md).
-The execution worker has been live-tested on macOS; continuous service setup for
-Linux and Windows has not yet been verified.
+**Guided, opt-in "automatic delegation."** The guided onboarding flow can now
+turn this on for you if you explicitly ask for it; it stays off by default and
+existing answer files keep working unchanged. Saying yes adds, on top of the
+ordinary consultation bridge:
+
+- a private orchestration configuration generated outside the checkout, with
+  resolved absolute paths and owner-only permissions;
+- the caller-bound orchestration MCP server registered alongside (not instead
+  of) the consultation entries in Codex's and Claude's configurations; and
+- on macOS, a guided or installed per-user execution-worker LaunchAgent,
+  never as root, staged from a safe template with private logs and config.
+
+Turning it on requires passing three synthetic, non-client verification
+checks first (Codex-to-Claude bounded execution, Claude-to-Codex bounded
+execution, and eligible work to a local model); apply refuses to enable it
+without that evidence. The completion report says exactly
+**"Automatic delegation: enabled"**, **"...: partial"**, or **"...: blocked"**
+depending on what was actually proven, never more than that. See
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md) for the manual
+reference path and current platform boundary.
+
+**Honest current limitation:** this checkout ships the bounded Claude
+execution harness but not yet a Codex one (`src/agent_bridge/execution/`), so
+the Claude-to-Codex direction (and, because the executor validates both
+harnesses together, the whole cross-provider execution lane) cannot pass
+verification until that harness exists. The onboarding flow detects and
+reports this precisely rather than claiming it works. Local routing and
+consultation are unaffected. The execution worker's LaunchAgent has been
+live-tested on macOS only; continuous service setup for Linux and Windows is
+not offered, only portable registration and configuration.
 
 ## What it will not do
 
@@ -210,7 +236,15 @@ Linux and Windows has not yet been verified.
 - **Advanced orchestration is not yet a portable service installer.** Its core
   queue and routing logic is tested offline, while the persistent execution
   worker and subscription-backed implementation lane are currently verified on
-  macOS only.
+  macOS only. Guided onboarding can register and configure it on any supported
+  platform; only the continuously-running macOS LaunchAgent is offered as an
+  installed service.
+- **The cross-provider execution lane needs a Codex-side harness this
+  checkout does not yet ship.** Only the Claude execution harness exists today
+  (`src/agent_bridge/execution/claude_task.py`); until a matching Codex one is
+  added, automatic-delegation verification reports the Claude-to-Codex
+  direction, and the whole execution lane, as blocked rather than claiming it
+  works.
 
 ## Checking it yourself
 

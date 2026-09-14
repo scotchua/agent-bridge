@@ -4,6 +4,15 @@ This is an additive server. It does not replace or widen `agent-bridge-mcp`.
 The existing bridge remains consultation-only and exposes only the opposite
 peer's consultation tools.
 
+**Guided path.** `setup_bridge.py onboard` can now do everything below for you
+as an explicit opt-in ("automatic delegation"): generate the private config,
+register the caller-bound server in both app configurations, stage or install
+the macOS LaunchAgent, and gate all of it on the synthetic verification
+described here. See [INSTALL.md](../INSTALL.md#automatic-delegation-optional-opt-in).
+The rest of this document is the manual/reference path and still applies
+verbatim if you prefer to wire it up by hand, or need to troubleshoot what the
+guided path generated.
+
 The standalone `agent-bridge-orchestration` server gives either caller the
 same durable work controls:
 
@@ -81,3 +90,20 @@ Windows and Linux execution-worker service installation remains unverified.
 The bundled resource sampler is also macOS-specific; without a separately
 reviewed platform sampler, local jobs on Windows or Linux defer rather than
 assuming the machine has safe spare capacity.
+
+**Current limitation: no Codex execution harness ships yet.** `codex_task.py`
+does not exist in `src/agent_bridge/execution/` alongside `claude_task.py`.
+`SubprocessHarnessExecutor` validates both harness paths together, so until a
+Codex one is added, the execution lane cannot be constructed at all for either
+direction. `agent_bridge.orchestration.delegation.harness_availability()`
+reports this precisely, and `bin/agent-bridge-orchestration-verify` reports
+both directions as blocked with that reason rather than claiming a pass.
+
+`bin/agent-bridge-orchestration-verify` runs the three synthetic checks this
+document describes (Codex-to-Claude bounded execution, Claude-to-Codex bounded
+execution, eligible work to the local model) against disposable, synthetic
+content only, and writes a durable result the guided `onboard apply
+--delegation-results` step validates before it will register anything. It
+never applies, commits, pushes, merges, downloads a model, or enables paid
+fallback, and it refuses to run against a result path inside a temporary
+directory.
