@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_bridge.execution.claude_task import TaskError, _env, _remove, _run, _sandboxed, run_task
+from agent_bridge.execution.claude_task import TaskError, _command, _env, _remove, _run, _sandboxed, run_task
 
 
 class ClaudeTaskTests(unittest.TestCase):
@@ -35,6 +35,15 @@ class ClaudeTaskTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_current_cli_command_keeps_the_bounded_tool_set(self):
+        argv = _command(self.fake, "sonnet", "high")
+        self.assertIn("--safe-mode", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob,Edit,Write")
+        self.assertNotIn("Bash", argv)
+        self.assertNotIn("--restricted", argv)
+        self.assertNotIn("--permission-prompts", argv)
 
     def test_returns_patch_and_does_not_touch_source(self):
         result = run_task(brief=self.brief, repo=self.repo,
