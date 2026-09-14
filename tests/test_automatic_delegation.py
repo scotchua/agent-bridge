@@ -8,6 +8,8 @@ patch, or makes a live provider call.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -20,7 +22,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
-from agent_bridge.orchestration import delegation  # noqa: E402
+from agent_bridge.orchestration import delegation, windows_preflight  # noqa: E402
 
 
 def answers(**changes):
@@ -537,6 +539,227 @@ class OrchestrationServeSubcommandTests(unittest.TestCase):
             self.assertIn("work_route_local", names)
             self.assertFalse(names & {"claude_start", "codex_start"})
             self.assertFalse(names & {"execution_dispatch"})  # no execution config supplied
+
+
+_GOOD_MANIFEST = {
+    "schema_version": 1, "distro_release": "22.04.3",
+    "rootfs_sha256": "a" * 64, "node_version": "20.11.0",
+    "claude_version": "1.0.0", "codex_version": "1.0.0",
+}
+
+
+def _fake_windows_subprocess_run(*, ready: bool):
+    """Bounded fake for windows_preflight's ``subprocess.run`` calls only."""
+    def runner(argv, **kwargs):
+        exe = argv[0]
+        if exe == "cmd.exe":
+            stdout = b"Microsoft Windows [Version 10.0.22631.3527]\r\n"
+        elif exe == "wsl.exe":
+            stdout = b"WSL version: 2.1.5.0\r\n" if ready else b"WSL version: 1.0.0.0\r\n"
+        elif exe == "powershell.exe":
+            stdout = b"Enabled\r\n" if ready else b"Disabled\r\n"
+        elif exe == "systeminfo.exe":
+            stdout = (b"Virtualization Enabled In Firmware: Yes\r\n" if ready
+                      else b"Virtualization Enabled In Firmware: No\r\n")
+        else:
+            raise AssertionError(f"unexpected command spawned in a test: {argv!r}")
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
+    return runner
+
+
+WINDOWS_DELEGATION_CHOICE = {
+    "enabled": True,
+    "windows_wsl_manifest_path": r"C:\Users\agent\wsl\manifest.json",
+    "windows_wsl_rootfs_path": r"C:\Users\agent\wsl\rootfs.tar",
+}
+
+
+class WindowsPathCompatibilityTests(unittest.TestCase):
+    def test_old_answers_without_windows_fields_stay_disabled(self):
+        raw = {"version": 1, "directions": "both",
+               "targets": {"codex": True, "claude_code": True, "claude_desktop": False},
+               "privacy": {"mode": "baseline"}, "local_ollama": {"enabled": False},
+               "automatic_delegation": {"enabled": False}}
+        validated = onboard.validate_answers(raw)
+        self.assertEqual(validated["automatic_delegation"], {"enabled": False})
+
+    def test_enabled_without_windows_fields_is_still_accepted(self):
+        validated = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+        self.assertNotIn("windows_wsl_manifest_path", validated["automatic_delegation"])
+        self.assertNotIn("windows_wsl_rootfs_path", validated["automatic_delegation"])
+
+    def test_valid_windows_paths_are_accepted_and_preserved(self):
+        validated = onboard.validate_answers(answers(
+            automatic_delegation=dict(WINDOWS_DELEGATION_CHOICE)))
+        self.assertEqual(validated["automatic_delegation"]["windows_wsl_manifest_path"],
+                         WINDOWS_DELEGATION_CHOICE["windows_wsl_manifest_path"])
+        self.assertEqual(validated["automatic_delegation"]["windows_wsl_rootfs_path"],
+                         WINDOWS_DELEGATION_CHOICE["windows_wsl_rootfs_path"])
+
+    def test_manifest_without_rootfs_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "must both be set or both omitted"):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": True, "windows_wsl_manifest_path": r"C:\a\manifest.json"}))
+
+    def test_relative_windows_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": True, "windows_wsl_manifest_path": r"manifest.json",
+                "windows_wsl_rootfs_path": r"C:\a\rootfs.tar"}))
+
+    def test_unc_windows_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": True, "windows_wsl_manifest_path": r"\\server\share\manifest.json",
+                "windows_wsl_rootfs_path": r"C:\a\rootfs.tar"}))
+
+    def test_device_windows_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": True, "windows_wsl_manifest_path": r"\\?\C:\a\manifest.json",
+                "windows_wsl_rootfs_path": r"C:\a\rootfs.tar"}))
+
+    def test_traversal_windows_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": True, "windows_wsl_manifest_path": r"C:\a\..\manifest.json",
+                "windows_wsl_rootfs_path": r"C:\a\rootfs.tar"}))
+
+    def test_disabled_rejects_stray_windows_fields(self):
+        with self.assertRaisesRegex(ValueError, "omit local_worker_executable"):
+            onboard.validate_answers(answers(automatic_delegation={
+                "enabled": False, "windows_wsl_manifest_path": r"C:\a\manifest.json"}))
+
+
+class WindowsPreflightWiringTests(unittest.TestCase):
+    def test_ready_when_all_checks_and_manifest_pass(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                        side_effect=_fake_windows_subprocess_run(ready=True)), \
+             mock.patch.object(onboard.store, "sha256_file", return_value="a" * 64), \
+             mock.patch.object(onboard.store, "read_json", return_value=dict(_GOOD_MANIFEST)):
+            summary = onboard._windows_preflight_summary(WINDOWS_DELEGATION_CHOICE, platform="win32")
+        self.assertEqual(summary["status"], windows_preflight.STATUS_PREREQUISITES_READY)
+        self.assertTrue(summary["prerequisites_ready"])
+        self.assertIn("does not enable", summary["prerequisites_ready_meaning"])
+        for check in summary["checks"].values():
+            self.assertTrue(check.startswith("ready: "))
+
+    def test_missing_manifest_path_is_reported_as_not_ready(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                        side_effect=_fake_windows_subprocess_run(ready=True)):
+            summary = onboard._windows_preflight_summary({"enabled": True}, platform="win32")
+        self.assertEqual(summary["status"], windows_preflight.STATUS_PREREQUISITES_NOT_READY)
+        self.assertFalse(summary["prerequisites_ready"])
+        self.assertTrue(summary["checks"]["manifest"].startswith("not ready: "))
+
+    def test_failed_prerequisite_checks_are_reported_as_not_ready(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                        side_effect=_fake_windows_subprocess_run(ready=False)), \
+             mock.patch.object(onboard.store, "sha256_file", return_value="a" * 64), \
+             mock.patch.object(onboard.store, "read_json", return_value=dict(_GOOD_MANIFEST)):
+            summary = onboard._windows_preflight_summary(WINDOWS_DELEGATION_CHOICE, platform="win32")
+        self.assertEqual(summary["status"], windows_preflight.STATUS_PREREQUISITES_NOT_READY)
+        self.assertFalse(summary["prerequisites_ready"])
+        self.assertTrue(summary["checks"]["wsl_version"].startswith("not ready: "))
+        self.assertTrue(summary["checks"]["virtual_machine_platform"].startswith("not ready: "))
+        self.assertTrue(summary["checks"]["firmware_virtualization"].startswith("not ready: "))
+
+    def test_no_preflight_command_is_run_on_non_windows_platforms(self):
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("preflight must never spawn a process on non-Windows platforms")
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run",
+                        side_effect=_forbidden):
+            for platform_name in ("darwin", "linux"):
+                summary = onboard._windows_preflight_summary(WINDOWS_DELEGATION_CHOICE, platform=platform_name)
+                self.assertIsNone(summary)
+
+    def test_ready_prerequisites_are_not_the_same_as_delegation_enabled(self):
+        ready_report = {"status": windows_preflight.STATUS_PREREQUISITES_READY,
+                        "prerequisites_ready": True, "checks": {}, "detail": ""}
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=ready_report), \
+             mock.patch.object(onboard.delegation, "platform_boundary_report",
+                              return_value={"platform": "windows",
+                                            "execution_worker_service": "not installed automatically",
+                                            "continuous_service_verified": False,
+                                            "resource_sampler": "n/a", "registration_and_config": "supported"}):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            result = onboard.status(choices)
+        self.assertTrue(result["windows_preflight"]["prerequisites_ready"])
+        self.assertEqual(result["execution_delegation"], "blocked")
+        self.assertIn("not implemented yet", result["execution_delegation_note"])
+
+
+class WindowsPlanReportingTests(unittest.TestCase):
+    def test_plan_includes_windows_preflight_and_blocked_execution_note(self):
+        ready_report = {"status": windows_preflight.STATUS_PREREQUISITES_READY,
+                        "prerequisites_ready": True, "checks": {}, "detail": ""}
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=ready_report):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            result = onboard.plan(choices, str(ROOT))
+        automatic = result["automatic_delegation"]
+        self.assertEqual(automatic["windows_preflight"], ready_report)
+        self.assertIn("blocked", automatic["execution_delegation_note"])
+
+    def test_plan_omits_windows_preflight_on_non_windows(self):
+        with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None):
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            result = onboard.plan(choices, str(ROOT))
+        self.assertIsNone(result["automatic_delegation"]["windows_preflight"])
+        self.assertIsNone(result["automatic_delegation"]["execution_delegation_note"])
+
+
+class WindowsApplyRefusalTests(unittest.TestCase):
+    """Applying on Windows must still report execution delegation blocked."""
+
+    def _stage(self, tmp, choices):
+        home = os.path.join(tmp, "home")
+        candidate = os.path.join(tmp, "candidate.json")
+        results = os.path.join(tmp, "results.json")
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        active = active_in(tmp)
+        staged = setup_cmd.write_candidate(candidate, onboard.privacy_overlay(choices), active)
+        plan_doc = {"answers_sha256": onboard._sha(choices),
+                   "effective_config_sha256": config.effective_config_sha256(staged.raw),
+                   "directions": choices["directions"], "targets": choices["targets"],
+                   "pins": {peer: {key: staged.peer(peer).get(key) for key in ("executable", "allowed_versions")}
+                            for peer in ("claude", "codex")}}
+        store.atomic_write_json(candidate + ".onboarding-plan.json", plan_doc)
+        results_doc = {"verdict": "PASS", "effective_config_sha256": config.effective_config_sha256(staged.raw),
+                      "configured_versions": {"claude": [], "codex": []},
+                      "observed_versions": {"claude": [], "codex": []},
+                      "controls_requested": {"timeout_canaries": 1}, "controls_executed": {"timeout_canaries": 1}}
+        store.atomic_write_json(results, results_doc)
+        return home, candidate, results
+
+    def test_successful_preflight_still_reports_execution_delegation_blocked_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            home, candidate, results = self._stage(tmp, choices)
+            cfg = delegation.build_config(home, str(ROOT), local_worker_executable=None)
+            delegation_results = os.path.join(tmp, "delegation.json")
+            store.atomic_write_json(delegation_results, evidence(cfg))
+            ready_report = {"status": windows_preflight.STATUS_PREREQUISITES_READY,
+                            "prerequisites_ready": True, "checks": {}, "detail": ""}
+            windows_boundary = {"platform": "windows",
+                               "execution_worker_service": "not installed automatically",
+                               "continuous_service_verified": False,
+                               "resource_sampler": "n/a", "registration_and_config": "supported"}
+            with mock.patch.object(setup_cmd, "validate_promotion"), \
+                 mock.patch.object(setup_cmd, "promote_candidate", return_value={}), \
+                 mock.patch.object(setup_cmd, "is_durable", return_value=True), \
+                 mock.patch.object(setup_cmd, "find_all", return_value=[]), \
+                 mock.patch.object(config, "local_config_path", return_value=os.path.join(tmp, "local.json")), \
+                 mock.patch.object(onboard.delegation, "platform_boundary_report", return_value=windows_boundary), \
+                 mock.patch.object(onboard, "_windows_preflight_summary", return_value=ready_report):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    onboard.apply(choices, candidate, results, str(ROOT), home=home,
+                                 delegation_results=delegation_results)
+            report = json.loads(buffer.getvalue())["automatic_delegation"]
+            self.assertEqual(report["status"]["overall"], "enabled")
+            self.assertEqual(report["windows_preflight"], ready_report)
+            self.assertEqual(report["execution_delegation"], "blocked")
+            self.assertIn("not implemented yet", report["execution_delegation_note"])
 
 
 if __name__ == "__main__":

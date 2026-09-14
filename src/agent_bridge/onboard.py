@@ -18,7 +18,7 @@ import tomllib
 from typing import Any, Callable
 
 from . import config, setup_cmd, store
-from .orchestration import delegation
+from .orchestration import delegation, windows_preflight, windows_wsl
 
 ANSWERS_VERSION = 1
 SAFE_CLASSES = ("internal", "public", "synthetic")
@@ -112,11 +112,14 @@ def validate_answers(raw: Any) -> dict[str, Any]:
     # Absent entirely on any answers file written before this opt-in existed;
     # such a file must keep loading and must default to disabled.
     delegation_choice = raw.get("automatic_delegation", {"enabled": False})
+    delegation_optional_keys = {"local_worker_executable", "windows_wsl_manifest_path",
+                                "windows_wsl_rootfs_path"}
     if (not isinstance(delegation_choice, dict)
-            or set(delegation_choice) - {"enabled", "local_worker_executable"}
+            or set(delegation_choice) - ({"enabled"} | delegation_optional_keys)
             or not isinstance(delegation_choice.get("enabled"), bool)):
         raise ValueError("automatic_delegation must set an explicit true/false enabled, "
-                         "and may only otherwise set local_worker_executable")
+                         "and may only otherwise set local_worker_executable, "
+                         "windows_wsl_manifest_path, and windows_wsl_rootfs_path")
     normal_delegation: dict[str, Any] = {"enabled": delegation_choice["enabled"]}
     if delegation_choice["enabled"]:
         worker_executable = delegation_choice.get("local_worker_executable")
@@ -127,8 +130,31 @@ def validate_answers(raw: Any) -> dict[str, Any]:
             if not os.path.isabs(expanded):
                 raise ValueError("automatic_delegation.local_worker_executable must be an absolute path")
             normal_delegation["local_worker_executable"] = expanded
+
+        # Optional, Windows-only, pinned absolute native paths for a future
+        # WSL2 manifest/rootfs preflight check. Absent on every answers file
+        # written before this opt-in existed; such a file must keep loading
+        # with no Windows preflight paths configured.
+        manifest_path = delegation_choice.get("windows_wsl_manifest_path")
+        rootfs_path = delegation_choice.get("windows_wsl_rootfs_path")
+        if (manifest_path is None) != (rootfs_path is None):
+            raise ValueError("automatic_delegation.windows_wsl_manifest_path and "
+                             "windows_wsl_rootfs_path must both be set or both omitted")
+        if manifest_path is not None:
+            for field_name, value in (("windows_wsl_manifest_path", manifest_path),
+                                      ("windows_wsl_rootfs_path", rootfs_path)):
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"automatic_delegation.{field_name} must be a "
+                                     "non-empty absolute native Windows path")
+                try:
+                    windows_wsl._validate_windows_host_path(field_name, value)
+                except windows_wsl.WindowsWslContractError as exc:
+                    raise ValueError(str(exc)) from exc
+            normal_delegation["windows_wsl_manifest_path"] = manifest_path
+            normal_delegation["windows_wsl_rootfs_path"] = rootfs_path
     elif set(delegation_choice) != {"enabled"}:
-        raise ValueError("omit local_worker_executable when automatic_delegation is disabled")
+        raise ValueError("omit local_worker_executable, windows_wsl_manifest_path, and "
+                         "windows_wsl_rootfs_path when automatic_delegation is disabled")
 
     return {"version": ANSWERS_VERSION, "directions": direction, "targets": dict(targets),
             "privacy": {"mode": mode, "peers": peer_lists}, "local_ollama": normal_local,
@@ -265,6 +291,53 @@ def _local_command(local: dict[str, Any], root: str) -> dict[str, Any]:
     return {"command": _portable_python(), "args": args}
 
 
+def _windows_preflight_summary(delegation_choice: dict[str, Any], *,
+                               platform: str | None = None) -> dict[str, Any] | None:
+    """Run/read the fail-closed Windows preflight before delegation verification.
+
+    Returns ``None`` on any non-Windows platform without spawning any
+    process. On native Windows, this is read-only evidence about local
+    prerequisites; ``prerequisites_ready`` is never the same thing as
+    automatic delegation being enabled, and this function never claims that
+    it is.
+    """
+    if not windows_preflight.is_windows(platform):
+        return None
+    manifest_path = delegation_choice.get("windows_wsl_manifest_path")
+    rootfs_path = delegation_choice.get("windows_wsl_rootfs_path")
+    expected_hash = None
+    if rootfs_path is not None:
+        try:
+            expected_hash = store.sha256_file(rootfs_path)
+        except OSError:
+            expected_hash = None
+    report = windows_preflight.run_preflight(
+        platform=platform, manifest_path=manifest_path,
+        manifest_loader=(store.read_json if manifest_path is not None else None),
+        expected_rootfs_sha256=expected_hash)
+    named_checks = (
+        ("windows_build", report.windows_build),
+        ("wsl_version", report.wsl_version),
+        ("virtual_machine_platform", report.virtual_machine_platform),
+        ("firmware_virtualization", report.firmware_virtualization),
+        ("manifest", report.manifest),
+    )
+    plain_language = {
+        name: (("ready: " if check.passed else "not ready: ") + check.detail)
+        for name, check in named_checks if check is not None
+    }
+    return {
+        "status": report.status,
+        "prerequisites_ready": report.status == windows_preflight.STATUS_PREREQUISITES_READY,
+        "prerequisites_ready_meaning": (
+            "prerequisites_ready reflects local, read-only preflight evidence "
+            "only; it does not enable automatic delegation and by itself "
+            "authorizes nothing"),
+        "checks": plain_language,
+        "detail": report.detail,
+    }
+
+
 def _orchestration_command(caller: str, root: str, delegation_config_path: str) -> dict[str, Any]:
     return {"command": _portable_python(),
             "args": [os.path.join(root, "setup_bridge.py"), "serve-orchestration",
@@ -302,6 +375,7 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                     registrations.append({"target": label, "name": "agent-bridge-orchestration",
                                           **_orchestration_command("claude", root, delegation_config_path)})
         boundary = delegation.platform_boundary_report()
+        windows_preflight_report = _windows_preflight_summary(delegation_choice)
         delegation_plan = {
             "config_path": delegation_config_path,
             "required_directions": list(delegation.required_directions_for(callers)),
@@ -309,6 +383,13 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
                                  if delegation_choice.get("local_worker_executable")
                                  else "not configured; verification will report it as not_configured"),
             "platform": boundary,
+            "windows_preflight": windows_preflight_report,
+            "execution_delegation_note": (
+                None if windows_preflight_report is None else
+                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
+                "when windows_preflight.prerequisites_ready is true, automatic "
+                "execution delegation on Windows remains blocked until live Windows "
+                "evidence exists; consultation (peer registrations) is unaffected."),
             "launch_agent": None if boundary["platform"] != "darwin" else {
                 "plist_path": delegation.launch_agent_path(home),
                 "note": ("Staged during apply as a private, owner-only file. Loading it into "
@@ -326,6 +407,30 @@ def plan(answers: dict[str, Any], root: str) -> dict[str, Any]:
             "local_worker": (None if not local["enabled"] else [_portable_python(), *_local_command(local, root)["args"]]),
             "automatic_delegation": delegation_plan,
             "next": "Run stage, complete the existing canaries, then run apply."}
+
+
+def status(answers: dict[str, Any]) -> dict[str, Any]:
+    """Report current automatic-delegation status without changing anything.
+
+    On native Windows this runs/reads the fail-closed preflight before any
+    delegation verification is considered, and makes explicit that
+    ``prerequisites_ready`` is evidence only, never delegation enablement.
+    """
+    delegation_choice = answers["automatic_delegation"]
+    result: dict[str, Any] = {"automatic_delegation_enabled": delegation_choice["enabled"]}
+    if delegation_choice["enabled"]:
+        boundary = delegation.platform_boundary_report()
+        windows_preflight_report = _windows_preflight_summary(delegation_choice)
+        result["platform"] = boundary
+        result["windows_preflight"] = windows_preflight_report
+        if windows_preflight_report is not None:
+            result["execution_delegation"] = "blocked"
+            result["execution_delegation_note"] = (
+                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
+                "when windows_preflight.prerequisites_ready is true, automatic "
+                "execution delegation on Windows remains blocked until live Windows "
+                "evidence exists; consultation (peer registrations) is unaffected.")
+    return result
 
 
 def _bytes(path: str) -> bytes | None:
@@ -762,6 +867,19 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
                 "Continuous execution-worker service installation is not offered "
                 "on this platform; registration and configuration are portable."),
         }
+        if boundary["platform"] == "windows":
+            # Read/run the fail-closed preflight for reporting only. Live
+            # Windows/WSL2 execution delegation is not implemented yet, so
+            # automatic execution delegation stays blocked here regardless of
+            # the preflight outcome; consultation (peer registrations above)
+            # is unaffected by this.
+            delegation_report["windows_preflight"] = _windows_preflight_summary(delegation_choice)
+            delegation_report["execution_delegation"] = "blocked"
+            delegation_report["execution_delegation_note"] = (
+                "Live Windows/WSL2 execution delegation is not implemented yet. Even "
+                "when windows_preflight.prerequisites_ready is true, automatic "
+                "execution delegation on Windows remains blocked until live Windows "
+                "evidence exists; consultation (peer registrations) is unaffected.")
     print(json.dumps({"backups": backups, "installed_files": sorted(updates),
                       "restore_note": "Inspect backups before restoring; whole-file restore may erase later edits.",
                       "host_loading_verified": False,
@@ -914,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     q = sub.add_parser("questionnaire"); q.add_argument("--answers", default=default_answers_path())
     p = sub.add_parser("plan"); p.add_argument("--answers", required=True); p.add_argument("--root", default=config.REPO_ROOT)
+    st = sub.add_parser("status"); st.add_argument("--answers", required=True)
     s = sub.add_parser("stage"); s.add_argument("--answers", required=True); s.add_argument("--candidate", required=True)
     a = sub.add_parser("apply"); a.add_argument("--answers", required=True); a.add_argument("--candidate", required=True); a.add_argument("--results", required=True); a.add_argument("--root", default=config.REPO_ROOT); a.add_argument("--home")
     a.add_argument("--delegation-results", help="Required when automatic_delegation.enabled is true.")
@@ -929,6 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
             print(args.answers)
         elif args.command == "plan":
             print(json.dumps(plan(load_answers(args.answers), args.root), indent=2))
+        elif args.command == "status":
+            print(json.dumps(status(load_answers(args.answers)), indent=2))
         elif args.command == "stage":
             print(json.dumps(stage(load_answers(args.answers), args.candidate), indent=2))
         elif args.command == "apply":
