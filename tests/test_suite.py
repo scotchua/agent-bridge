@@ -4241,10 +4241,6 @@ def main() -> int:
     return summary(SKIPPED)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 def test_peer_home_config_guard_is_contents_based() -> None:
     """The isolated home's config.toml is judged by contents, not existence.
 
@@ -4287,3 +4283,7 @@ def test_peer_home_config_guard_is_contents_based() -> None:
                 f"{name}: guard raised={raised}, expected {should_raise}")
         finally:
             shutil.rmtree(home, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -320,10 +320,6 @@ class QueuePrivacyAtCreationTests(unittest.TestCase):
                          0o600)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReadPrivateFileTests(unittest.TestCase):
     """Verify and read through one descriptor, not one name checked twice."""
 
@@ -453,3 +449,7 @@ class IdentityPinnedWriteTests(unittest.TestCase):
         fresh = self.root / "new.json"
         wpv.atomic_private_write(fresh, b"x", secure=self.secure, root=self.root)
         self.assertEqual(fresh.read_bytes(), b"x")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -496,10 +496,6 @@ class ExitCodeTests(SetupTestCase):
                               ws.EXIT_CONSENT_REQUIRED, ws.EXIT_USAGE}), 5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class OnboardingPointsAtTheCommandTests(SetupTestCase):
     """A status report that names no action leaves the reader stuck."""
 
@@ -630,3 +626,7 @@ class RunbookTests(unittest.TestCase):
 
         self.assertEqual(wr.RELEASE_TRUST_ANCHORS, ())
         self.assertIn("manifest_untrusted:no_release_anchor", self.text)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -521,10 +521,6 @@ class HonestyTests(unittest.TestCase):
         self.assertIn("provider lane", dr.DRIVER_LIMITATION)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class _WindowsLike:
     """A platform stub that reports the real mode rather than always yes.
 
@@ -833,3 +829,7 @@ class ResumeMachineTests(DriverTestCase):
         result = dr.finish_resume(context)
         self.assertEqual(result["status"], dr.STEP_FAILED)
         self.assertEqual(result["reason"], "resume_task_not_removed")
+
+
+if __name__ == "__main__":
+    unittest.main()

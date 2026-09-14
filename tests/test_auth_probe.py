@@ -222,10 +222,6 @@ class NoOutputEscapesTests(unittest.TestCase):
         self.assertNotIn("stderr=stderr", body)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class _FakeCapsule:
     """The real capsule's interface over an ordinary directory.
 
@@ -484,3 +480,7 @@ class ProbeLifecycleTests(unittest.TestCase):
                 lambda *a: (_ for _ in ()).throw(OSError("boom")),
                 self._tools(), time.monotonic())
         self.assertTrue(captured["capsule"].exited)
+
+
+if __name__ == "__main__":
+    unittest.main()

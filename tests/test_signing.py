@@ -138,10 +138,6 @@ class RoundTripTests(unittest.TestCase):
         self.assertFalse(signing.verify(message, signature, other))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 #: The eight encodings of points whose order divides the cofactor, from the
 #: published "Taming the many EdDSAs" test set. Written out as literals rather
 #: than computed, so this test disagrees with the module if the module's own
@@ -245,3 +241,7 @@ class CoverageHonestyTests(unittest.TestCase):
 
     def test_the_guarantee_mentions_the_small_order_rejection(self):
         self.assertIn("small-order", signing.SIGNATURE_GUARANTEE)
+
+
+if __name__ == "__main__":
+    unittest.main()

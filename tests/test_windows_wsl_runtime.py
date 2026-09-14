@@ -1710,10 +1710,6 @@ class DocumentedLimitationTests(unittest.TestCase):
             "narrows the window; it does not\n  close it", wr.__doc__)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RegistrationProofTests(unittest.TestCase):
     """A distro name is not a capability.
 
@@ -2027,3 +2023,7 @@ class ReceiptOrderingTests(unittest.TestCase):
         self.assertEqual(result.status, wr.STATUS_ABORTED)
         self.assertEqual(result.reason, wr.REASON_RECEIPT_WRITE_FAILED)
         self.assertEqual(result.detail, "OSError")
+
+
+if __name__ == "__main__":
+    unittest.main()
