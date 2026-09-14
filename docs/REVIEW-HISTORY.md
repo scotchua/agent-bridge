@@ -681,3 +681,150 @@ step still refuses by design. The hardened verifier is stronger than the
 library alternative that was measured against it, and it is still not an
 audited implementation, which is stated in the module rather than left to be
 inferred.
+
+## The consolidation round
+
+A round with no external reviewer. The work was to make the change reviewable,
+close the gaps that could be closed without a Windows machine, and be exact
+about the ones that cannot be.
+
+### Public main's platform refusal, kept and made true
+
+Public main `4287429` refuses automatic delegation on any platform but macOS.
+This branch is the Windows lane, so the obvious integration was to delete the
+refusal to make room for the work. That would have been weakening a trust
+check to accommodate a feature, which is the move this project keeps refusing
+elsewhere.
+
+The refusal stayed. What changed is what it is derived from: no longer a
+hard-coded platform name, but whether this machine carries a boundary
+verification record. Today no machine can carry one, so the observable
+behaviour is identical to public main, refused everywhere but macOS. The
+difference is that the gate now states a fact about the machine, and opens
+when the lane is genuinely proven rather than when somebody edits a constant.
+
+The gate reads the durable record and spawns nothing. An earlier draft routed
+it through the preflight sweep, which meant onboarding ran a subprocess ladder
+in order to decide whether to ask a question.
+
+`tests/test_public_hotfix.py` is public main's own regression file, copied
+unmodified. It passes against this tree, which is the evidence that the
+integration preserved the fixes rather than the claim that it did.
+
+### One definition of success, and a test that keeps it that way
+
+`outcome_is_success` existed and most paths called it. `delegation._direction_status`
+did not: it judged a direction by `returncode == 0`, which is a fact about a
+process, and the evidence row it read carried no harness verdict at all. So a
+supplied `--delegation-results` file could enable a direction on the strength
+of a zero exit, and no audit of that file could have caught it, because the
+information needed to catch it was not in the file.
+
+The row now carries `harness_ok`, `harness_status` and `harness_verdict` end
+to end, the gate calls the one function, and `VERIFICATION_PROFILE` is
+`automatic-delegation-v2` so evidence written under the weaker rule is refused
+by name rather than graded against a rule it was never produced under.
+
+`tests/test_success_gate_unity.py` asserts the property rather than the
+instances: it reads the source of every execution module and requires that
+only `outcome_is_success` compares an outcome's exit code to zero. One
+exemption is listed by name with its reason, because an unexplained exemption
+is how a re-derived rule gets back in.
+
+### Three Windows paths that are not the file they spell
+
+Found by writing the tests, not by review. `_validate_windows_host_path`
+accepted all three:
+
+* `C:\agent-bridge\NUL`, and the same for every DOS device name, in any
+  directory, with or without an extension. Win32 resolves it as a device. A
+  record written there is accepted and gone, which makes an unwritten record
+  indistinguishable from a written one.
+* `C:\agent-bridge\record.json:hidden`, an alternate data stream. Writing one
+  leaves the visible file untouched, and a hash or an ACL taken on the base
+  name describes something else.
+* `C:\agent-bridge\record.json ` with a trailing space, or a trailing dot.
+  Win32 strips both, so two strings that compare unequal are one file. Every
+  identity check in this project is a string comparison somewhere.
+
+All three are refused now, and the over-refusal was checked too: `NULL`,
+`CONFIG`, `COM10` and `console` are ordinary names and still pass, because a
+check people work around is not a check.
+
+### Offline fixtures for a lane that had only been mocked
+
+The guest provider lane was tested through a seam that returns a hand-written
+`(returncode, stdout, stderr)` triple. That is the right way to test the
+decisions and it is not a test of the lane: the triple never came from a
+process, so the real subprocess path, the Codex answer file, and the child
+environment were all outside it.
+
+`tests/fakes/fake_guest_claude.py` and `fake_guest_codex.py` are provider CLIs
+that really run, emitting the shapes each provider actually produces. The lane
+now runs end to end against them with no runner seam at all. The mode is
+passed on argv rather than in the environment, because the guest runner
+rebuilds the child environment from a fixed allowlist and would have stripped
+it, which would have left every test silently running the default.
+
+The fixture that matters most is the Codex mode that writes no answer file
+while the sentinel is still in the stream. A stdout-scraping probe passes
+there. This one must not, and now there is a test that says so.
+
+### A validation runner that cannot flatter a machine
+
+`agent-bridge-windows-setup validate` runs a fixed, ordered suite and prints
+one JSON object. The verdict is computed from the suite rather than from the
+rows, so a report missing a row entirely is not ready either. Timings and
+timestamps live in a separate envelope the verdict is not computed from, so
+two runs on an unchanged machine produce byte-identical checks and a diff of
+two reports is a diff of what changed about the machine.
+
+Three ways a suite like this stops being trustworthy are closed by
+construction. A check with no runner is `blocked`, never skipped silently. A
+check that raises or returns the wrong shape is a failure, and the exception
+text is discarded rather than carried into a report people paste into issues.
+And `blocked` and `skipped` are not passes, so a report full of skips cannot
+be mistaken for a machine that worked.
+
+It writes nothing. The durable record stays with `windows_evidence`, which
+refuses to be written anywhere but on Windows and binds itself to the machine
+and the artefacts. A green report is something a person reads; keeping the two
+apart is what stops a green report from enabling delegation on its own.
+
+### A signed image fixture, and a signing procedure with no key in it
+
+Every link of the image trust chain had a test. The chain did not.
+`tools/make_test_image.py` builds a complete one offline in about a second:
+rootfs tarball, manifest, canonical bytes, digest, signature, anchor, verified
+through the project's own verifier. Two builds are byte-identical, and
+`--check` proves that rather than asserting it.
+
+Its key is derived from a constant published in that file, and is therefore
+worthless. That is the only safe way to ship a signed fixture: one signed by a
+key that had to stay secret would either commit the secret or stop working.
+The release tool refuses that key by name, and a test asserts it never appears
+among the shipped anchors.
+
+`tools/release_signing.py` never reads, writes, derives or accepts a private
+key. The shipped package cannot sign at all. The tool emits the exact
+canonical bytes to sign, the signature is produced elsewhere by whoever holds
+the key, and the tool verifies it before printing an anchor. It refuses a file
+that is a key by name or by content, and its `scan` subcommand checks the
+whole working tree and runs in CI.
+
+### What is still not true, after this round
+
+No step of this has run on Windows. No image has been imported, no canary has
+run in a real guest, no provider lane has been observed against a real
+subscription, and no release has been signed, so `RELEASE_TRUST_ANCHORS` is
+still empty and the image step still refuses by design.
+
+The validation runner has never produced a `ready` verdict, and cannot, on any
+machine in this project's reach. Its `platform` check fails first everywhere
+else, by design.
+
+The Windows path, locking, line-ending and process tests assert real Win32
+semantics, and three of them are skipped off Windows because they need the
+real namespace to say anything. The rest are pure and run on every runner,
+which is the point: a Windows-only test that runs on one runner is a test that
+stops being read.

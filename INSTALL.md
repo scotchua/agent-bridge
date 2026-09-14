@@ -84,6 +84,19 @@ you after a restart. Consents are separate flags and none of them survives a
 reboot: a resumed stage that needs one waits for you. It has not been run on a
 live Windows host.
 
+`validate` reads the machine and prints one JSON report, writing nothing:
+
+```text
+bin\agent-bridge-windows-setup validate --report validation.json
+```
+
+Every check is named, says what it proves and what it does not, and a check
+that could not run is reported as blocked rather than skipped, so the verdict
+is `ready` only when all of them passed. Two runs on an unchanged machine
+produce the same checks, so you can diff one against the last. Attach the
+report when you tell somebody the lane works; it is the only form of that
+claim anybody can check.
+
 Delegation on Windows does not run Claude Code or Codex jobs yet. The mechanism
 is there: the guest is handed a memory-only session capsule for the job's
 lifetime, never an API key and never a copy of your credential store. What has

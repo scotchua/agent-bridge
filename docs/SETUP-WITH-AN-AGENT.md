@@ -48,6 +48,12 @@ The ladder is walked by `bin\agent-bridge-windows-setup` (equivalently
 consent flag rather than passing them together, and do not carry a consent
 across a reboot: the command will not, and neither should you.
 
+When the ladder reports ready, run `validate --report <path>` and show the user
+the report rather than summarising it. It writes nothing and needs no consent.
+Do not describe the lane as working on the strength of a `plan` that looks
+finished: the report is what says so, and a check it could not run is reported
+as blocked, which is not a pass.
+
 ### 2. Ask the user, do not guess
 
 Bundle these choices into a short conversation. The questionnaire is also

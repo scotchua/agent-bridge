@@ -630,9 +630,10 @@ bin\agent-bridge-windows-setup status
 Equivalently `python setup_bridge.py windows-setup <subcommand>`, or
 `python -m agent_bridge.windows_setup`.
 
-Four subcommands. `plan` is read-only. `step` does the single next thing.
+Five subcommands. `plan` is read-only. `step` does the single next thing.
 `status` shows the resume record and the logon task. `resume` is what the logon
-task runs after a restart. Exit codes are the step vocabulary, so a wrapper
+task runs after a restart. `validate` runs the deterministic check suite below
+and prints a report. Exit codes are the step vocabulary, so a wrapper
 branches without parsing: 0 ok, 1 failed, 2 blocked, 3 a consent is required, 4
 bad arguments. One JSON object on stdout per invocation.
 
@@ -682,6 +683,61 @@ reboot-required registering the ownership-proven task, the resume continuing at
 the recorded stage, both terminal paths retiring the record and the task, the
 refusal when there is no way back, the refusal when the task is not ours, and
 the orphaned-task report. What it does not do is run on Windows.
+
+## The validation report
+
+`validate` exists because "it works on my machine" is not a form of evidence
+anybody else can act on, and a screenshot is not either. It runs a fixed,
+ordered list of named checks and prints one JSON object.
+
+```
+bin\agent-bridge-windows-setup validate --report validation.json
+```
+
+What makes it deterministic, and why each part is required:
+
+* **Fixed order, no parallelism.** The checks are a tuple, run front to back. A
+  check whose prerequisite failed is reported `blocked` rather than run, so a
+  cascade produces one failure and a list of things that were never attempted,
+  instead of twelve failures that all say the same thing.
+* **No wall clock in the verdict.** Timings and the timestamp live in a
+  separate `envelope` key that the verdict is not computed from, so two runs on
+  an unchanged machine produce byte-identical `checks` and a diff of two
+  reports is a diff of what changed about the machine.
+* **A closed vocabulary.** `pass`, `fail`, `blocked`, `skipped`, and nothing
+  else. A check that returns an unknown status, returns the wrong shape, or
+  raises is a `fail` naming the check. Treating a misbehaving check as a pass
+  would be the worst failure this command has.
+* **`blocked` and `skipped` are not passes.** The verdict is `ready` only when
+  every check in the suite passed, computed from the suite rather than from the
+  rows, so a report that is missing a row entirely is not ready either. A suite
+  that only listed the checks somebody had got around to writing would call a
+  half-validated machine ready.
+* **Bounded facts only.** A check may attach numbers, booleans and short
+  tokens. A path, a username or a line of command output is refused rather than
+  serialised, because "just this once" is how a host path ends up in a report
+  somebody pastes into an issue. An exception's text is discarded entirely.
+
+Every row carries `proves` and `does_not_prove`, so a person reading a green
+run sees, next to each pass, the thing that pass does not establish. The report
+also carries a `not_proven` list about itself: a subscription session surviving
+the boundary, unreachability of the network (the egress check samples
+destinations and reads the ruleset back, which is a different claim), and
+anything about the image's contents beyond it being the reviewed one.
+
+The four guest-side checks are four readings of **one** ephemeral job, not four
+jobs. Four instances would be four imports and four teardowns, and their four
+answers could disagree with each other.
+
+`validate` writes nothing to the machine. The durable record stays with
+`windows_evidence`, which refuses to be written anywhere but on Windows and
+binds itself to the host and the artefacts. A report is something a person
+reads and attaches; keeping the two apart is what stops a green report from
+enabling delegation on its own.
+
+Nothing in this suite has produced a `ready` verdict anywhere, and it cannot on
+any machine in this project's reach: the `platform` check fails first
+everywhere but Windows, by design.
 
 ## Evidence, not assumption
 
