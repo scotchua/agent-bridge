@@ -107,33 +107,19 @@ def version_of(path: str) -> str:
 
 def claude_signed_in(path: str) -> bool | None:
     """True, False, or None when the CLI does not report it."""
-    try:
-        proc = subprocess.run([path, "auth", "status"], capture_output=True,
-                              timeout=30, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    try:
-        return bool(json.loads(proc.stdout.decode("utf-8", "replace")).get("loggedIn"))
-    except (ValueError, AttributeError):
-        return None
+    from .health import auth_status
+    from .runner import scrubbed_env
+    state = auth_status("claude", path, scrubbed_env())["state"]
+    return {"signed_in": True, "not_signed_in": False}.get(state)
 
 
 def codex_signed_in(path: str, codex_home: str) -> bool | None:
-    """Whether the ISOLATED codex home has credentials. Not the default one."""
-    auth = os.path.join(os.path.expanduser(codex_home), "auth.json")
-    if os.path.isfile(auth):
-        return True
-    try:
-        proc = subprocess.run([path, "login", "status"], capture_output=True,
-                              timeout=30, check=False,
-                              env={**os.environ, "CODEX_HOME":
-                                   os.path.expanduser(codex_home)}, shell=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    text = (proc.stdout + proc.stderr).decode("utf-8", "replace").lower()
-    if "not logged in" in text or "no credentials" in text:
-        return False
-    return True if proc.returncode == 0 else None
+    """CLI-reported login visibility in the isolated home; not token validity."""
+    from .health import auth_status
+    from .runner import scrubbed_env
+    state = auth_status("codex", path, scrubbed_env(
+        {"CODEX_HOME": os.path.expanduser(codex_home)}))["state"]
+    return {"signed_in": True, "not_signed_in": False}.get(state)
 
 
 def write_candidate(path: str, proposed_overlay: dict[str, Any],
@@ -405,11 +391,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {path}{durability}")
             print(f"      version: {version or 'unknown'}   ({flag})")
 
-        # Prefer a signed-in install. Discovery alone can pick a second copy
-        # that has never been logged in, which then fails on every call.
-        # Prefer signed in, then durable. Discovery alone can pick a second
-        # copy that has never been logged in, or a temp-directory shim that
-        # will be cleaned out from under the pin.
+        # Prefer reported credential visibility, then a durable path. Multiple
+        # installs may share credentials; this is not an independent login
+        # per executable. Neither status nor file presence proves refresh works.
         def rank(row: tuple[str, str, bool | None]) -> tuple[int, int]:
             signed_rank = {True: 0, None: 1, False: 2}[row[2]]
             return (signed_rank, 0 if is_durable(row[0]) else 1)

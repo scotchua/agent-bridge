@@ -102,6 +102,13 @@ def main() -> int:
         return emit(base(session_id, "Failed to authenticate: OAuth session expired "
                                      "and could not be refreshed",
                          is_error=True, terminal="api_error"), 1)
+    if mode == "structured_output_exhausted":
+        envelope = base(session_id, None, is_error=True,
+                        terminal="structured_output_retry_exhausted")
+        envelope.pop("result")
+        envelope.update(subtype="error_max_structured_output_retries", num_turns=6,
+                        errors=["Failed to provide valid structured output after 5 attempts"])
+        return emit(envelope, 1)
     if mode == "nonzero":
         sys.stderr.write("fake claude exploded\n")
         return 3

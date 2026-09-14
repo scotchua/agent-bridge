@@ -1,0 +1,13 @@
+{
+  "config_version": "1",
+  "state_root": "/absolute/path/to/orchestration-state",
+  "local_queue_root": "/absolute/path/to/orchestration-state/local-queue",
+  "capacity_db": "/absolute/path/to/orchestration-state/capacity.sqlite3",
+  "worker_executable": "/absolute/path/to/private-local-worker",
+  "worker_state": "/absolute/path/to/private-local-worker-state",
+  "execution_queue_root": "/absolute/path/to/orchestration-state/execution-queue",
+  "codex_task_executable": "/absolute/path/to/codex_task.py",
+  "claude_task_executable": "/absolute/path/to/claude_task.py",
+  "python_executable": "/absolute/path/to/python3",
+  "interval_seconds": 5.0
+}

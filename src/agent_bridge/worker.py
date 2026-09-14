@@ -298,6 +298,8 @@ def execute(job_dir: str) -> int:
         ),
         "peer_session_id": peer_session_id_final,
         "peer_executable": peer_info.get("executable"),
+        "peer_executable_realpath": peer_info.get("realpath"),
+        "peer_auth_failure_reason": (final.notes.get("auth_failure_reason") if final else None),
         "peer_observed_version": peer_info.get("observed_version"),
         "peer_requested_model": cfg.peer(peer).get("model"),
         # Recorded whether set or not. A null here means "the CLI's own
@@ -362,8 +364,15 @@ def execute(job_dir: str) -> int:
         retired = registry.retire_attempt_markers(cfg, job_id)
         if retired:
             runner.pause_after_marker_transition(cfg.peer_extra_env(peer), "committed")
+    # Existing MCP processes cache their error enum. Keep a category they
+    # understand on disk; newer readers promote only this closed diagnostic.
+    # Retry policy and provenance retain the specific deterministic category.
+    compatible_category = (ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID
+                            if category is ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED
+                            else category)
     registry.write_status(
-        cfg, job_id, status, error_category=category.value,
+        cfg, job_id, status, error_category=compatible_category.value,
+        diagnostic_category=(category.value if compatible_category is not category else None),
         retries_exhausted=retries_exhausted,
         finished_at=finished_at, attempts=len(attempts_log),
         conversation_id=conversation_id, peer=peer, caller=caller,

@@ -35,34 +35,35 @@ class PeerOutcome:
     notes: dict[str, Any] = field(default_factory=dict)
 
 
-#: Substrings that identify an authentication failure.  Matching is not
-#: echoing: the matched text never reaches a caller-visible field.
-AUTH_MARKERS = (
-    "failed to authenticate",
-    "oauth session expired",
-    "not logged in",
-    "please run `claude login`",
-    "please run claude login",
-    "401 unauthorized",
-    "missing bearer",
-    "invalid api key",
-    "unauthorized",
-    "no credentials",
-    "run `codex login`",
-    "codex login",
+# Match only diagnostics from failed CLI runs, never successful model prose.
+# Reasons are closed identifiers: raw peer text must not escape quarantine.
+AUTH_REASONS = (
+    ("oauth_refresh_failed", ("oauth session expired and could not be refreshed",
+                              "oauth access token could not be refreshed")),
+    ("oauth_refresh_rejected", ("oauth refresh token is no longer valid",
+                                "refresh_token_reused", "refresh_token_expired",
+                                "refresh_token_invalidated")),
+    ("not_logged_in", ("not logged in", "no credentials")),
+    ("http_401", ("401 unauthorized", "401: unauthorized", "status code 401")),
+    ("credential_rejected", ("failed to authenticate", "oauth session expired",
+                             "missing bearer", "invalid api key")),
+    ("login_required", ("please run `claude login`", "please run claude login",
+                        "please run /login", "please run `codex login`",
+                        "please run codex login")),
 )
 
 
+def auth_failure_reason(*blobs: bytes | str | None) -> str | None:
+    texts = [(b.decode("utf-8", "replace") if isinstance(b, bytes) else b).lower()
+             for b in blobs if isinstance(b, (bytes, str)) and b]
+    for reason, markers in AUTH_REASONS:
+        if any(marker in text for text in texts for marker in markers):
+            return reason
+    return None
+
+
 def looks_like_auth_failure(*blobs: bytes | str | None) -> bool:
-    for blob in blobs:
-        if not blob:
-            continue
-        text = blob.decode("utf-8", "replace") if isinstance(blob, bytes) else blob
-        lowered = text.lower()
-        for marker in AUTH_MARKERS:
-            if marker in lowered:
-                return True
-    return False
+    return auth_failure_reason(*blobs) is not None
 
 
 def strip_fences(text: str) -> str:

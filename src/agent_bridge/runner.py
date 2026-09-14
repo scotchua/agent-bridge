@@ -257,3 +257,10 @@ def scrubbed_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def credential_context(env: dict[str, str]) -> dict[str, str]:
+    """Non-secret identity/store selectors only; never tokens or full env."""
+    return {k: env[k] for k in ("HOME", "USER", "LOGNAME", "CODEX_HOME",
+                                "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+            if k in env}

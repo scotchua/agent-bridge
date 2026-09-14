@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-bridge.execution-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/agent-bridge/bin/agent-bridge-execution-worker</string>
+    <string>--config</string>
+    <string>/ABSOLUTE/PRIVATE/PATH/orchestration.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_BRIDGE_PYTHON</key>
+    <string>/ABSOLUTE/PATH/TO/APPROVED/python3</string>
+    <key>USER</key>
+    <string>ACCOUNT_SHORT_NAME</string>
+    <key>LOGNAME</key>
+    <string>ACCOUNT_SHORT_NAME</string>
+    <key>PATH</key>
+    <string>/ABSOLUTE/PATH/TO/CLAUDE/BIN:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PRIVATE/PATH/execution-worker.stdout.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PRIVATE/PATH/execution-worker.stderr.log</string>
+  <key>Umask</key><integer>63</integer>
+</dict>
+</plist>

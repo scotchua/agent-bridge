@@ -26,7 +26,7 @@ from typing import Any
 from .. import runner
 from ..config import Config
 from ..errors import ErrorCategory
-from .base import PeerOutcome, looks_like_auth_failure, parse_single_object
+from .base import PeerOutcome, auth_failure_reason, parse_single_object
 
 PEER = "claude"
 
@@ -124,6 +124,7 @@ def run_consultation(
         group_kill=result.group_kill,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
+        notes={"credential_context": runner.credential_context(env)},
     )
 
     if result.spawn_failed:
@@ -149,7 +150,9 @@ def run_consultation(
     try:
         envelope = json.loads(result.stdout.decode("utf-8", "replace"))
     except ValueError:
-        if looks_like_auth_failure(result.stdout, result.stderr):
+        reason = auth_failure_reason(result.stdout, result.stderr) if result.returncode not in (0, None) else None
+        if reason:
+            outcome.notes.update(auth_failure_reason=reason, auth_failure_source="failed_process_output")
             outcome.category = ErrorCategory.PEER_AUTH_FAILURE
         elif result.returncode not in (0, None):
             outcome.category = ErrorCategory.PEER_NONZERO_EXIT
@@ -185,6 +188,7 @@ def run_consultation(
         )
     requested_model = spec.get("model")
     outcome.notes = {
+        **outcome.notes,
         "descendant_held_pipes": result.descendant_held_pipes,
         # Absence of these has been observed intermittently on 2.1.241, and not
         # together. Recording presence separately turns a null in the ledger
@@ -218,8 +222,15 @@ def run_consultation(
     # `is_error` is authoritative. `subtype` says "success" even on failure.
     if envelope.get("is_error") is True:
         blob = envelope.get("result") if isinstance(envelope.get("result"), str) else ""
-        if looks_like_auth_failure(blob, result.stderr):
+        reason = auth_failure_reason(blob, result.stderr)
+        if reason:
+            outcome.notes.update(auth_failure_reason=reason, auth_failure_source="error_envelope")
             outcome.category = ErrorCategory.PEER_AUTH_FAILURE
+        elif (envelope.get("subtype") == "error_max_structured_output_retries"
+              or envelope.get("terminal_reason") == "structured_output_retry_exhausted"):
+            # The CLI already made its own corrective attempts. An identical
+            # outer retry hides the real failure and repeats that entire loop.
+            outcome.category = ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED
         else:
             outcome.category = ErrorCategory.PEER_NONZERO_EXIT
         return outcome
@@ -229,11 +240,10 @@ def run_consultation(
     # nonzero status, so accepting the payload here would make a failed run
     # caller-visible as a completed consultation.
     if result.returncode not in (0, None):
-        outcome.category = (
-            ErrorCategory.PEER_AUTH_FAILURE
-            if looks_like_auth_failure(result.stderr)
-            else ErrorCategory.PEER_NONZERO_EXIT
-        )
+        reason = auth_failure_reason(result.stderr)
+        if reason:
+            outcome.notes.update(auth_failure_reason=reason, auth_failure_source="failed_process_stderr")
+        outcome.category = ErrorCategory.PEER_AUTH_FAILURE if reason else ErrorCategory.PEER_NONZERO_EXIT
         return outcome
 
     if session_migrated:

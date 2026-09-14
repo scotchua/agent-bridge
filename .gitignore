@@ -4,6 +4,8 @@ __pycache__/
 canaries/.timeout-*.json
 .DS_Store
 config/local.json
+config/com.agent-bridge.execution-worker.plist
+.release-review/
 
 # Live relay state: state.json, locks, auth-repair working dirs. Mode 0600,
 # machine-local, and never meant to be shared. Untracked was not enough: one

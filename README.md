@@ -11,6 +11,9 @@ Connect Claude and Codex so you can say **“ask the other assistant”** withou
 copying messages between them. Either assistant can coordinate the work, ask
 its teammate for help, and bring the answer back into your conversation.
 An optional existing local Ollama model can handle routine text tasks.
+An advanced, separately configured orchestration server can also assign durable
+work stages and dispatch bounded implementation jobs between the two provider
+CLIs without automatically applying their patches.
 
 The bridge runs on your computer. Claude and Codex consultations still go to
 their providers through your own accounts.
@@ -83,6 +86,7 @@ portable guided commands, see [SETUP-WITH-AN-AGENT.md](docs/SETUP-WITH-AN-AGENT.
 | Shared instructions | A generated collaboration and model-effort policy, with managed pointers for the selected Codex and Claude Code installations. |
 | Privacy choices | Baseline, strict, or custom eligibility rules for each receiving peer. |
 | Optional local worker | Bounded summarization, extraction, classification, checklists and log triage through an existing Ollama model. |
+| Advanced orchestration | Durable stage ownership, time-bounded capacity observations, automatic local routing for eligible mechanical work, and bounded cross-provider implementation jobs. |
 | Exchange records | Prompts, replies, job status and available model/version/effort provenance. |
 | Guided installation and removal | Staged settings, verification, backups, conflict checks and an uninstall preview. |
 
@@ -138,6 +142,31 @@ that cloud assistant's conversation. The worker checks for supported local
 model metadata and rejects recognized cloud routes, but it is not a network
 sandbox around an arbitrary Ollama server.
 
+## Advanced orchestration
+
+The repository includes an additive orchestration MCP server for users who want
+more than consultation. It can:
+
+- route eligible non-client mechanical text to the local worker without a cloud
+  fallback;
+- register and claim durable work stages so only one assistant owns a stage;
+- use fresh, time-limited capacity observations when selecting an allowed
+  route; and
+- queue a bounded implementation job for the other provider's subscription
+  CLI.
+
+Cross-provider implementation runs in disposable Git worktrees and returns an
+unapplied patch. It never grants permission to apply, commit, push or merge.
+On macOS, a separate per-user execution worker runs outside the desktop-app MCP
+sandboxes so the provider CLIs can use their existing subscription logins. A
+crash after a possible provider send blocks the job for reconciliation instead
+of silently sending it again.
+
+This advanced path is currently configured manually and is not installed by the
+guided onboarding flow. See [Orchestration and local-worker MCP](docs/orchestration-mcp.md).
+The execution worker has been live-tested on macOS; continuous service setup for
+Linux and Windows has not yet been verified.
+
 ## What it will not do
 
 - **Synchronize all your chats or give either assistant the other's memory.**
@@ -148,9 +177,10 @@ sandbox around an arbitrary Ollama server.
 - **Automatically grant equal permissions in every app.** Accounts, host tools
   and platform permissions remain separate. Setup reproduces the supported
   connection and shared guidance, not the author's entire environment.
-- **Guarantee lower subscription usage or automatically balance allowances.**
-  Consultations and live checks use capacity too. The author's separate capacity
-  collectors and workload-routing integrations are not included in this setup.
+- **Guarantee lower subscription usage or discover subscription allowances.**
+  Consultations and live checks use capacity too. Advanced orchestration can use
+  fresh observations supplied by an authorized source, but it does not scrape,
+  infer or promise provider quotas.
 - **Make agreement proof of correctness.** Peer replies are evidence to assess,
   not instructions to obey or an automatic approval to publish.
 
@@ -177,6 +207,10 @@ sandbox around an arbitrary Ollama server.
 - **Offline CI is not a live installation test.** It uses stand-in provider
   programs. Your accounts, login, selected models and optional Ollama service
   still need verification on your computer.
+- **Advanced orchestration is not yet a portable service installer.** Its core
+  queue and routing logic is tested offline, while the persistent execution
+  worker and subscription-backed implementation lane are currently verified on
+  macOS only.
 
 ## Checking it yourself
 
@@ -218,9 +252,11 @@ configuration are retained separately.
 | `AGENTS.md` / `CLAUDE.md` | Entry point for an assistant working with this repo. |
 | `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
 | `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
+| `docs/orchestration-mcp.md` | Manual advanced orchestration, local routing and external execution-worker setup. |
 | `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
 | `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
 | `src/agent_bridge/` | Broker, MCP servers, onboarding and local worker. |
+| `src/agent_bridge/orchestration/` | Durable stage routing and cross-provider execution queue. |
 | `config/broker.json` | Machine-neutral defaults. |
 | `tests/` | Offline tests, including onboarding and local-worker coverage. |
 | `canaries/run_canaries.py` | Live checks required before activation. |
@@ -242,3 +278,14 @@ public issue.
 ## Licence
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+
+## Connectivity and login health
+
+Run `bin/agent-bridge-admin health` for both pinned executables, version drift,
+credential context and local login visibility (`--json` for a timestamped report).
+It does not log in, change pins, read credential contents or send inference.
+A local signed-in result does not test network connectivity or token refresh.
+On macOS, repeat a negative restricted-shell check in normal Terminal with
+Keychain access before replacing login. See the [health runbook](docs/bridge-health.md)
+and [September 6 investigation](docs/audits/connectivity-investigation-2026-09-06.md).

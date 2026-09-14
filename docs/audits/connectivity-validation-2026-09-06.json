@@ -1,0 +1,51 @@
+{
+  "date": "2026-09-06",
+  "targeted_tests": {
+    "passed": 14,
+    "failed": 0
+  },
+  "offline_restricted": {
+    "passed": 520,
+    "failed": 0,
+    "skipped": 5
+  },
+  "offline_host": {
+    "passed": 538,
+    "failed": 0,
+    "skipped": 0
+  },
+  "effective_config_sha256": "4f3ffa9b26989a6abdd817081deac3cce449731ea98cfd2e6e2225a1b7a1bc6f",
+  "pins_changed": false,
+  "login_performed": false,
+  "live_jobs": [
+    "9532e721-7f37-4e04-a772-cb2d0a3c6e10",
+    "ab5dcebd-ed58-402e-9383-c90b44c64238",
+    "d0448e08-66ca-4c09-a8d1-46ebe25eeac3",
+    "99993dfd-d820-42f2-aadd-cba8d2a89a36"
+  ],
+  "limits": [
+    "Live tests did not cross token expiry or force refresh.",
+    "Reverse test used real stdio MCP, not Claude Desktop UI.",
+    "Full suite preceded final auth-status isolation flags; targeted tests and normal-context health verified those flags afterward."
+  ],
+  "review_failure_followup": {
+    "jobs_inspected": [
+      "330fd2a8-b37f-4e87-abf9-cbbc2f8ca850",
+      "4791da17-eb5b-4dc9-8849-c900c83b831f"
+    ],
+    "targeted_tests": {
+      "passed": 17,
+      "failed": 0
+    },
+    "final_offline_host": {
+      "passed": 538,
+      "failed": 0,
+      "skipped": 0
+    },
+    "new_live_calls": 0,
+    "configuration_changed": false,
+    "historical_job_records_rewritten": false,
+    "independent_review_completed": false,
+    "change": "Classify CLI structured-output retry exhaustion, suppress identical bridge retry, preserve quarantine and compatibility with existing MCP readers."
+  }
+}

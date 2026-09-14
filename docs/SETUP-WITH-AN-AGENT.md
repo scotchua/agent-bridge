@@ -180,3 +180,18 @@ The author's separate capacity collectors, opaque local-asset pilot, certified
 legacy summarizer, accounting connectors and account-specific approvals are not
 silently installed by this connection setup. They are separate workflows, not
 prerequisites for Claude and Codex to talk through the bridge.
+
+## Optional advanced orchestration
+
+The repository also contains an additive orchestration MCP server that is not
+installed by the guided onboarding commands above. It provides durable stage
+ownership, time-bounded capacity routing, automatic local admission for eligible
+mechanical text, and a queue for bounded implementation work on the opposite
+provider. Returned patches are never applied automatically.
+
+Use [orchestration-mcp.md](orchestration-mcp.md) only when the user explicitly
+wants this advanced path. Keep its configuration and state outside the checkout.
+On macOS, install its separate per-user execution worker so provider calls do
+not inherit a desktop app's MCP sandbox. Do not claim continuous Linux or
+Windows execution-worker service support until it has been independently
+tested there.

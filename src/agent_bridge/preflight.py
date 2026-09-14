@@ -91,6 +91,7 @@ def check_peer(cfg: Config, peer: str) -> dict[str, Any]:
     return {
         "executable": executable,
         "observed_version": version,
+        "realpath": os.path.realpath(executable),
         "allowed_versions": allowed,
         "version_pinned": bool(allowed),
     }

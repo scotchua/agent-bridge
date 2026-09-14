@@ -31,7 +31,7 @@ from typing import Any
 from .. import preflight, runner, store
 from ..config import Config
 from ..errors import ErrorCategory
-from .base import PeerOutcome, looks_like_auth_failure, parse_single_object
+from .base import PeerOutcome, auth_failure_reason, parse_single_object
 
 PEER = "codex"
 
@@ -123,8 +123,10 @@ def parse_events(
                     all_ids.append(candidate)
                 if not thread_id:
                     thread_id = candidate
-        elif etype == "error":
-            message = event.get("message")
+        elif etype in ("error", "turn.failed"):
+            failure = event.get("error")
+            message = (failure.get("message") if etype == "turn.failed" and isinstance(failure, dict)
+                       else event.get("message"))
             if isinstance(message, str):
                 errors.append(message)
     return thread_id, errors, events, all_ids
@@ -176,6 +178,7 @@ def run_consultation(
         group_kill=result.group_kill,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
+        notes={"credential_context": runner.credential_context(env)},
     )
 
     if result.spawn_failed:
@@ -191,6 +194,7 @@ def run_consultation(
     ambiguous = len(observed_ids) > 1
     outcome.peer_session_id = thread_id if thread_id else parsed_thread_id
     outcome.notes = {
+        **outcome.notes,
         "descendant_held_pipes": result.descendant_held_pipes,
         "requested_reasoning_effort": cfg.peer_reasoning_effort(PEER),
         "peer_home": home_inventory,
@@ -230,11 +234,15 @@ def run_consultation(
     if result.descendant_held_pipes:
         outcome.category = ErrorCategory.PEER_OUTPUT_INCOMPLETE
         return outcome
-    if looks_like_auth_failure(result.stderr, " ".join(error_messages)):
-        outcome.category = ErrorCategory.PEER_AUTH_FAILURE
-        return outcome
-    if result.returncode not in (0, None):
-        outcome.category = ErrorCategory.PEER_NONZERO_EXIT
+    # Recoverable error events may precede a successful turn. Successful
+    # output must not become an auth failure because stderr mentions login.
+    failed = result.returncode not in (0, None) or any(
+        e.get("type") == "turn.failed" for e in events)
+    if failed:
+        reason = auth_failure_reason(result.stderr, *error_messages)
+        if reason:
+            outcome.notes.update(auth_failure_reason=reason, auth_failure_source="failed_process_diagnostics")
+        outcome.category = ErrorCategory.PEER_AUTH_FAILURE if reason else ErrorCategory.PEER_NONZERO_EXIT
         return outcome
     # Migration is checked last of the failure modes: it is a statement about a
     # run that otherwise completed, so a timeout or a kill takes precedence.

@@ -46,6 +46,7 @@ class ErrorCategory(str, enum.Enum):
     # code plus schema metadata.
     PEER_OUTPUT_MALFORMED = "peer_output_malformed"
     PEER_OUTPUT_SCHEMA_INVALID = "peer_output_schema_invalid"
+    PEER_STRUCTURED_OUTPUT_EXHAUSTED = "peer_structured_output_exhausted"
     PEER_OUTPUT_TOO_LARGE = "peer_output_too_large"
     PEER_OUTPUT_INCOMPLETE = "peer_output_incomplete"
     PEER_SESSION_ID_MISSING = "peer_session_id_missing"
@@ -89,6 +90,7 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.STATE_ROOT_INSECURE,
     ErrorCategory.PEER_HOME_CONFIG_PRESENT,
     ErrorCategory.PEER_AUTH_FAILURE,
+    ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED,
     ErrorCategory.PEER_CONTRACT_VERSION_MISMATCH,
     ErrorCategory.PEER_SESSION_MIGRATED,
     ErrorCategory.PEER_OUTPUT_INCOMPLETE,
@@ -171,12 +173,22 @@ _HINTS: dict[ErrorCategory, str] = {
         "could be handed back to the peer. Remove it before running."
     ),
     ErrorCategory.PEER_AUTH_FAILURE: (
-        "Peer CLI is not authenticated. Operator action is required; the bridge "
-        "will not attempt to authenticate."
+        "Peer CLI reported a credential or token-refresh failure. Run "
+        "agent-bridge-admin health for the pinned CLI and credential context. "
+        "On macOS, compare in a normal Terminal with Keychain access before "
+        "changing login. Desktop sign-in does not prove peer CLI access. "
+        "The bridge will not log in or retry this automatically."
     ),
     ErrorCategory.PEER_OUTPUT_MALFORMED: "Peer output was not parseable JSON. It was quarantined.",
     ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID: (
         "Peer output did not satisfy the response contract. It was quarantined."
+    ),
+    ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED: (
+        "Peer CLI exhausted its own structured-output retries without a valid "
+        "response. This is not an authentication diagnosis. The error envelope "
+        "was quarantined; the bridge will not repeat the same request automatically. "
+        "Ask the maintainer to inspect the CLI/schema interaction before retrying "
+        "the review. No independent review was completed."
     ),
     ErrorCategory.PEER_OUTPUT_TOO_LARGE: "Peer output exceeded a configured size limit.",
     ErrorCategory.PEER_OUTPUT_INCOMPLETE: (
@@ -233,6 +245,18 @@ _overlapping = sorted(
 )
 if _overlapping:  # pragma: no cover - import-time guard
     raise AssertionError(f"error categories in more than one class: {_overlapping}")
+
+
+def category_from_status(status: dict) -> ErrorCategory:
+    """Promote an additive, closed diagnostic without accepting arbitrary text."""
+    category = status.get("error_category")
+    if (category == ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID.value
+            and status.get("diagnostic_category") == ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED.value):
+        return ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED
+    try:
+        return ErrorCategory(category or "internal_error")
+    except ValueError:
+        return ErrorCategory.INTERNAL_ERROR
 
 
 def hint(category: ErrorCategory) -> str:

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Additive stage-routing and local-worker MCP server. Does not replace consultation.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+PY=${AGENT_BRIDGE_PYTHON:-python3}
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$PY" -P -m agent_bridge.orchestration.server "$@"

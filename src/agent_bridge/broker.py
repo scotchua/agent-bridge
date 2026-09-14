@@ -16,7 +16,7 @@ from typing import Any
 
 from . import preflight, provenance, registry, store
 from .config import Config, canonical_uuid
-from .errors import BrokerError, ErrorCategory, hint, is_retryable
+from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_from_status
 
 CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
@@ -336,10 +336,7 @@ def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     }
     category = status.get("error_category")
     if status.get("status") in registry.TERMINAL_STATUSES and category and category != "ok":
-        try:
-            enum_category = ErrorCategory(category)
-        except ValueError:
-            enum_category = ErrorCategory.INTERNAL_ERROR
+        enum_category = category_from_status(status)
         payload["error_category"] = enum_category.value
         payload["error_hint"] = hint(enum_category)
         if status.get("retries_exhausted"):
@@ -356,10 +353,7 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     if status.get("status") not in registry.TERMINAL_STATUSES:
         raise BrokerError(ErrorCategory.JOB_NOT_COMPLETE)
     if status.get("status") != "complete":
-        try:
-            category = ErrorCategory(status.get("error_category") or "internal_error")
-        except ValueError:
-            category = ErrorCategory.INTERNAL_ERROR
+        category = category_from_status(status)
         response = error_response(
             category, job_id=job_id, conversation_id=status.get("conversation_id"),
             status=status.get("status"),

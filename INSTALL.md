@@ -4,6 +4,12 @@ For the easier conversational path, start with
 [Set this up with Claude or Codex](docs/SETUP-WITH-AN-AGENT.md). The steps below
 remain the lower-level verification and troubleshooting reference.
 
+The guided installer covers consultation and its optional local worker. The
+newer durable stage router and bounded cross-provider implementation lane are an
+advanced manual feature; see
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md). Its persistent
+execution-worker service is currently verified on macOS.
+
 Written for someone who is comfortable in a terminal but is not a developer. If
 any step fails, the failure message is meant to tell you what to do; if it does
 not, that is a bug worth reporting.

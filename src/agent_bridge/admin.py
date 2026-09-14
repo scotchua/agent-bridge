@@ -470,6 +470,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="Show broker state.")
+    health = sub.add_parser("health", help="Check pinned CLI and local login visibility; no login changes.")
+    health.add_argument("--peer", choices=("claude", "codex"))
+    health.add_argument("--json", action="store_true")
     cleanup = sub.add_parser("cleanup", help="Apply retention. Dry run unless --apply.")
     cleanup.add_argument("--apply", action="store_true", help="Actually delete.")
     ledger = sub.add_parser("ledger", help="Show recent ledger records.")
@@ -490,7 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config)
-        return {"status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
+        from .health import cmd_health
+        return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
                 "reporting": cmd_reporting,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
             args.command](cfg, args)

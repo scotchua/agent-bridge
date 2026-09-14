@@ -4185,6 +4185,11 @@ def test_platform_guard() -> None:
 
 
 def main() -> int:
+    import unittest
+    import test_health
+    health_results = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_health))
+    check("Health and authentication regressions", health_results.wasSuccessful())
     test_contract_accepted_by_both_peers()
     test_timeout_canary_effective_config_and_verdict()
     test_candidate_verification_path()
