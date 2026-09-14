@@ -217,11 +217,16 @@ If the user says yes:
    execution-worker LaunchAgent with `onboard activate-launch-agent`. Never
    run it as root, and never claim it is active without checking; loading is
    idempotent.
-5. Explain the honest current limitation: this checkout ships the Claude
-   execution harness but not yet a Codex one, so the Claude-to-Codex direction
-   (and the whole execution lane, since both harnesses are validated together)
-   will report blocked until that harness exists. Do not claim it works
-   around this.
+5. Explain the honest current limitation: both bounded implementation
+   harnesses (Claude and Codex) ship in this checkout, so a fresh, supported
+   macOS install with both CLIs signed in can construct and run either
+   direction; a `partial` or `blocked` result on a real machine means a live
+   provider CLI is not signed in, not authorized, or the environment does not
+   satisfy a preflight check, not that source code is missing. The Codex
+   harness's write confinement comes from Codex's own `workspace-write`
+   sandbox rather than a tool allowlist, and neither harness claims filesystem
+   read confinement; say so if asked how it is confined. Do not claim it works
+   around any of this.
 
 Uninstall follows the same pattern as ordinary removal: `onboard uninstall --delegation-only`
 removes only the orchestration MCP entries and LaunchAgent file it can still

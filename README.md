@@ -183,15 +183,16 @@ depending on what was actually proven, never more than that. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md) for the manual
 reference path and current platform boundary.
 
-**Honest current limitation:** this checkout ships the bounded Claude
-execution harness but not yet a Codex one (`src/agent_bridge/execution/`), so
-the Claude-to-Codex direction (and, because the executor validates both
-harnesses together, the whole cross-provider execution lane) cannot pass
-verification until that harness exists. The onboarding flow detects and
-reports this precisely rather than claiming it works. Local routing and
-consultation are unaffected. The execution worker's LaunchAgent has been
-live-tested on macOS only; continuous service setup for Linux and Windows is
-not offered, only portable registration and configuration.
+**Honest current limitation:** this checkout ships bounded implementation
+harnesses for both directions (`src/agent_bridge/execution/claude_task.py`
+and `codex_task.py`), so a fresh, supported macOS install with both CLIs
+signed in can construct and run the execution lane in either direction
+without installing anything beyond this repository. Passing verification
+still needs this machine's own signed-in provider CLIs; it is not proven by
+source code existing. Local routing and consultation are unaffected. The
+execution worker's LaunchAgent has been live-tested on macOS only; continuous
+service setup for Linux and Windows is not offered, only portable
+registration and configuration.
 
 ## What it will not do
 
@@ -239,12 +240,15 @@ not offered, only portable registration and configuration.
   macOS only. Guided onboarding can register and configure it on any supported
   platform; only the continuously-running macOS LaunchAgent is offered as an
   installed service.
-- **The cross-provider execution lane needs a Codex-side harness this
-  checkout does not yet ship.** Only the Claude execution harness exists today
-  (`src/agent_bridge/execution/claude_task.py`); until a matching Codex one is
-  added, automatic-delegation verification reports the Claude-to-Codex
-  direction, and the whole execution lane, as blocked rather than claiming it
-  works.
+- **The Codex execution harness's write confinement is Codex's own sandbox,
+  not this project's.** `codex_task.py` runs `codex exec -s workspace-write`
+  in a disposable worktree, pinning network access off; unlike the Claude
+  harness (a restricted tool allowlist, no shell), Codex retains its own shell
+  tool inside that sandbox. Confinement is exactly what Codex documents for
+  `workspace-write`, no more, and read confinement is not claimed for either
+  harness. A bundled harness proves the lane can be constructed and its
+  offline contract tested; it is not a substitute for the live synthetic
+  verification this machine's signed-in CLIs still have to pass.
 
 ## Checking it yourself
 

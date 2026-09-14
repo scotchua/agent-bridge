@@ -1,0 +1,372 @@
+"""Bounded Codex subscription implementation lane.
+
+Mirrors `claude_task.py`: a disposable git worktree, one generation turn, an
+unapplied patch that is independently reapplied and verified against a fresh
+worktree, and this harness's own bounded verification commands. It never
+applies, commits, pushes, or merges, and it never falls back to a paid API
+key: `codex login status` must report a ChatGPT-authenticated isolated
+`CODEX_HOME` before any turn runs.
+
+Differences from the Claude lane, stated rather than left implicit:
+
+1. Codex's own OS-level sandbox is the write boundary here, not a tool
+   allowlist. `-s workspace-write -C <worktree>` is Codex's documented
+   mechanism for confining writes to one directory, and
+   `sandbox_workspace_write.network_access` is pinned to Boolean `false` so a
+   drifted default cannot open network access mid-run. Unlike the Claude
+   lane (`--tools Read,Grep,Glob,Edit,Write`, no shell), Codex keeps its own
+   shell tool inside that sandbox: confinement here is exactly the boundary
+   the vendor documents for `workspace-write`, no more, and no broader claim
+   is made.
+2. `--ignore-user-config` and `--ignore-rules` stop `$CODEX_HOME/config.toml`
+   and `.rules` from loading, but Codex still discovers `AGENTS.md` by
+   walking upward from its working directory (measured in
+   `docs/verified-cli-behaviour.md`). The worktree itself is the caller's own
+   repository and may legitimately carry `AGENTS.md`/`CLAUDE.md`; this harness
+   does not gate that. What it does gate is everything *above* the disposable
+   per-job directory this harness controls (the task root and its ancestors),
+   walked for the same contaminant set the consultation backend refuses on,
+   before any Codex invocation.
+3. The isolated `CODEX_HOME` defaults to the same path `config/broker.json`
+   documents for consultation (`~/.agent-bridge/codex-home`), so one
+   `codex login` covers both lanes. This harness never copies credentials
+   into it, never writes to it beyond what Codex itself writes, and never
+   falls back to the shared desktop `~/.codex` home; a missing or
+   logged-out isolated home fails the job closed with that fact stated
+   plainly rather than silently trying the default home.
+4. Read confinement is not claimed. `-s workspace-write` restricts writes,
+   not reads, identically to the consultation peer's documented limitation
+   (see the README's "Honest limits"). The controls that actually apply are
+   the refusal of client-derived classifications, the disposable per-job
+   worktree, and the ancestor instruction-file walk above; none of them is a
+   filesystem read boundary, and none is claimed as one here.
+
+Verified against the same codex-cli 0.147.0 facts recorded in
+`docs/verified-cli-behaviour.md` and `backends/codex_backend.py`: the session
+identifier is `thread_id`, carried on the `thread.started` JSONL event; the
+final message is read from the documented `--output-last-message` file
+channel; and the prompt goes on stdin for a first turn (`codex exec` reads
+stdin when given no prompt argument).
+"""
+from __future__ import annotations
+
+import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tempfile, time, uuid
+from pathlib import Path
+try:
+    from .. import runner, preflight, store
+    from ..errors import BrokerError
+except ImportError:  # The orchestration worker invokes this file directly.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from agent_bridge import runner, preflight, store
+    from agent_bridge.errors import BrokerError
+
+class TaskError(RuntimeError): pass
+
+ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
+ALLOWED_VERIFY_PROGRAMS={"git","pytest","python","python3","npm","pnpm","yarn","cargo","go"}
+MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
+DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
+DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
+GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
+
+def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:bytes|None=None):
+    """Use the bridge's measured streaming caps and bounded post-kill drain."""
+    r=runner.run(argv,cwd=str(cwd),env=env,stdin_data=(input_bytes or b"").decode("utf-8"),timeout=timeout,
+                 grace=2,stdout_cap=MAX_STREAM_BYTES,stderr_cap=MAX_STREAM_BYTES)
+    if r.spawn_failed: raise TaskError("command spawn failed")
+    if r.timed_out: raise TaskError(f"command timed out after {timeout}s")
+    if r.cap_exceeded: raise TaskError("command output exceeded bounded capture")
+    if r.descendant_held_pipes: raise TaskError("command output stream did not close")
+    return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
+
+def _env():
+    e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
+       "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
+    for k in ("USER","LOGNAME"):
+        if os.environ.get(k): e[k]=os.environ[k]
+    return e
+
+def _git(repo:Path,*args:str,timeout:int=30,env=None):
+    r=_run(_git_argv(*args),cwd=repo,env=env or _env(),timeout=timeout)
+    if r.returncode: raise TaskError("git prerequisite failed")
+    return r.stdout.decode().strip()
+
+def _git_argv(*args:str):
+    return [GIT_BIN,"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
+            "-c","diff.external=","-c","core.attributesFile=/dev/null",*args]
+
+def _sha(path:Path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def _source_state(repo:Path,env):
+    return {"head":_git(repo,"rev-parse","HEAD",env=env),
+            "status":_git(repo,"status","--porcelain=v2","--untracked-files=all",env=env),
+            "config_sha256":_sha(repo/".git"/"config")}
+
+def _assert_macos():
+    if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        raise TaskError("Codex execution lane requires supported macOS sandbox-exec")
+
+def _atomic_json(path:Path,value:dict):
+    fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,"w") as f: json.dump(value,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+def _verify_argv(commands:list[list[str]]):
+    if not commands: return []
+    for c in commands:
+        if not isinstance(c,list) or not c or not all(isinstance(x,str) and x for x in c): raise TaskError("verification must be JSON argv arrays")
+        p=Path(c[0]).name
+        if c[0]!=p or p not in ALLOWED_VERIFY_PROGRAMS: raise TaskError("verification executable is not allowlisted")
+        if p in {"python","python3"} and c[1:3]!=["-m","pytest"]: raise TaskError("Python verification is limited to python -m pytest")
+        if p=="git" and (len(c)<2 or c[1] not in {"diff","status"}): raise TaskError("git verification is read-only")
+        if any(any(x in a for x in ("\0","\n","\r")) for a in c): raise TaskError("control character in verification argv")
+    return [c[:] for c in commands]
+
+def _auth(codex_bin:Path,codex_home:Path,env):
+    e={**env,"CODEX_HOME":str(codex_home)}
+    r=_run([str(codex_bin),"login","status"],cwd=codex_home,env=e,timeout=30)
+    text=(r.stdout+r.stderr).decode("utf-8","replace").lower()
+    if "not logged in" in text or "no credentials" in text:
+        raise TaskError("Codex is not authenticated in the isolated CODEX_HOME")
+    if r.returncode==0 and "logged in using chatgpt" in text:
+        return {"auth_method":"chatgpt"}
+    raise TaskError("Codex is not authenticated through a supported ChatGPT subscription")
+
+def _command(codex_bin:Path,model:str|None,reasoning_effort:str|None,workspace:Path,last_message_file:Path):
+    argv=[str(codex_bin),"exec","--json","--ignore-user-config","--ignore-rules",
+          "--strict-config","--skip-git-repo-check",
+          "--output-last-message",str(last_message_file),
+          "-c",'sandbox_mode="workspace-write"',
+          "-c",'sandbox_workspace_write.network_access=false']
+    if reasoning_effort:
+        argv+=["-c",f'model_reasoning_effort="{reasoning_effort}"']
+    argv+=["-s","workspace-write","-C",str(workspace)]
+    if model and model!="default":
+        argv+=["-m",model]
+    return argv
+
+def _parse_events(stdout:bytes):
+    thread_id=None; errors=[]; events=[]
+    for line in stdout.decode("utf-8","replace").splitlines():
+        line=line.strip()
+        if not line or not line.startswith("{"): continue
+        try: event=json.loads(line)
+        except ValueError: continue
+        if not isinstance(event,dict): continue
+        events.append(event)
+        etype=event.get("type")
+        if etype=="thread.started":
+            candidate=event.get("thread_id")
+            if isinstance(candidate,str) and candidate and not thread_id:
+                thread_id=candidate
+        elif etype in ("error","turn.failed"):
+            failure=event.get("error")
+            message=(failure.get("message") if etype=="turn.failed" and isinstance(failure,dict)
+                     else event.get("message"))
+            if isinstance(message,str): errors.append(message)
+    return thread_id,errors,events
+
+def _patch(tree:Path,base:str,env):
+    ignored=_git(tree,"ls-files","--others","--ignored","--exclude-standard",env=env)
+    if ignored: raise TaskError("Codex produced ignored untracked files")
+    add=_run(_git_argv("add","-N","--","."),cwd=tree,env=env,timeout=30)
+    if add.returncode: raise TaskError("could not stage intent-to-add entries")
+    r=_run(_git_argv("diff","--binary","--no-ext-diff","--no-textconv",base),cwd=tree,env=env,timeout=60)
+    if r.returncode: raise TaskError("could not capture patch")
+    if not r.stdout: raise TaskError("Codex produced an empty patch")
+    return r.stdout
+
+def _remove(repo:Path,tree:Path,env):
+    if not tree.exists(): return True
+    try:
+        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=60)
+    except (OSError,TaskError,subprocess.SubprocessError):
+        return False
+    # Never run repository-wide `worktree prune`: it can discard unrelated
+    # users' stale-but-recoverable worktree registrations.
+    return result.returncode==0 and not tree.exists()
+
+def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int):
+    scratch.mkdir(mode=0o700)
+    profile=scratch/"verify.sb"
+    def quoted(value:Path): return str(value).replace('\\','\\\\').replace('"','\\"')
+    executable=Path(GIT_BIN if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
+    runtime_root=executable.parent.parent if str(executable).startswith("/Users/") else executable.parent
+    read_roots=[Path("/System"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/Library/Frameworks"),Path("/Library/Developer"),
+                Path("/etc"),Path("/var/db"),Path("/var/select"),Path("/var/run"),Path("/private/etc"),
+                Path("/private/var/db"),Path("/private/var/select"),Path("/private/var/run"),
+                tree,tree.resolve(),scratch,scratch.resolve(),runtime_root]
+    # A linked worktree's index and object database live under the source
+    # repository's git directory. Permit only those git internals, never the
+    # source working tree or its local config.
+    git_marker=tree/".git"
+    marker=git_marker.read_text().strip() if git_marker.exists() else ""
+    if marker.startswith("gitdir: "):
+        gitdir=Path(marker[8:]).resolve()
+        commondir=(gitdir/(gitdir/"commondir").read_text().strip()).resolve()
+        read_roots.extend([gitdir,commondir/"objects",commondir/"refs",commondir/"HEAD",commondir/"packed-refs",commondir/"config"])
+    read_rules=" ".join(f'(subpath "{quoted(path)}")' for path in read_roots)
+    ancestors=set()
+    for path in read_roots:
+        ancestors.update(path.resolve().parents)
+    ancestor_rules=" ".join(f'(literal "{quoted(path)}")' for path in ancestors)
+    profile.write_text('(version 1)\n(allow default)\n(deny network*)\n(deny file-read-data)\n(deny file-write*)\n'
+                       f'(allow file-read-data {read_rules} {ancestor_rules} (literal "/dev/null") (literal "/dev/urandom"))\n'
+                       f'(allow file-write* (literal "/dev/null") (subpath "{quoted(tree)}") (subpath "{quoted(tree.resolve())}") '
+                       f'(subpath "{quoted(scratch)}") (subpath "{quoted(scratch.resolve())}"))\n')
+    os.chmod(profile,0o600)
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    if command[0]=="git": command=_git_argv(*command[1:])
+    started=time.monotonic()
+    result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_profile_sha256=_sha(profile)
+    result.duration_seconds=time.monotonic()-started
+    return result
+
+def _assert_no_ancestor_contamination(job:Path):
+    """Refuse if anything above this disposable job directory is contaminated.
+
+    Deliberately does not inspect the worktree itself: that is the caller's
+    own repository, already access-controlled by classification, and Codex is
+    entitled to read its own checked-out AGENTS.md/CLAUDE.md. What must never
+    happen is Codex walking further up into the bridge's own directories
+    (task root, home, filesystem root) and picking up an unrelated
+    instruction file nobody meant to expose to this job.
+    """
+    try:
+        preflight.assert_workspace_clean(str(job))
+    except BrokerError as exc:
+        raise TaskError(f"ancestor instruction-file check failed: {exc.category.value}") from exc
+
+def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Path=DEFAULT_CODEX_HOME,
+             classification:str,model:str|None=None,reasoning_effort:str|None=None,
+             verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
+    _assert_macos()
+    if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
+    if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
+    if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
+    if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
+    raw=brief.read_bytes()
+    if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
+    try: brief_text=raw.decode()
+    except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
+    checks=_verify_argv(verify_argv or []); env=_env(); source_before=_source_state(repo,env)
+    base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
+    version=_run([str(codex_bin),"--version"],cwd=codex_bin.parent,env=env,timeout=30)
+    if version.returncode: raise TaskError("could not identify Codex executable")
+    task_root.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(task_root,0o700)
+    job=task_root/uuid.uuid4().hex; job.mkdir(mode=0o700); gen=job/"generation-worktree"; fresh=job/"verification-worktree"
+    receipt={"schema":2,"job_id":job.name,"status":"running","route":"codex-subscription-cli","classification":classification,
+             "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,
+             "reasoning_effort_requested":reasoning_effort,
+             "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(codex_bin.resolve()),
+             "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
+             "codex_home":str(codex_home),"source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
+    pending_exc=None
+    try:
+        _assert_no_ancestor_contamination(job)
+        store.secure_mkdir(str(codex_home))
+        try:
+            preflight.assert_peer_home_has_no_config(str(codex_home))
+        except BrokerError as exc:
+            raise TaskError(f"isolated CODEX_HOME carries unexpected config: {exc.category.value}") from exc
+        receipt["auth"]=_auth(codex_bin,codex_home,env)
+        receipt["codex_home_inventory"]=preflight.peer_home_inventory(str(codex_home))
+        _git(repo,"worktree","add","--detach",str(gen),base_sha,timeout=120,env=env); marker=(gen/".git").read_bytes()
+        last_message_file=job/"codex-last-message.txt"
+        argv=_command(codex_bin,model,reasoning_effort,gen,last_message_file)
+        codex_env={**env,"CODEX_HOME":str(codex_home)}
+        r=_run(argv,cwd=gen,env=codex_env,timeout=timeout,input_bytes=("TASK BRIEF\n\n"+brief_text).encode())
+        for n,data in (("codex.stdout",r.stdout),("codex.stderr",r.stderr)):
+            (job/n).write_bytes(data); os.chmod(job/n,0o600)
+            receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
+        thread_id,error_messages,events=_parse_events(r.stdout)
+        failed=r.returncode not in (0,None) or any(e.get("type")=="turn.failed" for e in events)
+        receipt["response_metadata"]={"thread_id":thread_id,"event_count":len(events),
+                                      "event_types":sorted({str(e.get("type")) for e in events})[:20],
+                                      "error_event_count":len(error_messages)}
+        if failed: raise TaskError(f"Codex exited with status {r.returncode}")
+        if not thread_id: raise TaskError("Codex did not report a thread id")
+        last_message=last_message_file.read_bytes() if last_message_file.is_file() else b""
+        if not last_message.strip(): raise TaskError("Codex produced no final message")
+        receipt["last_message_sha256"]=hashlib.sha256(last_message).hexdigest()
+        if (gen/".git").read_bytes()!=marker: raise TaskError("Codex altered git metadata")
+        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env)
+        _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
+        a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
+        if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
+        applied=_patch(fresh,base_sha,env)
+        if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
+        evidence=[]
+        for i,c in enumerate(checks,1):
+            scratch=job/f"verify-{i}-scratch"
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout)
+            outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
+            outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
+            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":"macos-no-network-scratch-home",
+                             "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
+                             "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+        receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",
+                       generated_patch_sha256=hashlib.sha256(patch).hexdigest(),applied_patch_sha256=hashlib.sha256(applied).hexdigest(),
+                       patch_sha256=hashlib.sha256(patch).hexdigest(),patch_bytes=len(patch),verification=evidence,
+                       fresh_worktree_patch_match=True,finished_at=time.time())
+    except Exception as exc:
+        pending_exc=exc
+        # TaskError messages are fixed, operator-safe diagnostics defined by
+        # this harness. Persist them in the mode-0600 receipt so failures can
+        # be corrected without exposing provider output or credentials.
+        detail=str(exc) if isinstance(exc,TaskError) else None
+        receipt.update(status="failed_pending_integrity",error=type(exc).__name__,
+                       error_detail=detail,finished_at=time.time())
+    finally:
+        generation_removed=_remove(repo,gen,env)
+        verification_removed=_remove(repo,fresh,env)
+        cleanup_ok=generation_removed and verification_removed
+        receipt["cleanup"]={"generation_worktree":str(gen),"generation_removed":generation_removed,
+                            "verification_worktree":str(fresh),"verification_removed":verification_removed}
+    try:
+        source_after=_source_state(repo,env)
+        source_match=source_after==source_before
+        receipt["source_after"]=source_after
+    except Exception:
+        source_match=False
+    receipt["source_integrity_match"]=source_match
+    if not cleanup_ok:
+        receipt.update(status="failed",error="WorktreeCleanupError",finished_at=time.time())
+    elif not source_match:
+        receipt.update(status="failed",error="SourceIntegrityError",finished_at=time.time())
+    elif pending_exc is not None:
+        receipt.update(status="failed",error=type(pending_exc).__name__,finished_at=time.time())
+    elif receipt["status"]=="verification_passed_pending_integrity":
+        receipt["status"]="complete"
+    elif receipt["status"]=="verification_failed_pending_integrity":
+        receipt["status"]="verification_failed"
+    _atomic_json(job/"receipt.json",receipt)
+    if not cleanup_ok: raise TaskError("disposable worktree cleanup failed")
+    if not source_match: raise TaskError("source repository integrity changed during task")
+    if pending_exc is not None: raise pending_exc
+    return {**receipt,"job_dir":str(job),"patch":str(job/"changes.patch")}
+
+def main(argv=None):
+    p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
+    p.add_argument("--codex-bin",type=Path,default=Path(shutil.which("codex") or "codex"),dest="codex_bin")
+    p.add_argument("--codex-home",type=Path,default=DEFAULT_CODEX_HOME,dest="codex_home")
+    p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS))
+    p.add_argument("--model",default=None); p.add_argument("--reasoning-effort",default=None,dest="reasoning_effort")
+    p.add_argument("--base",default="HEAD"); p.add_argument("--timeout",type=int,default=900)
+    p.add_argument("--verify-timeout",type=int,default=300)
+    p.add_argument("--tasks-dir",type=Path,default=DEFAULT_TASK_ROOT,dest="task_root")
+    p.add_argument("--verify-json",action="append",default=[])
+    a=p.parse_args(argv)
+    try:
+        checks=[json.loads(x) for x in a.verify_json]; del a.verify_json; result=run_task(**vars(a),verify_argv=checks)
+    except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc: print(json.dumps({"ok":False,"error":type(exc).__name__})); return 1
+    print(json.dumps({"ok":True,**result},sort_keys=True)); return 0
+
+if __name__=="__main__": raise SystemExit(main())

@@ -46,9 +46,13 @@ def invoke(payload: dict[str, Any], *, worker: str, state: str, queue_root: str,
     instruction = payload["params"].get("instruction", "")
     if not isinstance(instruction, str):
         raise ValueError("instruction must be text")
+    provider = payload["params"].get("provider", "auto")
+    if provider not in {"auto", "apple", "qwen"}:
+        raise ValueError("provider must be auto, apple, or qwen")
     classification, caller, purpose = _provenance(queue_root, payload.get("job_id", ""))
     arguments = {"task": task, "text": payload["input"], "instruction": instruction,
-                 "classification": classification, "caller": caller, "purpose": purpose, "provider": "auto"}
+                 "classification": classification, "caller": caller, "purpose": purpose,
+                 "provider": provider}
     init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
     call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "local_worker_process", "arguments": arguments}}
     env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}

@@ -42,7 +42,11 @@ class DelegationVerificationError(ValueError):
 
 
 def _portable_python() -> str:
-    executable = os.path.abspath(sys.executable)
+    # Framework and package-manager Python launchers are commonly symlinks.
+    # Pin the resolved executable so later availability checks and the
+    # background service are bound to a real file rather than rejecting a
+    # normal, durable installation.
+    executable = os.path.realpath(os.path.abspath(sys.executable))
     if os.name == "nt" and "windowsapps" in executable.replace("\\", "/").lower():
         raise DelegationConfigError(
             "the Microsoft Store WindowsApps Python alias cannot be used as a durable launcher")
@@ -275,18 +279,31 @@ def _xml_escape(value: str) -> str:
 
 
 def render_launch_agent(*, worker_binary: str, config_path: str, python_executable: str,
-                         account: str, claude_bin_dir: str, stdout_log: str,
-                         stderr_log: str) -> bytes:
-    """Render the safe template with resolved absolute paths. No credentials."""
+                         account: str, claude_bin_dir: str, codex_bin_dir: str | None = None,
+                         stdout_log: str, stderr_log: str) -> bytes:
+    """Render the safe template with resolved absolute paths. No credentials.
+
+    ``codex_bin_dir`` defaults to ``claude_bin_dir`` when omitted or identical,
+    which keeps the common case (both CLIs installed to the same bin
+    directory) a single path. When the two CLIs live in different
+    directories, both must be on the worker's PATH: `codex_task.py` and
+    `claude_task.py` each fall back to a bare `shutil.which()` lookup for
+    their own provider's executable when nothing is pinned, and a directory
+    left off `PATH` here means that lookup fails closed with a clear
+    "executable unavailable" error rather than silently searching elsewhere.
+    """
+    codex_bin_dir = codex_bin_dir or claude_bin_dir
     for name, value in (("worker_binary", worker_binary), ("config_path", config_path),
                         ("python_executable", python_executable),
-                        ("claude_bin_dir", claude_bin_dir), ("stdout_log", stdout_log),
-                        ("stderr_log", stderr_log)):
+                        ("claude_bin_dir", claude_bin_dir), ("codex_bin_dir", codex_bin_dir),
+                        ("stdout_log", stdout_log), ("stderr_log", stderr_log)):
         if not isinstance(value, str) or not os.path.isabs(value):
             raise DelegationConfigError(f"launch agent field {name!r} must be an absolute path")
     if not account or "/" in account or "\\" in account:
         raise DelegationConfigError("launch agent account must be a bare account short name")
     e = _xml_escape
+    bin_dirs = [claude_bin_dir] + ([codex_bin_dir] if codex_bin_dir != claude_bin_dir else [])
+    bin_path = ":".join(e(p) for p in bin_dirs)
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -309,7 +326,7 @@ def render_launch_agent(*, worker_binary: str, config_path: str, python_executab
         '    <key>LOGNAME</key>\n'
         f'    <string>{e(account)}</string>\n'
         '    <key>PATH</key>\n'
-        f'    <string>{e(claude_bin_dir)}:/usr/bin:/bin:/usr/sbin:/sbin</string>\n'
+        f'    <string>{bin_path}:/usr/bin:/bin:/usr/sbin:/sbin</string>\n'
         '  </dict>\n'
         '  <key>StandardOutPath</key>\n'
         f'  <string>{e(stdout_log)}</string>\n'

@@ -312,6 +312,13 @@ eligible non-client mechanical text. It never applies, commits, pushes, or
 merges on its own, and it never silently falls back from local processing to
 a cloud model or a paid API.
 
+Both bounded implementation harnesses (Claude and Codex) already ship in this
+checkout; nothing extra needs installing for either direction. The Codex
+execution harness signs in through the same isolated `CODEX_HOME`
+(`~/.agent-bridge/codex-home`) documented above for consultation, so the
+`codex login` you already ran covers this too. It never copies credentials
+and never falls back to your default `~/.codex` home.
+
 **Turn it on:**
 
 ```
@@ -351,8 +358,9 @@ and refuses outright if nothing required was actually proven. Otherwise the
 completion report says exactly `"Automatic delegation: enabled"`,
 `"...: partial"`, or `"...: blocked"`, matching what the evidence showed. A
 `"partial"` result commonly means the local-model lane was not configured, or
-one execution direction is unavailable in this checkout (see the honest
-limitation in the README about the missing Codex execution harness).
+one direction's live provider CLI is not signed in or not authorized on this
+machine (see the honest limitations in the README about the two harnesses'
+different confinement).
 
 **On macOS**, apply stages a private, owner-only LaunchAgent template for the
 execution worker but does not silently load it. Load it into the login GUI

@@ -73,10 +73,16 @@ For continuous macOS operation, copy
 placeholder with an absolute path, keep the resulting file private, and load it
 as a per-user LaunchAgent. The template stores no credentials. Provider sign-in
 continues to use the CLIs' existing Keychain-backed subscription sessions.
-Set the template's Python path, account short name, Claude binary directory,
-private configuration path and private log paths for the target Mac. Keep the
-filled-in plist out of the repository. Load it in the logged-in user's GUI
-launchd domain, not as root or a system daemon.
+Set the template's Python path, account short name, Claude and Codex binary
+directories (the same directory twice if both CLIs live together), private
+configuration path and private log paths for the target Mac. A CLI's
+directory missing from `PATH` here means that provider's harness cannot
+discover its executable at run time (`codex_task.py` and `claude_task.py`
+both fall back to a bare `shutil.which()` lookup when no pinned executable
+is passed), and the job fails closed with `Codex executable unavailable` or
+`Claude executable unavailable` rather than silently searching elsewhere.
+Keep the filled-in plist out of the repository. Load it in the logged-in
+user's GUI launchd domain, not as root or a system daemon.
 
 Before relying on the lane, submit a synthetic job from each configured caller.
 Confirm the terminal receipt identifies the opposite provider, source integrity
@@ -91,13 +97,33 @@ The bundled resource sampler is also macOS-specific; without a separately
 reviewed platform sampler, local jobs on Windows or Linux defer rather than
 assuming the machine has safe spare capacity.
 
-**Current limitation: no Codex execution harness ships yet.** `codex_task.py`
-does not exist in `src/agent_bridge/execution/` alongside `claude_task.py`.
-`SubprocessHarnessExecutor` validates both harness paths together, so until a
-Codex one is added, the execution lane cannot be constructed at all for either
-direction. `agent_bridge.orchestration.delegation.harness_availability()`
-reports this precisely, and `bin/agent-bridge-orchestration-verify` reports
-both directions as blocked with that reason rather than claiming a pass.
+Both bounded implementation harnesses ship in `src/agent_bridge/execution/`:
+`claude_task.py` and `codex_task.py`. `SubprocessHarnessExecutor` validates
+both harness paths before either direction can be constructed, so a fresh,
+supported macOS checkout with both provider CLIs signed in can exercise
+Codex-to-Claude and Claude-to-Codex bounded execution without installing
+anything outside this repository. `agent_bridge.orchestration.delegation.harness_availability()`
+reports the bundled files present; it still cannot and does not report a live
+pass, since that needs this machine's own signed-in CLIs.
+
+The Codex harness's confinement is different from the Claude harness's, and
+this is stated plainly rather than glossed over: Claude's lane trusts a tool
+allowlist (`--tools Read,Grep,Glob,Edit,Write`, no shell) because Claude Code
+has no native OS-level sandbox; the Codex lane instead runs `codex exec` under
+Codex's own `-s workspace-write` sandbox, pinned with
+`sandbox_workspace_write.network_access="false"`, and Codex keeps its own
+shell tool inside that boundary. Neither lane claims filesystem-read
+confinement; `-s workspace-write` restricts writes, not reads, exactly like
+the consultation peer's documented limitation. The Codex harness additionally
+walks every ancestor of its own disposable task-root directory (never the
+worktree/repository itself) for `AGENTS.md`/`.rules`/`CLAUDE.md`/`.codexrules`
+before every run, because `--ignore-user-config`/`--ignore-rules` do not stop
+Codex from discovering `AGENTS.md` by walking upward from its working
+directory. The isolated `CODEX_HOME` defaults to the same path
+`config/broker.json` documents for consultation
+(`~/.agent-bridge/codex-home`), so one `codex login` covers both lanes; the
+harness never copies credentials into it and never falls back to the shared
+desktop `~/.codex` home.
 
 `bin/agent-bridge-orchestration-verify` runs the three synthetic checks this
 document describes (Codex-to-Claude bounded execution, Claude-to-Codex bounded

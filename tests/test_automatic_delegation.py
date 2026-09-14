@@ -116,12 +116,29 @@ class ConfigGenerationTests(unittest.TestCase):
     def test_harness_availability_reflects_the_current_checkout(self):
         cfg = delegation.build_config(tempfile.gettempdir(), str(ROOT), local_worker_executable=None)
         availability = delegation.harness_availability(cfg)
+        # Both bounded implementation harnesses are bundled in this checkout,
+        # so the execution lane can be constructed for either direction on a
+        # fresh, supported macOS install without any external skill install.
         self.assertTrue(availability["claude_task_executable"])
-        # Honest, current limitation: no codex execution harness ships yet, so
-        # the executor cannot be constructed for either direction.
-        self.assertFalse(availability["codex_task_executable"])
-        self.assertFalse(availability["execution_complete"])
+        self.assertTrue(availability["codex_task_executable"])
+        self.assertTrue(availability["execution_complete"])
         self.assertFalse(availability["local_worker_configured"])
+
+    def test_both_bundled_harnesses_run_through_the_configured_python(self):
+        """Both harnesses are real, executable Python files, not placeholders.
+
+        This does not contact any provider; it only proves each harness file
+        parses and its own argument parser runs cleanly under the same
+        interpreter guided config generation configures, which is what a
+        fresh checkout needs before it can even attempt a live provider call.
+        """
+        cfg = delegation.build_config(tempfile.gettempdir(), str(ROOT), local_worker_executable=None)
+        for key in ("codex_task_executable", "claude_task_executable"):
+            proc = subprocess.run(
+                [cfg["python_executable"], "-P", cfg[key], "--help"],
+                capture_output=True, timeout=20, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("--classification", proc.stdout)
 
     def test_local_worker_executable_marks_configured_when_present(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,6 +179,27 @@ class LaunchAgentTests(unittest.TestCase):
             delegation.render_launch_agent(
                 worker_binary="relative/path", config_path="/a", python_executable="/b",
                 account="alice", claude_bin_dir="/c", stdout_log="/d", stderr_log="/e")
+
+    def test_codex_bin_dir_defaults_to_claude_bin_dir_when_omitted(self):
+        rendered = delegation.render_launch_agent(
+            worker_binary="/repo/bin/agent-bridge-execution-worker",
+            config_path="/home/user/.agent-bridge/orchestration/orchestration.json",
+            python_executable="/usr/bin/python3", account="alice",
+            claude_bin_dir="/opt/homebrew/bin",
+            stdout_log="/home/user/.agent-bridge/orchestration/execution-worker.stdout.log",
+            stderr_log="/home/user/.agent-bridge/orchestration/execution-worker.stderr.log")
+        self.assertIn("<string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>", rendered.decode())
+
+    def test_codex_bin_dir_is_added_to_path_when_different_from_claude(self):
+        rendered = delegation.render_launch_agent(
+            worker_binary="/repo/bin/agent-bridge-execution-worker",
+            config_path="/home/user/.agent-bridge/orchestration/orchestration.json",
+            python_executable="/usr/bin/python3", account="alice",
+            claude_bin_dir="/opt/homebrew/bin", codex_bin_dir="/usr/local/bin",
+            stdout_log="/home/user/.agent-bridge/orchestration/execution-worker.stdout.log",
+            stderr_log="/home/user/.agent-bridge/orchestration/execution-worker.stderr.log")
+        self.assertIn("<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+                     rendered.decode())
 
     def test_activate_refuses_non_darwin_and_root(self):
         with mock.patch("sys.platform", "linux"):

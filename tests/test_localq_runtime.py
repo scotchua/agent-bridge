@@ -64,6 +64,34 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tool_args["classification"], "public")
             self.assertNotIn("API_KEY", " ".join(run.call_args.kwargs["env"]))
 
+    def test_worker_child_forwards_an_explicit_supported_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker, state = root / "worker.py", root / "state"
+            worker.write_text("# fixture", encoding="utf-8")
+            state.mkdir()
+            import sqlite3
+            db = sqlite3.connect(root / "localq.sqlite3")
+            db.execute("CREATE TABLE jobs(job_id TEXT,classification TEXT,caller TEXT,purpose TEXT)")
+            db.execute("INSERT INTO jobs VALUES('a1','synthetic','codex','test')")
+            db.commit(); db.close()
+            value = {"status": "draft", "job_id": "b2", "provider": "qwen", "output": {"answer": "draft"}}
+            wire = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n" + json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"isError": False, "content": [{"type": "text", "text": json.dumps(value)}]}}) + "\n"
+            class Completed:
+                returncode = 0
+                stdout = wire
+            with patch("agent_bridge.localq.worker_child.subprocess.run", return_value=Completed()) as run:
+                worker_child.invoke({"job_id": "a1", "task_type": "summarize", "input": "source",
+                                     "params": {"provider": "qwen"}},
+                                    worker=str(worker), state=str(state), queue_root=str(root))
+            sent = run.call_args.kwargs["input"].splitlines()[1]
+            self.assertEqual(json.loads(sent)["params"]["arguments"]["provider"], "qwen")
+
+            with self.assertRaisesRegex(ValueError, "provider must be"):
+                worker_child.invoke({"job_id": "a1", "task_type": "summarize", "input": "source",
+                                     "params": {"provider": "remote"}},
+                                    worker=str(worker), state=str(state), queue_root=str(root))
+
     def test_service_once_writes_atomic_restartable_metadata_without_inference(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "spool"

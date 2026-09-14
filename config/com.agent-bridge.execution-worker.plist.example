@@ -22,7 +22,7 @@
     <key>LOGNAME</key>
     <string>ACCOUNT_SHORT_NAME</string>
     <key>PATH</key>
-    <string>/ABSOLUTE/PATH/TO/CLAUDE/BIN:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/ABSOLUTE/PATH/TO/CLAUDE/BIN:/ABSOLUTE/PATH/TO/CODEX/BIN:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>StandardOutPath</key><string>/ABSOLUTE/PRIVATE/PATH/execution-worker.stdout.log</string>
   <key>StandardErrorPath</key><string>/ABSOLUTE/PRIVATE/PATH/execution-worker.stderr.log</string>

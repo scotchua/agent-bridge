@@ -102,11 +102,12 @@ jobs:
         if: runner.os != 'Windows'
         run: python3 -m unittest discover -s tests -p "test_execution_worker.py"
 
-      - name: macOS Claude execution-lane tests
+      - name: macOS execution-lane tests
         if: runner.os == 'macOS'
         run: |
           python3 -m unittest discover -s tests -p "test_localq_runtime.py"
           python3 -m unittest discover -s tests -p "test_claude_task.py"
+          python3 -m unittest discover -s tests -p "test_codex_task.py"
 
       - name: Setup reports cleanly with no CLIs installed
         shell: bash

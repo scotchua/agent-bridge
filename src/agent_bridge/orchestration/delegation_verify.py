@@ -33,8 +33,10 @@ from .execution_queue import (
 
 SYNTHETIC_BRIEF = (
     "This is a synthetic, non-client verification brief for agent-bridge automatic "
-    "delegation. Do not modify any file. Reply that the bounded harness executed "
-    "successfully in this disposable worktree, then stop.\n"
+    "delegation. Append exactly one line, the text 'agent-bridge synthetic "
+    "verification ok', to a file named VERIFICATION.md in this disposable worktree, "
+    "creating the file if it does not exist. Do not read, modify, or reference any "
+    "other file. Then reply that the bounded harness executed successfully, and stop.\n"
 )
 LOCAL_MODEL_INPUT = "\n".join(
     f"Synthetic verification line {i}: agent-bridge automatic delegation local-model check."
@@ -73,7 +75,7 @@ def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
     repo = _disposable_repo()
     brief = repo / ".agent-bridge-verify-brief.txt"
     brief.write_text(SYNTHETIC_BRIEF, encoding="utf-8")
-    verify_argv = [["git", "status"]] if provider == "claude" else None
+    verify_argv = [["git", "status"]]
     try:
         queue = ExecutionQueue(queue_root, executor, recover_interrupted=False)
         submitted = queue.submit(
@@ -117,7 +119,7 @@ def _local_model_check(cfg: Any) -> dict[str, Any]:
     service = Service(str(cfg.local_queue_root), str(cfg.worker_executable), str(cfg.worker_state))
     submitted = service.queue.submit(
         task_type="summarize", input=LOCAL_MODEL_INPUT,
-        params={"instruction": "Summarize in one sentence."},
+        params={"instruction": "Summarize in one sentence.", "provider": "qwen"},
         priority="interactive", classification="synthetic", caller="codex", purpose="test",
         idempotency_key=f"delegation-verify-local-{int(time.time())}")
     job_id = submitted["job_id"]
@@ -200,6 +202,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     store.atomic_write_json(args.out, results)
     print(f"wrote {args.out}")
+    cfg_doc = store.read_json(args.config)
+    worker_path = cfg_doc.get("worker_executable", "")
+    local_required = (isinstance(worker_path, str)
+                      and Path(worker_path).is_file()
+                      and Path(worker_path).name != delegation.NO_WORKER_SENTINEL)
+    try:
+        delegation.validate_evidence(
+            results, cfg_doc,
+            required_directions=delegation.required_directions_for(callers),
+            local_worker_required=local_required)
+    except delegation.DelegationVerificationError as exc:
+        print(f"delegation verification incomplete: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

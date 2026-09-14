@@ -713,12 +713,14 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
         }
         if boundary["platform"] == "darwin":
             claude_candidates = setup_cmd.find_all("claude")
+            codex_candidates = setup_cmd.find_all("codex")
             plist_bytes = delegation.render_launch_agent(
                 worker_binary=os.path.join(root, "bin", "agent-bridge-execution-worker"),
                 config_path=paths["delegation_config"],
                 python_executable=delegation_cfg["python_executable"],
                 account=(os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"),
                 claude_bin_dir=(os.path.dirname(claude_candidates[0]) if claude_candidates else "/usr/local/bin"),
+                codex_bin_dir=(os.path.dirname(codex_candidates[0]) if codex_candidates else None),
                 stdout_log=os.path.join(delegation.private_root(home), "execution-worker.stdout.log"),
                 stderr_log=os.path.join(delegation.private_root(home), "execution-worker.stderr.log"))
             add(paths["launch_agent"], _owned_file_update(

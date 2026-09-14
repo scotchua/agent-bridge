@@ -103,14 +103,15 @@ class SubprocessHarnessExecutor:
                 "--repo", request["repo"], "--base", request["base"],
                 "--timeout", str(request["timeout_seconds"])]
         if provider == "codex":
-            argv += ["--model", request["model"], "--reasoning-effort", request["effort"],
+            argv += ["--classification", request["classification"],
+                     "--model", request["model"], "--reasoning-effort", request["effort"],
                      "--tasks-dir", str(job_dir / "harness")]
         else:
             argv += ["--classification", request["classification"],
                      "--model", request["model"], "--effort", request["effort"],
                      "--task-root", str(job_dir / "harness")]
-            for command in request["verify_argv"]:
-                argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
+        for command in request["verify_argv"]:
+            argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         account = pwd.getpwuid(os.getuid()).pw_name
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
