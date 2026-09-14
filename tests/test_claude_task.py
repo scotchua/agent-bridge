@@ -40,6 +40,7 @@ class ClaudeTaskTests(unittest.TestCase):
         argv = _command(self.fake, "sonnet", "high")
         self.assertIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "auto")
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob,Edit,Write")
         self.assertNotIn("Bash", argv)
         self.assertNotIn("--restricted", argv)
