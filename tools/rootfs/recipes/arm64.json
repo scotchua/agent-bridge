@@ -1,0 +1,21 @@
+{
+  "_stub": "THIS RECIPE IS NOT BUILDABLE. base_digest is an all-zero placeholder, claude_version/codex_version are stand-ins rather than observed releases, and node_tarball_sha256/claude_integrity/codex_integrity are unfilled. validate_recipe refuses it by name and windows_rootfs.release_blockers() lists it as unreleasable. Replace every value with one you have actually observed, including a real pinned version for every apt package and a real integrity pin for every download, before claiming an image can be built from it.",
+  "apt_packages": [
+    "ca-certificates=20230311+deb12u1",
+    "curl=7.88.1-10+deb12u12",
+    "git=REPLACE-WITH-OBSERVED-VERSION",
+    "nftables=REPLACE-WITH-OBSERVED-VERSION",
+    "python3-minimal=3.11.2-1+b1",
+    "xz-utils=5.4.1-0.2"
+  ],
+  "architecture": "arm64",
+  "base_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "base_image": "library/debian",
+  "claude_integrity": "REPLACE-WITH-OBSERVED-NPM-INTEGRITY",
+  "claude_version": "1.0.0",
+  "codex_integrity": "REPLACE-WITH-OBSERVED-NPM-INTEGRITY",
+  "codex_version": "0.1.0",
+  "distro_release": "12.9",
+  "node_tarball_sha256": "REPLACE-WITH-OBSERVED-SHA256",
+  "node_version": "20.19.0"
+}

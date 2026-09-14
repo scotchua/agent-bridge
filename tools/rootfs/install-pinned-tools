@@ -1,0 +1,121 @@
+#!/bin/sh
+# Install the pinned toolchain into the image and record what was installed.
+#
+# Runs inside the build container only. Every version comes from the recipe on
+# the command line; nothing here resolves "latest", and nothing is installed
+# that the manifest does not name.
+#
+# It writes /etc/agent-bridge/versions.json itself, hashing each binary it just
+# installed, so the image's statement about its contents is generated from the
+# contents rather than copied in from a file somebody typed.
+set -eu
+
+NODE_VERSION=""
+NODE_SHA256=""
+CLAUDE_VERSION=""
+CLAUDE_INTEGRITY=""
+CODEX_VERSION=""
+CODEX_INTEGRITY=""
+ARCH=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --node)              NODE_VERSION="$2"; shift 2 ;;
+    --node-sha256)       NODE_SHA256="$2"; shift 2 ;;
+    --claude)            CLAUDE_VERSION="$2"; shift 2 ;;
+    --claude-integrity)  CLAUDE_INTEGRITY="$2"; shift 2 ;;
+    --codex)             CODEX_VERSION="$2"; shift 2 ;;
+    --codex-integrity)   CODEX_INTEGRITY="$2"; shift 2 ;;
+    --arch)              ARCH="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+for value in "$NODE_VERSION" "$NODE_SHA256" "$CLAUDE_VERSION" \
+             "$CLAUDE_INTEGRITY" "$CODEX_VERSION" "$CODEX_INTEGRITY" "$ARCH"; do
+  [ -n "$value" ] || { echo "every version, integrity pin and the architecture must be supplied" >&2; exit 2; }
+done
+
+# Verify a downloaded file against a digest that came from the recipe, which
+# was in the repository before anything was fetched. Deliberately not the
+# checksum file the same origin serves next to the download: that is learned
+# after the download and only proves the origin agrees with itself.
+verify_sha256() {
+  observed="$(sha256sum "$1" | cut -d" " -f1)"
+  if [ "$observed" != "$2" ]; then
+    echo "integrity check failed for $1" >&2
+    exit 1
+  fi
+}
+
+verify_integrity() {
+  # npm publishes "sha512-<base64>". Compare in the same form.
+  observed="sha512-$(openssl dgst -sha512 -binary "$1" | openssl base64 -A)"
+  if [ "$observed" != "$2" ]; then
+    echo "integrity check failed for $1" >&2
+    exit 1
+  fi
+}
+
+case "$ARCH" in
+  amd64) NODE_ARCH="x64" ;;
+  arm64) NODE_ARCH="arm64" ;;
+  *) echo "unsupported architecture: $ARCH" >&2; exit 2 ;;
+esac
+
+# Node, from the official tarball for the exact version. Extracted into
+# /usr/local so npm and node land on the default PATH.
+NODE_TARBALL="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  -o "/tmp/${NODE_TARBALL}" \
+  "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}"
+# Verify before extracting. An unverified archive extracted as root is the
+# whole supply chain in one step.
+verify_sha256 "/tmp/${NODE_TARBALL}" "$NODE_SHA256"
+tar -xJf "/tmp/${NODE_TARBALL}" -C /usr/local --strip-components=1
+rm -f "/tmp/${NODE_TARBALL}"
+
+# The two provider CLIs. Fetched as their exact published tarballs so the
+# bytes can be checked against a pinned integrity before npm executes any of
+# their install scripts. "npm install <name>@<version>" would resolve, fetch
+# and run in one step with nothing this build had beforehand to compare to.
+CLAUDE_TGZ="/tmp/claude-code-${CLAUDE_VERSION}.tgz"
+CODEX_TGZ="/tmp/codex-${CODEX_VERSION}.tgz"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  -o "$CLAUDE_TGZ" \
+  "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${CLAUDE_VERSION}.tgz"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  -o "$CODEX_TGZ" \
+  "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}.tgz"
+verify_integrity "$CLAUDE_TGZ" "$CLAUDE_INTEGRITY"
+verify_integrity "$CODEX_TGZ" "$CODEX_INTEGRITY"
+npm install --global --no-fund --no-audit "$CLAUDE_TGZ" "$CODEX_TGZ"
+rm -f "$CLAUDE_TGZ" "$CODEX_TGZ"
+npm cache clean --force
+
+mkdir -p /etc/agent-bridge
+
+node_path="$(command -v node)"
+claude_path="$(command -v claude)"
+codex_path="$(command -v codex)"
+
+for path in "$node_path" "$claude_path" "$codex_path"; do
+  [ -n "$path" ] || { echo "a pinned tool is missing after install" >&2; exit 1; }
+done
+
+hash_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+cat > /etc/agent-bridge/versions.json <<JSON
+{
+  "schema_version": 1,
+  "tools": {
+    "claude": {"version": "${CLAUDE_VERSION}", "path": "${claude_path}", "sha256": "$(hash_of "$claude_path")"},
+    "codex": {"version": "${CODEX_VERSION}", "path": "${codex_path}", "sha256": "$(hash_of "$codex_path")"},
+    "node": {"version": "${NODE_VERSION}", "path": "${node_path}", "sha256": "$(hash_of "$node_path")"}
+  }
+}
+JSON
+
+# The image ships no network tooling and no credentials. Nothing above logs in
+# to a provider: see guest_runner.AUTHENTICATION_BLOCKER.
+chmod 0644 /etc/agent-bridge/versions.json

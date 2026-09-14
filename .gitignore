@@ -11,3 +11,10 @@ config/com.agent-bridge.execution-worker.plist
 # machine-local, and never meant to be shared. Untracked was not enough: one
 # `git add -A` in a dirty tree would have committed and pushed it.
 .claude-codex-relay/
+
+# Built WSL2 guest images. Hundreds of megabytes, rebuilt from a pinned
+# recipe, and a new copy in history on every build. The recipe and the
+# expected hashes are what is versioned; the tarball is not.
+/build/
+*.tar
+!tests/**/*.tar
