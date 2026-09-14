@@ -21,6 +21,7 @@ treated as proof that WSL delegation works.
 
 from __future__ import annotations
 
+import ntpath
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -124,7 +125,11 @@ def parse_manifest(data: Mapping[str, Any]) -> PinnedBaseImageManifest:
     if not isinstance(data, Mapping):
         raise ManifestError("manifest must be a mapping")
 
-    keys = set(data.keys())
+    raw_keys = list(data.keys())
+    if any(not isinstance(key, str) for key in raw_keys):
+        raise ManifestError("manifest keys must be strings")
+
+    keys = set(raw_keys)
     expected = set(_MANIFEST_KEYS)
     if keys != expected:
         missing = expected - keys
@@ -137,8 +142,8 @@ def parse_manifest(data: Mapping[str, Any]) -> PinnedBaseImageManifest:
     schema_version = data["schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise ManifestError("schema_version must be an int")
-    if schema_version < 1:
-        raise ManifestError("schema_version must be a positive pinned integer")
+    if schema_version != 1:
+        raise ManifestError("schema_version must be exactly 1")
 
     distro_release = _reject_unpinned_version("distro_release", data["distro_release"])
 
@@ -231,6 +236,35 @@ def parse_wsl_version(wsl_version_output: str) -> PrerequisiteCheckResult:
     return PrerequisiteCheckResult(True, "WSL version meets minimum", value)
 
 
+def all_prerequisites_met(
+    windows_build: PrerequisiteCheckResult,
+    wsl_version: PrerequisiteCheckResult,
+    *,
+    virtual_machine_platform_enabled: bool,
+    firmware_virtualization_enabled: bool,
+) -> bool:
+    """Pure aggregate of all Windows/WSL2 prerequisites.
+
+    Fails closed: passes only when both parsed results explicitly
+    passed and both boolean feature flags are explicitly ``True``.
+    Unknown, missing, or non-bool values never count as satisfied.
+    """
+
+    if not isinstance(windows_build, PrerequisiteCheckResult):
+        return False
+    if not isinstance(wsl_version, PrerequisiteCheckResult):
+        return False
+    if windows_build.passed is not True:
+        return False
+    if wsl_version.passed is not True:
+        return False
+    if virtual_machine_platform_enabled is not True:
+        return False
+    if firmware_virtualization_enabled is not True:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Safe ephemeral distro names
 # ---------------------------------------------------------------------------
@@ -312,6 +346,8 @@ def build_guest_environment(overrides: Mapping[str, str]) -> dict[str, str]:
             raise JobSpecError(f"guest environment key not allowlisted: {key!r}")
         if _CONTROL_CHAR_RE.search(value):
             raise JobSpecError(f"guest environment value for {key!r} has control characters")
+        if _looks_like_windows_path(value) or _contains_host_marker(value):
+            raise JobSpecError(f"guest environment value for {key!r} references a host path: {value!r}")
         result[key] = value
     return result
 
@@ -324,9 +360,12 @@ _JOB_SPEC_KEYS = frozenset({"command", "workdir", "env"})
 
 ALLOWED_GUEST_PATH_PREFIXES = ("/root/", "/home/", "/tmp/", "/workspace/")
 
+GUEST_RUNNER_PATH = "/usr/local/bin/agent-bridge-guest-runner"
+
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _UNC_PATH_RE = re.compile(r"^\\\\")
 _UNC_PATH_SLASH_RE = re.compile(r"^//[^/]")
+_DRIVE_AFTER_PREFIX_RE = re.compile(r"(^|[=\s:])[A-Za-z]:[\\/]")
 
 _SECRET_KEY_RE = re.compile(
     r"(secret|token|password|passwd|credential|apikey|api_key|private_key)",
@@ -361,6 +400,25 @@ def _looks_like_windows_path(value: str) -> bool:
     return False
 
 
+def _contains_host_marker(value: str) -> bool:
+    """Detect host-mount markers or Windows paths anywhere within a string,
+    including when embedded after ``KEY=`` or option-style prefixes."""
+
+    if "\\" in value:
+        return True
+    if "/mnt/" in value:
+        return True
+    if value == "/mnt":
+        return True
+    if _UNC_PATH_RE.search(value) or _UNC_PATH_SLASH_RE.match(value):
+        return True
+    if _DRIVE_AFTER_PREFIX_RE.search(value):
+        return True
+    if ".." in re.split(r"[\\/]", value):
+        return True
+    return False
+
+
 def _reject_host_path(name: str, value: str) -> None:
     if not isinstance(value, str) or not value:
         raise JobSpecError(f"{name} must be a non-empty string")
@@ -368,8 +426,8 @@ def _reject_host_path(name: str, value: str) -> None:
         raise JobSpecError(f"{name} contains control characters")
     if _looks_like_windows_path(value):
         raise JobSpecError(f"{name} looks like a Windows path: {value!r}")
-    if value.startswith("/mnt/"):
-        raise JobSpecError(f"{name} references a WSL host mount: {value!r}")
+    if _contains_host_marker(value):
+        raise JobSpecError(f"{name} references a host path or mount: {value!r}")
     if ".." in value.split("/"):
         raise JobSpecError(f"{name} contains path traversal: {value!r}")
 
@@ -386,6 +444,8 @@ def validate_job_spec(spec: Mapping[str, Any]) -> GuestJobSpec:
         raise JobSpecError("job spec must be a mapping")
 
     keys = set(spec.keys())
+    if any(not isinstance(key, str) for key in keys):
+        raise JobSpecError("job spec keys must be strings")
     if keys & _HOST_FALLBACK_KEYS:
         raise JobSpecError("host-fallback options are not permitted")
     if keys & _MOUNT_OR_SYMLINK_KEYS:
@@ -403,13 +463,18 @@ def validate_job_spec(spec: Mapping[str, Any]) -> GuestJobSpec:
         raise JobSpecError("command must be a list of strings")
     if not command:
         raise JobSpecError("command must not be empty")
+    if command[0] != GUEST_RUNNER_PATH:
+        raise JobSpecError(
+            f"command must invoke the pinned guest runner {GUEST_RUNNER_PATH!r}, "
+            f"got {command[0]!r}"
+        )
     validated_command = []
     for arg in command:
         if not isinstance(arg, str):
             raise JobSpecError("command arguments must be strings")
         if _CONTROL_CHAR_RE.search(arg):
             raise JobSpecError("command argument contains control characters")
-        if _looks_like_windows_path(arg) or arg.startswith("/mnt/"):
+        if _looks_like_windows_path(arg) or _contains_host_marker(arg):
             raise JobSpecError(f"command argument references a host path: {arg!r}")
         validated_command.append(arg)
 
@@ -424,6 +489,8 @@ def validate_job_spec(spec: Mapping[str, Any]) -> GuestJobSpec:
     if not isinstance(env_input, Mapping):
         raise JobSpecError("env must be a mapping")
     for key in env_input:
+        if not isinstance(key, str):
+            raise JobSpecError("env keys must be strings")
         if _SECRET_KEY_RE.search(key):
             raise JobSpecError(f"env key looks like a secret/credential: {key!r}")
     env = build_guest_environment(env_input)
@@ -450,6 +517,32 @@ def _reject_shell_unsafe(name: str, value: str) -> str:
     return value
 
 
+_UNC_PREFIXES = ("\\\\", "//")
+_DEVICE_PREFIXES = ("\\\\.\\", "\\\\?\\", "//./", "//?/")
+
+
+def _validate_windows_host_path(name: str, value: str) -> str:
+    """Validate an absolute native Windows path (not UNC/device/relative)."""
+
+    _reject_shell_unsafe(name, value)
+    if ".." in re.split(r"[\\/]", value):
+        raise WindowsWslContractError(f"{name} contains path traversal: {value!r}")
+    for prefix in _DEVICE_PREFIXES:
+        if value.startswith(prefix):
+            raise WindowsWslContractError(f"{name} is a device path: {value!r}")
+    for prefix in _UNC_PREFIXES:
+        if value.startswith(prefix):
+            raise WindowsWslContractError(f"{name} is a UNC/network path: {value!r}")
+    drive, tail = ntpath.splitdrive(value)
+    if not drive or not re.match(r"^[A-Za-z]:$", drive):
+        raise WindowsWslContractError(f"{name} must be an absolute drive path: {value!r}")
+    if not tail.startswith("\\") and not tail.startswith("/"):
+        raise WindowsWslContractError(f"{name} must be an absolute path: {value!r}")
+    if not ntpath.isabs(value):
+        raise WindowsWslContractError(f"{name} must be an absolute path: {value!r}")
+    return value
+
+
 def build_import_argv(
     distro_name: str, install_dir: str, rootfs_path: str, *, wsl_version: int = 2
 ) -> list[str]:
@@ -457,10 +550,10 @@ def build_import_argv(
     legitimate here since this targets the Windows host, not the guest."""
 
     validate_distro_name(distro_name)
-    _reject_shell_unsafe("install_dir", install_dir)
-    _reject_shell_unsafe("rootfs_path", rootfs_path)
-    if wsl_version not in (1, 2):
-        raise WindowsWslContractError("wsl_version must be 1 or 2")
+    _validate_windows_host_path("install_dir", install_dir)
+    _validate_windows_host_path("rootfs_path", rootfs_path)
+    if wsl_version != 2:
+        raise WindowsWslContractError("wsl_version must be 2 (WSL1 is not permitted)")
     return [
         "wsl.exe",
         "--import",
@@ -499,7 +592,7 @@ def build_guest_exec_argv(distro_name: str, job: GuestJobSpec) -> list[str]:
     argv.extend(job.command)
 
     for arg in argv:
-        if _looks_like_windows_path(arg) or arg.startswith("/mnt/"):
+        if _looks_like_windows_path(arg) or _contains_host_marker(arg):
             raise WindowsWslContractError(
                 f"refusing to build guest exec argv containing a host path: {arg!r}"
             )
@@ -529,17 +622,33 @@ def select_stale_instances(
     ``agent-bridge-`` safety prefix, regardless of age.
     """
 
+    if not isinstance(max_age, timedelta):
+        raise WindowsWslContractError("max_age must be a timedelta")
     if max_age <= timedelta(0):
         raise WindowsWslContractError("max_age must be positive")
+    if not isinstance(now, datetime):
+        raise WindowsWslContractError("now must be a datetime")
 
     stale: list[str] = []
     for record in instances:
         if not isinstance(record, InstanceRecord):
             raise WindowsWslContractError("instances must be InstanceRecord values")
+        if not isinstance(record.created_at, datetime):
+            raise WindowsWslContractError("created_at must be a datetime")
+        if (record.created_at.tzinfo is None) != (now.tzinfo is None):
+            raise WindowsWslContractError(
+                "now and created_at must be both naive or both timezone-aware"
+            )
         try:
             validate_distro_name(record.name)
         except DistroNameError:
             continue
-        if now - record.created_at >= max_age:
+        try:
+            age_exceeded = now - record.created_at >= max_age
+        except TypeError as exc:
+            raise WindowsWslContractError(
+                f"incompatible datetime values: {exc}"
+            ) from exc
+        if age_exceeded:
             stale.append(record.name)
     return stale
