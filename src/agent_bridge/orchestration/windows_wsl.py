@@ -520,6 +520,49 @@ def _reject_shell_unsafe(name: str, value: str) -> str:
 _UNC_PREFIXES = ("\\\\", "//")
 _DEVICE_PREFIXES = ("\\\\.\\", "\\\\?\\", "//./", "//?/")
 
+#: The DOS device names. Win32 still resolves these as devices in *any*
+#: directory, with or without an extension, so ``C:\\agent-bridge\\NUL`` is not a
+#: file that can be created: it is the null device. A runtime root or record
+#: path that lands on one accepts every write and returns nothing, which would
+#: make an unwritten record indistinguishable from a written one. Refused by
+#: name rather than discovered at the first write.
+_RESERVED_DEVICE_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{digit}" for digit in "123456789"),
+    *(f"LPT{digit}" for digit in "123456789"),
+})
+
+
+def _reject_reserved_and_ambiguous_components(name: str, value: str) -> None:
+    """The three ways a Windows path is not the file its text says it is.
+
+    Each of these is a case where Win32 and a string comparison disagree, and
+    every identity check in this project is a string comparison somewhere.
+
+    * A **reserved device name** resolves to a device, not a file.
+    * An **alternate data stream** (``file.json:hidden``) is a separate stream
+      on the same file. Writing one leaves the visible file untouched, and an
+      ACL or hash taken on the base name says nothing about it.
+    * A **trailing dot or space** is stripped by Win32 on the way to the
+      filesystem, so ``record.json `` and ``record.json`` are one file that
+      compares unequal as two strings.
+    """
+
+    _drive, tail = ntpath.splitdrive(value)
+    for component in re.split(r"[\\/]", tail):
+        if not component:
+            continue
+        if component != component.rstrip(". "):
+            raise WindowsWslContractError(
+                f"{name} has a component with a trailing dot or space: {value!r}")
+        if ":" in component:
+            raise WindowsWslContractError(
+                f"{name} names an alternate data stream: {value!r}")
+        stem = component.split(".", 1)[0].upper()
+        if stem in _RESERVED_DEVICE_NAMES:
+            raise WindowsWslContractError(
+                f"{name} contains a reserved device name: {value!r}")
+
 
 def _validate_windows_host_path(name: str, value: str) -> str:
     """Validate an absolute native Windows path (not UNC/device/relative)."""
@@ -540,6 +583,7 @@ def _validate_windows_host_path(name: str, value: str) -> str:
         raise WindowsWslContractError(f"{name} must be an absolute path: {value!r}")
     if not ntpath.isabs(value):
         raise WindowsWslContractError(f"{name} must be an absolute path: {value!r}")
+    _reject_reserved_and_ambiguous_components(name, value)
     return value
 
 

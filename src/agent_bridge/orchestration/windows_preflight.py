@@ -52,15 +52,6 @@ _MINIMAL_ENV = {
 
 _CMD_VER_ARGV = ["cmd.exe", "/d", "/s", "/c", "ver"]
 _WSL_VERSION_ARGV = ["wsl.exe", "--version"]
-_VMP_FEATURE_ARGV = [
-    "powershell.exe",
-    "-NoProfile",
-    "-NonInteractive",
-    "-NoLogo",
-    "-Command",
-    "Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform "
-    "| Select-Object -ExpandProperty State",
-]
 _FIRMWARE_VIRT_ARGV = [
     "systeminfo.exe",
 ]
@@ -179,16 +170,47 @@ def _parse_feature_state(output: str, feature_name: str) -> PrerequisiteCheckRes
     return PrerequisiteCheckResult(True, f"{feature_name} is Enabled", state)
 
 
+_FEATURE_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def feature_state_argv(feature_name: str) -> list[str]:
+    """Read-only query argv for one Windows optional feature.
+
+    The name is checked against a narrow character class rather than quoted:
+    it is interpolated into a PowerShell command, and the set of real feature
+    names never needs anything outside it, so refusing is both safe and
+    sufficient.
+    """
+
+    if not isinstance(feature_name, str) or not _FEATURE_NAME_RE.match(feature_name):
+        raise ValueError("feature name must be 1-64 characters of [A-Za-z0-9-]")
+    return [
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-NoLogo", "-Command",
+        f"Get-WindowsOptionalFeature -Online -FeatureName {feature_name} "
+        "| Select-Object -ExpandProperty State",
+    ]
+
+
+def collect_optional_feature(feature_name: str) -> PrerequisiteCheckResult:
+    """Collect one optional feature's state. Read-only, never enables it."""
+
+    try:
+        argv = feature_state_argv(feature_name)
+    except ValueError as exc:
+        return PrerequisiteCheckResult(False, str(exc), None)
+    outcome = _run_argv(argv)
+    if not outcome.ok:
+        return PrerequisiteCheckResult(False, outcome.detail, None)
+    return _parse_feature_state(outcome.stdout or "", feature_name)
+
+
 def collect_virtual_machine_platform() -> PrerequisiteCheckResult:
     """Collect the VirtualMachinePlatform optional feature state.
 
     Uses a read-only, non-elevated query. Never enables the feature.
     """
 
-    outcome = _run_argv(_VMP_FEATURE_ARGV)
-    if not outcome.ok:
-        return PrerequisiteCheckResult(False, outcome.detail, None)
-    return _parse_feature_state(outcome.stdout or "", "VirtualMachinePlatform")
+    return collect_optional_feature("VirtualMachinePlatform")
 
 
 _FIRMWARE_VIRT_LABEL = "Virtualization Enabled In Firmware"
