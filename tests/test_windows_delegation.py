@@ -653,6 +653,27 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(outcome["harness_status"], gr.HARNESS_VERIFICATION_FAILED)
         self.assertEqual(outcome["guest"]["verification"][0]["returncode"], 1)
 
+    def test_every_outcome_speaks_the_queues_contract(self):
+        from agent_bridge.orchestration import execution_queue as eq
+        for result in (_result(),
+                       _result(stdout=_guest_response(
+                           status="completed",
+                           harness_status=gr.HARNESS_VERIFICATION_FAILED,
+                           reason="verification_failed",
+                           verification=[_check(returncode=1)])),
+                       _result(status=wr.STATUS_ABORTED, reason="canary_failed",
+                               exit_code=None, stdout=b"", canaries_passed=False),
+                       _result(stdout=b"not json at all")):
+            eq.validate_outcome(self._dispatch(result))
+
+    def test_a_refusal_also_speaks_the_queues_contract(self):
+        from agent_bridge.orchestration import execution_queue as eq
+        executor = wd.WindowsWslExecutor(
+            self.fixture.config, provision_state=None, platform_name="win32")
+        outcome = executor(_request())
+        eq.validate_outcome(outcome)
+        self.assertEqual(outcome["harness_status"], gr.HARNESS_ABORTED)
+
     def test_incomplete_cleanup_is_carried_into_the_outcome(self):
         outcome = self._dispatch(_result(
             status=wr.STATUS_ABORTED, reason=wr.REASON_CLEANUP_FAILED, stdout=b"",

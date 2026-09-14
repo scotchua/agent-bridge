@@ -1,13 +1,15 @@
 """Bounded Claude subscription implementation lane."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
     from .. import runner
+    from . import claude_config
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
+    from agent_bridge.execution import claude_config
 
 class TaskError(RuntimeError): pass
 
@@ -28,12 +30,22 @@ def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:byt
     if r.descendant_held_pipes: raise TaskError("command output stream did not close")
     return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
 
-def _env():
+def _env(claude_config_dir:Path|None=None):
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
        "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
+    # A store selector, never a token. Without it the CLI resolves ~/.claude,
+    # the store the desktop app and interactive sessions also refresh; a
+    # concurrent invalid-grant cleanup there blanks the tokens and this lane
+    # reports a lost login. Which directory is allowed is claude_config's
+    # decision, not this function's.
+    if claude_config_dir is not None: e["CLAUDE_CONFIG_DIR"]=str(claude_config_dir)
     return e
+
+def _checked_config_dir(value:Path|None):
+    try: return claude_config.checked_config_dir(value)
+    except claude_config.ConfigDirError as exc: raise TaskError(str(exc)) from None
 
 def _git(repo:Path,*args:str,timeout:int=30,env=None):
     r=_run(_git_argv(*args),cwd=repo,env=env or _env(),timeout=timeout)
@@ -47,10 +59,123 @@ def _git_argv(*args:str):
 def _sha(path:Path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+#: A task may legitimately start in a dirty tree. What must never happen is
+#: that the task changes the user's working copy, and "git status text is
+#: unchanged" does not say that: porcelain=v2 reports HEAD and index hashes
+#: for a modified file, never the worktree content, and reports untracked
+#: files by name only. Overwriting a file that was already modified, or
+#: rewriting an untracked one, leaves the status output byte-identical. So the
+#: snapshot hashes content as well.
+MAX_SNAPSHOT_FILES=2048
+MAX_SNAPSHOT_BYTES=256*1024*1024
+MAX_SNAPSHOT_FILE_BYTES=64*1024*1024
+SNAPSHOT_CHUNK_BYTES=1024*1024
+
+def _relevant_paths(repo:Path,env)->list[str]:
+    """Every path git considers not-clean, from a single NUL-delimited status."""
+    raw=_git(repo,"status","--porcelain=v2","--untracked-files=all","-z",env=env)
+    paths=[];fields=raw.split("\x00");i=0
+    while i<len(fields):
+        entry=fields[i];i+=1
+        if not entry: continue
+        kind=entry[0]
+        if kind=="1":
+            paths.append(entry.split(" ",8)[8])
+        elif kind=="2":
+            # A renamed entry is "<fields> <path>" followed by the original
+            # path as its own NUL-delimited field. Both sides matter.
+            paths.append(entry.split(" ",9)[9])
+            if i<len(fields): paths.append(fields[i]);i+=1
+        elif kind in ("?","!","u"):
+            paths.append(entry.split(" ",10)[-1] if kind=="u" else entry[2:])
+    return sorted(set(p for p in paths if p))
+
+def _content_snapshot(repo:Path,env)->dict:
+    """Bounded hash of the content of every not-clean file.
+
+    Bounded, and a breach of the bound is a refusal rather than a smaller
+    snapshot: a snapshot that silently skipped files would report integrity it
+    never checked. The bound is deliberately far above any repository this
+    lane is meant to run in.
+    """
+    paths=_relevant_paths(repo,env)
+    if len(paths)>MAX_SNAPSHOT_FILES:
+        raise TaskError("source snapshot exceeds the file bound; refusing to run without integrity coverage")
+    digest=hashlib.sha256();total=0
+    for rel in paths:
+        target=repo/rel
+        digest.update(rel.encode("utf-8","surrogateescape"));digest.update(b"\x00")
+        try:
+            info=target.lstat()
+        except OSError:
+            digest.update(b"absent\x00\x00");continue
+        mode=info.st_mode
+        if stat.S_ISLNK(mode):
+            digest.update(b"link\x00");digest.update(os.readlink(target).encode("utf-8","surrogateescape"))
+        elif stat.S_ISDIR(mode):
+            # A submodule or an untracked directory git reported as one entry.
+            digest.update(b"dir\x00")
+        elif stat.S_ISREG(mode):
+            total+=_hash_regular_file(target,digest,MAX_SNAPSHOT_BYTES-total)
+        else:
+            # A FIFO, socket or device node in the worktree. It is never
+            # opened: reading one can block until something writes, or have
+            # side effects on the host, and a snapshot that hangs is an
+            # integrity check that never completes.
+            raise TaskError("source snapshot found a file that is not regular, a directory or a symlink")
+        digest.update(b"\x00")
+    return {"files":len(paths),"bytes":total,"sha256":digest.hexdigest()}
+
+def _hash_regular_file(target:Path,digest,budget:int)->int:
+    """Hash one regular file through a descriptor this function opened.
+
+    Opened with O_NOFOLLOW, so a symlink swapped in between the enumeration
+    and the read is refused rather than followed, and with O_NONBLOCK, so a
+    node that is not what lstat just said it was cannot block the open. The
+    type and size are then re-checked on the descriptor itself, because the
+    name was checked a moment ago and the descriptor is what is actually read.
+
+    Bytes are counted as they arrive and charged against both the per-file and
+    the cumulative bound, and the identity is re-checked at the end. A file
+    that grows or is replaced mid-read is a refusal, never a hash of a prefix
+    that would compare equal to the one taken before the task.
+    """
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
+    try: descriptor=os.open(target,flags)
+    except OSError as exc: raise TaskError("source snapshot could not read a changed file") from exc
+    try:
+        opened=os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise TaskError("source snapshot found a non-regular file where a regular file was expected")
+        if opened.st_size>MAX_SNAPSHOT_FILE_BYTES:
+            raise TaskError("source snapshot exceeds the per-file byte bound; refusing to run without integrity coverage")
+        if opened.st_size>budget:
+            raise TaskError("source snapshot exceeds the byte bound; refusing to run without integrity coverage")
+        os.set_blocking(descriptor,True)
+        digest.update(b"file\x00");digest.update(str(opened.st_mode&0o777).encode("ascii"));digest.update(b"\x00")
+        read=0
+        while True:
+            chunk=os.read(descriptor,SNAPSHOT_CHUNK_BYTES)
+            if not chunk: break
+            read+=len(chunk)
+            if read>opened.st_size or read>budget:
+                raise TaskError("a file grew while the source snapshot was being taken")
+            digest.update(chunk)
+        if read!=opened.st_size:
+            raise TaskError("a file changed size while the source snapshot was being taken")
+        final=os.fstat(descriptor)
+        if (final.st_dev,final.st_ino,final.st_size)!=(opened.st_dev,opened.st_ino,opened.st_size):
+            raise TaskError("a file was replaced while the source snapshot was being taken")
+        digest.update(str(read).encode("ascii"))
+        return read
+    finally:
+        os.close(descriptor)
+
 def _source_state(repo:Path,env):
     return {"head":_git(repo,"rev-parse","HEAD",env=env),
             "status":_git(repo,"status","--porcelain=v2","--untracked-files=all",env=env),
-            "config_sha256":_sha(repo/".git"/"config")}
+            "config_sha256":_sha(repo/".git"/"config"),
+            "content":_content_snapshot(repo,env)}
 
 def _assert_macos():
     if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
@@ -152,6 +277,10 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
                        f'(subpath "{quoted(scratch)}") (subpath "{quoted(scratch.resolve())}"))\n')
     os.chmod(profile,0o600)
     sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    # Verification runs project code from the brief's repository. It has no use
+    # for the lane's credential store, and pointing it at one would hand every
+    # verify command a path to a live subscription session.
+    sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
     result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
@@ -159,18 +288,20 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
     result.duration_seconds=time.monotonic()-started
     return result
 
-def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,classification:str,model:str,effort:str,
+def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
+             classification:str,model:str,effort:str,
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
     _assert_macos()
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,claude_bin)): raise TaskError("all paths must be absolute")
+    claude_config_dir=_checked_config_dir(claude_config_dir)
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not claude_bin.is_file() or not os.access(claude_bin,os.X_OK): raise TaskError("Claude executable unavailable")
     raw=brief.read_bytes()
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
     try: brief_text=raw.decode()
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
-    checks=_verify_argv(verify_argv); env=_env(); source_before=_source_state(repo,env)
+    checks=_verify_argv(verify_argv); env=_env(claude_config_dir); source_before=_source_state(repo,env)
     base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(claude_bin),"--version"],cwd=claude_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Claude executable")
@@ -179,6 +310,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,classificatio
     receipt={"schema":2,"job_id":job.name,"status":"running","route":"claude-subscription-cli","classification":classification,
              "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,"effort_requested":effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(claude_bin.resolve()),
+             "claude_config_dir":str(claude_config_dir),
              "executable_sha256":_sha(claude_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
              "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
@@ -256,6 +388,12 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,classificatio
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
     p.add_argument("--task-root",type=Path,default=DEFAULT_TASK_ROOT); p.add_argument("--claude-bin",type=Path,default=Path(shutil.which("claude") or "claude"))
+    # No default to ~/.claude. Silently sharing the desktop store is the defect
+    # this flag exists to prevent, so an unset value is a refusal, not a
+    # fallback. An inherited CLAUDE_CONFIG_DIR is a starting point only: it is
+    # still checked against the one canonical directory.
+    p.add_argument("--claude-config-dir",type=Path,
+                   default=Path(os.environ["CLAUDE_CONFIG_DIR"]) if os.environ.get("CLAUDE_CONFIG_DIR") else None)
     p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS)); p.add_argument("--model",default="sonnet")
     p.add_argument("--effort",default="medium",choices=("low","medium","high","xhigh","max")); p.add_argument("--base",default="HEAD")
     p.add_argument("--timeout",type=int,default=900); p.add_argument("--verify-timeout",type=int,default=300)
@@ -263,7 +401,20 @@ def main(argv=None):
     a=p.parse_args(argv)
     try:
         checks=[json.loads(x) for x in a.verify_json]; del a.verify_json; result=run_task(**vars(a),verify_argv=checks)
-    except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc: print(json.dumps({"ok":False,"error":type(exc).__name__})); return 1
-    print(json.dumps({"ok":True,**result},sort_keys=True)); return 0
+    except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc:
+        # TaskError messages are fixed, operator-safe diagnostics defined by
+        # this harness and by claude_config. Emitting them here is what lets an
+        # operator tell a configuration-store refusal from a patch failure
+        # without opening the mode-0600 receipt, which is not written for every
+        # early failure.
+        failure={"ok":False,"error":type(exc).__name__}
+        if isinstance(exc,TaskError): failure["error_detail"]=str(exc)
+        print(json.dumps(failure,sort_keys=True)); return 1
+    # A completed process is not a successful task. run_task returns normally
+    # when the generated patch applied cleanly but the verification commands
+    # failed, and reporting ok:true with exit 0 for that told every caller,
+    # including the execution queue, that unverified work had passed.
+    ok=result.get("status")=="complete"
+    print(json.dumps({"ok":ok,**result},sort_keys=True)); return 0 if ok else 3
 
 if __name__=="__main__": raise SystemExit(main())

@@ -24,10 +24,14 @@ import sys
 from typing import Any
 
 from .. import store
+from ..execution import claude_config
 
 CONFIG_VERSION = "1"
 LAUNCH_AGENT_LABEL = "com.agent-bridge.execution-worker"
-VERIFICATION_PROFILE = "automatic-delegation-v1"
+#: Bumped when the shape or the meaning of a direction row changes. v2 added
+#: the harness verdict fields, so a v1 report is refused by name rather than
+#: being judged against a rule it was never written for.
+VERIFICATION_PROFILE = "automatic-delegation-v2"
 DIRECTIONS = ("codex->claude", "claude->codex")
 PROVIDER_FOR_CALLER = {"codex": "claude", "claude": "codex"}
 NO_WORKER_SENTINEL = "no-local-worker-configured"
@@ -74,6 +78,13 @@ def paths_for(home: str, root: str) -> dict[str, str]:
             os.path.join(root, "src", "agent_bridge", "execution", "codex_task.py")),
         "claude_task_executable": os.path.realpath(
             os.path.join(root, "src", "agent_bridge", "execution", "claude_task.py")),
+        # The execution lane's own Claude store, so the lane's subscription
+        # login is not the store the desktop app and interactive sessions
+        # refresh. One canonical location, derived by claude_config rather
+        # than chosen here: a second definition of "which store" is how the
+        # lane ended up sharing one. Sign in there once with the pinned
+        # executable and this directory set; never copy credentials into it.
+        "claude_config_dir": claude_config.canonical_config_path(home),
     }
 
 
@@ -99,6 +110,7 @@ def build_config(home: str, root: str, *, local_worker_executable: str | None,
         "execution_queue_root": paths["execution_queue_root"],
         "codex_task_executable": paths["codex_task_executable"],
         "claude_task_executable": paths["claude_task_executable"],
+        "claude_config_dir": paths["claude_config_dir"],
         "python_executable": _portable_python(),
         "interval_seconds": float(interval_seconds),
     }
@@ -122,6 +134,12 @@ def harness_availability(cfg: dict[str, Any]) -> dict[str, Any]:
     python_ok = usable_file(cfg.get("python_executable")) and os.access(cfg["python_executable"], os.X_OK)
     codex_ok = usable_file(cfg.get("codex_task_executable"))
     claude_ok = usable_file(cfg.get("claude_task_executable"))
+    # Reported separately from execution_complete, and never folded into it:
+    # the harness files ship with the checkout, but the lane's own login is an
+    # operator step needing a browser authorization that no shipped file can
+    # satisfy. claude_config decides what "ready" means, including that the
+    # directory is the canonical one and is readable only by its owner.
+    claude_config_dir_ready = claude_config.is_ready(cfg.get("claude_config_dir"))
     worker_path = cfg.get("worker_executable")
     worker_configured = (usable_file(worker_path)
                          and os.path.basename(str(worker_path)) != NO_WORKER_SENTINEL)
@@ -129,7 +147,11 @@ def harness_availability(cfg: dict[str, Any]) -> dict[str, Any]:
         "python": python_ok,
         "codex_task_executable": codex_ok,
         "claude_task_executable": claude_ok,
+        "claude_config_dir_ready": claude_config_dir_ready,
         "execution_complete": python_ok and codex_ok and claude_ok,
+        # What the Claude lane can actually dispatch. execution_complete says
+        # the files are present; this says the lane will not refuse.
+        "claude_lane_ready": python_ok and claude_ok and claude_config_dir_ready,
         "local_worker_configured": worker_configured,
     }
 
@@ -179,7 +201,9 @@ REQUIRED_TOP_KEYS = frozenset({
     "directions", "local_model", *REQUIRED_SAFETY_FLAGS,
 })
 _DIRECTION_ROW_KEYS = frozenset({
-    "attempted", "reason", "state", "returncode", "source_classification",
+    "attempted", "reason", "state", "returncode",
+    "harness_ok", "harness_status", "harness_verdict",
+    "source_classification",
     "worktree_removed", "permission_to_apply", "permission_to_commit",
     "permission_to_push", "permission_to_merge",
 })
@@ -193,7 +217,17 @@ def _direction_status(direction: str, row: Any) -> str:
         if not isinstance(reason, str) or not reason:
             raise DelegationVerificationError(f"delegation evidence for {direction} must name a reason when not attempted")
         return "blocked:" + reason
-    if (row.get("state") != "complete" or row.get("returncode") != 0
+    # The same gate the queue used, not a second opinion about the same run.
+    # This block used to read `returncode == 0`, which is a fact about a
+    # process: a harness that exited zero after its verification commands
+    # failed satisfied it. Calling execution_queue.outcome_is_success means
+    # there is exactly one definition of a successful execution in this
+    # project, and evidence that predates it is refused by shape rather than
+    # silently measured against the weaker rule.
+    from .execution_queue import outcome_is_success
+
+    if (row.get("state") != "complete"
+            or not outcome_is_success(row)
             or row.get("source_classification") != "synthetic"
             or row.get("worktree_removed") is not True
             or any(row.get(key) is not False for key in

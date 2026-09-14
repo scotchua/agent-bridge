@@ -22,7 +22,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
-from agent_bridge.orchestration import delegation, windows_preflight  # noqa: E402
+from agent_bridge.orchestration import (  # noqa: E402
+    delegation, windows_preflight, windows_wsl_provision as wp)
 
 
 def answers(**changes):
@@ -43,13 +44,18 @@ def active_in(directory):
 
 PASSING_ROW = {
     "attempted": True, "reason": None, "state": "complete", "returncode": 0,
+    # The harness verdict, not just the process exit code. A row without these
+    # is a v1 row and is refused by shape.
+    "harness_ok": True, "harness_status": "complete", "harness_verdict": "read",
     "source_classification": "synthetic", "worktree_removed": True,
     "permission_to_apply": False, "permission_to_commit": False,
     "permission_to_push": False, "permission_to_merge": False,
 }
 BLOCKED_ROW = {
     "attempted": False, "reason": "execution_configuration_missing", "state": None,
-    "returncode": None, "source_classification": None, "worktree_removed": None,
+    "returncode": None, "harness_ok": None, "harness_status": None,
+    "harness_verdict": None,
+    "source_classification": None, "worktree_removed": None,
     "permission_to_apply": None, "permission_to_commit": None,
     "permission_to_push": None, "permission_to_merge": None,
 }
@@ -66,6 +72,22 @@ def evidence(cfg, *, codex_to_claude=None, claude_to_codex=None, local_model=Non
         "no_patches_applied": True, "no_commits": True, "no_pushes": True,
         "no_merges": True, "no_paid_fallback": True, "no_client_data": True,
     }
+
+
+
+def _write_private(path, text):
+    """Fixtures write records the way production does: owner-only.
+
+    The evidence loader refuses anything else, on purpose: a record other
+    accounts could have written is not evidence about this machine.
+    """
+    descriptor = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, text.encode("utf-8"))
+    finally:
+        os.close(descriptor)
+    if os.name != "nt":
+        os.chmod(str(path), 0o600)
 
 
 class AnswersCompatibilityTests(unittest.TestCase):
@@ -759,7 +781,9 @@ class WindowsApplyRefusalTests(unittest.TestCase):
             self.assertEqual(report["status"]["overall"], "enabled")
             self.assertEqual(report["windows_preflight"], ready_report)
             self.assertEqual(report["execution_delegation"], "blocked")
-            self.assertIn("not implemented yet", report["execution_delegation_note"])
+            self.assertIn("remains blocked", report["execution_delegation_note"])
+
+
 
 
 if __name__ == "__main__":

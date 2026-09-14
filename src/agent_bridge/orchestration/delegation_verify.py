@@ -48,6 +48,7 @@ MAX_DRAIN_ATTEMPTS = 50
 
 def _empty_row(reason: str) -> dict[str, Any]:
     return {"attempted": False, "reason": reason, "state": None, "returncode": None,
+            "harness_ok": None, "harness_status": None, "harness_verdict": None,
             "source_classification": None, "worktree_removed": None,
             "permission_to_apply": None, "permission_to_commit": None,
             "permission_to_push": None, "permission_to_merge": None}
@@ -64,18 +65,80 @@ def _disposable_repo() -> Path:
     return directory
 
 
-def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
-                    caller: str, provider: str) -> dict[str, Any]:
+def _verification_queue_root() -> Path:
+    """A queue root that exists only for this one synthetic job.
+
+    Never the configured production queue. ``run_once`` selects the oldest
+    queued job in whatever root it was given, not the job that was just
+    submitted, so draining the production queue here would execute the user's
+    real queued work, send it to a provider, and consume its receipt as a side
+    effect of an opt-in check. An isolated root makes that structurally
+    impossible rather than merely unlikely.
+    """
+
+    return Path(tempfile.mkdtemp(prefix="agent-bridge-verify-queue-"))
+
+
+def select_executor(cfg: Any, *, platform_name: str | None = None) -> tuple[Any, str]:
+    """The executor this machine actually dispatches through.
+
+    On Windows that is :class:`~.windows_delegation.WindowsWslExecutor`, built
+    from the verification record on this host. Verification has to use the
+    same executor production does, or it verifies something nobody runs: a
+    POSIX subprocess harness on a Windows machine would pass here and then be
+    replaced at dispatch time by an executor with entirely different gates.
+
+    The Windows executor is built even when nothing is verified. It then
+    refuses every job by name, which is a far more useful answer than an
+    unavailable harness, and it is the only caller positioned to record live
+    evidence once a real run succeeds.
+    """
+
+    from .windows_preflight import is_windows
+
+    if is_windows(platform_name):
+        from . import windows_delegation
+
+        missing = [name for name in ("windows_wsl_runtime_root",
+                                     "windows_wsl_rootfs_path",
+                                     "windows_wsl_manifest_path")
+                   if getattr(cfg, name, None) is None]
+        if missing:
+            return None, "windows_wsl_configuration_missing"
+        config = windows_delegation.DelegationConfig(
+            runtime_root=cfg.windows_wsl_runtime_root,
+            rootfs_path=cfg.windows_wsl_rootfs_path,
+            manifest_path=cfg.windows_wsl_manifest_path,
+            sidecar_path=getattr(cfg, "windows_wsl_sidecar_path", None))
+        return windows_delegation.verified_executor(
+            config, platform_name=platform_name), ""
+
+    if cfg.execution_queue_root is None:
+        return None, "execution_configuration_missing"
+    try:
+        return SubprocessHarnessExecutor(Harnesses(
+            codex=cfg.codex_task_executable, claude=cfg.claude_task_executable,
+            python=cfg.python_executable,
+            claude_config_dir=cfg.claude_config_dir)), ""
+    except ExecutionAdmissionError as exc:
+        return None, str(exc) or type(exc).__name__
+
+
+def _run_direction(executor: Any, _unused_queue_root: Any,
+                   *, caller: str, provider: str) -> dict[str, Any]:
     """Submit and drain exactly one synthetic job for one direction.
 
     Never applies, commits, pushes, or merges: the harness only returns an
     unapplied receipt, and this function does nothing to the disposable
-    repository beyond removing it afterward.
+    repository beyond removing it afterward. The queue it drains is created
+    here and destroyed here; the configured queue root is deliberately not
+    used, and is accepted only so callers do not have to change.
     """
     repo = _disposable_repo()
     brief = repo / ".agent-bridge-verify-brief.txt"
     brief.write_text(SYNTHETIC_BRIEF, encoding="utf-8")
     verify_argv = [["git", "status"]]
+    queue_root = _verification_queue_root()
     try:
         queue = ExecutionQueue(queue_root, executor, recover_interrupted=False)
         submitted = queue.submit(
@@ -92,7 +155,11 @@ def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
         receipt = queue.result(job_id)
     except ExecutionAdmissionError as exc:
         shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(queue_root, ignore_errors=True)
         return _empty_row(str(exc) or type(exc).__name__)
+    finally:
+        # The receipt is already read; the queue was only ever scaffolding.
+        shutil.rmtree(queue_root, ignore_errors=True)
     removed = True
     try:
         shutil.rmtree(repo)
@@ -102,6 +169,13 @@ def _run_direction(executor: SubprocessHarnessExecutor, queue_root: Path, *,
     return {
         "attempted": True, "reason": None, "state": receipt.get("state"),
         "returncode": harness.get("returncode"),
+        # The harness's own verdict, carried through rather than re-derived.
+        # A zero exit code is a fact about a process; these are the fact about
+        # the task, and the evidence gate reads them through the same
+        # ``outcome_is_success`` the queue used to set ``state``.
+        "harness_ok": harness.get("harness_ok"),
+        "harness_status": harness.get("harness_status"),
+        "harness_verdict": harness.get("harness_verdict"),
         "source_classification": receipt.get("classification"),
         "worktree_removed": removed,
         "permission_to_apply": receipt.get("permission_to_apply", False),
@@ -116,7 +190,18 @@ def _local_model_check(cfg: Any) -> dict[str, Any]:
     if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
         return {"status": "not_configured"}
     from ..localq.service import Service  # deferred: only needed on this path
-    service = Service(str(cfg.local_queue_root), str(cfg.worker_executable), str(cfg.worker_state))
+    # Same isolation as the provider directions, for the same reason:
+    # ``service.once()`` runs whatever is queued, and the user's own local
+    # queue is not this check's to consume.
+    queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-verify-localq-"))
+    try:
+        return _local_model_check_in(cfg, Service(
+            str(queue_root), str(cfg.worker_executable), str(cfg.worker_state)))
+    finally:
+        shutil.rmtree(queue_root, ignore_errors=True)
+
+
+def _local_model_check_in(cfg: Any, service: Any) -> dict[str, Any]:
     submitted = service.queue.submit(
         task_type="summarize", input=LOCAL_MODEL_INPUT,
         params={"instruction": "Summarize in one sentence.", "provider": "qwen"},
@@ -139,17 +224,7 @@ def run(config_path: str, *, callers: tuple[str, ...]) -> dict[str, Any]:
     required = delegation.required_directions_for(callers)
     directions: dict[str, Any] = {d: _empty_row("not_requested") for d in delegation.DIRECTIONS}
 
-    executor: SubprocessHarnessExecutor | None = None
-    executor_error: str | None = None
-    if cfg.execution_queue_root is None:
-        executor_error = "execution_configuration_missing"
-    else:
-        try:
-            executor = SubprocessHarnessExecutor(Harnesses(
-                codex=cfg.codex_task_executable, claude=cfg.claude_task_executable,
-                python=cfg.python_executable))
-        except ExecutionAdmissionError as exc:
-            executor_error = str(exc) or type(exc).__name__
+    executor, executor_error = select_executor(cfg)
 
     for direction in required:
         caller, provider = direction.split("->")
@@ -157,7 +232,7 @@ def run(config_path: str, *, callers: tuple[str, ...]) -> dict[str, Any]:
             directions[direction] = _empty_row(executor_error or "execution_harness_unavailable")
             continue
         directions[direction] = _run_direction(
-            executor, cfg.execution_queue_root, caller=caller, provider=provider)
+            executor, None, caller=caller, provider=provider)
 
     local_model = _local_model_check(cfg)
 

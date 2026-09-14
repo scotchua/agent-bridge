@@ -19,9 +19,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from agent_bridge.platform import platform as host_platform
+
+from ..execution import claude_config
+from . import windows_privacy as wpv
 
 
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
@@ -38,6 +41,11 @@ class Harnesses:
     codex: Path
     claude: Path
     python: Path
+    # The configuration directory the Claude harness signs in against. It
+    # selects a store, it is not a credential. Keeping the lane off the
+    # default ~/.claude store stops a concurrent desktop refresh from signing
+    # the lane out; claude_config decides which directory is allowed.
+    claude_config_dir: Path | None = None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -89,6 +97,12 @@ class SubprocessHarnessExecutor:
                 raise ExecutionAdmissionError(f"{name}_harness_unavailable")
         if not os.access(harnesses.python, os.X_OK):
             raise ExecutionAdmissionError("python_harness_not_executable")
+        directory = harnesses.claude_config_dir
+        # Checked at construction as well as at dispatch. A wrong store found
+        # here is a setup problem an operator can fix before any job is
+        # claimed; found at dispatch it is a failed job.
+        if directory is not None and not claude_config.is_ready(directory):
+            raise ExecutionAdmissionError("claude_config_dir_unavailable")
         self.harnesses = harnesses
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
@@ -107,9 +121,17 @@ class SubprocessHarnessExecutor:
                      "--model", request["model"], "--reasoning-effort", request["effort"],
                      "--tasks-dir", str(job_dir / "harness")]
         else:
+            # Fail closed rather than let the harness fall back to the shared
+            # default store; an unisolated lane is the recurring login-loss
+            # bug, and a store that is not the lane's own is not a store this
+            # dispatcher may point a subscription login at.
+            directory = self.harnesses.claude_config_dir
+            if not claude_config.is_ready(directory):
+                raise ExecutionAdmissionError("claude_config_dir_unavailable")
             argv += ["--classification", request["classification"],
                      "--model", request["model"], "--effort", request["effort"],
-                     "--task-root", str(job_dir / "harness")]
+                     "--task-root", str(job_dir / "harness"),
+                     "--claude-config-dir", str(directory)]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         account = pwd.getpwuid(os.getuid()).pw_name
@@ -133,10 +155,137 @@ class SubprocessHarnessExecutor:
             target = job_dir / name
             target.write_bytes(payload)
             os.chmod(target, 0o600)
+        summary = _harness_summary(stdout)
         return {"returncode": process.returncode,
                 "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                 "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr)}
+                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+                **summary}
+
+
+#: The only harness status that means the work is done and verified. Every
+#: other value, including "verification_failed", is a task that did not pass.
+HARNESS_COMPLETE = "complete"
+
+#: The complete outcome vocabulary, shared by every executor.
+#:
+#: There is exactly one semantic schema for an execution outcome, and every
+#: executor speaks it: the POSIX ``SubprocessHarnessExecutor`` reading a
+#: harness receipt, and the Windows ``WindowsWslExecutor`` translating a guest
+#: response. Two executors with two different notions of "done" is how a
+#: verification failure became a completed job once already; a single
+#: vocabulary, enforced at the point the queue records a state, is what stops
+#: it becoming one again.
+HARNESS_VERIFICATION_FAILED = "verification_failed"
+HARNESS_FAILED = "failed"
+HARNESS_ABORTED = "aborted"
+HARNESS_STATUSES = frozenset({HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
+                              HARNESS_FAILED, HARNESS_ABORTED})
+
+#: Fields every outcome must carry. ``harness_verdict`` says how the status was
+#: learned, which is what distinguishes "the harness said it failed" from "the
+#: harness said nothing we could read".
+OUTCOME_REQUIRED_KEYS = ("returncode", "harness_ok", "harness_status",
+                         "harness_verdict")
+
+
+def validate_outcome(outcome: object) -> Mapping[str, Any]:
+    """Hold an executor to the outcome contract before anything is recorded.
+
+    Fail closed: an executor that returns a shape the queue does not
+    understand is a bug that must surface as a failed job with a named
+    reason, never as a job whose state was decided by whichever keys happened
+    to be missing.
+    """
+
+    if not isinstance(outcome, Mapping):
+        raise ExecutionAdmissionError("execution_outcome_not_a_mapping")
+    for key in OUTCOME_REQUIRED_KEYS:
+        if key not in outcome:
+            raise ExecutionAdmissionError("execution_outcome_incomplete")
+    returncode = outcome["returncode"]
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise ExecutionAdmissionError("execution_outcome_returncode_invalid")
+    if not isinstance(outcome["harness_ok"], bool):
+        raise ExecutionAdmissionError("execution_outcome_harness_ok_invalid")
+    if outcome["harness_status"] not in HARNESS_STATUSES:
+        raise ExecutionAdmissionError("execution_outcome_harness_status_invalid")
+    if not isinstance(outcome["harness_verdict"], str) or not outcome["harness_verdict"]:
+        raise ExecutionAdmissionError("execution_outcome_harness_verdict_invalid")
+    # A status and an ok flag that disagree is a contradiction, not a result.
+    if outcome["harness_ok"] != (outcome["harness_status"] == HARNESS_COMPLETE):
+        raise ExecutionAdmissionError("execution_outcome_inconsistent")
+    return outcome
+
+
+def _harness_summary(stdout: bytes) -> dict[str, Any]:
+    """Read the harness's own verdict out of its final JSON line.
+
+    A process that exits 0 is not a task that succeeded, and treating it as
+    one is how a verification failure became a completed job. The harness
+    states its verdict in the receipt it prints; that verdict is what counts.
+    Unreadable output is a refusal, never an assumption of success.
+    """
+
+    for line in reversed(stdout.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return _unreadable("receipt_unparseable")
+        if not isinstance(parsed, dict):
+            return _unreadable("receipt_not_an_object")
+        status = parsed.get("status")
+        if status not in HARNESS_STATUSES:
+            # A status outside the vocabulary is output nobody agreed on. It
+            # is not a completion, and it is not silently renamed to one.
+            return _unreadable("receipt_status_unknown")
+        return {"harness_ok": parsed.get("ok") is True and status == HARNESS_COMPLETE,
+                "harness_status": status, "harness_verdict": "read"}
+    return _unreadable("receipt_absent")
+
+
+def _unreadable(verdict: str) -> dict[str, Any]:
+    """No usable verdict is an aborted job, never an assumed one."""
+
+    return {"harness_ok": False, "harness_status": HARNESS_ABORTED,
+            "harness_verdict": verdict}
+
+
+def outcome_is_success(outcome: Mapping[str, Any]) -> bool:
+    """Both gates: the process exited 0 *and* the harness said it completed.
+
+    Either alone is insufficient. A zero exit with a "verification_failed"
+    receipt is the case this exists for; a nonzero exit with a "complete"
+    receipt would mean the harness contradicted itself, which is equally not
+    a success.
+    """
+
+    if outcome.get("returncode") != 0:
+        return False
+    if not outcome.get("harness_ok"):
+        return False
+    return outcome.get("harness_status") == HARNESS_COMPLETE
+
+
+def require_private_queue(path: Path, *, platform: Any = None,
+                         root: Path | None = None) -> None:
+    """Establish and read back an owner-only ACL, or refuse to use the path.
+
+    ``mkdir(mode=0o700)`` and ``chmod`` are no-ops on Windows: the directory
+    inherits whatever its parent grants and nothing says so. This queue holds
+    brief paths, repository paths, model choices and job outcomes, so a
+    directory whose privacy cannot be established is one nothing may be
+    written into. It is called at creation and again for each job directory
+    *before* the request is written, not afterwards by the worker: by the time
+    a worker takes its lock the content is already on disk.
+    """
+
+    try:
+        wpv.require_private_directory(path, root=root or path, platform=platform)
+    except wpv.PrivacyError as exc:
+        raise ExecutionAdmissionError(f"queue_{exc.reason}") from exc
 
 
 class ExecutionQueue:
@@ -145,10 +294,17 @@ class ExecutionQueue:
     def __init__(self, root: str | Path,
                  executor: Callable[[dict[str, Any], Path], dict[str, Any]] | None,
                  *, clock: Callable[[], float] = time.time,
-                 recover_interrupted: bool = True):
+                 recover_interrupted: bool = True,
+                 platform: Any = None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        try:
+            os.chmod(self.root, 0o700)
+        except OSError:
+            # Windows: st_mode is not the mechanism. The ACL check below is.
+            pass
+        self._platform = platform
+        require_private_queue(self.root, platform=platform)
         self.executor, self.clock = executor, clock
         self._lock = threading.Lock()
         if recover_interrupted:
@@ -239,6 +395,11 @@ class ExecutionQueue:
             job_id = uuid.uuid4().hex
             directory = self.root / job_id
             directory.mkdir(mode=0o700)
+            # Before the request, never after it. The request names the brief
+            # and the repository; a job directory that turned out to be
+            # readable by other accounts would have leaked them already.
+            require_private_queue(directory, platform=self._platform,
+                                  root=self.root)
             request = {"schema": 1, "job_id": job_id, **identity,
                        "paid_fallback": False, "idempotency_key": key,
                        "submitted_at": self.clock()}
@@ -301,8 +462,10 @@ class ExecutionQueue:
             if hashlib.sha256(current).hexdigest() != request["brief_sha256"]:
                 raise ExecutionAdmissionError("brief_changed_after_admission")
             outcome = self.executor(request, selected)
-            receipt.update(state="complete" if outcome.get("returncode") == 0 else "failed",
-                           harness=outcome, finished_at=self.clock())
+            validate_outcome(outcome)
+            receipt.update(
+                state="complete" if outcome_is_success(outcome) else "failed",
+                harness=outcome, finished_at=self.clock())
         except Exception as exc:
             receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())
         _atomic_json(selected / "receipt.json", receipt)

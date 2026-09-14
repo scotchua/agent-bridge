@@ -9,5 +9,6 @@
   "codex_task_executable": "/absolute/path/to/codex_task.py",
   "claude_task_executable": "/absolute/path/to/claude_task.py",
   "python_executable": "/absolute/path/to/python3",
+  "claude_config_dir": "/absolute/path/to/home/.agent-bridge/claude-home",
   "interval_seconds": 5.0
 }

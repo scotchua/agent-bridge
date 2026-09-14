@@ -1,3 +1,6 @@
+import contextlib
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,7 +15,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_bridge.execution.codex_task import TaskError, _env, _remove, _run, _sandboxed, run_task
+from agent_bridge.execution import codex_task as module
+from agent_bridge.execution.codex_task import (
+    TaskError, _env, _git, _relevant_paths, _remove, _run, _sandboxed,
+    _source_state, main, run_task)
 
 # `_env()` builds a fixed, minimal environment from scratch (see the module
 # under test): it does not forward arbitrary variables from the parent
@@ -271,6 +277,241 @@ class CodexTaskTests(unittest.TestCase):
         receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
         self.assertEqual(receipt["codex_home"], str(self.codex_home))
         self.assertNotEqual(str(self.codex_home), os.path.expanduser("~/.codex"))
+
+
+
+class CodexExitStatusTests(CodexTaskTests):
+    """A completed process is not a verified task.
+
+    Independently reported by Charlie; reproduced against the baseline before
+    this fix. ``run_task`` returns normally when the patch applied cleanly but
+    the verification commands failed, and the CLI printed ok:true and exited 0
+    for that, so the execution queue recorded unverified work as complete.
+    """
+
+    def _main(self, check):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main([str(self.brief), "--repo", str(self.repo),
+                         "--tasks-dir", str(self.root / "tasks"),
+                         "--codex-bin", str(self.fake),
+                         "--codex-home", str(self.codex_home),
+                         "--classification", "synthetic",
+                         "--verify-json", json.dumps(check)])
+        lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        return code, json.loads(lines[-1])
+
+    def test_a_clean_run_reports_ok_and_exits_zero(self):
+        code, payload = self._main(["git", "diff", "--check"])
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "complete")
+
+    def test_a_failed_verification_exits_nonzero(self):
+        code, payload = self._main(["git", "diff", "--exit-code"])
+        self.assertNotEqual(code, 0)
+        self.assertFalse(payload["ok"], payload)
+        self.assertEqual(payload["status"], "verification_failed", payload)
+
+    def test_the_failing_check_is_recorded_in_the_receipt(self):
+        _, payload = self._main(["git", "diff", "--exit-code"])
+        self.assertTrue(any(entry["returncode"] != 0
+                            for entry in payload["verification"]))
+
+
+class CodexSourceIntegrityTests(unittest.TestCase):
+    """Content changes to files that were already dirty must be detected.
+
+    Independently reported by Charlie; reproduced against the baseline. git
+    status --porcelain=v2 reports HEAD and index hashes for a modified file,
+    never the worktree content, so rewriting a file that was already modified
+    leaves the status output byte-identical and the old comparison saw nothing.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"],
+                       cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo,
+                       check=True)
+        (self.repo / "value.txt").write_text("before\n")
+        (self.repo / "staged.txt").write_text("staged one\n")
+        subprocess.run(["git", "add", "value.txt", "staged.txt"], cwd=self.repo,
+                       check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True)
+        (self.repo / "value.txt").write_text("already modified\n")
+        (self.repo / "staged.txt").write_text("staged two\n")
+        subprocess.run(["git", "add", "staged.txt"], cwd=self.repo, check=True)
+        (self.repo / "untracked.txt").write_text("untracked one\n")
+        self.env = _env()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _status(self):
+        return _git(self.repo, "status", "--porcelain=v2",
+                    "--untracked-files=all", env=self.env)
+
+    def _snapshot(self):
+        return _source_state(self.repo, self.env)
+
+    def test_rewriting_an_already_modified_file_changes_the_snapshot(self):
+        before, status_before = self._snapshot(), self._status()
+        (self.repo / "value.txt").write_text("modified again\n")
+        self.assertEqual(self._status(), status_before,
+                         "fixture is wrong: git status must be unchanged")
+        self.assertNotEqual(self._snapshot(), before)
+
+    def test_rewriting_an_untracked_file_changes_the_snapshot(self):
+        before, status_before = self._snapshot(), self._status()
+        (self.repo / "untracked.txt").write_text("untracked two\n")
+        self.assertEqual(self._status(), status_before)
+        self.assertNotEqual(self._snapshot(), before)
+
+    def test_an_unchanged_tree_snapshots_identically(self):
+        self.assertEqual(self._snapshot(), self._snapshot())
+
+    def test_the_snapshot_covers_every_not_clean_path(self):
+        self.assertEqual(_relevant_paths(self.repo, self.env),
+                         ["staged.txt", "untracked.txt", "value.txt"])
+
+    def test_a_tree_with_too_many_dirty_files_refuses_rather_than_skipping(self):
+        with mock.patch.object(module, "MAX_SNAPSHOT_FILES", 1):
+            with self.assertRaises(TaskError):
+                self._snapshot()
+
+    def test_a_tree_with_too_many_dirty_bytes_refuses_rather_than_skipping(self):
+        with mock.patch.object(module, "MAX_SNAPSHOT_BYTES", 4):
+            with self.assertRaises(TaskError):
+                self._snapshot()
+
+    # -- bounded and nonblocking, not merely bounded ------------------------
+    #
+    # git never enumerates a FIFO, socket or device node as untracked, so the
+    # way one reaches the snapshot is a swap between the enumeration and the
+    # open. These exercise the guarantee at the point that matters: the file
+    # is opened by this code, and what the descriptor turns out to be is
+    # checked on the descriptor.
+
+    def test_a_fifo_is_refused_rather_than_opened_and_waited_on(self):
+        """Opening one to read waits for a writer. A snapshot must not hang."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs on this platform")
+        pipe = self.repo / "pipe"
+        os.mkfifo(pipe)
+        with self.assertRaises(TaskError) as caught:
+            module._hash_regular_file(pipe, hashlib.sha256(), 4096)
+        self.assertIn("non-regular", str(caught.exception))
+
+    def test_a_socket_is_refused(self):
+        import socket
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(endpoint.close)
+        try:
+            endpoint.bind(str(self.repo / "sock"))
+        except OSError:
+            self.skipTest("cannot bind a unix socket here")
+        with self.assertRaises(TaskError):
+            module._hash_regular_file(self.repo / "sock", hashlib.sha256(), 4096)
+
+    def test_a_device_node_is_refused(self):
+        node = Path("/dev/null")
+        if not node.exists():
+            self.skipTest("no /dev/null here")
+        with self.assertRaises(TaskError) as caught:
+            module._hash_regular_file(node, hashlib.sha256(), 4096)
+        self.assertIn("non-regular", str(caught.exception))
+
+    def test_a_symlink_is_never_followed_by_the_reader(self):
+        outside = self.root / "outside.txt"
+        outside.write_text("secret\n")
+        link = self.repo / "link.txt"
+        link.symlink_to(outside)
+        with self.assertRaises(TaskError) as caught:
+            module._hash_regular_file(link, hashlib.sha256(), 4096)
+        self.assertIn("could not read", str(caught.exception))
+
+    def test_a_file_that_grows_while_it_is_read_is_refused(self):
+        """A prefix hashed as if it were the whole file would compare equal."""
+        target = self.repo / "untracked.txt"
+        target.write_bytes(b"a" * 8)
+        watched = target.stat().st_ino
+        real_read, state = os.read, {"grown": False}
+
+        def growing_read(descriptor, size):
+            if not state["grown"] and os.fstat(descriptor).st_ino == watched:
+                state["grown"] = True
+                with open(target, "ab") as handle:
+                    handle.write(b"b" * 4096)
+            return real_read(descriptor, size)
+
+        with mock.patch.object(module.os, "read", growing_read):
+            with self.assertRaises(TaskError) as caught:
+                self._snapshot()
+        self.assertIn("grew while the source snapshot", str(caught.exception))
+
+    def test_a_file_that_shrinks_while_it_is_read_is_refused(self):
+        target = self.repo / "untracked.txt"
+        target.write_bytes(b"a" * 4096)
+        watched = target.stat().st_ino
+        real_read, state = os.read, {"seen": False}
+
+        def shrinking_read(descriptor, size):
+            if os.fstat(descriptor).st_ino != watched:
+                return real_read(descriptor, size)
+            if state["seen"]:
+                return b""
+            state["seen"] = True
+            return real_read(descriptor, 8)
+
+        with mock.patch.object(module.os, "read", shrinking_read):
+            with self.assertRaises(TaskError) as caught:
+                self._snapshot()
+        self.assertIn("changed size", str(caught.exception))
+
+    def test_a_file_replaced_under_the_descriptor_is_refused(self):
+        target = self.repo / "untracked.txt"
+        target.write_bytes(b"a" * 16)
+        watched = target.stat().st_ino
+        real_fstat, state = os.fstat, {"seen": 0}
+
+        def drifting_fstat(descriptor):
+            info = real_fstat(descriptor)
+            if info.st_ino != watched:
+                return info
+            state["seen"] += 1
+            if state["seen"] == 1:
+                return info
+            return os.stat_result(
+                tuple(info)[:1] + (info.st_ino + 1,) + tuple(info)[2:10])
+
+        with mock.patch.object(module.os, "fstat", drifting_fstat):
+            with self.assertRaises(TaskError) as caught:
+                self._snapshot()
+        self.assertIn("replaced", str(caught.exception))
+
+    def test_a_single_file_over_the_per_file_bound_is_refused(self):
+        (self.repo / "untracked.txt").write_bytes(b"x" * 64)
+        with mock.patch.object(module, "MAX_SNAPSHOT_FILE_BYTES", 8):
+            with self.assertRaises(TaskError) as caught:
+                self._snapshot()
+        self.assertIn("per-file", str(caught.exception))
+
+    def test_a_directory_entry_is_recorded_without_being_walked(self):
+        (self.repo / "untracked.txt").unlink()
+        nested = self.repo / "nested"
+        nested.mkdir()
+        (nested / "inner.txt").write_text("inner\n")
+        before = self._snapshot()
+        (nested / "inner.txt").write_text("inner two\n")
+        self.assertNotEqual(self._snapshot(), before)
+
+
+
 
 
 if __name__ == "__main__":

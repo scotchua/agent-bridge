@@ -9,7 +9,6 @@ foreground test cannot send the same request twice.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 import signal
 import socket
@@ -17,6 +16,7 @@ import sys
 import time
 from pathlib import Path
 
+from ..platform import platform as host_platform
 from .config import load
 from .execution_queue import (
     ExecutionAdmissionError,
@@ -30,45 +30,146 @@ class WorkerAlreadyRunning(RuntimeError):
     """Another process owns the queue-level worker lock."""
 
 
+class QueueNotPrivate(RuntimeError):
+    """The queue root could not be confirmed readable only by its owner."""
+
+
 class WorkerLock:
-    def __init__(self, queue_root: Path):
+    """One advisory lock over the whole queue, held for the worker's lifetime.
+
+    Taken through the platform abstraction rather than ``fcntl`` directly.
+    ``fcntl`` does not exist on Windows, so importing it at module scope made
+    this module unimportable there, which meant a Windows host could not even
+    read the worker's own error messages. The platform layer already provides
+    an exclusive lock with the same guarantee on both systems.
+    """
+
+    def __init__(self, queue_root: Path, platform: object | None = None):
         self.path = queue_root / ".execution-worker.lock"
         self._fd: int | None = None
+        self._release: object = None
+        self._platform = platform if platform is not None else host_platform
 
     def __enter__(self) -> "WorkerLock":
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.path.parent, 0o700)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        os.fchmod(fd, 0o600)
+        # O_NOFOLLOW is POSIX-only; on Windows the same protection comes from
+        # the owner-only ACL the platform layer applies to the directory.
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            self._platform.enforce_owner_only_file(fd)
+        except OSError:
+            os.close(fd)
+            raise
+        except (AttributeError, NotImplementedError) as exc:
+            # Not "the platform cannot do this, carry on". The queue holds job
+            # requests and their outcomes; if this process cannot establish
+            # that only its owner can read them, it must not start. mkdir's
+            # mode argument is a no-op on Windows, so swallowing this was
+            # exactly the case where the directory stayed world-readable and
+            # nothing said so.
+            os.close(fd)
+            raise QueueNotPrivate("queue_root_acl_unenforceable") from exc
+        self._verify_queue_root(fd)
+        # timeout=0: this is a liveness question, not a queue to wait in. A
+        # second worker must report that one is already running, not block.
+        release = self._platform.lock_exclusive(fd, str(self.path), 0.0)
+        try:
+            release.__enter__()
+        except TimeoutError as exc:
             os.close(fd)
             raise WorkerAlreadyRunning("execution_worker_already_running") from exc
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        except OSError as exc:
+            os.close(fd)
+            raise WorkerAlreadyRunning("execution_worker_already_running") from exc
+        # Write first, then truncate to what was written. Truncating to zero
+        # first would momentarily drop byte 0, which is exactly the byte the
+        # Windows lock is taken on.
+        os.lseek(fd, 0, os.SEEK_SET)
+        written = os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        os.ftruncate(fd, written)
         os.fsync(fd)
         self._fd = fd
+        self._release = release
         return self
+
+    def _verify_queue_root(self, fd: int) -> None:
+        """Set and read back the directory's own permissions, then trust them.
+
+        ``enforce_owner_only_file`` covers the lock file. The directory is a
+        separate object with separate permissions, and on Windows it inherits
+        whatever its parent grants unless something says otherwise. The
+        platform call both applies and re-reads, so a failure here means the
+        protection is genuinely absent rather than merely unrequested.
+        """
+
+        verify = getattr(self._platform, "verify_owner_only_path", None)
+        if verify is None:
+            os.close(fd)
+            raise QueueNotPrivate("queue_root_acl_unenforceable")
+        try:
+            verified, _evidence = verify(str(self.path.parent), str(self.path))
+        except OSError as exc:
+            os.close(fd)
+            raise QueueNotPrivate("queue_root_acl_unverified") from exc
+        if not verified:
+            os.close(fd)
+            # The evidence mapping can name a pathname; the exception carries
+            # only the reason code, matching every other durable refusal here.
+            raise QueueNotPrivate("queue_root_not_owner_only")
 
     def __exit__(self, *_: object) -> None:
         if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            if self._release is not None:
+                self._release.__exit__(None, None, None)
+                self._release = None
             os.close(self._fd)
             self._fd = None
 
 
-def _configured_queue(config_path: str) -> ExecutionQueue:
-    cfg = load(config_path)
-    required = (cfg.execution_queue_root, cfg.codex_task_executable,
-                cfg.claude_task_executable, cfg.python_executable)
+def select_executor(cfg, *, os_name: str | None = None):
+    """Choose the executor this platform actually has.
+
+    On Windows the POSIX harness executor cannot run at all, so the queue gets
+    the WSL2 executor instead. That executor refuses rather than runs today,
+    but it refuses with the specific reason (provisioning stage, or the
+    provider authentication blocker), which is what an operator needs, instead
+    of a generic "platform unsupported" from a harness that was never going to
+    work here.
+    """
+
+    name = os.name if os_name is None else os_name
+    if name == "nt":
+        if cfg.windows_wsl_runtime_root is None:
+            raise ExecutionAdmissionError("windows_wsl_configuration_missing")
+        # Imported here so POSIX workers never pay for, or depend on, the
+        # Windows delegation stack.
+        from .windows_delegation import DelegationConfig, verified_executor
+        # verified_executor, not the bare class: the worker must not decide for
+        # itself that the host is provisioned. It reads the machine-bound
+        # verification record, and gets an executor that refuses by name when
+        # there is not one.
+        return verified_executor(DelegationConfig(
+            runtime_root=cfg.windows_wsl_runtime_root,
+            rootfs_path=cfg.windows_wsl_rootfs_path,
+            manifest_path=cfg.windows_wsl_manifest_path,
+            sidecar_path=cfg.windows_wsl_sidecar_path,
+        ))
+    required = (cfg.codex_task_executable, cfg.claude_task_executable,
+                cfg.python_executable)
     if any(value is None for value in required):
         raise ExecutionAdmissionError("execution_configuration_missing")
-    harnesses = Harnesses(codex=cfg.codex_task_executable,
-                          claude=cfg.claude_task_executable,
-                          python=cfg.python_executable)
-    return ExecutionQueue(cfg.execution_queue_root,
-                          SubprocessHarnessExecutor(harnesses),
+    return SubprocessHarnessExecutor(Harnesses(
+        codex=cfg.codex_task_executable, claude=cfg.claude_task_executable,
+        python=cfg.python_executable,
+        claude_config_dir=cfg.claude_config_dir))
+
+
+def _configured_queue(config_path: str) -> ExecutionQueue:
+    cfg = load(config_path)
+    if cfg.execution_queue_root is None:
+        raise ExecutionAdmissionError("execution_configuration_missing")
+    return ExecutionQueue(cfg.execution_queue_root, select_executor(cfg),
                           recover_interrupted=True)
 
 
@@ -120,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(args.config, once=args.once, interval=args.interval,
                    worker_id=args.worker_id)
-    except (ExecutionAdmissionError, WorkerAlreadyRunning, ValueError) as exc:
+    except (ExecutionAdmissionError, WorkerAlreadyRunning, QueueNotPrivate,
+            ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

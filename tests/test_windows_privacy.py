@@ -242,6 +242,84 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "acl_unenforceable")
 
 
+class QueuePrivacyAtCreationTests(unittest.TestCase):
+    """Blocker 6: the ACL is established before any request content exists."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "queue"
+        self.repo = Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = Path(self.temp.name) / "brief.txt"
+        self.brief.write_text("do the thing\n", encoding="utf-8")
+
+    def _queue(self, **kwargs):
+        return eq.ExecutionQueue(self.root, None, recover_interrupted=False,
+                                 **kwargs)
+
+    def _submit(self, queue):
+        return queue.submit(
+            caller="codex", provider="claude", repo=str(self.repo),
+            brief=str(self.brief), base="HEAD", classification="synthetic",
+            model="sonnet", effort="low", item_id="i", stage="s", owner_id="o",
+            stage_revision=0, verify_argv=[["git", "status"]])
+
+    def test_a_queue_root_that_cannot_be_protected_is_refused_at_creation(self):
+        with self.assertRaises(eq.ExecutionAdmissionError) as caught:
+            self._queue(platform=_RefusingPlatform())
+        self.assertEqual(str(caught.exception), "queue_directory_not_owner_only")
+
+    def test_a_platform_that_cannot_answer_is_refused_at_creation(self):
+        with self.assertRaises(eq.ExecutionAdmissionError) as caught:
+            self._queue(platform=_NoAclPlatform())
+        self.assertEqual(str(caught.exception), "queue_acl_unenforceable")
+
+    def test_a_job_directory_is_protected_before_the_request_is_written(self):
+        queue = self._queue()
+        seen = []
+        real = eq.require_private_queue
+
+        def watching(path, **kwargs):
+            seen.append((Path(path).name,
+                         sorted(p.name for p in Path(path).iterdir())))
+            return real(path, **kwargs)
+
+        eq.require_private_queue = watching
+        self.addCleanup(setattr, eq, "require_private_queue", real)
+        submitted = self._submit(queue)
+        directory = [row for row in seen if row[0] == submitted["job_id"]]
+        self.assertEqual(len(directory), 1)
+        self.assertEqual(directory[0][1], [],
+                         "the job directory must be empty when it is protected")
+
+    def test_a_submission_into_an_unprotectable_directory_writes_nothing(self):
+        queue = self._queue()
+        real = eq.require_private_queue
+
+        def refuse(path, **kwargs):
+            if Path(path) != queue.root:
+                raise eq.ExecutionAdmissionError("queue_directory_not_owner_only")
+            return real(path, **kwargs)
+
+        eq.require_private_queue = refuse
+        self.addCleanup(setattr, eq, "require_private_queue", real)
+        with self.assertRaises(eq.ExecutionAdmissionError):
+            self._submit(queue)
+        for directory in queue.root.iterdir():
+            self.assertFalse((directory / "request.json").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits")
+    def test_a_real_submission_leaves_an_owner_only_job_directory(self):
+        queue = self._queue()
+        submitted = self._submit(queue)
+        directory = queue.root / submitted["job_id"]
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((directory / "request.json").stat().st_mode & 0o777,
+                         0o600)
+
+
 if __name__ == "__main__":
     unittest.main()
 

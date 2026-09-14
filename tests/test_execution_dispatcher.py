@@ -12,19 +12,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration.execution_queue import ExecutionAdmissionError, ExecutionQueue, _atomic_json
+from agent_bridge.orchestration.execution_queue import (
+    ExecutionAdmissionError, ExecutionQueue, _atomic_json, _harness_summary,
+    outcome_is_success)
 from agent_bridge.orchestration.server import Server
 
 
 class FakeExecutor:
-    def __init__(self, returncode=0):
+    """Shaped like SubprocessHarnessExecutor's outcome, semantics included.
+
+    The exit code and the harness's own verdict are separate inputs here
+    precisely because they can disagree on a real run: a harness whose
+    verification commands failed still exits 0 today.
+    """
+
+    def __init__(self, returncode=0, harness_ok=True, harness_status="complete"):
         self.returncode = returncode
+        self.harness_ok = harness_ok
+        self.harness_status = harness_status
         self.requests = []
 
     def __call__(self, request, job_dir):
         self.requests.append(request)
         return {"returncode": self.returncode, "stdout_sha256": "a" * 64,
-                "stderr_sha256": "b" * 64, "stdout_bytes": 10, "stderr_bytes": 0}
+                "stderr_sha256": "b" * 64, "stdout_bytes": 10, "stderr_bytes": 0,
+                "harness_ok": self.harness_ok,
+                "harness_status": self.harness_status,
+                "harness_verdict": "read"}
 
 
 class Sampler:
@@ -187,6 +201,63 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["error"], "interrupted_requires_reconciliation")
         self.assertEqual(self.fake.requests, [])
+
+
+
+class HarnessVerdictTests(unittest.TestCase):
+    """A zero exit code is not a verified task."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _made(self, **extra):
+        outcome = {"returncode": 0, "harness_ok": True,
+                   "harness_status": "complete"}
+        outcome.update(extra)
+        return outcome
+
+    def test_a_clean_run_succeeds(self):
+        self.assertTrue(outcome_is_success(self._made()))
+
+    def test_a_verification_failure_that_exited_zero_is_not_a_success(self):
+        self.assertFalse(outcome_is_success(self._made(
+            harness_ok=False, harness_status="verification_failed")))
+
+    def test_a_harness_that_said_ok_but_did_not_complete_is_not_a_success(self):
+        self.assertFalse(outcome_is_success(self._made(
+            harness_status="verification_failed")))
+
+    def test_a_nonzero_exit_is_not_a_success_whatever_the_receipt_said(self):
+        self.assertFalse(outcome_is_success(self._made(returncode=1)))
+
+    def test_an_outcome_with_no_verdict_at_all_is_not_a_success(self):
+        self.assertFalse(outcome_is_success({"returncode": 0}))
+
+    def test_an_unparseable_final_line_is_not_a_success(self):
+        summary = _harness_summary(b"not json\n")
+        self.assertEqual(summary["harness_verdict"], "receipt_unparseable")
+        self.assertFalse(outcome_is_success({"returncode": 0, **summary}))
+
+    def test_no_output_at_all_is_not_a_success(self):
+        summary = _harness_summary(b"")
+        self.assertEqual(summary["harness_verdict"], "receipt_absent")
+        self.assertFalse(outcome_is_success({"returncode": 0, **summary}))
+
+    def test_the_verdict_is_read_from_the_last_line_not_the_first(self):
+        stdout = (b'{"ok": true, "status": "complete"}\n'
+                  b'{"ok": false, "status": "verification_failed"}\n')
+        summary = _harness_summary(stdout)
+        self.assertEqual(summary["harness_status"], "verification_failed")
+        self.assertFalse(summary["harness_ok"])
+
+    def test_a_json_array_is_refused_rather_than_indexed(self):
+        self.assertEqual(_harness_summary(b'["complete"]')["harness_verdict"],
+                         "receipt_not_an_object")
+
 
 
 if __name__ == "__main__":
