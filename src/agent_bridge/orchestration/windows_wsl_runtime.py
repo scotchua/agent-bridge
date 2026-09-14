@@ -121,6 +121,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from .. import runner, store
 from ..platform import platform as host_platform
+from . import guest_runner
 from . import windows_wsl as ww
 from .windows_preflight import is_windows
 
@@ -143,8 +144,17 @@ SCHEMA_VERSION = 1
 # ---------------------------------------------------------------------------
 
 MAX_ROOTFS_BYTES = 8 * 1024 * 1024 * 1024
-MAX_INPUT_BYTES = 4 * 1024 * 1024
+
+#: The transport bounds, derived from what the guest protocol actually needs
+#: to carry rather than picked here. A transport limit below the protocol's
+#: own maximum is not a safety margin, it is a job that fails at the outer
+#: layer with a reason that names the wrong thing; the assertions below fail
+#: the import if the two ever drift apart again.
+MAX_INPUT_BYTES = 24 * 1024 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+
+assert MAX_INPUT_BYTES >= guest_runner.REQUIRED_TRANSPORT_INPUT_BYTES
+assert MAX_OUTPUT_BYTES >= guest_runner.REQUIRED_TRANSPORT_OUTPUT_BYTES
 MAX_TIMEOUT_SECONDS = 3600.0
 MAX_LOCK_TIMEOUT_SECONDS = 600.0
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -167,6 +177,20 @@ CANARY_INTEROP = "wsl-interop-absent"
 CANARY_WSL_CONF = "wsl-conf-sha256"
 CANARY_GUEST_RUNNER = "guest-runner-sha256"
 CANARY_VERSIONS = "pinned-versions"
+CANARY_EGRESS = "network-egress-policy"
+CANARY_EGRESS_PROBE = "network-egress-unreachable"
+
+#: The sha256 of the exact nftables program the guest installs, and the ranges
+#: it drops. Pinned here so the host verifies the policy the guest applied is
+#: the policy this release expects, not merely that some table exists.
+EGRESS_RULESET_SHA256 = "581cfc4411ba41753fa4bb255fdba3894efc2320d6b647dff69f5d3f3e6e2572"
+EGRESS_BLOCKED_RANGES = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,fc00::/7,fe80::/10"
+
+#: The destinations the reachability probe must have tried, and how many. A
+#: ruleset-text canary proves the rules were loaded; only this one is evidence
+#: that anything is actually unreachable, and only about these addresses.
+PROBE_TARGETS_SHA256 = "4049ec9d419556bed2ec25e41e6518a629d38b8f1ddfc34deddafcd267b17a7b"
+PROBE_TARGET_COUNT = 7
 
 CANARY_ORDER = (
     CANARY_HOST_MOUNT,
@@ -174,6 +198,8 @@ CANARY_ORDER = (
     CANARY_WSL_CONF,
     CANARY_GUEST_RUNNER,
     CANARY_VERSIONS,
+    CANARY_EGRESS,
+    CANARY_EGRESS_PROBE,
 )
 
 WSL_CONF_SHA256 = hashlib.sha256(ww.WSL_CONF_CONTENTS.encode("utf-8")).hexdigest()
@@ -391,10 +417,14 @@ def validate_limits(limits: Any) -> RuntimeLimits:
     )
 
 
+#: The defaults a caller gets when it does not choose. They are the hard
+#: ceilings for input and output on purpose: a default below the protocol's
+#: maximum refuses a legitimate job, and the ceiling is where the actual
+#: safety argument lives.
 DEFAULT_LIMITS = RuntimeLimits(
     rootfs_max_bytes=4 * 1024 * 1024 * 1024,
-    input_max_bytes=1024 * 1024,
-    output_max_bytes=4 * 1024 * 1024,
+    input_max_bytes=MAX_INPUT_BYTES,
+    output_max_bytes=MAX_OUTPUT_BYTES,
     job_timeout_seconds=900.0,
     canary_timeout_seconds=60.0,
     import_timeout_seconds=600.0,
@@ -1076,6 +1106,14 @@ def canary_expectations(
             f" claude={manifest.claude_version}"
             f" codex={manifest.codex_version}"
         ),
+        CANARY_EGRESS: (
+            f"{CANARY_EGRESS}:{EGRESS_RULESET_SHA256}"
+            f" blocked={EGRESS_BLOCKED_RANGES}"
+        ),
+        CANARY_EGRESS_PROBE: (
+            f"{CANARY_EGRESS_PROBE}:{PROBE_TARGETS_SHA256}"
+            f" targets={PROBE_TARGET_COUNT}"
+        ),
     }
 
 
@@ -1097,18 +1135,41 @@ def _matches_exactly(raw: bytes, expected: str) -> bool:
     return text in (expected, expected + "\n", expected + "\r\n")
 
 
+#: Canary names, as they appear in a receipt's ``timings``. Fixed, derived
+#: from the canary name itself, so a new canary cannot be added without its
+#: cost becoming visible.
+def canary_timing_key(name: str) -> str:
+    return "canary_" + name.replace("-", "_") + "_seconds"
+
+
 def _run_canaries(
     ops: HostOps,
     distro_name: str,
     manifest: ww.PinnedBaseImageManifest,
     guest_runner_sha256: str,
     limits: RuntimeLimits,
+    timings: dict[str, float] | None = None,
 ) -> None:
+    """Run every canary in order, recording what each one cost.
+
+    The per-canary timing is not bookkeeping. ``network-egress-unreachable``
+    opens a real connection attempt to each protected destination and waits
+    out the ones that are correctly dropped, so it is the most expensive check
+    here by a wide margin and its cost scales with the target list. Folding
+    that into a single ``canary_seconds`` total is how a probe becomes a thing
+    somebody "optimises" later without evidence, by looking at an aggregate
+    and guessing which part of it was slow.
+
+    So each canary's measured duration lands in the receipt under its own key.
+    The probe stays; what it costs is now a number rather than an impression.
+    """
+
     expectations = canary_expectations(manifest, guest_runner_sha256)
     host_cwd = ops.host_cwd()
     for name in CANARY_ORDER:
         job = ww.validate_job_spec(canary_job_spec(name, distro_name))
         argv = ww.build_guest_exec_argv(distro_name, job)
+        started = ops.monotonic()
         result = ops.run_host(
             argv,
             cwd=host_cwd,
@@ -1118,6 +1179,10 @@ def _run_canaries(
             stderr_cap=limits.output_max_bytes,
             stdin_data="",
         )
+        if timings is not None:
+            # Recorded before the verdict, so a canary that failed still
+            # reports what it spent failing.
+            timings[canary_timing_key(name)] = ops.monotonic() - started
         failure = command_failure(result)
         if failure:
             raise WindowsWslRuntimeError(
@@ -1675,7 +1740,8 @@ def _run_job_on_windows(request: JobRequest, ops: HostOps) -> RuntimeResult:
                 # --- fixed canaries before any caller payload -------------
                 canary_started = ops.monotonic()
                 _run_canaries(
-                    ops, distro_name, request.manifest, guest_runner_sha256, limits)
+                    ops, distro_name, request.manifest, guest_runner_sha256,
+                    limits, timings)
                 timings["canary_seconds"] = ops.monotonic() - canary_started
                 canaries_passed = True
 
