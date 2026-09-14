@@ -115,7 +115,7 @@ restarts**, in another window:
 
 ```bat
 bin\agent-bridge-windows-setup status
-schtasks /query /tn AgentBridgeProvisionResume /v /fo LIST
+schtasks /query /tn AgentBridgeSetupResume /v /fo LIST
 ```
 
 **Expected:** `resume_task_registered` is `true`, `resume` carries the stage

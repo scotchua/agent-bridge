@@ -556,6 +556,72 @@ class RunbookTests(unittest.TestCase):
     def test_it_does_not_claim_any_of_it_has_been_run(self):
         self.assertIn("nothing below has been run", self.text.lower())
 
+    def test_it_names_the_real_resume_task(self):
+        # The one thing in the runbook a reader checks before letting the
+        # machine restart. A wrong name here sends them looking for a task
+        # that does not exist and reading its absence as a missing resume.
+        self.assertIn(wp.RESUME_TASK_NAME, self.text)
+
+    def test_every_step_status_it_quotes_is_a_real_one(self):
+        import re
+
+        quoted = set(re.findall(r"`(ok|blocked|failed|consent_required|"
+                                r"reboot_scheduled)`", self.text))
+        self.assertTrue(quoted)
+        self.assertLessEqual(quoted, set(dr.STEP_STATUSES))
+
+    def test_the_checks_it_walks_a_reader_through_are_real_checks(self):
+        """Named explicitly, not intersected.
+
+        An intersection test passes when the runbook names a check that does
+        not exist, because a bogus name simply falls outside the set. These
+        are the ids the document tells a reader to watch, so each one is
+        asserted to exist and to still be spelled that way.
+        """
+
+        from agent_bridge.orchestration import windows_validation as wv
+
+        real = {check.id for check in wv.CHECKS}
+        for name in ("platform", "distro_registered", "guest_runner",
+                     "canaries", "egress_policy", "round_trip"):
+            self.assertIn(name, real)
+            self.assertIn(f"`{name}`", self.text)
+        self.assertIn(f"`{wv.VERDICT_READY}`", self.text)
+        self.assertIn(f"`{wv.VERDICT_NOT_READY}`", self.text)
+
+    def test_the_provider_verdict_table_is_the_whole_vocabulary(self):
+        # The runbook tells the operator these are the only outcomes and that
+        # anything else is a defect. That claim is only safe while the table
+        # is complete, so completeness is checked in both directions.
+        import re
+
+        from agent_bridge.orchestration import guest_runner as guest
+
+        listed = set(re.findall(r"`(auth_probe_\w+)`", self.text))
+        self.assertEqual(listed, set(guest.PROBE_VERDICTS))
+
+    def test_it_explains_every_canary_and_invents_none(self):
+        # Step 9 tells the operator what each canary failure means. A canary
+        # added later with no entry here leaves them reading an unexplained
+        # name at the one moment containment is in question.
+        import re
+
+        from agent_bridge.orchestration import windows_wsl_runtime as runtime
+
+        listed = set(re.findall(r"`([a-z]+(?:-[a-z0-9]+)+)`", self.text))
+        canaries = set(runtime.CANARY_ORDER)
+        self.assertEqual(listed & canaries, canaries)
+
+    def test_the_pass_reason_it_promises_for_the_round_trip_is_the_real_one(self):
+        from agent_bridge.orchestration import windows_validation as wv
+
+        observation = wv.GuestRoundTrip.__doc__
+        self.assertIsNotNone(observation)
+        self.assertIn("job_completed_and_instance_destroyed", self.text)
+        source = (ROOT / "src" / "agent_bridge" / "orchestration"
+                  / "windows_validation.py").read_text(encoding="utf-8")
+        self.assertIn('"job_completed_and_instance_destroyed"', source)
+
     def test_it_names_the_refusal_the_image_step_gives_today(self):
         # RELEASE_TRUST_ANCHORS ships empty, so this is the reason a reader
         # will actually see. If the constant is ever populated by default the
