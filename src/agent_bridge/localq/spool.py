@@ -98,7 +98,8 @@ class SubprocessBackend:
             raise RuntimeError("child payload lacks job id")
         env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
         proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, start_new_session=True, env=env)
+                                stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+                                env=env, shell=False)
         with self._lock:
             self._processes[job_id] = proc
         try:

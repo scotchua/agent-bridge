@@ -54,7 +54,8 @@ def invoke(payload: dict[str, Any], *, worker: str, state: str, queue_root: str,
     env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
     proc = subprocess.run([python, str(script), "--state", str(root), "--allow-inline-nonclient", "serve"],
                           input=json.dumps(init) + "\n" + json.dumps(call) + "\n", text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=timeout, check=False)
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=timeout,
+                          check=False, shell=False)
     if proc.returncode != 0:
         raise RuntimeError("private worker exited unsuccessfully")
     lines = proc.stdout.splitlines()

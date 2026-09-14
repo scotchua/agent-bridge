@@ -117,7 +117,8 @@ class SubprocessHarnessExecutor:
                "USER": account, "LOGNAME": account}
         process = subprocess.Popen(argv, cwd=request["repo"], env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
+                                   stderr=subprocess.PIPE, start_new_session=True,
+                                   shell=False)
         try:
             stdout, stderr = process.communicate(timeout=request["timeout_seconds"] + 60)
         except subprocess.TimeoutExpired:
