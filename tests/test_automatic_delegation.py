@@ -93,9 +93,10 @@ class AnswersCompatibilityTests(unittest.TestCase):
                 "enabled": True, "local_worker_executable": "relative/path"}))
 
     def test_enabled_accepts_absolute_worker_path(self):
+        worker = os.path.abspath(os.path.join(tempfile.gettempdir(), "worker"))
         validated = onboard.validate_answers(answers(automatic_delegation={
-            "enabled": True, "local_worker_executable": "/abs/path/worker"}))
-        self.assertEqual(validated["automatic_delegation"]["local_worker_executable"], "/abs/path/worker")
+            "enabled": True, "local_worker_executable": worker}))
+        self.assertEqual(validated["automatic_delegation"]["local_worker_executable"], worker)
 
 
 class ConfigGenerationTests(unittest.TestCase):
@@ -162,6 +163,7 @@ class PlatformBoundaryTests(unittest.TestCase):
             self.assertEqual(report["registration_and_config"], "supported (portable MCP registration and private config generation)")
 
 
+@unittest.skipIf(os.name == "nt", "LaunchAgent rendering is a macOS/POSIX-only feature")
 class LaunchAgentTests(unittest.TestCase):
     def test_render_requires_absolute_paths_and_carries_no_credentials(self):
         rendered = delegation.render_launch_agent(
