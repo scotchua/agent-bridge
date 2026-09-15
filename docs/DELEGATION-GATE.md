@@ -15,8 +15,12 @@ Covered, with the hook installed and trusted:
 
 * Claude Code editing tools (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`)
   and `Bash` commands that look like they write.
-* Codex CLI `apply_patch` and shell tools (`local_shell`, `shell`,
-  `shell_command`, `exec_command`) whose command looks like it writes.
+* Codex CLI `apply_patch` and its shell tool, which Codex names `Bash` in
+  hook input (the internal names `local_shell`, `shell`, `shell_command`,
+  `exec_command` are matched too), when the command looks like it writes.
+  A writing shell command that names a path in another repository
+  (`git -C /other commit`, `cd /other && ...`, `cp x /other/y`) needs that
+  repository's receipt as well as the working directory's.
 * The gate's own state and the hook files. An editing tool, or a shell
   command the heuristic reads as a write, aimed under the state root, at
   the orchestration config, at the stage router's database (and its
@@ -51,8 +55,9 @@ Not covered, stated plainly:
 * Shell commands that write in a way the text heuristic does not recognise.
   The heuristic (redirection, `tee`, `sed -i`, `rm`/`mv`/`cp`/`touch`/...,
   writing `git` subcommands including a `git tag` that creates or deletes,
-  package installs, inline interpreters, here-documents, formatters that
-  are not run in their report-only mode) catches the ordinary ways a shell
+  package installs, inline interpreters, here-documents, archive creation
+  and extraction, `find -delete`/`-exec rm`, formatters that are not run in
+  their report-only mode) catches the ordinary ways a shell
   writes and can be evaded by an agent that means to. Reads, `--check` and
   `--diff` runs, `git tag --list` and `ruff check` pass as reads. The
   editing tools are the deterministic part. The protected-path rule for
@@ -66,8 +71,12 @@ Not covered, stated plainly:
 * Windows installation of the hook entries is written (`.cmd` launcher) but
   has not been run live; do not claim it works there until it has.
 
-Everything the gate does is logged to `<state_root>/routing/gate-events.jsonl`
-so an evasion or an unexpected allow is visible after the fact.
+Every decision on a gated call is logged to
+`<state_root>/routing/gate-events.jsonl`: each deny, each allow by receipt,
+each allow outside a repository, and an internal failure once the state root
+is known. Calls the gate classifies as reads or as non-editing tools are not
+logged, so a shell write the heuristic misses leaves no trace here; the log
+shows what the gate judged, not what it did not see.
 
 ## How a stage becomes editable
 

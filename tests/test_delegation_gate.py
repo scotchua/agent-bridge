@@ -190,13 +190,25 @@ class ClassificationTests(GateCase):
                  "git tag", "git tag --list 'v*'", "git tag -l", "git tag -n3", "git tag --contains abc",
                  "prettier --check ."]
         for command in writes:
-            self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w"),
-                             ("shell", ["/w"]), command)
+            kind, paths = gate.classify("claude", "Bash", {"command": command}, "/w")
+            # The working directory comes first; words that look like paths follow it.
+            self.assertEqual((kind, paths[0]), ("shell", "/w"), command)
         for command in reads:
             self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w"),
                              ("shell_read", []), command)
         self.assertEqual(gate.classify("codex", "local_shell", {"command": ["git", "commit", "-m", "x"]}, "/w"),
                          ("shell", ["/w"]))
+        # Codex names its shell tool Bash in hook input, and its patch text may travel in "command".
+        self.assertEqual(gate.classify("codex", "Bash", {"command": "git commit -m x"}, "/w"), ("shell", ["/w"]))
+        self.assertIn("Bash", gate.MATCHERS["codex"])
+        kind, paths = gate.classify("codex", "apply_patch",
+                                    {"command": "*** Begin Patch\n*** Update File: a.py\n*** End Patch"}, "/w")
+        self.assertEqual((kind, paths), ("edit", [os.path.join("/w", "a.py")]))
+        for command in ("tar -xzf a.tgz", "tar xf a.tar", "tar -C out -xf a.tar", "tar -czf a.tgz src",
+                        "unzip a.zip", "find . -name '*.pyc' -delete", "find src -exec rm {} \\;"):
+            self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w")[0], "shell", command)
+        for command in ("tar -tzf a.tgz", "tar --list -f a.tar", "find . -name '*.py'"):
+            self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w")[0], "shell_read", command)
 
 
 class JudgmentTests(GateCase):
@@ -229,6 +241,19 @@ class JudgmentTests(GateCase):
         decision = self.judge("claude", "Edit", {"file_path": str(self.repo / "a")}, clock=lambda: 1101.0)
         self.assertEqual(decision.code, "routing_receipt_expired")
         self.assertIn("stage_renew", decision.reason)
+
+    def test_a_shell_write_aimed_at_another_repository_needs_that_receipt(self):
+        self.receipt()          # only self.repo is receipted
+        for command in (f"git -C {self.other} commit -m x", f"cd {self.other} && git commit -m x",
+                        f"cp a.txt {self.other / 'b.txt'}", f"echo x > {self.other / 'c'}"):
+            decision = self.judge("claude", "Bash", {"command": command})
+            self.assertEqual(decision.code, "no_routing_receipt", (command, decision))
+            self.assertIn(os.path.realpath(self.other), decision.repos)
+        inside = self.judge("claude", "Bash", {"command": f"git -C {self.repo} commit -m x"})
+        self.assertEqual(inside.code, "routing_receipt_valid")
+        codex = gate.judge("codex", "Bash", {"command": f"git -C {self.other} push"}, str(self.repo),
+                           state_root=str(self.state), clock=self.clock)
+        self.assertEqual(codex.code, "no_routing_receipt")
 
     def test_every_repository_touched_needs_its_own_receipt(self):
         self.receipt()
@@ -460,6 +485,16 @@ class HookProcessTests(GateCase):
         usage = subprocess.run([sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "install"],
                                capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
         self.assertEqual(usage.returncode, 2)         # a person at the terminal still sees usage
+
+    def test_an_internal_failure_is_logged_when_the_state_root_is_known(self):
+        config = self.write_config()
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "codex",
+             "--config", str(config)], input=b"[1, 2]", capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertIn("[gate_error]", json.loads(completed.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        events = (self.state / "routing" / "gate-events.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(events[-1])["code"], "gate_error")
 
     def test_a_config_without_a_capacity_db_denies(self):
         config = self.base / "orchestration.json"

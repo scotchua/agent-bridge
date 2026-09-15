@@ -81,13 +81,15 @@ EDIT_TOOLS = {
 #: Tools whose call runs a shell command.
 SHELL_TOOLS = {
     "claude": frozenset({"Bash"}),
-    "codex": frozenset({"local_shell", "shell", "shell_command", "exec_command"}),
+    # Codex names its shell tool "Bash" in hook input (its hooks documentation);
+    # the internal names are kept so an older or differently built host still matches.
+    "codex": frozenset({"Bash", "local_shell", "shell", "shell_command", "exec_command"}),
 }
 PATH_FIELDS = ("file_path", "notebook_path", "path")
 #: The matcher each client's hook entry carries.
 MATCHERS = {
     "claude": "Edit|Write|MultiEdit|NotebookEdit|Bash",
-    "codex": "apply_patch|local_shell|shell|shell_command|exec_command",
+    "codex": "apply_patch|Bash|local_shell|shell|shell_command|exec_command",
 }
 
 _PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$", re.M)
@@ -104,6 +106,9 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
     r"<<-?\s*['\"]?\w+['\"]?",                # here-document
+    r"(^|[\s;&|('\"])tar(\s+-C\s+\S+)?\s+(-?[A-Za-z]*[xc][A-Za-z]*|--extract|--create|--get|--update|--append)(\s|$)",
+    r"(^|[\s;&|('\"])(unzip|zip|gunzip|gzip|bunzip2|bzip2|xz|unxz)(\s|$)",
+    r"(^|[\s;&|('\"])find\s.*(\s-delete(\s|$)|\s-exec\s+(rm|mv|cp|sed\s+-i|chmod|chown|truncate)(\s|$))",
     r"(^|[\s;&|('\"])(gofmt\s+-w|rustfmt|eslint\s+--fix|ruff\s+format|ruff\s+(check\s+)?--fix)(\s|$)",
 ))
 #: Formatters that write unless asked only to report.
@@ -441,14 +446,19 @@ def _edit_paths(client: str, tool_input: Any, cwd: str) -> list[str]:
 
 
 def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[str, list[str]]:
-    """``("edit", paths)``, ``("shell", [cwd])`` for a writing command,
-    ``("shell_read", [])`` for one that does not look like it writes, or
-    ``("other", [])``."""
+    """``("edit", paths)``, ``("shell", [cwd, *named paths])`` for a writing
+    command, ``("shell_read", [])`` for one that does not look like it
+    writes, or ``("other", [])``."""
     if tool_name in EDIT_TOOLS[client]:
         return "edit", _edit_paths(client, tool_input, cwd)
     if tool_name in SHELL_TOOLS[client]:
-        if shell_writes(_command_text(tool_input)):
-            return "shell", [cwd]
+        command = _command_text(tool_input)
+        if shell_writes(command):
+            # The command runs in cwd, and may name files elsewhere (git -C
+            # /other commit, cd /other && ..., cp x /other/y). Every named
+            # path counts as a place the command may write, so each
+            # repository among them needs its own receipt.
+            return "shell", [cwd, *_command_paths(command, cwd)]
         return "shell_read", []
     return "other", []
 
@@ -912,6 +922,7 @@ def main(argv: list[str] | None = None) -> int:
     # Hook mode: judge the call described on stdin. Always exit 0; the
     # decision travels in the JSON so the host applies it, and a deny is
     # a deny whatever went wrong on the way to it.
+    state_root = None
     try:
         if not args.client:
             raise ValueError("--client is required in hook mode")
@@ -928,6 +939,11 @@ def main(argv: list[str] | None = None) -> int:
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "
                             f"nothing is implemented until the gate can")
+        if state_root:
+            try:
+                record_event(state_root, args.client or "unknown", "unknown", decision)
+            except Exception:  # noqa: BLE001  the deny stands whether or not it could be logged
+                pass
     sys.stdout.write(json.dumps(hook_output(decision), sort_keys=True) + "\n")
     return 0
 
