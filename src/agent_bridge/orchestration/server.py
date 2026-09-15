@@ -28,7 +28,8 @@ INSTRUCTIONS = (
 
 class Server:
     def __init__(self, caller: str, service: Service, router: StageRouter, *,
-                 execution: ExecutionQueue | None = None, interval: float = 5.0):
+                 execution: ExecutionQueue | None = None, interval: float = 5.0,
+                 state_root: str | None = None):
         if caller not in {"claude", "codex"}:
             raise ValueError("caller_invalid")
         if interval <= 0:
@@ -36,7 +37,8 @@ class Server:
         self.caller, self.service, self.router = caller, service, router
         self.execution, self.interval = execution, interval
         self.intake = AutomaticIntake(service.queue)
-        self.tools = build_tools(caller, router, service.queue, self.intake, execution)
+        self.tools = build_tools(caller, router, service.queue, self.intake, execution,
+                                 state_root=state_root)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -163,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         execution = ExecutionQueue(cfg.execution_queue_root, None,
                                    recover_interrupted=False)
     return Server(args.caller, service, router, execution=execution,
-                  interval=cfg.interval_seconds).serve()
+                  interval=cfg.interval_seconds, state_root=str(cfg.state_root)).serve()
 
 
 if __name__ == "__main__":

@@ -128,6 +128,16 @@ configuration directory) records `error` and `error_detail` at the top of the
 receipt. A receipt that says only `"error": "TaskError"` is a defect, not a
 diagnosis.
 
+`routing_decide` turns a proven stage binding into a durable routing receipt
+for one repository (`<state_root>/routing/<hash>.json`, mirrored to
+`routing/audit.jsonl`). It requires the same binding proof as
+`execution_dispatch`: the stage is owned, by the named `owner_id`, at the
+named `stage_revision`. The receipt is what the delegation-first gate reads:
+a PreToolUse hook in Claude Code and the Codex CLI that refuses editing tools
+and writing shell commands in a repository with no fresh receipt, or one whose
+`owner_route` is the other provider. Install, coverage, and the plainly stated
+surfaces it cannot intercept are in [DELEGATION-GATE.md](DELEGATION-GATE.md).
+
 The Codex harness's confinement is different from the Claude harness's, and
 this is stated plainly rather than glossed over: Claude's lane trusts a tool
 allowlist (`--tools Read,Grep,Glob,Edit,Write`, no shell) because Claude Code

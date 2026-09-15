@@ -299,6 +299,7 @@ configuration are retained separately.
 | `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
 | `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
 | `docs/orchestration-mcp.md` | Manual advanced orchestration, local routing and external execution-worker setup. |
+| `docs/DELEGATION-GATE.md` | Host-enforced delegation-first gate for Claude Code and the Codex CLI, with its stated limits. |
 | `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
 | `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
 | `src/agent_bridge/` | Broker, MCP servers, onboarding and local worker. |

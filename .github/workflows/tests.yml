@@ -108,6 +108,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_localq_intake.py"
           python3 -m unittest discover -s tests -p "test_localq_server.py"
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
+          python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
 
       - name: Guided automatic-delegation opt-in

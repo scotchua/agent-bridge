@@ -7,6 +7,7 @@ from typing import Any, Callable
 from ..capacity_router import CapacityObservation, RoutingError, StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
+from . import gate
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
 
@@ -17,7 +18,8 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 intake: AutomaticIntake,
-                execution: ExecutionQueue | None = None) -> dict[str, dict[str, Any]]:
+                execution: ExecutionQueue | None = None,
+                state_root: str | None = None) -> dict[str, dict[str, Any]]:
     """Build one caller-bound tool set.
 
     Caller provenance is injected here and is intentionally absent from the
@@ -140,6 +142,38 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                                       "local_queue": queue.state_report(),
                                       "execution_queue": execution.state_report() if execution else {"disabled": 1}},
         },
+    }
+    decide = _schema({
+        **identity, "owner_id": {"type": "string"},
+        "stage_revision": {"type": "integer", "minimum": 0},
+        "repo": {"type": "string"},
+        "reason": {"type": "string", "maxLength": gate.MAX_REASON},
+        "ttl_seconds": {"type": "integer", "minimum": gate.MIN_TTL_SECONDS,
+                        "maximum": gate.MAX_TTL_SECONDS},
+    }, ["item_id", "stage", "owner_id", "stage_revision", "repo", "reason"])
+
+    def decide_routing(args: dict[str, Any]) -> dict[str, Any]:
+        if state_root is None:
+            return {"ok": False, "error": "routing_receipts_unavailable"}
+        try:
+            current = router.get(args.get("item_id"), args.get("stage"))
+            if (current["state"] != "owned" or current["owner_id"] != args.get("owner_id")
+                    or current["revision"] != args.get("stage_revision")):
+                raise RoutingError("execution_stage_binding_invalid")
+            receipt = gate.record_decision(
+                state_root, caller=caller, stage_record=current, repo=args.get("repo"),
+                reason=args.get("reason"), ttl_seconds=args.get("ttl_seconds", 4 * 3600),
+                clock=router.clock)
+            return {"ok": True, "receipt": receipt}
+        except (RoutingError, TypeError, ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc) or type(exc).__name__}
+
+    tools["routing_decide"] = {
+        "description": ("Record the routing decision for an owned stage as a durable receipt for "
+                        "one repository. The delegation-first gate lets a client edit that "
+                        "repository only while a fresh receipt names its route. Requires the "
+                        "same stage binding as execution_dispatch."),
+        "inputSchema": decide, "handler": decide_routing,
     }
     if execution is not None:
         dispatch = _schema({
