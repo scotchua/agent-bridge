@@ -1000,3 +1000,137 @@ and each one was found within minutes of driving the real workflow end to end.
     certify a defect, pointed the other way: a green run is not evidence that
     a flaky check is benign, and two of them are not evidence either. Count
     the runs before naming a cause.
+
+## Round six: an adversarial review of the automatic delegation work
+
+Commit `58e4d8c` and the four that followed it were reviewed adversarially
+and rejected before merge, with two critical defects and four high-impact
+gaps. The review's evidence was independent: 544 core tests passed with five
+environmental skips and 118 focused gate, routing and audit tests passed, and
+none of those passing tests covered any of the defects. That sentence is the
+whole round in miniature, so it goes first.
+
+47. **Routing could be escaped one directory down.** Judgment keyed on the
+    nearest ancestor holding `.git`. An assistant routed away from a
+    repository could therefore run `git init src` and edit freely inside the
+    repository it had just created, because the nested root keyed to a
+    different receipt and had none. Judgment considers every enclosing
+    repository now, and creating a repository counts as a write.
+
+    The escape needed no exotic mechanism and no privileged call. It is the
+    kind of thing a test written from the inside does not think to try,
+    which is what adversarial review is for.
+
+48. **Confinement that confined nothing much.** Linux verification denied
+    the network and then let generated code write anywhere the account
+    could reach. The receipt said `sandbox` and the source repository was
+    checked afterwards, so the evidence looked complete while proving
+    nothing about the rest of the machine. It now runs inside a mount
+    namespace and, more to the point, **refuses to run at all** unless a
+    write outside the worktree, a write to `$HOME` and a remount of `/` all
+    actually fail on this host at that moment.
+
+    Building that boundary produced four defects of its own, each of which
+    left a boundary that passed its own tests while restricting nothing:
+    sealing `/` before binding the worktree made the worktree unwritable
+    (the kernel refuses to remount a bind read-write over a read-only
+    source); an inherited working directory left a handle on the sealed
+    mount, so relative writes failed and absolute ones succeeded; retaining
+    `CAP_SYS_ADMIN` let the payload remount `/` read-write and get zero back;
+    and `os.execv` does not search `PATH`, so the verification command never
+    ran. The self-check exists because of the third one.
+
+49. **Capacity was evidence in name only.** The MCP tool `capacity_observe`
+    let either assistant name the route, the availability, the source string
+    and a freshness window of any length. So "a fresh observation from an
+    authorized source" meant whatever the model typed, for a route it knew
+    nothing about, lasting years, and there was no collector to compare it
+    against. The tool is gone; capacity has two writers, neither on the wire;
+    a `trusted` column set by the writer rather than read from the row
+    decides what routes work, and defaults to untrusted so an installed
+    ledger's existing rows stop counting on upgrade.
+
+    The general shape is worth naming: a field that only a trustworthy
+    caller would fill in honestly is not a security property, it is a
+    convention. The fix was not to validate the field harder. It was to
+    remove the caller.
+
+50. **Two fixes for staleness, and the second one taught the first a lesson.**
+    Finding 44 recorded the policy fingerprint so an operator's edit took
+    effect at once. Capacity had exactly the same four-hour lag and nobody
+    noticed, because the first fix looked like it had settled the category.
+    A receipt now records a capacity digest too.
+
+    The first attempt at that digest re-decided on every single call, because
+    the hook rewrites its own presence row every time it runs, so a digest
+    over the table changed every time. The digest is route names only, minus
+    the asking client's own presence row: eight re-decisions became three.
+    A fingerprint has to cover exactly what the decision depended on, and a
+    self-observation is not something the decision depended on.
+
+51. **Withdrawing the operator's declaration did not withdraw it.** The
+    replacement for `capacity_observe` is a list in the operator's own
+    policy file, replayed into the ledger with a short freshness so that
+    deleting a route takes effect promptly. A test asked whether it actually
+    did, and it did not: the row the previous replay wrote stayed eligible
+    until it aged out, so a deletion meant nothing for fifteen minutes. The
+    withdrawal is replayed too, matched on its own source so it cannot
+    remove a peer's real first-hand presence.
+
+    I had written the fifteen-minute freshness *as* the withdrawal
+    mechanism in the docstring before checking that it was one.
+
+52. **Cleanup keyed on the repository answered for the wrong job.** A
+    dispatch intent names a route, item, stage, owner and revision, and
+    retiring it was keyed on the repository alone. An assistant holding any
+    other owned stage in that repository could dispatch that instead and the
+    intent for the stage it was actually refused would be recorded as met.
+    The audit's "routed but never dispatched" column is the one thing that
+    catches a routing nobody honoured, so a cleanup that clears more than it
+    dispatched is the single bug that column cannot survive. Every field of
+    the binding is compared now, and a mismatch is recorded rather than
+    silent.
+
+53. **Independence was enforced in one direction only.** A review of the
+    asking client's own work was correctly sent to the peer. A review of the
+    *peer's* work fell through to the ordinary branch, where the peer was
+    allowed and had capacity, and went straight back to its author. Half a
+    guard reads like a whole one.
+
+54. **Two failing checks were about the account, not the code.** Two suite
+    checks prove the bridge fails closed when a directory cannot be listed
+    or written, and both create that condition with `chmod`. Running as uid
+    0, the condition cannot be created at all: the restriction is a no-op and
+    the check reports a failure that has nothing to do with the code, on the
+    same line a real regression would use. They measure whether mode bits
+    bind this account and skip by name when they do not.
+
+### What is still not true, after this round
+
+* **The two desktop products and Codex on the web cannot be intercepted.**
+  They expose no hook surface. This is stated in the README, in
+  `DELEGATION-GATE.md` and in the installer's `not_covered` list, and it is
+  why the honest name for this feature is "automatic routing in Claude Code
+  and the Codex CLI, with assistant-mediated dispatch". If that is not where
+  someone works, this changes nothing for them.
+* **The brief is the assistant's words.** A `PreToolUse` payload names a tool
+  and some paths. The gate compels the dispatch and names the route, item,
+  stage, owner and revision; it cannot write the task.
+* **Mechanical work an assistant simply does in its own context is not
+  intercepted,** because it produces no tool call. What is automatic at the
+  local lane is the admission: classification, the privacy refusal, the
+  submission and the absence of any paid fallback. The choice to use the lane
+  is still the assistant's, and the end-to-end test that says so used to
+  claim otherwise.
+* **The Linux confinement confines writes and the network, not reads.** The
+  receipt records `confines_reads: false`. It is offered for synthetic
+  material only, and only after proving its own boundary on the host.
+* **Generation is unconfined on every platform.** The provider CLI runs with
+  the real `HOME` and its own Read and Write tools inside the generation
+  worktree. That is the direct worktree-to-patch channel and confining
+  verification does not touch it.
+* **Nothing here has been live-tested on Windows or macOS.** Everything in
+  this round ran on Linux. The Windows `.cmd` hook launcher is written and
+  has never been run under either host, and `INSTALL.md` now says that
+  instead of leaving it to be inferred from a sentence three paragraphs
+  earlier that said automatic delegation was unavailable.

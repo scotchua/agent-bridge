@@ -558,7 +558,16 @@ class BothDirections(Workflow):
 
 
 class LocalLane(Workflow):
-    """Either assistant, to a local model, without anyone asking for it."""
+    """Either assistant, to a local model, with the admission automatic.
+
+    The docstring used to say "without anyone asking for it", and an
+    adversarial review was right that this test does not show that: it calls
+    ``work_route_local`` itself. What is automatic here is everything after
+    that call. The gate cannot route file edits to a local worker that does
+    not edit files, so the choice of lane is the assistant's; the
+    classification, the privacy refusal, the submission and the absence of
+    any paid fallback are not.
+    """
 
     def route_local(self, caller, text, task_type="log_triage",
                     classification="internal_nonclient"):
@@ -578,7 +587,8 @@ class LocalLane(Workflow):
         text = "\n".join(f"2026-09-15T10:{minute:02d}:00 WARN retry {minute}"
                          for minute in range(40))
         decision = self.route_local("codex", text)
-        # The intake decided and submitted. Nobody said "use the local model".
+        # The intake classified and submitted with nothing further asked of
+        # anyone. The call itself was the assistant's: see the class docstring.
         self.assertTrue(decision["ok"], decision)
         self.assertEqual(decision["decision"], "local")
         self.assertEqual(decision["reason"], "eligible_mechanical_work")

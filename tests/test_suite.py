@@ -184,9 +184,49 @@ SYMLINK_REMEDY = ("creating a symlink needs Developer Mode or an elevated "
                   "session on Windows")
 
 
+def _zombies(pids: list[str]) -> set[str]:
+    """Which of these pids are reaped-pending corpses. POSIX only."""
+    try:
+        probe = subprocess.run(["ps", "-o", "pid=,stat=", "-p", ",".join(pids)],
+                               capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return set()       # cannot tell, so claim nothing
+    found = set()
+    for line in probe.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].startswith("Z"):
+            found.add(parts[0])
+    return found
+
+
 def group_survivors(pgid: int) -> list[str]:
-    """Pids still alive in a process group or Job Object."""
-    return active_platform.process_group_members(pgid) or []
+    """Pids still *alive* in a process group or Job Object. Zombies excluded.
+
+    The distinction is the whole point of this helper, and leaving it out made
+    two of the orphan-process checks intermittent. A SIGKILLed grandchild is a
+    zombie until its parent reaps it, the checks sample half a second after
+    the group kill, and reaping lands either side of that window:
+
+        t+0.1s  members in group 9205: [('9206', 'Z')]
+        t+0.5s  members in group 9205: [('9206', 'Z')]
+        t+1.0s  members in group 9205: []
+
+    The check asks whether a live process survived the kill. A zombie holds no
+    resources, runs no code and cannot be signalled; counting it as a survivor
+    answers a different question and fails a passing implementation.
+
+    Production reconciliation (``process_group_members``) keeps the
+    conflation, deliberately. There, counting a zombie as alive means holding
+    a job for reconciliation slightly longer than necessary, which is the safe
+    direction; teaching it to skip zombies would make it readier to release a
+    stage, which is not. The asymmetry is the point: a test wants the true
+    answer, a liveness gate wants the conservative one.
+    """
+    members = active_platform.process_group_members(pgid) or []
+    if os.name == "nt" or not members:
+        return members
+    dead = _zombies(members)
+    return [pid for pid in members if pid not in dead]
 
 
 def test_tool_exposure() -> None:

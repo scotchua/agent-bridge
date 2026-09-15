@@ -94,7 +94,7 @@ portable guided commands, see [SETUP-WITH-AN-AGENT.md](docs/SETUP-WITH-AN-AGENT.
 | Shared instructions | A generated collaboration and model-effort policy, with managed pointers for the selected Codex and Claude Code installations. |
 | Privacy choices | Baseline, strict, or custom eligibility rules for each receiving peer. |
 | Optional local worker | Bounded summarization, extraction, classification, checklists and log triage through an existing Ollama model. |
-| Advanced orchestration | Durable stage ownership, time-bounded capacity observations, automatic local routing for eligible mechanical work, and bounded cross-provider implementation jobs. |
+| Advanced orchestration | Durable stage ownership, capacity the operator declares or the hook observes first-hand, automatic admission for eligible mechanical work sent to a local model, and bounded cross-provider implementation jobs. |
 | Delegation-first gate | The routing decision is made automatically before implementation, from your own policy, and no edit happens without a receipt naming the route. Includes an audit of what was eligible, routed, retained and bypassed. |
 | Exchange records | Prompts, replies, job status and available model/version/effort provenance. |
 | Guided installation and removal | Staged settings, verification, backups, conflict checks and an uninstall preview. |
@@ -159,8 +159,9 @@ more than consultation. It can:
 - route eligible non-client mechanical text to the local worker without a cloud
   fallback;
 - register and claim durable work stages so only one assistant owns a stage;
-- use fresh, time-limited capacity observations when selecting an allowed
-  route;
+- select a route only from routes with fresh capacity, which the operator
+  declares in the policy file or the gate hook observes first-hand; no tool
+  lets an assistant declare a route available;
 - queue a bounded implementation job for the other provider's subscription
   CLI; and
 - **make the routing decision automatically, and refuse implementation
@@ -195,13 +196,32 @@ depending on what was actually proven, never more than that. See
 reference path and current platform boundary.
 
 Saying yes also installs the **delegation-first gate**, which is the part that
-makes delegation automatic rather than available:
+makes delegation automatic rather than available.
+
+**What it is, named precisely: automatic routing in Claude Code and the Codex
+CLI, with assistant-mediated dispatch.** Three qualifications carried in that
+sentence, each of them load-bearing:
+
+ • **Automatic routing.** The decision is computed and recorded before any
+   substantial edit, and the edit is refused without it. That part is
+   enforced by the host, not requested.
+ • **In the two CLIs.** Claude Code and the Codex CLI expose a `PreToolUse`
+   hook. Claude Desktop, the Codex desktop app and Codex on the web do not,
+   so nothing local intercepts them. If those are where you work, this
+   changes nothing for you.
+ • **Assistant-mediated dispatch.** A tool call names files, not the task, so
+   the gate can compel the dispatch and name the route, item, stage and
+   owner, but the assistant writes the brief. We are not going to call a
+   sentence in an instruction file enforcement.
+
+The mechanism:
 
 - Before any substantial edit, a `PreToolUse` hook computes the route from
-  **your** routing policy, the stage router's fresh capacity observations and
-  this host's load, claims the stage, and writes a durable receipt naming the
-  route and the reason. No sentence from you and no tool call from the
-  assistant is involved.
+  **your** routing policy, the routes with fresh capacity, and this host's
+  load, claims the stage, and writes a durable receipt naming the route, the
+  reason, and digests of the policy and capacity it decided under. Change
+  either and the next call re-decides. No sentence from you and no tool call
+  from the assistant is involved.
 - Work your policy retains is then allowed with no friction. Work it routes
   elsewhere is refused, and the assistant is handed the one dispatch call to
   make. You never relay anything.

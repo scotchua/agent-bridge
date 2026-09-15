@@ -282,6 +282,12 @@ def stage_name(router: StageRouter, item_id: str, task_type: str, *,
             return candidate          # never registered: free
         if current.get("state") in ("complete", "blocked"):
             continue                  # terminal: history, try the next one
+        if (current.get("state") == "owned" and owner_id is not None
+                and current.get("owner_id") != owner_id):
+            # Somebody else's stage, whatever route it is on. Adopting it
+            # would write a receipt naming an owner this decider cannot
+            # renew, so the next generation is used instead.
+            continue
         if (route is not None and current.get("state") == "owned"
                 and current.get("owner_route") != route):
             if owner_id is not None and current.get("owner_id") == owner_id:
@@ -342,20 +348,71 @@ def _write_intent(state_root: str, *, receipt: dict[str, Any],
     return intent
 
 
-def clear_intent(state_root: str, repo: str, *, clock: Any = time.time) -> bool:
-    """Retire the intent once the work it names has actually been dispatched.
+#: The intent fields a dispatch must match to retire it. Every one of them,
+#: because any subset lets one job answer for another.
+INTENT_BINDING = ("route", "item_id", "stage", "owner_id", "stage_revision")
 
-    Called by the orchestration MCP when ``execution_dispatch`` or
-    ``work_route_local`` accepts a job for this repository. Returns whether
-    there was one to retire.
+
+def clear_intent(state_root: str, repo: str, *, clock: Any = time.time,
+                 binding: dict[str, Any] | None = None) -> bool:
+    """Retire the intent once *the work it names* has actually been dispatched.
+
+    Called by the orchestration MCP when ``execution_dispatch`` accepts a job.
+    Returns whether there was a matching one to retire.
+
+    ``binding`` is the route, item, stage, owner and revision the accepted job
+    was bound to, and every field must equal the intent's. Keyed on the
+    repository alone, this retired whatever intent the repository had: an
+    assistant that owned some other stage in the same repository could
+    dispatch that, and the intent for the stage it was actually refused would
+    be recorded as met. The audit's "routed but never dispatched" column is
+    the thing that catches a route nobody honoured, so a cleanup that clears
+    more than it dispatched is the one bug that column cannot survive.
+
+    Omitting ``binding`` retires whatever is there, and is for a caller that
+    is not answering an intent at all: ``ensure_decision`` retiring one it has
+    just superseded. It is not reachable from a tool.
+    """
+    path = intent_path(state_root, repo)
+    if not os.path.exists(path):
+        return False
+    existing = read_intent(state_root, repo) or {}
+    if binding is not None:
+        mismatched = [field for field in INTENT_BINDING
+                      if existing.get(field) != binding.get(field)]
+        if mismatched:
+            store.append_ledger(
+                os.path.join(gate.receipt_dir(state_root), gate.AUDIT_LEDGER),
+                {"event": "dispatch_intent_unmatched", "repo": os.path.realpath(repo),
+                 "route": existing.get("route"), "mismatched": mismatched,
+                 "at": float(clock())})
+            return False
+    store.append_ledger(os.path.join(gate.receipt_dir(state_root), gate.AUDIT_LEDGER),
+                        {"event": "dispatch_intent_met", "repo": os.path.realpath(repo),
+                         "route": existing.get("route"), "at": float(clock())})
+    os.unlink(path)
+    return True
+
+
+def retire_superseded_intent(state_root: str, repo: str, *, reason: str,
+                             clock: Any = time.time) -> bool:
+    """Drop an intent the current decision no longer owes.
+
+    A decision that retains the work leaves nothing owed to another route, so
+    an intent written by an earlier decision is not merely stale, it is
+    wrong: the audit would keep reporting work as routed away and never
+    dispatched when the policy has since decided to keep it. Recorded with
+    its reason rather than deleted quietly.
     """
     path = intent_path(state_root, repo)
     if not os.path.exists(path):
         return False
     existing = read_intent(state_root, repo) or {}
     store.append_ledger(os.path.join(gate.receipt_dir(state_root), gate.AUDIT_LEDGER),
-                        {"event": "dispatch_intent_met", "repo": os.path.realpath(repo),
-                         "route": existing.get("route"), "at": float(clock())})
+                        {"event": "dispatch_intent_superseded",
+                         "repo": os.path.realpath(repo), "route": existing.get("route"),
+                         "stage": existing.get("stage"), "reason": reason,
+                         "at": float(clock())})
     os.unlink(path)
     return True
 
@@ -427,6 +484,13 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                         owner_id=owner, lease_seconds=lease_seconds)
     if record.get("state") != "owned":
         raise AutoDecisionError(f"stage_not_owned_after_claim:{record.get('state')}")
+    if record.get("owner_id") != owner:
+        # A stage owned on the right route by somebody else is not this
+        # decision's to speak for: a receipt naming a foreign owner points at
+        # a lease this decider cannot renew, and ``stage_name`` skips such a
+        # generation, so reaching here means one was claimed in between.
+        raise AutoDecisionError(
+            f"stage_owned_by_another_owner:{record.get('owner_id')}")
     if record.get("owner_route") != route:
         # The invariant, checked rather than assumed: a receipt must never
         # name a route the decision did not choose. ``stage_name`` picks a
@@ -453,4 +517,17 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                                    clock=clock)
         except OSError as exc:
             raise AutoDecisionError(f"intent_write_failed:{type(exc).__name__}") from None
+    else:
+        # Nothing is owed to another route now. An intent an earlier decision
+        # wrote would otherwise sit in the audit's "routed but never
+        # dispatched" column forever, describing a routing the policy has
+        # since reversed.
+        try:
+            retire_superseded_intent(
+                state_root, repo_root, clock=clock,
+                reason=f"decision is now {decision.code}")
+        except OSError:
+            # The decision and its receipt stand; a tidy-up that failed is
+            # reported by the audit, not a reason to deny the call.
+            pass
     return Outcome(decision=decision, receipt=receipt, intent=intent)

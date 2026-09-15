@@ -86,6 +86,14 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
     empty = _schema({}, [])
 
     def route_local(args: dict[str, Any]) -> dict[str, Any]:
+        # This call retires no dispatch intent, and cannot: it carries no
+        # repository, item or stage, so there is nothing to match an intent
+        # against, and retiring one on the strength of "some local work
+        # happened" is exactly the unbound cleanup ``clear_intent`` now
+        # refuses. It is also not currently reachable: the gate infers
+        # ``implementation`` from every tool call, because a local worker does
+        # not edit files, so no local intent is ever written. Anyone adding
+        # one has to add the stage identity to this schema first.
         return call(intake.route, {"params": None, "risk_flags": [], **args, "caller": caller})
 
     tools = {
@@ -208,7 +216,18 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 # "routed but never dispatched" column meaningful instead of
                 # every satisfied intent sitting in it forever.
                 try:
-                    autodecide.clear_intent(state_root, args["repo"], clock=router.clock)
+                    # Bound to this exact job. Keyed on the repository alone,
+                    # any owned stage in it could retire the intent for the
+                    # stage that was actually refused, and the audit's
+                    # "routed but never dispatched" column would record the
+                    # unhonoured routing as met.
+                    autodecide.clear_intent(
+                        state_root, args["repo"], clock=router.clock,
+                        binding={"route": current["owner_route"],
+                                 "item_id": current["item_id"],
+                                 "stage": current["stage"],
+                                 "owner_id": current["owner_id"],
+                                 "stage_revision": current["revision"]})
                 except (OSError, ValueError, KeyError):
                     # A job was accepted. Failing the dispatch because its
                     # bookkeeping could not be tidied would be the worse

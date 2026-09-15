@@ -155,7 +155,7 @@ surfaces it cannot intercept are in [DELEGATION-GATE.md](DELEGATION-GATE.md).
 
 **`routing_decide` is the manual path.** By default the hook does not wait to
 be called: with no valid receipt it computes the route itself from the
-operator's `routing-policy.json`, the fresh capacity observations in this
+operator's `routing-policy.json`, the routes with fresh capacity in this
 database, and the host's load average per core, then registers, claims and
 records the decision before the edit is judged. So a decision always exists
 before implementation, it was computed rather than requested, and a receipt

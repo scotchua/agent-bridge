@@ -228,6 +228,7 @@ CODES = frozenset({
     "retained_local_load_high",
     "retained_local_load_unknown",
     "retained_is_the_policy",
+    "retained_review_independence",
     "routed_local_mechanical",
     "routed_peer_implementation",
     "routed_peer_review_independence",
@@ -314,6 +315,16 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
     # 4. Capacity, for the peer route.
     peer_allowed = (peer in repo_policy.allowed_routes
                     and repo_policy.classification in policy.peer_classifications)
+    if signal.is_review and signal.author_route == peer:
+        # The gap this closes. The guard below only fired when the client was
+        # itself the author, so a review of the *peer's* work fell through to
+        # the ordinary branch and was routed straight back to the peer, which
+        # is the author. Independence is not a preference: the asking client
+        # is the independent reviewer here, so it keeps the work.
+        return retain(
+            "retained_review_independence",
+            f"this is a review of {peer}'s own work, so it is not routed back "
+            f"to {peer}; {signal.client} is the independent reviewer")
     if signal.is_review and signal.author_route == signal.client:
         # Independence is not a preference. If the only other route is not
         # available, the work is retained and says so, never reviewed by its

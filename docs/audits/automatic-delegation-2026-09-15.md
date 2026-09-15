@@ -382,11 +382,13 @@ error_detail:    Claude is not authenticated through a supported claude.ai subsc
   against this branch and a pristine worktree of `origin/main` on the same
   machine.
 
-  **Observation for the maintainer, not changed here.**
-  `platform.process_group_members` is also used by production reconciliation.
-  Returning zombies there means a reconciler can judge an already-dead group
-  still alive and re-signal it. Harmless, but it is the same conflation, and
-  changing production semantics is not this change's call to make.
+  **Resolved in the review round below.** `group_survivors`, the test helper,
+  now excludes zombies, so the check measures the question it asks.
+  `platform.process_group_members` keeps the conflation deliberately: there,
+  counting a zombie as alive holds a job for reconciliation slightly longer
+  than necessary, which is the safe direction, while skipping zombies would
+  make it readier to release a stage, which is not. A test wants the true
+  answer; a liveness gate wants the conservative one.
 
 ## Next steps for a real host
 
@@ -401,3 +403,180 @@ error_detail:    Claude is not authenticated through a supported claude.ai subsc
    `gate-hook audit`. That is the whole workflow in three steps.
 4. Do not publish a release, and do not make broad Windows claims, until 1 and
    2 have produced evidence on the hosts in question.
+
+---
+
+# The adversarial review round
+
+The five commits above were reviewed adversarially and **rejected before
+merge**: two critical defects and four high-impact gaps. The review's own
+evidence is the part worth quoting: 544 core tests passed with five
+environmental skips, 118 focused gate, routing and audit tests passed, and
+none of those passing tests covered any of the defects.
+
+Everything below ran on Linux. Nothing here is evidence about macOS or
+Windows, and no provider account was contacted.
+
+## Critical: routing could be escaped one directory down
+
+Judgment keyed on the nearest ancestor holding `.git`. Reproduced end to end
+against the fix:
+
+```text
+STEP 1  claude tries to Edit secret.py at the routed root        -> DENY [routed_elsewhere]
+STEP 2  claude tries the escape command: git init src            -> DENY [routed_elsewhere]
+STEP 3  nested .git exists: yes
+STEP 4  claude tries to Edit a PRE-EXISTING file inside it       -> DENY [routed_elsewhere]
+STEP 5  claude tries a shell write inside the nested repo        -> DENY [routed_elsewhere]
+STEP 6  codex, which the decision chose, edits inside it         -> ALLOW
+```
+
+Judgment now considers every enclosing repository, and `git init`, `clone`
+and `submodule` count as writes. Eight regression tests in
+`tests/test_automatic_gate.py::TheRoutingEscapeAnAdversarialReviewFound`.
+
+## Critical: Linux verification was not confined
+
+It denied the network and let generated code write anywhere the account could
+reach, so checking the source repository afterwards proved nothing about the
+rest of the machine.
+
+Verification now runs inside a mount namespace that binds the worktree and
+scratch directory writable, seals every other mount point read-only, drops
+all capabilities, and **refuses to run at all** unless a write outside the
+worktree, a write to `$HOME` and a remount of `/` all actually fail on this
+host at that moment. Measured escape matrix, every row as stated:
+
+```text
+inside worktree: relative write, absolute write, mkdir      OK
+outside worktree; $HOME; clobber an outside file            REFUSED
+the source repository; the job directory; /dev/shm          REFUSED
+via /proc/1/root; via symlink; via hardlink                 REFUSED
+remount / read-write                                        REFUSED (rc=7)
+bind-mount over cwd                                         no effect
+nested unshare (uid_map write EROFS 30, remount errno 1)    no effect
+network                                                     DENIED
+git status --porcelain / git diff --check                   rc=0
+python3 -m unittest --help / python -m unittest --help      rc=0
+```
+
+Four defects surfaced while building it, each leaving a boundary that passed
+its own tests and restricted nothing: sealing `/` before binding the worktree
+(unwritable worktree), an inherited working directory (relative writes
+EROFS, absolute writes fine), retained `CAP_SYS_ADMIN` (the payload could
+remount `/` and get 0 back), and `os.execv` not searching `PATH` (the
+verification command never ran). The self-check exists because of the third.
+
+**Still not confined:** reads, on Linux, which the receipt records as
+`confines_reads: false`, and **generation on every platform**, which runs
+with the real `HOME` and the provider's own Read and Write tools inside the
+generation worktree. That is the direct worktree-to-patch channel and this
+change does not touch it.
+
+## High: capacity was model-controlled
+
+`capacity_observe` let either assistant name the route, availability, source
+and a freshness window of any length. The tool is removed. Capacity has two
+writers, neither on the wire: the hook's own first-hand presence, and
+`declared_available` in the operator's policy file, replayed as a declaration
+and withdrawn when the operator deletes a route. The ledger's `trusted`
+column is set by the writing code path, never read from the row, defaults to
+untrusted so an installed database's existing rows stop counting on upgrade,
+and only a trusted row routes work. No window may exceed the routing lease.
+
+Proven by `tests/test_capacity_router.py` (20 tests, including a legacy
+database built without the column, whose pre-existing row grades `untrusted`
+and blocks the stage) and `tests/test_automatic_gate.py` (declaration alone
+routes; withdrawal stops it; withdrawal cannot erase a peer's real presence;
+an untrusted row routes nothing).
+
+**Not claimed:** the declaration is not a health check. Nothing in this tree
+probes whether a declared peer is actually reachable, and the ledger and the
+audit both print the source so the difference is visible rather than implied.
+
+## High: decisions went stale for four hours
+
+A receipt now records a digest of the routes with eligible capacity, so a
+decision that retained work because the peer was unavailable is re-made the
+moment the peer appears. Measured, with the policy untouched between the two
+calls, so only the capacity digest can be what noticed.
+
+The first version of the digest re-decided on every call, because the hook
+rewrites its own presence row every time it runs: eight decisions where one
+was correct. The digest is route names only, minus the asking client's own
+presence row. Confirmed at one decision across four consecutive hook calls,
+and a receipt written by one client no longer forces the other to re-decide.
+
+## High: the red head, and the hardcoded interpreter
+
+CI was red on the reviewed head (Ubuntu 3.11, Ubuntu 3.13, Windows 3.13). The
+cause was mine: `_require_confinement` ran before the verify-command check, so
+runners with no usable namespace errored instead of skipping. Reordered, and
+tests that need a backend skip by name. **CI is green on `6af1be4`**
+(run 34992443320).
+
+The end-to-end suite assumed a bare `python`, which cost the reviewer three
+failures on macOS, where it has not existed since system Python 2 was
+removed. It probes `python3` first, which is what the setup documentation
+says, and skips by name on a host with neither.
+
+Two suite checks that need a directory's mode bits to actually deny access
+now measure whether mode bits bind this account and skip when they do not.
+Running as uid 0, the restriction is a no-op and the check was reporting a
+failure about the account on the line a real regression would use.
+
+## High: what this is, named precisely
+
+**Automatic routing in Claude Code and the Codex CLI, with
+assistant-mediated dispatch.** All three qualifications are load-bearing, and
+the README, `INSTALL.md` and `DELEGATION-GATE.md` now carry the phrase rather
+than leaving it to be assembled from separate paragraphs.
+
+The end-to-end test whose docstring said local work was routed "without
+anyone asking for it" calls `work_route_local` itself. What is automatic at
+the local lane is the *admission*: classification, the privacy refusal, the
+submission, and the absence of any paid fallback. The choice of lane is the
+assistant's, because the gate cannot route file edits to a worker that does
+not edit files. The docstring says that now.
+
+## The follow-ups the review allowed to come after merge, done here anyway
+
+* **Dispatch-intent cleanup is bound to the exact job** (route, item, stage,
+  owner, revision). Keyed on the repository alone, any owned stage in it
+  could retire the intent for the stage that was actually refused, and the
+  audit's "routed but never dispatched" column is the one thing that catches
+  an unhonoured routing. A mismatch is recorded rather than silent.
+* **A decision that retains the work retires the intent an earlier decision
+  wrote,** with its reason, so the audit stops reporting a routing the policy
+  has reversed.
+* **Independence is enforced in both directions.** A review of the *peer's*
+  work used to fall through to the ordinary branch and go straight back to
+  its author.
+* **A stage somebody else owns is not adopted.** A receipt naming a foreign
+  owner points at a lease this decider cannot renew.
+* **The routing policy is read once** for both the rules and the digest
+  stamped in the receipt, so an operator's save cannot land between the two.
+* **The delivered patch is re-read and compared** to what was generated
+  before it is returned, which is the one check that does not depend on
+  confinement being correct.
+* **Windows instructions no longer contradict themselves.** "Automatic
+  delegation is not available on Windows" sat three paragraphs above
+  "automatic delegation on Windows runs jobs in an ephemeral WSL2 guest".
+  The gate and the execution lane are named as separate components, the
+  `.cmd` launcher is described as written and never run, and the WSL2 path is
+  described as provisioning work in progress.
+
+## Still outstanding, and stated rather than closed
+
+1. **The Windows hook launcher has never been run under either host.** Not
+   fixable from here.
+2. **The hook has not been exercised through the real Codex and Claude Code
+   hosts** in this round; the gate is driven as a subprocess with real
+   `PreToolUse` payloads, which is the same interface but not the same
+   integration.
+3. **Shell-command interception is a heuristic over command text**, stated as
+   such in the module docstring, the README and `DELEGATION-GATE.md`. It is
+   not a security boundary. The editing tools are the deterministic part.
+4. **Generation is unconfined.** See above.
+5. **No release, and no broad Windows or macOS claim,** until evidence exists
+   on those hosts.

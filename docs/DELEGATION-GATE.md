@@ -160,23 +160,57 @@ assistant asked for. The `considered` block holds no task content.
 
 ### Capacity evidence
 
-When the decision retains the work, the hook records one capacity observation
-for **its own route only**, sourced `gate-hook:client-present` and fresh for
-15 minutes. A client that just made a tool call is demonstrably running, so
-that is an observation rather than an assumption. The hook never records one
-for the peer or the local model: those still need a real observation from an
-authorized source, and without one the policy retains the work.
+Capacity has exactly two writers, and neither of them is an assistant. There
+used to be a third, the MCP tool `capacity_observe`, and an adversarial
+review was right about it: the assistant chose the route, the availability,
+the source string and the freshness window, so "a fresh observation from an
+authorized source" meant whatever the model typed, for any route, lasting
+years. The tool is gone.
+
+**The hook's own presence.** On every decision the hook records one
+observation for **its own route only**, sourced `gate-hook:client-present`
+and fresh for 15 minutes. A client that just made a tool call is demonstrably
+running, so that is an observation rather than an assumption. It is never
+recorded for the peer or the local model.
+
+**The operator's declaration.** `declared_available` in
+`routing-policy.json` lists the routes installed on this machine. The hook
+replays it into the ledger on every decision, sourced
+`policy:operator-declared` and fresh for the same 15 minutes, and withdraws a
+route the operator has deleted. It is a **standing declaration, not a health
+check**, and nothing here claims otherwise: the ledger records the source,
+the audit prints it, and a route nobody has declared and that has not run the
+hook itself is not dispatched to.
+
+The withdrawal matches on that source, so deleting a route from your policy
+removes what the declaration put there and cannot remove a peer's own
+first-hand presence.
+
+Two hard limits on what a row can be:
+
+* **only a trusted row routes work.** `trusted` is set by the code path that
+  writes the row, never read from the row itself, and it defaults to
+  untrusted. So rows an older version accepted through the removed tool stop
+  counting the moment this version opens the database.
+* **no row outlasts the work it would authorise.** A window longer than the
+  routing lease (4 hours) is refused rather than clamped.
 
 ### Decisions are re-made when they are overtaken
 
 An automatic receipt is replaced by a fresh decision, rather than refused,
-in four ordinary cases:
+in five ordinary cases:
 
 * **the policy changed.** Every automatic receipt records a fingerprint of
   the policy it was decided under, so editing `routing-policy.json` takes
   effect on the very next gated call. Without this, classifying a repository
   changed nothing until the receipt happened to expire, up to four hours
   later, which makes your own document look inert.
+* **the set of routes with capacity changed.** Recorded the same way, and for
+  the same reason: a receipt saying "the peer has no fresh capacity" is
+  exactly the one that should stop being true the moment the peer appears.
+  The digest is route names only, and it leaves out the asking client's own
+  presence row, because the hook rewrites that row on every call and a
+  digest over the whole table re-decided every call.
 * it was decided for a different kind of work;
 * it has expired;
 * the stage it points at is finished, reassigned or its lease has lapsed,
@@ -214,9 +248,13 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
 * **It cannot route a file edit to a local model.** The local worker
   processes bounded inline text and returns a draft; it does not read files,
   run commands or edit anything. An intent telling it to edit a file would be
-  unmeetable. Automatic local routing therefore happens at the local worker's
-  own entry point, `work_route_local`, whose intake classifies and submits
-  without anyone asking for it.
+  unmeetable. So the gate does not send local work: what is automatic at the
+  local lane is the *admission*, not the *choice of lane*. An assistant calls
+  `work_route_local`, and from that point nobody is asked anything: the
+  intake classifies the material, applies the privacy rules, refuses
+  client-derived text, submits the job and never falls back to a paid API.
+  The assistant still decides to call it, and we do not describe that as the
+  gate having routed the work.
 * **It cannot see mechanical work an assistant just does in its own
   context.** That produces no tool call, so no local mechanism intercepts it.
   This is a limit of the hook surface. An instruction file does not fix it

@@ -127,6 +127,7 @@ class ClaudeTaskTests(unittest.TestCase):
         defence in depth, which is the point: it holds if either of those is
         ever widened.
         """
+        requires_confinement(self)      # run_task refuses before generation
         real = claude_task._sandboxed
 
         def rewrite(command, tree, scratch, env, timeout, backend):

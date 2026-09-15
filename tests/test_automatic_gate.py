@@ -852,5 +852,131 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
                          "codex re-decided a receipt that already named codex")
 
 
+class ReviewIsNeverRoutedBackToItsAuthor(unittest.TestCase):
+    """The second half of the independence rule, which was missing.
+
+    The guard only fired when the asking client was itself the author. A
+    review of the *peer's* work fell through to the ordinary branch, where
+    the peer was allowed and had capacity, and was routed straight back to
+    the author.
+    """
+
+    def decide(self, client, author_route, *, fresh=("claude", "codex")):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("public", ("claude", "codex"))})
+        return autoroute.decide(
+            autoroute.Signal(client=client, repo="/r", task_type="review",
+                             is_review=True, author_route=author_route),
+            policy, fresh_routes=frozenset(fresh),
+            load=autoroute.Load(0.1, True))
+
+    def test_a_review_of_the_peers_work_is_not_sent_to_the_peer(self):
+        decision = self.decide("claude", "codex")
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_review_independence")
+
+    def test_a_review_of_our_own_work_still_goes_to_the_peer(self):
+        decision = self.decide("claude", "claude")
+        self.assertEqual(decision.route, "codex")
+        self.assertEqual(decision.code, "routed_peer_review_independence")
+
+    def test_neither_direction_can_self_review(self):
+        for client, peer in (("claude", "codex"), ("codex", "claude")):
+            self.assertNotEqual(self.decide(client, peer).route, peer)
+            self.assertNotEqual(self.decide(client, client).route, client)
+
+    def test_a_review_of_local_output_may_still_go_to_the_peer(self):
+        """Only the author is excluded, not every other route."""
+        decision = self.decide("claude", "local")
+        self.assertEqual(decision.route, "codex")
+
+    def test_the_code_is_in_the_closed_vocabulary(self):
+        self.assertIn("retained_review_independence", autoroute.CODES)
+
+
+class AnIntentIsRetiredOnlyByTheJobItNames(AutoCase):
+    """Cleanup was keyed on the repository, so any job answered for any intent."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.intent = autodecide.read_intent(str(self.state), str(self.repo))
+
+    def events(self) -> list[dict]:
+        path = self.state / "routing" / gate.AUDIT_LEDGER
+        return [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def binding(self, **overrides) -> dict:
+        return {field: self.intent[field] for field
+                in autodecide.INTENT_BINDING} | overrides
+
+    def test_the_exact_binding_retires_it(self):
+        self.assertTrue(autodecide.clear_intent(
+            str(self.state), str(self.repo), binding=self.binding()))
+        self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
+
+    def test_a_different_stage_does_not(self):
+        self.assertFalse(autodecide.clear_intent(
+            str(self.state), str(self.repo),
+            binding=self.binding(stage="implementation#9")))
+        self.assertIsNotNone(autodecide.read_intent(str(self.state), str(self.repo)))
+
+    def test_every_field_of_the_binding_is_load_bearing(self):
+        for field in autodecide.INTENT_BINDING:
+            wrong = "elsewhere" if field != "stage_revision" else 999
+            self.assertFalse(
+                autodecide.clear_intent(str(self.state), str(self.repo),
+                                        binding=self.binding(**{field: wrong})),
+                f"{field} was not checked")
+            self.assertIsNotNone(
+                autodecide.read_intent(str(self.state), str(self.repo)))
+
+    def test_a_mismatch_is_recorded_rather_than_silent(self):
+        autodecide.clear_intent(str(self.state), str(self.repo),
+                                binding=self.binding(owner_id="someone-else"))
+        unmatched = [e for e in self.events()
+                     if e.get("event") == "dispatch_intent_unmatched"]
+        self.assertTrue(unmatched)
+        self.assertEqual(unmatched[-1]["mismatched"], ["owner_id"])
+
+    def test_a_decision_that_retains_the_work_retires_the_intent(self):
+        """Otherwise the audit reports a routing the policy has reversed."""
+        self.observe("codex", available=False)
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
+        superseded = [e for e in self.events()
+                      if e.get("event") == "dispatch_intent_superseded"]
+        self.assertTrue(superseded)
+        self.assertIn("retained_no_fresh_capacity", superseded[-1]["reason"])
+
+
+class AStageSomebodyElseOwnsIsNotAdopted(AutoCase):
+    """A receipt naming a foreign owner points at a lease it cannot renew."""
+
+    def test_the_decision_uses_the_next_generation_instead(self):
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude"]}})
+        self.observe("claude")          # so the foreign claim below succeeds
+        router = StageRouter(str(self.db))
+        item = autodecide.item_id_for(str(self.repo))
+        registered = router.register(item, "implementation",
+                                     allowed_routes=["claude"])
+        router.assign(item, "implementation", owner_id="some-agents-own-owner",
+                      lease_seconds=600, expected_revision=registered["revision"])
+
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        self.assertEqual(receipt["owner_id"], autodecide.owner_id_for("claude"))
+        self.assertNotEqual(receipt["stage"], "implementation")
+        self.assertEqual(router.get(item, "implementation")["owner_id"],
+                         "some-agents-own-owner")
+
+
 if __name__ == "__main__":
     unittest.main()
