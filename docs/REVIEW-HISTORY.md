@@ -980,10 +980,23 @@ and each one was found within minutes of driving the real workflow end to end.
     somebody thought of; the documented workflow is the case the user will
     actually hit.
 
-One near miss worth naming. Two main-suite checks about orphan processes
-failed during this work and were **not** a regression: they are timing-
-sensitive, the machine was loaded by parallel test runs, and `runner.py`,
-`broker.py` and `platform/` were untouched. Two consecutive runs on an idle
-machine returned to the baseline. The temptation to record "4 failures,
-pre-existing" without checking is exactly how a real regression gets filed as
-noise.
+46. **I called an intermittent failure "load-induced" on two clean runs.**
+    Two main-suite checks about orphan processes (`codex->claude` and
+    `claude->codex: no orphan processes survive in the killed groups`) failed
+    during this work. Two consecutive runs came back clean, so I recorded
+    them as load-induced and moved on. Three further runs then produced 2, 4
+    and 3 total failures: the checks are **intermittent in this container**,
+    not reliably clean, and "two runs passed" did not support the conclusion
+    I drew from it.
+
+    Attribution rests on a branch-versus-main comparison instead, which is
+    the thing that actually answers the question: the same suite alternated
+    between this branch and a pristine worktree of `origin/main`, four rounds
+    each, on the same machine. `runner.py`, `broker.py`, `platform/` and
+    `backends/` are untouched by this branch, which is a reason to expect no
+    difference, not evidence of none.
+
+    The lesson is the one this document already makes about tests that
+    certify a defect, pointed the other way: a green run is not evidence that
+    a flaky check is benign, and two of them are not evidence either. Count
+    the runs before naming a cause.

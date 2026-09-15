@@ -347,11 +347,46 @@ error_detail:    Claude is not authenticated through a supported claude.ai subsc
   fixtures for the same environment reason. All three pass in CI on
   `a6c59ed`, so they are artifacts of this container.
 
-  Two main-suite checks about orphan processes also failed once during this
-  work and were **not** regressions: they are timing-sensitive, the machine
-  was loaded by parallel test runs, and `runner.py`, `broker.py` and
-  `platform/` were untouched. Two consecutive runs on an idle machine
-  returned to the 2-failure baseline.
+  **The main suite's two orphan-process checks are intermittent here, and
+  the first attribution of them in this document was wrong.** They were
+  called load-induced on the strength of two clean runs. Three further runs
+  produced 2, 4 and 3 total failures, so the checks are not reliably clean in
+  this container and two passes did not support that conclusion:
+
+  ```text
+  solo run 1   passed: 559   failed: 2     (baseline only)
+  solo run 2   passed: 557   failed: 4     (both orphan checks)
+  solo run 3   passed: 558   failed: 3     (one orphan check)
+  ```
+
+  The mechanism is understood and reproduces standalone, in code this branch
+  does not touch. `group_survivors` calls `process_group_members`, which
+  enumerates with `ps -A -o pid=,pgid=` and counts **any** process in the
+  group, and the check runs 0.5 seconds after the group kill. A SIGKILLed
+  grandchild is a zombie until reaped, and reaping in this container lands
+  either side of that window:
+
+  ```text
+  t+ 0.1s  members in group 9205: [('9206', 'Z')]
+  t+ 0.5s  members in group 9205: [('9206', 'Z')]   <- the check samples here
+  t+ 1.0s  members in group 9205: []
+  ```
+
+  So the check asks "did a live process survive the group kill" and measures
+  "does `ps` still list anything", which are not the same question. A zombie
+  holds nothing and can do nothing. The 0.5s sleep is in
+  `tests/test_suite.py` and the enumeration is in `platform/posix.py`;
+  `runner.py`, `broker.py`, `platform/` and `backends/` carry no change on
+  this branch, which is a reason to expect no difference rather than evidence
+  of none, so attribution also rests on running the same suite alternately
+  against this branch and a pristine worktree of `origin/main` on the same
+  machine.
+
+  **Observation for the maintainer, not changed here.**
+  `platform.process_group_members` is also used by production reconciliation.
+  Returning zombies there means a reconciler can judge an already-dead group
+  still alive and re-signal it. Harmless, but it is the same conflation, and
+  changing production semantics is not this change's call to make.
 
 ## Next steps for a real host
 
