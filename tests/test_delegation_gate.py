@@ -833,6 +833,21 @@ class TheWindowsHookCommandQuoting(unittest.TestCase):
                         "Get-ChildItem", "where python", "findstr x app.py"):
             self.assertFalse(gate.shell_writes(command), command)
 
+    def test_a_windows_tree_command_reaches_a_protected_ancestor(self):
+        r"""The matching half: `rd /s` reaches a tree just as `rm -r` does.
+
+        The tree-verb list decides whether naming an *ancestor* of a
+        protected path counts as reaching it. It listed POSIX verbs only, so
+        on Windows a recursive delete of a directory holding the gate's own
+        state read as touching only that directory.
+        """
+        for command in (r"rd /s /q C:\Users\x\.agent-bridge",
+                        r"Remove-Item -Recurse .\state",
+                        "xcopy /s a b", "robocopy a b /e"):
+            self.assertTrue(gate._TREE_VERBS.search(command), command)
+        for command in ("dir", "Get-Content x", "type x"):
+            self.assertFalse(gate._TREE_VERBS.search(command), command)
+
     def test_flattening_an_argv_for_the_heuristic_is_a_different_direction(self):
         r"""``shlex.join`` elsewhere in this module is not the same defect.
 

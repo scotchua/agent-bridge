@@ -409,7 +409,12 @@ def _under(path: str, root: str) -> bool:
 #: protected path reaches the protected path.
 _TREE_VERBS = re.compile(
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|rmdir|shred|ln|chmod|chown|dd|truncate|tar|unzip|zip|"
-    r"git\s+clean|git\s+worktree|find)(\s|$)")
+    r"git\s+clean|git\s+worktree|find"
+    # The Windows half, for the same reason it was added to the write
+    # patterns: naming an ancestor of a protected path reaches the protected
+    # path, and `rd /s` does that just as `rm -r` does.
+    r"|(?i:del|erase|rd|move|copy|xcopy|robocopy|ren|rename|mklink|attrib|icacls|"
+    r"takeown|Remove-Item|Copy-Item|Move-Item|Rename-Item|Set-Acl))(\s|$)")
 
 
 def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
