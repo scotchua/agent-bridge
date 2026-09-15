@@ -152,7 +152,11 @@ class PermissionTests(ConfigDirTestCase):
         cc.checked_config_dir(self.canonical, home=self.home)
         platform_support.assert_owner_only(self, secret, 0o600,
                                            inside_protected_store=True)
-        platform_support.assert_owner_only(self, nested, 0o700)
+        # The directory carried only entries inherited from the protected
+        # root, which is owner-only already; enforcement leaves such an
+        # object alone rather than rewriting what is already right.
+        platform_support.assert_owner_only(self, nested, 0o700,
+                                           inside_protected_store=True)
         self.assertTrue(cc.is_ready(self.canonical, home=self.home))
 
     def test_readiness_sees_a_permissive_nested_file_on_windows(self):

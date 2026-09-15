@@ -223,10 +223,11 @@ MAX_STORE_OBJECTS = 20000
 def _walk_store(directory: Path) -> tuple[list[str], list[str]]:
     """Every directory and file under the store, links refused, bounded.
 
-    Names are built from the store path exactly as given so that they match
-    what ``icacls /t`` prints for the same objects. A link or alias anywhere
-    in the tree refuses the store: the ACL that would be applied through it
-    belongs to whatever it points at.
+    Enumerated with ``os.scandir`` and each entry examined with
+    ``DirEntry.stat(follow_symlinks=False)``, so a link or alias anywhere in
+    the tree refuses the store before anything is applied through it. The
+    platform layer opens each name again for its ACL and refuses a reparse
+    point at that open too; this walk is the first check, not the only one.
     """
 
     directories: list[str] = []
@@ -257,13 +258,13 @@ def _enforce_private_nt(directory: Path) -> Path:
     traversed, so nothing inside it is reachable by name. Windows grants
     every account "bypass traverse checking" by default: a nested file with
     its own permissive entry is readable by anyone who knows its path,
-    whatever its parents allow. So the whole tree is enforced. Directories
-    are protected one by one with inheritable owner-only entries, which
-    rewrites the inherited entries of everything beneath them; one pass then
-    removes every explicit foreign entry from every object; and one
-    recursive read-back proves every object, so that "enforced" and
-    "verified" remain two observations. Every refusal keeps the fixed
-    operator text this module promises.
+    whatever its parents allow. So the whole tree is enforced: the root is
+    protected first, every walked object is then judged through its own
+    handle and, where it fails, has its DACL replaced in one write with the
+    exact owner-only DACL, and one read-only pass proves every object
+    afterwards, so that "enforced" and "verified" remain two observations.
+    An object owned by another account is never touched and refuses the
+    store. Every refusal keeps the fixed operator text this module promises.
     """
 
     from agent_bridge.orchestration import windows_privacy as wpv
@@ -287,13 +288,15 @@ def _enforce_private_nt(directory: Path) -> Path:
             "Claude configuration directory holds more files than this lane "
             "created")
     try:
-        for child in directories:
-            wpv.require_private_directory(child, root=directory)
-        removed, _evidence = host.remove_foreign_grants_tree(
+        protected, evidence = host.enforce_owner_only_tree(
             str(directory), directories + files)
-    except (OSError, wpv.PrivacyError):
-        removed = False
-    if not removed:
+    except OSError:
+        protected, evidence = False, {}
+    if not protected:
+        if evidence.get("objects_foreign_owned"):
+            raise ConfigDirError(
+                "Claude configuration directory contains a file owned by "
+                "another account")
         raise ConfigDirError(
             "Claude configuration directory contents could not be protected")
 

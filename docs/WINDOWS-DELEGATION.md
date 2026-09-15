@@ -218,16 +218,23 @@ canaries run last, so a cheaper structural proof fails first.
   roughly 1028:1, which makes it decorative. 500 is between the two, and
   `tests/test_workspace_unpacking.py` asserts both measurements rather than
   leaving the choice as an opinion.
-* **Owner-only ACLs**, verified by reading them back with `icacls` rather than
-  trusting a zero exit code. Applying one never passes through a broader ACL
-  than the one found: the owner's grant is written first, inherited entries
-  are cut second, and remaining explicit entries for anyone else are removed
-  by name third, so an interruption after any step leaves the object no more
-  readable than before. Read paths only observe; they never repair, so a
-  record another account could read stays visible as exactly that. The Claude
-  lane's store is enforced and observed as a whole tree, because Windows grants
-  every account "bypass traverse checking": a nested file with its own
-  permissive entry is readable by name whatever its parents allow.
+* **Owner-only ACLs**, applied and verified through Win32 security calls on
+  an open handle rather than through `icacls` text. The object is opened once
+  (refused if it is a reparse point), its owner and DACL are read through that
+  handle, the DACL is replaced in a single `SetSecurityInfo` call with the exact
+  owner-only DACL, and the result is read back through the same handle and
+  decoded byte for byte. There is no intermediate DACL between the one found
+  and the one written, so nothing is ever broader than either. An object owned
+  by another account is refused untouched: an `OWNER RIGHTS` entry grants
+  whoever owns the object, so ownership is checked before any entry counts.
+  Read paths only observe; they never repair, so a record another account
+  could read stays visible as exactly that. The Claude lane's store is
+  enforced and observed as a whole tree, because Windows grants every account
+  "bypass traverse checking": a nested file with its own permissive entry is
+  readable by name whatever its parents allow. Stated limitation: a tree is
+  enumerated by name and each entry opened by name; an object swapped between
+  those steps is caught by the reparse refusal and the ownership check on the
+  handle actually opened, not by a file-identity comparison.
 * **Fail-closed cleanup.** Registration is a tri-state (`none`, `created`,
   `unproven`), proven by listing the distro name immediately before and after
   the import. A name is never unregistered unless this run positively created

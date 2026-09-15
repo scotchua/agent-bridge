@@ -2,7 +2,7 @@
 
 Mode bits on POSIX; the real ACL read-back on Windows. Nothing here mocks the
 Windows boundary: a test that passes on Windows through this module passed
-against ``icacls``. The one stand-in, the POSIX mode-bit platform, exists so a
+against the security descriptor Windows actually holds for the object. The one stand-in, the POSIX mode-bit platform, exists so a
 test that hands code a ``platform=`` seam runs on macOS and Linux, where the
 Windows layer cannot; on Windows the same call returns the real platform.
 
@@ -49,8 +49,8 @@ class PosixModeBitPlatform:
 def owner_only_platform():
     """The object to pass through a ``platform=`` seam in a test.
 
-    The real platform on Windows, so the test exercises icacls; the mode-bit
-    stand-in elsewhere, where there is no Windows layer to exercise.
+    The real platform on Windows, so the test exercises the real ACL path;
+    the mode-bit stand-in elsewhere, where there is no Windows layer to exercise.
     """
 
     if os.name == "nt":
@@ -191,16 +191,23 @@ def drop_acl_bypass_privileges() -> list[str]:
         for name in ("SeBackupPrivilege", "SeRestorePrivilege"):
             luid = LUID()
             if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
-                continue
+                # Every Windows this runs on defines both names. A lookup
+                # failure means the fixture cannot know whether the token
+                # holds the privilege, which is not a state to test in.
+                raise OSError(ctypes.get_last_error(),
+                              f"LookupPrivilegeValueW({name}) failed")
             privileges = TOKEN_PRIVILEGES()
             privileges.PrivilegeCount = 1
             privileges.Privileges[0].Luid = luid
             privileges.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED
-            advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(privileges),
-                                           0, None, None)
-            # ERROR_NOT_ALL_ASSIGNED (1300) means the token never held it,
-            # which is the state wanted; anything else is a real failure.
+            adjusted = advapi32.AdjustTokenPrivileges(
+                token, False, ctypes.byref(privileges), 0, None, None)
             error = ctypes.get_last_error()
+            if not adjusted:
+                raise OSError(error, f"AdjustTokenPrivileges({name}) failed")
+            # A TRUE return with ERROR_NOT_ALL_ASSIGNED (1300) means the
+            # token never held it, which is the state wanted; anything else
+            # nonzero is a real failure.
             if error not in (0, 1300):
                 raise OSError(error, f"AdjustTokenPrivileges({name}) failed")
             if error == 0:

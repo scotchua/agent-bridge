@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from . import base
 from .windows_acl import (
-    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_foreign_principals,
-    icacls_listing_is_owner_only, icacls_tree_foreign_principals,
-    icacls_tree_listing_is_owner_only,
+    WINDOWS_OWNER_ONLY_GUARANTEE, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+    SecurityState, acl_size, build_owner_only_acl, is_exactly_owner_only,
+    judge_security, parse_acl, parse_sid,
 )
 
 import contextlib
@@ -115,51 +115,102 @@ kernel32.GetFinalPathNameByHandleW.argtypes = [
     wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
 ]
 kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
-kernel32.GetSystemDirectoryW.restype = wintypes.UINT
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.ReOpenFile.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+]
+kernel32.ReOpenFile.restype = wintypes.HANDLE
+kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+kernel32.LocalFree.restype = ctypes.c_void_p
 
 
-# Minimal environment for the ACL tools. Not a scrub for credentials (they
-# take none), but for PATH, PATHEXT and COMSPEC: a helper resolved by name
-# lets anyone who can write a directory on PATH decide what proves our ACL.
-_TOOL_ENV = {
-    "SYSTEMROOT": "C:\\Windows",
-    "SYSTEMDRIVE": "C:",
-}
+class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
 
 
-def _system_directory() -> str:
-    """Ask the OS where System32 is, rather than believing the environment.
+kernel32.GetFileInformationByHandle.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+]
+kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
 
-    SystemRoot is an ordinary environment variable and an attacker who can
-    set it can redirect every tool we invoke. GetSystemDirectoryW is the
-    authoritative answer and cannot be reached that way.
+# The owner-only ACL is read, written and read back through these, on an
+# open handle, with no helper program and no text. Prototypes are declared
+# for every one of them: GetCurrentProcess returns the pseudo-handle -1,
+# which ctypes' default int return truncates to 0xFFFFFFFF on x64, and
+# OpenProcessToken then fails with ERROR_INVALID_HANDLE (seen on the hosted
+# x64 runner, run 34938146871).
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+advapi32.OpenProcessToken.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.GetTokenInformation.restype = wintypes.BOOL
+advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+advapi32.GetLengthSid.restype = wintypes.DWORD
+advapi32.IsValidSid.argtypes = [ctypes.c_void_p]
+advapi32.IsValidSid.restype = wintypes.BOOL
+advapi32.IsValidAcl.argtypes = [ctypes.c_void_p]
+advapi32.IsValidAcl.restype = wintypes.BOOL
+advapi32.GetSecurityInfo.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+advapi32.GetSecurityInfo.restype = wintypes.DWORD
+advapi32.SetSecurityInfo.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+]
+advapi32.SetSecurityInfo.restype = wintypes.DWORD
+advapi32.GetSecurityDescriptorControl.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG),
+]
+advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
 
-    Fails closed. There is deliberately no fallback: a hardcoded
-    C:\\Windows\\System32 is a guess, and on a machine where the system
-    directory is somewhere else that guess either names nothing or names
-    something an attacker chose. Either way it would be used to run the
-    program whose output IS the owner-only proof, so a failed lookup must
-    stop the proof rather than substitute a default.
-    """
-    buffer = ctypes.create_unicode_buffer(260)
-    length = kernel32.GetSystemDirectoryW(buffer, len(buffer))
-    if not length or length >= len(buffer) or not buffer.value:
-        raise OSError(
-            "GetSystemDirectoryW failed; refusing to guess the system directory")
-    return buffer.value
-
-
-def _trusted_tool(name: str) -> str:
-    """Absolute path to a System32 executable. Never resolved through PATH.
-
-    subprocess with shell=False still resolves a bare name through the
-    inherited PATH, so "icacls" is an attacker-controlled choice of program
-    on any machine where a writable directory precedes System32. The ACL
-    round trip is the evidence the whole owner-only guarantee rests on, so
-    it must not be one of those choices.
-    """
-    return os.path.join(_system_directory(), name)
+TOKEN_QUERY = 0x0008
+TOKEN_USER_CLASS = 1
+ERROR_INSUFFICIENT_BUFFER = 122
+READ_CONTROL = 0x00020000
+WRITE_DAC = 0x00040000
+FILE_SHARE_ALL = 0x00000007
+OPEN_EXISTING = 3
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+SE_FILE_OBJECT = 1
+OWNER_SECURITY_INFORMATION = 0x00000001
+DACL_SECURITY_INFORMATION = 0x00000004
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+SDDL_REVISION_1 = 1
 
 
 class WindowsPlatform:
@@ -167,58 +218,58 @@ class WindowsPlatform:
 
     def __init__(self) -> None:
         # Unknown until something actually verifies it. Deliberately not
-        # probed here: an import-time probe costs two subprocesses on every
-        # invocation, and a cached answer can disagree with the live read-back
+        # probed here: a cached answer can disagree with the live read-back
         # that preflight performs, which is the only answer that matters.
         self.supports_owner_only_permissions = False
         self._jobs: dict[int, int] = {}
         self._jobs_lock = threading.Lock()
+        self._caller_sid_cache: str | None = None
 
     def set_owner_only_umask(self) -> None:
         os.umask(0o077)
 
     def enforce_owner_only_file(self, fd: int) -> None:
-        """Verify an owner-only ACL before the caller writes sensitive bytes.
+        """Protect the open file itself, through its handle, before the
+        caller writes sensitive bytes.
 
-        Failure clears the capability flag and raises PermissionError. The
-        caller owns the descriptor and must close it if enforcement fails.
+        The descriptor is reopened for READ_CONTROL and WRITE_DAC on the same
+        file object, so the DACL is read, replaced and read back on exactly
+        the file the caller holds, whatever its name points at by now.
+        Failure clears the capability flag and raises PermissionError with
+        the evidence attached. The caller owns the descriptor and must close
+        it if enforcement fails.
         """
-        path = self._path_from_fd(fd)
-        if not self._set_and_verify_owner_acl(path):
+        verified, evidence = self._protect_descriptor(fd)
+        if not verified:
             self.supports_owner_only_permissions = False
-            # The evidence travels with the exception. A bare "could not
-            # verify" has already cost a CI round trip per failure: the
-            # operator needs the identity that was parsed and the listing as
-            # it stands after the attempt, in one place.
-            diagnose = getattr(self, "acl_diagnostics", None)
-            evidence = repr(diagnose(path)) if diagnose is not None else ""
+            try:
+                path = self._path_from_fd(fd)
+            except OSError:
+                path = f"descriptor {fd}"
             raise PermissionError(
-                f"could not verify owner-only ACL for {path}: {evidence}")
+                f"could not verify owner-only ACL for {path}: {evidence!r}")
         self.supports_owner_only_permissions = True
 
     def verify_owner_only_path(self, directory: str,
                                probe_file: str) -> tuple[bool, dict[str, Any]]:
-        """Verify the ACL, not st_mode.
+        """Apply the owner-only ACL to both objects and read each back.
 
         st_mode on Windows carries only a read-only bit, so the POSIX-shaped
         assertion would reject a correctly protected directory. The Windows
-        guarantee is: no principal other than the owner, SYSTEM, and
-        Administrators has any access.
+        guarantee is: the object is owned by this account and no principal
+        other than the owner, SYSTEM, and Administrators has any access.
         """
-        results = {
+        results: dict[str, Any] = {
             "mechanism": "windows acl round-trip",
             "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
-            "directory_acl_verified": self._set_and_verify_owner_acl(
-                directory, inheritable=True),
-            "file_acl_verified": self._set_and_verify_owner_acl(probe_file),
         }
-        # Whichever target failed carries its own evidence. Reporting only a
-        # boolean has already cost several diagnostic round trips: knowing that
-        # something failed, without knowing which target or what the OS said,
-        # is barely better than knowing nothing.
         for label, target in (("directory", directory), ("file", probe_file)):
-            if not results[f"{label}_acl_verified"]:
-                results[f"{label}_evidence"] = self.acl_diagnostics(target)
+            verified, evidence = self._protect_path(target)
+            results[f"{label}_acl_verified"] = verified
+            # Whichever target failed carries its own evidence. A bare boolean
+            # has already cost several diagnostic round trips.
+            if not verified:
+                results[f"{label}_evidence"] = evidence
         verified = bool(results["directory_acl_verified"]
                         and results["file_acl_verified"])
         self.supports_owner_only_permissions = verified
@@ -666,11 +717,6 @@ class WindowsPlatform:
     def _acl_round_trip_supported(self) -> bool:
         """Actually probe, rather than assuming an answer.
 
-        This was a stub returning False, which pinned
-        supports_owner_only_permissions to False no matter how well the ACL
-        machinery worked, so the bridge refused to start on every Windows
-        machine for a reason unrelated to any ACL.
-
         Probes in a temporary directory that is discarded, so a failure here
         costs nothing and a success is evidence rather than an assumption.
         """
@@ -688,32 +734,263 @@ class WindowsPlatform:
         finally:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
-    def acl_diagnostics(self, path: str) -> dict[str, Any]:
-        """What the ACL looks like now. Describes; never re-applies anything."""
+    # ------------------------------------------------------------------
+    # Owner-only ACLs.
+    #
+    # Everything below works on an open handle: the object is opened once
+    # (with FILE_FLAG_OPEN_REPARSE_POINT, and refused if it turns out to be
+    # a reparse point), its owner and DACL are read through that handle, the
+    # DACL is replaced in one SetSecurityInfo call with the exact owner-only
+    # DACL, and the result is read back through the same handle. No helper
+    # program runs, no text is parsed, and nothing is addressed by name
+    # after the open, so a name that is swapped underneath the check points
+    # the check at a different object rather than at a different DACL.
+    #
+    # Known limitation, stated rather than hidden: a directory tree is
+    # enumerated by name (os.scandir) and each entry is then opened by name.
+    # An object swapped between those two steps is caught by the
+    # reparse-point refusal and by the ownership check on the handle that
+    # was actually opened; it is not caught by comparing file identities.
+    # ------------------------------------------------------------------
+
+    def _caller_sid(self) -> str | None:
+        """The SID of this process's token user, from the token itself."""
+        if self._caller_sid_cache is not None:
+            return self._caller_sid_cache
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                         TOKEN_QUERY, ctypes.byref(token)):
+            return None
         try:
-            whoami = _trusted_tool("whoami.exe")
-            icacls = _trusted_tool("icacls.exe")
+            needed = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, None, 0,
+                                         ctypes.byref(needed))
+            if ctypes.get_last_error() != ERROR_INSUFFICIENT_BUFFER or not needed.value:
+                return None
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, buffer,
+                                                needed, ctypes.byref(needed)):
+                return None
+            # TOKEN_USER begins with SID_AND_ATTRIBUTES, whose first field is
+            # the PSID.
+            sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+            if not sid_pointer or not advapi32.IsValidSid(sid_pointer):
+                return None
+            raw = ctypes.string_at(sid_pointer, advapi32.GetLengthSid(sid_pointer))
+            try:
+                self._caller_sid_cache = parse_sid(raw)
+            except ValueError:
+                return None
+            return self._caller_sid_cache
+        finally:
+            kernel32.CloseHandle(token)
+
+    def _examine_handle(self, handle: int) -> tuple[int | None, bool, dict[str, Any]]:
+        """Refuse a reparse point; report whether the object is a directory.
+
+        Closes the handle on refusal so callers never hold one they must
+        not use.
+        """
+        info = _BY_HANDLE_FILE_INFORMATION()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            return None, False, {"attributes_error": error}
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            kernel32.CloseHandle(handle)
+            return None, False, {"refused": "reparse point"}
+        return handle, bool(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY), {}
+
+    def _open_securable(self, path: str, *, write: bool
+                        ) -> tuple[int | None, bool, dict[str, Any]]:
+        """Open ``path`` for its security descriptor, never through a link."""
+        access = READ_CONTROL | (WRITE_DAC if write else 0)
+        handle = kernel32.CreateFileW(
+            path, access, FILE_SHARE_ALL, None, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
+        if handle in (None, 0, INVALID_HANDLE_VALUE):
+            return None, False, {"open_error": ctypes.get_last_error()}
+        return self._examine_handle(handle)
+
+    def _reopen_descriptor(self, fd: int, *, write: bool
+                           ) -> tuple[int | None, bool, dict[str, Any]]:
+        """A second handle to the very file ``fd`` holds, with security access.
+
+        ReOpenFile works from the existing handle, not from any name, so the
+        DACL that follows is applied to the file the caller is about to
+        write and to nothing else.
+        """
+        try:
+            original = msvcrt.get_osfhandle(fd)
         except OSError as exc:
-            return {"system_directory_error": str(exc), "tools_run": False}
-        identity = subprocess.run(
-            [whoami, "/user", "/fo", "csv", "/nh"],
-            capture_output=True, timeout=10, check=False, shell=False,
-            env=dict(_TOOL_ENV))
-        raw = identity.stdout.decode("utf-8", "replace").strip()
-        fields = raw.split(",")
-        user = fields[-1].strip('"') if fields else ""
-        observed = subprocess.run(
-            [icacls, path], capture_output=True, timeout=15,
-            check=False, shell=False, env=dict(_TOOL_ENV))
-        return {
-            "whoami_rc": identity.returncode,
-            "whoami_raw": raw,
-            "parsed_sid": user,
-            "sid_looks_valid": user.startswith("S-1-"),
-            "observed_rc": observed.returncode,
-            "observed": observed.stdout.decode("utf-8", "replace").strip(),
-            "observed_stderr": observed.stderr.decode("utf-8", "replace").strip(),
+            return None, False, {"descriptor_error": str(exc)}
+        access = READ_CONTROL | (WRITE_DAC if write else 0)
+        handle = kernel32.ReOpenFile(original, access, FILE_SHARE_ALL, 0)
+        if handle in (None, 0, INVALID_HANDLE_VALUE):
+            return None, False, {"reopen_error": ctypes.get_last_error()}
+        return self._examine_handle(handle)
+
+    def _sddl(self, descriptor: ctypes.c_void_p) -> str:
+        """The descriptor as SDDL text, for evidence only. Never judged."""
+        text = ctypes.c_void_p()
+        length = wintypes.ULONG(0)
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, SDDL_REVISION_1,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                ctypes.byref(text), ctypes.byref(length)):
+            return ""
+        try:
+            return ctypes.wstring_at(text.value) if text.value else ""
+        finally:
+            kernel32.LocalFree(text)
+
+    def _read_security(self, handle: int, is_directory: bool
+                       ) -> tuple[SecurityState | None, dict[str, Any]]:
+        """Owner and DACL of the object behind ``handle``, decoded strictly."""
+        owner = ctypes.c_void_p()
+        dacl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        status = advapi32.GetSecurityInfo(
+            handle, SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner), None, ctypes.byref(dacl), None,
+            ctypes.byref(descriptor))
+        if status != 0:
+            return None, {"read_error": status}
+        try:
+            control = wintypes.WORD(0)
+            revision = wintypes.DWORD(0)
+            if not advapi32.GetSecurityDescriptorControl(
+                    descriptor, ctypes.byref(control), ctypes.byref(revision)):
+                return None, {"control_error": ctypes.get_last_error()}
+            owner_sid = ""
+            if owner.value:
+                if not advapi32.IsValidSid(owner):
+                    return None, {"owner_error": "invalid owner SID"}
+                owner_sid = parse_sid(
+                    ctypes.string_at(owner.value, advapi32.GetLengthSid(owner)))
+            aces = None
+            if control.value & SE_DACL_PRESENT and dacl.value:
+                header = ctypes.string_at(dacl.value, 8)
+                aces = parse_acl(ctypes.string_at(dacl.value, acl_size(header)))
+            state = SecurityState(
+                owner_sid=owner_sid,
+                protected=bool(control.value & SE_DACL_PROTECTED),
+                dacl=aces,
+                is_directory=is_directory,
+                sddl=self._sddl(descriptor),
+            )
+            return state, {}
+        except ValueError as exc:
+            return None, {"decode_error": str(exc)}
+        finally:
+            kernel32.LocalFree(descriptor)
+
+    def _write_owner_only(self, handle: int, caller: str,
+                          is_directory: bool) -> str | None:
+        """Replace the DACL in one call. Returns an error string, or None."""
+        acl = build_owner_only_acl(caller, directory=is_directory)
+        buffer = ctypes.create_string_buffer(acl, len(acl))
+        if not advapi32.IsValidAcl(buffer):
+            return "built DACL is not valid"
+        status = advapi32.SetSecurityInfo(
+            handle, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, buffer, None)
+        return None if status == 0 else f"SetSecurityInfo failed with {status}"
+
+    def _protect_handle(self, handle: int, is_directory: bool
+                        ) -> tuple[bool, dict[str, Any]]:
+        """Read, replace, read back: all on one handle, one write in between.
+
+        An object owned by another account is refused untouched: its DACL
+        is that account's business, and an OWNER RIGHTS entry on it would
+        grant that account, not us, however owner-only it looked.
+        """
+        evidence: dict[str, Any] = {
+            "mechanism": "windows acl round-trip",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+            "directory": is_directory,
         }
+        caller = self._caller_sid()
+        if caller is None:
+            evidence["error"] = "caller identity unavailable"
+            return False, evidence
+        evidence["caller_sid"] = caller
+        before, error = self._read_security(handle, is_directory)
+        if before is None:
+            evidence.update(error)
+            return False, evidence
+        evidence["owner_sid"] = before.owner_sid
+        evidence["before"] = before.sddl
+        if before.owner_sid != caller:
+            evidence["refused"] = "owned by another account"
+            return False, evidence
+        failure = self._write_owner_only(handle, caller, is_directory)
+        if failure is not None:
+            evidence["error"] = failure
+            return False, evidence
+        after, error = self._read_security(handle, is_directory)
+        if after is None:
+            evidence.update(error)
+            return False, evidence
+        evidence["after"] = after.sddl
+        problems = judge_security(after, caller)
+        exact = is_exactly_owner_only(after, caller)
+        if not exact and not problems:
+            problems = ["read-back is not the DACL that was written"]
+        evidence["problems"] = problems
+        return exact, evidence
+
+    def _protect_path(self, path: str) -> tuple[bool, dict[str, Any]]:
+        handle, is_directory, error = self._open_securable(path, write=True)
+        if handle is None:
+            return False, {"mechanism": "windows acl round-trip",
+                           "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+                           "path": path, **error}
+        try:
+            return self._protect_handle(handle, is_directory)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _protect_descriptor(self, fd: int) -> tuple[bool, dict[str, Any]]:
+        handle, is_directory, error = self._reopen_descriptor(fd, write=True)
+        if handle is None:
+            return False, {"mechanism": "windows acl round-trip",
+                           "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE, **error}
+        try:
+            return self._protect_handle(handle, is_directory)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _set_and_verify_owner_acl(self, path: str) -> bool:
+        """Apply the owner-only ACL to one object by path and read it back."""
+        return self._protect_path(path)[0]
+
+    def _observe_handle(self, handle: int, is_directory: bool, *,
+                        allow_inherited: bool) -> tuple[bool, dict[str, Any]]:
+        evidence: dict[str, Any] = {
+            "mechanism": "windows acl read-back",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+            "directory": is_directory,
+        }
+        caller = self._caller_sid()
+        if caller is None:
+            evidence["error"] = "caller identity unavailable"
+            return False, evidence
+        evidence["caller_sid"] = caller
+        state, error = self._read_security(handle, is_directory)
+        if state is None:
+            evidence.update(error)
+            return False, evidence
+        problems = judge_security(state, caller, allow_inherited=allow_inherited)
+        evidence.update({
+            "owner_sid": state.owner_sid,
+            "protected": state.protected,
+            "sddl": state.sddl,
+            "problems": problems,
+        })
+        return not problems, evidence
 
     def observe_owner_only_acl(self, path: str, *, allow_inherited: bool = False
                                ) -> tuple[bool, dict[str, Any]]:
@@ -723,254 +1000,109 @@ class WindowsPlatform:
         ACL before it reads it. A readiness report and a test assertion both
         need the reading without the applying: describing a machine must not
         modify it, and an assertion that first repairs what it asserts proves
-        nothing. Same parser, same guarantee, no grant.
+        nothing. Same judgment, no write.
 
         ``allow_inherited`` is for an object inside a tree whose protected
         root has been proved separately (the Claude lane's store): its
         entries are copies of the root's. An object proved on its own keeps
         the default and refuses inherited entries.
         """
-        try:
-            whoami = _trusted_tool("whoami.exe")
-            icacls = _trusted_tool("icacls.exe")
-        except OSError as exc:
+        handle, is_directory, error = self._open_securable(path, write=False)
+        if handle is None:
             return False, {"mechanism": "windows acl read-back",
-                           "system_directory_error": str(exc)}
+                           "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+                           "path": path, **error}
         try:
-            identity_raw = subprocess.run(
-                [whoami, "/user", "/fo", "csv", "/nh"],
-                capture_output=True, timeout=10, check=False, shell=False,
-                env=dict(_TOOL_ENV),
-            ).stdout.decode("utf-8", "replace").strip()
-            observed = subprocess.run(
-                [icacls, path], capture_output=True,
-                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            return False, {"mechanism": "windows acl read-back",
-                           "error": type(exc).__name__}
-        fields = identity_raw.split(",")
-        user = fields[-1].strip('"')
-        owner_name = fields[0].strip('"') if len(fields) > 1 else ""
-        text = observed.stdout.decode("utf-8", "replace")
-        verified = bool(observed.returncode == 0 and user.startswith("S-1-")
-                        and icacls_listing_is_owner_only(
-                            text, user, owner_name, expected_path=path,
-                            allow_inherited=allow_inherited))
-        return verified, {
-            "mechanism": "windows acl read-back",
-            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
-            "whoami_raw": identity_raw,
-            "parsed_sid": user,
-            "observed_rc": observed.returncode,
-            "observed": text.strip(),
-        }
+            return self._observe_handle(handle, is_directory,
+                                        allow_inherited=allow_inherited)
+        finally:
+            kernel32.CloseHandle(handle)
 
-    def _set_and_verify_owner_acl(self, path: str, *,
-                                  inheritable: bool = False) -> bool:
-        """Apply the owner-only ACL to one object and read it back.
-
-        Every step either grants the owner or removes someone else. Nothing
-        here ever passes through a broader ACL than the one it found: the
-        owner's grant is written first, inherited entries are cut second,
-        and every remaining explicit entry for anyone but the owner, SYSTEM
-        and Administrators is removed by name third. An interruption after
-        any step leaves the object no more readable than before it. (A
-        ``/reset`` would have been shorter and would have handed the object
-        its parent's inheritable entries, whatever those are, for the length
-        of one process spawn, and for good if the next step failed.)
-
-        ``inheritable`` is for directories: the owner's entry is written
-        (OI)(CI) so that anything created inside inherits owner-only access.
-        Without it, Windows propagates the directory's change to its
-        children, strips their inherited entries, and leaves an object that
-        only ever had inherited entries with an empty ACL nobody can open.
-        The parser still refuses inherited entries on the object it is asked
-        to prove, so a child that matters is protected explicitly as well.
-        """
-        try:
-            # _trusted_tool may fail closed if the OS will not say where
-            # System32 is. That must return False BEFORE any process is
-            # spawned, never fall through to a guessed path.
-            whoami = _trusted_tool("whoami.exe")
-            icacls = _trusted_tool("icacls.exe")
-        except OSError:
-            return False
-        identity = subprocess.run(
-            [whoami, "/user", "/fo", "csv", "/nh"],
-            capture_output=True, timeout=10, check=False, shell=False,
-            env=dict(_TOOL_ENV),
-        ).stdout.decode("utf-8", "replace").strip().split(",")
-        user = identity[-1].strip('"')
-        if not user.startswith("S-1-"):
-            return False
-        owner_name = identity[0].strip('"') if len(identity) > 1 else ""
-        try:
-            # The SID must be written *SID. icacls treats a bare SID as an
-            # account name and fails with 1332, "No mapping between account
-            # names and security IDs was done", so the grant silently never
-            # applied and the capability could never be verified.
-            rights = "(OI)(CI)(F)" if inheritable else "(F)"
-            applied = subprocess.run(
-                [icacls, path, "/grant:r", f"*{user}:{rights}"],
-                capture_output=True, timeout=15, check=False, shell=False,
-                env=dict(_TOOL_ENV),
-            )
-            if applied.returncode != 0:
-                return False
-            protected = subprocess.run(
-                [icacls, path, "/inheritance:r"],
-                capture_output=True, timeout=15, check=False, shell=False,
-                env=dict(_TOOL_ENV),
-            )
-            if protected.returncode != 0:
-                return False
-            # "/grant:r" replaces only the named principal's explicit entries;
-            # an explicit entry for anyone else (an Everyone:(R) somebody
-            # added, say) survives it, so each one is removed by the name
-            # icacls printed for it. Removing is the only thing this step can
-            # do, so a listing it misreads cannot widen anything.
-            listed = subprocess.run(
-                [icacls, path], capture_output=True,
-                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
-            )
-            if listed.returncode != 0:
-                return False
-            foreign = icacls_listing_foreign_principals(
-                listed.stdout.decode("utf-8", "replace"), user, owner_name,
-                expected_path=path)
-            if foreign is None:
-                return False
-            for principal in foreign:
-                removed = subprocess.run(
-                    [icacls, path, "/remove:g", principal, "/remove:d", principal],
-                    capture_output=True, timeout=15, check=False, shell=False,
-                    env=dict(_TOOL_ENV),
-                )
-                if removed.returncode != 0:
-                    return False
-            observed = subprocess.run(
-                [icacls, path], capture_output=True,
-                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        text = observed.stdout.decode("utf-8", "replace")
-        return (observed.returncode == 0
-                and icacls_listing_is_owner_only(
-                    text, user, owner_name, expected_path=path))
-
-    def _owner_identity(self) -> tuple[str, str] | None:
-        """(SID, account name) of this process, or None if whoami will not say."""
-        try:
-            whoami = _trusted_tool("whoami.exe")
-            raw = subprocess.run(
-                [whoami, "/user", "/fo", "csv", "/nh"],
-                capture_output=True, timeout=10, check=False, shell=False,
-                env=dict(_TOOL_ENV),
-            ).stdout.decode("utf-8", "replace").strip()
-        except (OSError, subprocess.SubprocessError):
-            return None
-        fields = raw.split(",")
-        user = fields[-1].strip('"')
-        if not user.startswith("S-1-"):
-            return None
-        return user, (fields[0].strip('"') if len(fields) > 1 else "")
-
-    def _tree_listing(self, root: str) -> subprocess.CompletedProcess | None:
-        try:
-            icacls = _trusted_tool("icacls.exe")
-            return subprocess.run(
-                [icacls, root, "/t"], capture_output=True, timeout=120,
-                check=False, shell=False, env=dict(_TOOL_ENV),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
+    def acl_diagnostics(self, path: str) -> dict[str, Any]:
+        """What the ACL looks like now. Describes; never re-applies anything."""
+        verified, evidence = self.observe_owner_only_acl(path)
+        evidence["verified"] = verified
+        evidence["path"] = path
+        return evidence
 
     def observe_owner_only_tree(self, root: str, expected_paths: list[str]
                                 ) -> tuple[bool, dict[str, Any]]:
-        """Read one recursive listing back and judge every object in it.
+        """Judge every object the caller walked, each through its own handle.
 
-        Changes nothing. The root must be strictly owner-only (explicit
-        entries, protected); each descendant must carry only permitted
-        principals with the owner among them, inherited entries allowed,
-        because with the root protected an inherited entry can only be a
-        copy of one on an ancestor this same listing proves. The listing
-        must name exactly ``expected_paths`` plus the root: the caller
-        walked the store and refused links; an object it did not see is
-        not one it has vouched for.
+        Changes nothing. The root must be strictly owner-only (protected,
+        no inherited entry); each descendant must be owned by the caller
+        and carry only permitted principals with the caller among them,
+        inherited entries allowed, because with the root protected an
+        inherited entry can only be a copy of one on an ancestor this same
+        pass judges. An object the caller did not walk is not judged, and
+        not vouched for.
         """
-        identity = self._owner_identity()
-        if identity is None:
-            return False, {"mechanism": "windows acl tree read-back",
-                           "error": "owner identity unavailable"}
-        user, owner_name = identity
-        listed = self._tree_listing(root)
-        if listed is None or listed.returncode != 0:
-            return False, {"mechanism": "windows acl tree read-back",
-                           "parsed_sid": user,
-                           "observed_rc": None if listed is None else listed.returncode,
-                           "observed_stderr": "" if listed is None else
-                           listed.stderr.decode("utf-8", "replace").strip()}
-        text = listed.stdout.decode("utf-8", "replace")
-        verified, failed = icacls_tree_listing_is_owner_only(
-            text, user, owner_name, root, list(expected_paths))
-        return verified, {
+        failed: list[str] = []
+        verified, evidence = self.observe_owner_only_acl(root)
+        if not verified:
+            failed.append(root)
+        for path in expected_paths:
+            verified, _ = self.observe_owner_only_acl(path, allow_inherited=True)
+            if not verified:
+                failed.append(path)
+        return not failed, {
             "mechanism": "windows acl tree read-back",
             "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
-            "parsed_sid": user,
+            "caller_sid": evidence.get("caller_sid"),
             "objects_expected": len(expected_paths) + 1,
             "objects_failed": failed[:32],
-            "observed_rc": listed.returncode,
         }
 
-    def remove_foreign_grants_tree(self, root: str, expected_paths: list[str]
-                                   ) -> tuple[bool, dict[str, Any]]:
-        """Remove every explicit entry for anyone but the owner, SYSTEM and
-        Administrators from every object under ``root``. Removes only.
+    def enforce_owner_only_tree(self, root: str, expected_paths: list[str]
+                                ) -> tuple[bool, dict[str, Any]]:
+        """Bring every walked object to owner-only, each through its own handle.
 
-        The complement of the per-directory grant: directories under a store
-        are protected one by one with inheritable owner entries, which
-        rewrites the inherited entries of everything beneath them, but an
-        explicit entry somebody put on a nested file survives propagation
-        and is what this pass takes away. Principals are removed by the name
-        icacls printed; a name it cannot resolve fails the pass closed, and
-        so does a listing that names an object the caller did not walk.
+        The root is judged strictly and each descendant with inherited
+        entries allowed. An object that passes is left alone. One that
+        fails has its DACL replaced, in a single write, with the exact
+        owner-only DACL and is read back. One owned by another account is
+        never touched and fails the pass: it is that account's file, and
+        this lane must not use a store holding one. Nothing here removes
+        entries one at a time, so there is no intermediate DACL in which a
+        deny has gone while a grant it masked remains.
         """
-        identity = self._owner_identity()
-        if identity is None:
-            return False, {"mechanism": "windows acl tree removal",
-                           "error": "owner identity unavailable"}
-        user, owner_name = identity
-        listed = self._tree_listing(root)
-        if listed is None or listed.returncode != 0:
-            return False, {"mechanism": "windows acl tree removal",
-                           "error": "tree listing unavailable"}
-        foreign = icacls_tree_foreign_principals(
-            listed.stdout.decode("utf-8", "replace"), user, owner_name, root,
-            list(expected_paths))
-        if foreign is None:
-            return False, {"mechanism": "windows acl tree removal",
-                           "error": "listing named an object outside the walk"}
-        removed: list[str] = []
-        try:
-            icacls = _trusted_tool("icacls.exe")
-            for principal in foreign:
-                completed = subprocess.run(
-                    [icacls, root, "/t", "/remove:g", principal,
-                     "/remove:d", principal],
-                    capture_output=True, timeout=120, check=False,
-                    shell=False, env=dict(_TOOL_ENV),
-                )
-                if completed.returncode != 0:
-                    return False, {"mechanism": "windows acl tree removal",
-                                   "principal": principal,
-                                   "remove_rc": completed.returncode,
-                                   "remove_stderr": completed.stderr.decode(
-                                       "utf-8", "replace").strip()}
-                removed.append(principal)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return False, {"mechanism": "windows acl tree removal",
-                           "error": type(exc).__name__}
-        return True, {"mechanism": "windows acl tree removal",
-                      "removed_principals": removed}
+        evidence: dict[str, Any] = {
+            "mechanism": "windows acl tree enforcement",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+            "objects_expected": len(expected_paths) + 1,
+        }
+        caller = self._caller_sid()
+        if caller is None:
+            evidence["error"] = "caller identity unavailable"
+            return False, evidence
+        evidence["caller_sid"] = caller
+        repaired = 0
+        failed: list[str] = []
+        foreign_owned: list[str] = []
+        for index, path in enumerate([root, *expected_paths]):
+            handle, is_directory, _error = self._open_securable(path, write=True)
+            if handle is None:
+                failed.append(path)
+            else:
+                try:
+                    state, _error = self._read_security(handle, is_directory)
+                    if state is None:
+                        failed.append(path)
+                    elif state.owner_sid != caller:
+                        foreign_owned.append(path)
+                    elif judge_security(state, caller, allow_inherited=index > 0):
+                        verified, _ = self._protect_handle(handle, is_directory)
+                        if verified:
+                            repaired += 1
+                        else:
+                            failed.append(path)
+                finally:
+                    kernel32.CloseHandle(handle)
+            if len(failed) + len(foreign_owned) >= 32:
+                break
+        evidence.update({
+            "objects_repaired": repaired,
+            "objects_failed": failed[:32],
+            "objects_foreign_owned": foreign_owned[:32],
+        })
+        return not failed and not foreign_owned, evidence

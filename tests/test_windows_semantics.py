@@ -440,7 +440,9 @@ class ExclusiveLockTests(unittest.TestCase):
         self.addCleanup(process.kill)
         # Wait until the child says it actually holds the lock, rather than
         # sleeping and hoping.
-        self.assertEqual(process.stdout.readline(), b"held\n")
+        # Text-mode stdout writes the platform line ending, so the child
+        # says b"held\r\n" on Windows and b"held\n" elsewhere.
+        self.assertEqual(process.stdout.readline().rstrip(b"\r\n"), b"held")
         return process
 
     def test_a_second_holder_is_refused_while_the_first_holds_it(self):

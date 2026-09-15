@@ -98,7 +98,7 @@ def restrict_dir(path: str, kind: str):
 
 
 from agent_bridge.platform.windows_acl import (  # noqa: E402
-    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_is_owner_only,
+    WINDOWS_OWNER_ONLY_GUARANTEE,
 )
 
 BOTH = [("codex", "claude"), ("claude", "codex")]
@@ -3559,65 +3559,70 @@ def _parse_under(path: str, version: tuple) -> list:
 
 
 def test_windows_acl_parser_adversarial() -> None:
-    """Review-added cases for the ACL parser, beyond those it was written to.
+    """Review-added cases for the owner-only judgment, beyond those it was
+    written to.
 
-    The parser is the whole Windows privacy guarantee and it is pure text, so
-    it can be attacked from here even though nothing else Windows can be. Every
-    case below must fail closed; none was named in the brief that produced it.
+    The judgment is the whole Windows privacy guarantee and it is a decision
+    about decoded bytes, so it can be attacked from here even though nothing
+    else Windows can be. Every case below must fail closed.
     """
-    print("\n[windows acl parser, adversarial]")
-    from agent_bridge.platform.windows_acl import icacls_listing_is_owner_only as ok
+    print("\n[windows acl judgment, adversarial]")
+    from agent_bridge.platform import windows_acl as wacl
 
     sid = "S-1-5-21-1-2-3-1001"
-    real = ("C:\\T\\d NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
-            "        BUILTIN\\Administrators:(OI)(CI)(F)\n"
-            "        OWNER RIGHTS:(OI)(CI)(F)\n"
-            "Successfully processed 1 files; Failed processing 0 files\n")
+    other = "S-1-5-21-9-9-9-500"
+    oici = wacl.OBJECT_INHERIT_ACE | wacl.CONTAINER_INHERIT_ACE
 
+    def allow(principal, flags=0, mask=wacl.FILE_ALL_ACCESS):
+        return wacl.Ace(wacl.ACCESS_ALLOWED_ACE_TYPE, flags, mask, principal)
+
+    def judged(owner=sid, protected=True, directory=True, dacl=None, caller=sid,
+               allow_inherited=False):
+        observed = wacl.SecurityState(owner, protected, dacl, directory)
+        return wacl.judge_security(observed, caller, allow_inherited=allow_inherited) == []
+
+    real = (allow(wacl.SID_SYSTEM, oici), allow(wacl.SID_ADMINISTRATORS, oici),
+            allow(wacl.SID_OWNER_RIGHTS, oici))
     cases = [
+        ("the CPython mkdir(0o700) shape is accepted when the caller owns it",
+         judged(dacl=real), True),
         ("a second named account is refused",
-         real.replace("OWNER RIGHTS:(OI)(CI)(F)\n",
-                      "OWNER RIGHTS:(OI)(CI)(F)\n        MACHINE\\other:(F)\n"),
-         False),
-        ("an inherited ACE is refused",
-         real.replace("OWNER RIGHTS:(OI)(CI)(F)", "OWNER RIGHTS:(I)(OI)(CI)(F)"),
-         False),
-        ("a directory named like a principal cannot smuggle one in",
-         "C:\\T\\NT AUTHORITY\\SYSTEM Everyone:(F)\n", False),
-        ("a path ending in the owner name does not launder an unsafe ACE",
-         "C:\\T\\runneradmin Everyone:(F)\n", False),
+         judged(dacl=real + (allow(other),)), False),
+        ("an inherited ACE is refused on an object proved on its own",
+         judged(dacl=(allow(sid, wacl.INHERITED_ACE | oici),)), False),
+        ("and accepted on a descendant of a proved root",
+         judged(protected=False, dacl=(allow(sid, wacl.INHERITED_ACE | oici),),
+                allow_inherited=True), True),
+        ("OWNER RIGHTS on an object owned by someone else is refused",
+         judged(owner=other, dacl=real), False),
+        ("the exact owner-only DACL on an object owned by someone else is refused",
+         judged(owner=other, dacl=(allow(sid, oici),)), False),
         ("the owner named by SID rather than OWNER RIGHTS is accepted",
-         f"C:\\T\\d {sid}:(F)\n        NT AUTHORITY\\SYSTEM:(F)\n", True),
-        ("case is not significant",
-         real.lower(), True),
-        ("a localized listing fails closed rather than guessing",
-         "C:\\T\\d VORDEFINIERT\\Administratoren:(F)\n"
-         "        OWNER RIGHTS:(F)\n", False),
+         judged(dacl=(allow(sid), allow(wacl.SID_SYSTEM))), True),
+        ("caller SID case is not significant",
+         judged(dacl=real, caller=sid.lower()), True),
+        ("a deny entry is refused even though it grants nothing",
+         judged(dacl=real + (wacl.Ace(wacl.ACCESS_DENIED_ACE_TYPE, 0, 1, "S-1-1-0"),)), False),
+        ("an ACE type the code does not decode is refused",
+         judged(dacl=real + (wacl.Ace(0x09, 0, 0, None),)), False),
         ("SYSTEM and Administrators without the owner is refused",
-         "C:\\T\\d NT AUTHORITY\\SYSTEM:(F)\n"
-         "        BUILTIN\\Administrators:(F)\n", False),
-        ("a malformed owner sid is refused", real, False),
-        # The exact listing windows-latest produced for a file: one ACE, the
-        # owner by resolved account name. This was rejected, which meant the
-        # strictest possible ACL failed the check.
-        ("the owner by resolved account name is accepted",
-         "C:\\T\\state\\.permission-probe runnervm6iq3x\\runneradmin:(F)\n\n"
-         "Successfully processed 1 files; Failed processing 0 files", True),
+         judged(dacl=real[:2]), False),
+        ("a malformed caller sid is refused", judged(dacl=real, caller="nonsense"), False),
+        ("a NULL DACL is refused", judged(dacl=None), False),
+        ("an empty DACL is refused", judged(dacl=()), False),
+        ("an unprotected DACL is refused on an object proved on its own",
+         judged(protected=False, dacl=(allow(sid, oici),)), False),
+        ("an inherit-only stranger on a directory is refused",
+         judged(dacl=(allow(sid, oici), allow("S-1-1-0", wacl.INHERIT_ONLY_ACE | oici))),
+         False),
+        # The strictest ACL windows-latest produced for a file: one entry, the
+        # owner. This was once rejected by a name-based parser.
+        ("the owner alone is accepted", judged(directory=False, dacl=(allow(sid),)), True),
         ("a different account with the same shape is refused",
-         "C:\\T\\state\\.permission-probe runnervm6iq3x\\someoneelse:(F)\n", False),
+         judged(directory=False, dacl=(allow(other),)), False),
     ]
-    for label, text, expect in cases:
-        owner = "nonsense" if "malformed" in label else sid
-        expected_path = "C:\\T\\d"
-        if "resolved account name" in label or "same shape" in label:
-            ci_owner_name = "runnervm6iq3x\\runneradmin"
-            observed = ok(text, sid, ci_owner_name,
-                          expected_path="C:\\T\\state\\.permission-probe")
-            check(f"ACL: {label}", observed is expect, f"got {observed}")
-            continue
-        check(f"ACL: {label}",
-              ok(text, owner, "runneradmin", expected_path=expected_path) is expect,
-              f"got {ok(text, owner, 'runneradmin', expected_path=expected_path)}, want {expect}")
+    for label, observed, expect in cases:
+        check(f"ACL: {label}", observed is expect, f"got {observed}, want {expect}")
 
 
 def test_platform_boundary() -> None:
@@ -4139,34 +4144,44 @@ def test_state_root_permissions() -> None:
 
 
 def test_windows_acl_parser() -> None:
-    """The Windows ACL decision is pure text so it can be tested on POSIX."""
-    print("\n[Windows ACL parser]")
+    """The Windows ACL decision is about decoded bytes, so it runs on POSIX."""
+    print("\n[Windows ACL codec and judgment]")
+    from agent_bridge.platform import windows_acl as wacl
+
     owner = "S-1-5-21-1-2-3-1001"
-    listing = """C:\\state NT AUTHORITY\\SYSTEM:(OI)(CI)(F)
-              BUILTIN\\Administrators:(OI)(CI)(F)
-              OWNER RIGHTS:(OI)(CI)(F)
-Successfully processed 1 files; Failed processing 0 files
-"""
-    check("WA: the observed OWNER RIGHTS ACL is safe",
-          icacls_listing_is_owner_only(
-              listing, owner, "runneradmin", expected_path="C:\\state"))
+    check("WA: a SID round-trips through its binary form",
+          wacl.parse_sid(wacl.encode_sid(owner)) == owner)
+    check("WA: the well-known Administrators SID decodes from its known bytes",
+          wacl.parse_sid(bytes.fromhex("01020000000000052000000020020000"))
+          == wacl.SID_ADMINISTRATORS)
+    for directory in (False, True):
+        written = wacl.parse_acl(wacl.build_owner_only_acl(owner, directory=directory))
+        observed = wacl.SecurityState(owner, True, written, directory)
+        check(f"WA: the written {'directory' if directory else 'file'} DACL "
+              "decodes to exactly the owner's entry",
+              written == wacl.owner_only_aces(owner, directory=directory))
+        check("WA: and is judged owner-only and exact",
+              wacl.judge_security(observed, owner) == []
+              and wacl.is_exactly_owner_only(observed, owner))
+    everyone = wacl.Ace(wacl.ACCESS_ALLOWED_ACE_TYPE, 0, 1, "S-1-1-0")
+    users = wacl.Ace(wacl.ACCESS_ALLOWED_ACE_TYPE, 0, 0x1200A9, "S-1-5-32-545")
+    mine = wacl.owner_only_aces(owner, directory=False)
     check("WA: BUILTIN Users access is unsafe",
-          not icacls_listing_is_owner_only(
-              listing.replace("OWNER RIGHTS", "BUILTIN\\Users:(RX)\n"
-                              "              OWNER RIGHTS"),
-              owner, "runneradmin", expected_path="C:\\state"))
+          wacl.judge_security(wacl.SecurityState(owner, True, mine + (users,), False),
+                              owner) != [])
     check("WA: Everyone access is unsafe",
-          not icacls_listing_is_owner_only(
-              listing.replace("OWNER RIGHTS", "Everyone:(F)\n"
-                              "              OWNER RIGHTS"),
-              owner, "runneradmin", expected_path="C:\\state"))
-    check("WA: empty output fails closed",
-          not icacls_listing_is_owner_only(
-              "", owner, "runneradmin", expected_path="C:\\state"))
-    check("WA: unparseable output fails closed",
-          not icacls_listing_is_owner_only(
-              "Successfully processed 1 files", owner, "runneradmin",
-              expected_path="C:\\state"))
+          wacl.judge_security(wacl.SecurityState(owner, True, mine + (everyone,), False),
+                              owner) != [])
+    try:
+        wacl.parse_acl(b"")
+        check("WA: empty bytes fail closed", False, "parsed")
+    except ValueError:
+        check("WA: empty bytes fail closed", True)
+    try:
+        wacl.parse_acl(b"\x02\x00\x10\x00\x01\x00\x00\x00" + b"\xff" * 8)
+        check("WA: inconsistent bytes fail closed", False, "parsed")
+    except ValueError:
+        check("WA: inconsistent bytes fail closed", True)
     check("WA: Windows reports its distinct guarantee",
           WINDOWS_OWNER_ONLY_GUARANTEE ==
           "No principal other than the owner, SYSTEM, and Administrators has any access.")
