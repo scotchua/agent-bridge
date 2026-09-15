@@ -132,24 +132,28 @@ class ReceiptTests(GateCase):
 
 class ClassificationTests(GateCase):
     def test_claude_edit_tools_name_their_files(self):
-        kind, paths = gate.classify("claude", "Edit", {"file_path": "src/a.py"}, "/w")
-        self.assertEqual((kind, paths), ("edit", ["/w/src/a.py"]))
-        kind, paths = gate.classify("claude", "MultiEdit", {"edits": [{"file_path": "/abs/b.py"}]}, "/w")
-        self.assertEqual(paths, ["/abs/b.py"])
-        kind, paths = gate.classify("claude", "NotebookEdit", {"notebook_path": "n.ipynb"}, "/w")
-        self.assertEqual(paths, ["/w/n.ipynb"])
-        self.assertEqual(gate.classify("claude", "Read", {"file_path": "x"}, "/w"), ("other", []))
+        cwd = os.path.abspath(os.sep + "w")
+        kind, paths = gate.classify("claude", "Edit", {"file_path": "src/a.py"}, cwd)
+        self.assertEqual((kind, paths), ("edit", [os.path.join(cwd, "src/a.py")]))
+        absolute = os.path.abspath(os.sep + "abs" + os.sep + "b.py")
+        kind, paths = gate.classify("claude", "MultiEdit", {"edits": [{"file_path": absolute}]}, cwd)
+        self.assertEqual(paths, [absolute])
+        kind, paths = gate.classify("claude", "NotebookEdit", {"notebook_path": "n.ipynb"}, cwd)
+        self.assertEqual(paths, [os.path.join(cwd, "n.ipynb")])
+        self.assertEqual(gate.classify("claude", "Read", {"file_path": "x"}, cwd), ("other", []))
 
     def test_codex_apply_patch_names_every_file_in_the_patch(self):
         patch = ("*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n"
                  "*** Add File: docs/new.md\n+hello\n*** Delete File: old.txt\n"
                  "*** Update File: m.py\n*** Move to: moved.py\n*** End Patch\n")
         self.assertEqual(gate.patch_paths(patch), ["src/a.py", "docs/new.md", "old.txt", "m.py", "moved.py"])
-        kind, paths = gate.classify("codex", "apply_patch", {"input": patch}, "/w")
+        cwd = os.path.abspath(os.sep + "w")
+        kind, paths = gate.classify("codex", "apply_patch", {"input": patch}, cwd)
         self.assertEqual(kind, "edit")
-        self.assertEqual(paths, ["/w/src/a.py", "/w/docs/new.md", "/w/old.txt", "/w/m.py", "/w/moved.py"])
-        kind, paths = gate.classify("codex", "apply_patch", {"unknown": 1}, "/w")
-        self.assertEqual((kind, paths), ("edit", ["/w"]))
+        self.assertEqual(paths, [os.path.join(cwd, name) for name in
+                                 ("src/a.py", "docs/new.md", "old.txt", "m.py", "moved.py")])
+        kind, paths = gate.classify("codex", "apply_patch", {"unknown": 1}, cwd)
+        self.assertEqual((kind, paths), ("edit", [cwd]))
 
     def test_shell_commands_are_sorted_by_a_stated_heuristic(self):
         writes = ["echo hi > out.txt", "cat a >> b", "sed -i 's/a/b/' f", "rm -rf build",
@@ -404,7 +408,8 @@ class InstallTests(GateCase):
         self.assertEqual(report["installed"], {"claude": True, "codex": True})
         self.assertEqual(report["codex_trust"], "needs_review")
         self.assertEqual(report["receipts"][0]["status"], "valid")
-        key = f"{os.path.realpath(self.hooks)}:pre_tool_use:0:0"
+        # A TOML basic string escapes backslashes, which a Windows path holds.
+        key = f"{os.path.realpath(self.hooks)}:pre_tool_use:0:0".replace("\\", "\\\\")
         with open(self.toml, "a", encoding="utf-8") as handle:
             handle.write(f'\n[hooks.state."{key}"]\ntrusted_hash = "sha256:abc"\n')
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
