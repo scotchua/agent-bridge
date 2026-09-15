@@ -246,6 +246,52 @@ class JobWiringTests(unittest.TestCase):
                          "the policy was not loaded before the first check")
         self.assertTrue(order[2].endswith("git"))
 
+    def test_auth_capsule_is_gone_before_untrusted_verification(self):
+        state = {"mounted": False}
+
+        class TrackingCapsule(self.capsule):
+            def __enter__(inner):
+                state["mounted"] = True
+                return super(TrackingCapsule, inner).__enter__()
+
+            def __exit__(inner, *args):
+                state["mounted"] = False
+                return super(TrackingCapsule, inner).__exit__(*args)
+
+        def egress():
+            self.assertFalse(state["mounted"])
+            return "verify-egress-denied:x"
+
+        with mock.patch.object(gr, "read_versions",
+                               return_value=self.versions["tools"]), \
+             mock.patch.object(gr, "_AuthCapsule", TrackingCapsule), \
+             mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
+             mock.patch.object(gr, "capture_diff", lambda workdir: b""), \
+             mock.patch.object(gr, "enforce_verification_egress", egress), \
+             mock.patch.object(gr, "verify_program_path",
+                               lambda name: "/usr/bin/" + name):
+            gr.execute(gr.validate_request(self.request()),
+                       runner=lambda *args: (0, b"", b""))
+
+    def test_failed_capsule_cleanup_prevents_verification(self):
+        ran = []
+
+        class RefusingCleanup(self.capsule):
+            def __exit__(inner, *args):
+                super(RefusingCleanup, inner).__exit__(*args)
+                raise gr.GuestRunnerError("auth_cleanup_failed")
+
+        with mock.patch.object(gr, "read_versions",
+                               return_value=self.versions["tools"]), \
+             mock.patch.object(gr, "_AuthCapsule", RefusingCleanup), \
+             mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
+             mock.patch.object(gr, "enforce_verification_egress",
+                               lambda: ran.append("verify")):
+            response = gr.execute(gr.validate_request(self.request()),
+                                  runner=lambda *args: (0, b"", b""))
+        self.assertEqual(ran, [])
+        self.assertEqual(response["reason"], "auth_cleanup_failed")
+
     def test_a_policy_that_cannot_be_enforced_aborts_the_job(self):
         def failing():
             raise gr.GuestRunnerError("verify_egress_not_enforced")

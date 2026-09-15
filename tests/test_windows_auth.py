@@ -662,6 +662,14 @@ class EnrolmentLockingTests(AuthTestCase):
                 self._enrol(token="sk-ant-oat01-" + "t" * 40)
         self.assertEqual(caught.exception.reason, "enrolment_rollback_incomplete")
 
+    def test_unreadable_identity_is_not_reported_as_a_complete_rollback(self):
+        with mock.patch.object(wa.wpv, "file_identity",
+                               side_effect=wa.wpv.PrivacyError("file_unreadable")):
+            complete = wa._roll_back_secret(
+                Path(self.root) / "secret", b"old", lambda descriptor: None,
+                Path(self.root), expect_identity=object())
+        self.assertFalse(complete)
+
     def test_the_previous_ciphertext_is_captured_through_the_privacy_layer(self):
         """Not by reopening the pathname. The checked file is the read file."""
 

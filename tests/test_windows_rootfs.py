@@ -437,6 +437,14 @@ class RecipeHonestyTests(unittest.TestCase):
         self.assertEqual(gr.NFT_PATH, "/usr/sbin/nft")
         self.assertEqual(gr.GIT_PATH, "/usr/bin/git")
 
+    def test_image_creates_the_fixed_non_root_job_identity(self):
+        text = wrf.dockerfile(_recipe(), guest_runner_sha256=RUNNER_HASH)
+        self.assertIn(f"groupadd --gid {wrf.JOB_GID} {wrf.JOB_USER}", text)
+        self.assertIn(f"useradd --uid {wrf.JOB_UID}", text)
+        self.assertEqual((wrf.JOB_USER, wrf.JOB_UID, wrf.JOB_GID),
+                         (gr.JOB_USER, gr.JOB_UID, gr.JOB_GID))
+        self.assertNotEqual(gr.JOB_UID, 0)
+
     def test_the_shipped_recipes_do_not_yet_validate(self):
         """The recipes in tools/rootfs/recipes are stubs, and say so.
 

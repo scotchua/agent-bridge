@@ -53,6 +53,9 @@ ARCHITECTURES = ("amd64", "arm64")
 GUEST_RUNNER_PATH = ww.GUEST_RUNNER_PATH
 WSL_CONF_PATH = "/etc/wsl.conf"
 VERSIONS_PATH = "/etc/agent-bridge/versions.json"
+JOB_USER = "agent-bridge-job"
+JOB_UID = 10001
+JOB_GID = 10001
 WORKSPACE_PATHS = ("/workspace", "/workspace/canary", "/workspace/job")
 
 #: A fixed timestamp for every archive member. Build time is the single
@@ -265,6 +268,14 @@ COPY wsl.conf {WSL_CONF_PATH}
 RUN chmod 0644 {WSL_CONF_PATH}
 
 {install_packages}\
+# A fixed, non-login identity for every provider and verification child.  The
+# guest runner remains the narrow root supervisor for tmpfs and nftables.
+RUN /usr/sbin/groupadd --gid {JOB_GID} {JOB_USER} \
+ && /usr/sbin/useradd --uid {JOB_UID} \
+      --gid {JOB_GID} --home-dir /home/{JOB_USER} \
+      --create-home --shell /usr/sbin/nologin {JOB_USER} \
+ && chmod 0700 /home/{JOB_USER}
+
 # Pinned toolchain. Versions are fixed by the recipe, never resolved at build
 # time, so two builds of one recipe install the same programs. The installer
 # script comes from the build context and is removed again, so it is not part

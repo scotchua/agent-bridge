@@ -418,7 +418,11 @@ def _roll_back_secret(path: Path, previous: bytes | None, writer: Any,
     try:
         current = wpv.file_identity(path)
     except wpv.PrivacyError:
-        current = None
+        # Not being able to identify the file is not evidence that a newer,
+        # complete enrolment won the race.  Claiming success here leaves the
+        # new secret paired with the old record while hiding that recovery is
+        # incomplete.
+        return False
     if expect_identity is not None and current != expect_identity:
         # A newer enrolment is on disk. Leave it alone; nothing to undo.
         return True

@@ -208,7 +208,7 @@ def build_job_request(*, config: DelegationConfig, manifest: ww.PinnedBaseImageM
         "args": list(args),
         "workdir": GUEST_JOB_WORKDIR,
         "timeout_seconds": config.limits.job_timeout_seconds,
-        "env": {"HOME": "/root"},
+        "env": {"HOME": guest_runner.JOB_HOME},
         "stdin": stdin_data,
         "auth": dict(auth) if auth is not None else None,
         "workspace_tar_b64": workspace_tar_b64,
@@ -270,7 +270,7 @@ def build_auth_probe_request(*, config: DelegationConfig,
         "provider": provider,
         "workdir": GUEST_JOB_WORKDIR,
         "timeout_seconds": timeout,
-        "env": {"HOME": "/root"},
+        "env": {"HOME": guest_runner.JOB_HOME},
         "auth": dict(auth),
     }
     try:
@@ -699,7 +699,7 @@ def build_provider_job_request(*, config: DelegationConfig,
                   if verify_timeout_seconds is not None
                   else guest_runner.DEFAULT_VERIFY_TIMEOUT_SECONDS),
             timeout),
-        "env": {"HOME": "/root"},
+        "env": {"HOME": guest_runner.JOB_HOME},
         "auth": dict(auth) if auth is not None else None,
         "workspace_tar_b64": workspace_tar_b64,
     }

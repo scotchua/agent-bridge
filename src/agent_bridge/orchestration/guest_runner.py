@@ -38,6 +38,7 @@ Deliberate constraints, all of which the tests enforce:
 from __future__ import annotations
 
 import base64
+import contextlib
 import errno
 import hashlib
 import io
@@ -264,12 +265,20 @@ ALLOWED_WORKDIR_PREFIXES = ("/root/", "/home/", "/tmp/", "/workspace/")
 CHILD_ENV_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "AGENT_BRIDGE_JOB_ID")
 
 DEFAULT_CHILD_ENV = {
-    "HOME": "/root",
+    "HOME": "/home/agent-bridge-job",
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "TERM": "dumb",
 }
+
+# The runner is the narrow privileged supervisor: it mounts the in-memory
+# credential capsule and installs the nftables policy.  Provider and verifier
+# processes never inherit that privilege.
+JOB_USER = "agent-bridge-job"
+JOB_UID = 10001
+JOB_GID = 10001
+JOB_HOME = "/home/agent-bridge-job"
 
 #: Substrings that make an environment key look like a credential. Matching is
 #: on the key, because a value cannot be judged: a token and a sentence are the
@@ -1299,6 +1308,97 @@ def _git_env() -> dict[str, str]:
             "GIT_COMMITTER_EMAIL": "agent@bridge.invalid"}
 
 
+def _job_identity() -> tuple[int, int]:
+    """Return the pinned least-privileged guest identity or refuse."""
+
+    try:
+        import pwd
+        entry = pwd.getpwnam(JOB_USER)
+    except (ImportError, KeyError) as exc:
+        raise GuestRunnerError("job_user_unavailable") from exc
+    if entry.pw_uid != JOB_UID or entry.pw_gid != JOB_GID or entry.pw_uid == 0:
+        raise GuestRunnerError("job_user_invalid")
+    return entry.pw_uid, entry.pw_gid
+
+
+def _job_subprocess_kwargs() -> dict[str, object]:
+    """Popen's audited privilege-drop fields for a guest child."""
+
+    if os.geteuid() != 0:
+        return {}
+    uid, gid = _job_identity()
+    # Prefer Popen's native fields to preexec_fn: this process has pump
+    # threads, and arbitrary Python between fork and exec can deadlock.
+    return {"user": uid, "group": gid, "extra_groups": ()}
+
+
+def _job_user_pids() -> list[int]:
+    """Processes still owned by the disposable job identity in this guest."""
+
+    if os.geteuid() != 0:
+        return []
+    found: list[int] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError as exc:
+        raise GuestRunnerError("job_process_check_failed") from exc
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/status", "r", encoding="ascii") as handle:
+                uid_line = next((line for line in handle if line.startswith("Uid:")), "")
+            real_uid = int(uid_line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        if real_uid == JOB_UID:
+            found.append(int(name))
+    return found
+
+
+def _sweep_job_user_processes() -> None:
+    """Kill daemonised descendants before crossing a security transition."""
+
+    for pid in _job_user_pids():
+        with contextlib.suppress(OSError):
+            os.kill(pid, 9)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _job_user_pids():
+            return
+        time.sleep(0.02)
+    raise GuestRunnerError("job_process_cleanup_failed")
+
+
+def _grant_workspace_to_job_user(workdir: str) -> None:
+    """Make work files editable while keeping the baseline metadata guarded."""
+
+    # Portable unit tests run without privilege and do not execute a real
+    # provider.  The production guest runner is root because it must mount
+    # tmpfs and install nftables rules; there, absence of the user fails.
+    if os.geteuid() != 0:
+        return
+    uid, gid = _job_identity()
+    git_dir = os.path.join(workdir, ".git")
+    for directory, names, files in os.walk(workdir):
+        if directory == git_dir or directory.startswith(git_dir + os.sep):
+            continue
+        for name in names:
+            path = os.path.join(directory, name)
+            if path == git_dir:
+                continue
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o700)
+        for name in files:
+            path = os.path.join(directory, name)
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o600)
+    # A sticky, root-owned top level lets the job create files but prevents it
+    # from renaming or deleting the root-owned .git baseline.
+    os.chown(workdir, 0, 0)
+    os.chmod(workdir, 0o1777)
+
+
 def _git(args: list[str], cwd: str, timeout: float = 120.0):
     return subprocess.run(  # noqa: S603 - fixed binary, shell off
         [GIT_PATH] + args, cwd=cwd, shell=False, env=_git_env(),
@@ -1377,6 +1477,7 @@ def unpack_workspace(tar_b64: str, workdir: str) -> None:
         raise GuestRunnerError("workspace_git_unavailable")
     _git(["add", "-A"], workdir)
     _git(["commit", "-q", "--allow-empty", "-m", WORKSPACE_BASE_TAG], workdir)
+    _grant_workspace_to_job_user(workdir)
 
 
 class _ExtractionBudget:
@@ -1582,7 +1683,7 @@ def _bounded_git(args: list[str], cwd: str, *, limit: int,
 
     if timed_out:
         raise TimeoutError("git timed out")
-    if out.overflowed:
+    if out.overflowed or err.overflowed:
         raise _OutputTooLarge("diff exceeded its ceiling")
     return process.returncode, bytes(out.data), bytes(err.data)
 
@@ -1628,21 +1729,40 @@ class _AuthCapsule:
         if completed.returncode != 0:
             raise GuestRunnerError("auth_tmpfs_unavailable")
         self._mounted = True
+        if os.geteuid() == 0:
+            os.chown(AUTH_DIR, JOB_UID, JOB_GID)
+        os.chmod(AUTH_DIR, 0o700)
         self.root = tempfile.mkdtemp(prefix="session-", dir=AUTH_DIR)
+        if os.geteuid() == 0:
+            os.chown(self.root, JOB_UID, JOB_GID)
         os.chmod(self.root, 0o700)
         return self
 
     def __exit__(self, *_: object) -> None:
+        cleanup_ok = True
         if self.root is not None:
-            shutil.rmtree(self.root, ignore_errors=True)
+            try:
+                shutil.rmtree(self.root)
+            except OSError:
+                cleanup_ok = False
         if self._mounted:
             try:
-                subprocess.run(  # noqa: S603 - fixed argv, shell off
+                completed = subprocess.run(  # noqa: S603 - fixed argv, shell off
                     ["/bin/umount", AUTH_DIR], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, shell=False, timeout=30)
+                if completed.returncode != 0:
+                    cleanup_ok = False
             except (OSError, subprocess.SubprocessError):
-                pass
+                cleanup_ok = False
+            else:
+                self._mounted = False
+        with contextlib.suppress(OSError):
+            os.chown(AUTH_DIR, 0, 0)
+            os.chmod(AUTH_DIR, 0o700)
         self.auth = None
+        self.root = None
+        if not cleanup_ok:
+            raise GuestRunnerError("auth_cleanup_failed")
 
     def child_env(self) -> dict[str, str]:
         """Environment additions this capsule requires. Never persisted."""
@@ -1665,9 +1785,13 @@ class _AuthCapsule:
         if self.tool == "claude":
             os.makedirs(os.path.join(self.root, "claude"), mode=0o700,
                         exist_ok=True)
+            if os.geteuid() == 0:
+                os.chown(os.path.join(self.root, "claude"), JOB_UID, JOB_GID)
             return
         codex_home = os.path.join(self.root, "codex")
         os.makedirs(codex_home, mode=0o700, exist_ok=True)
+        if os.geteuid() == 0:
+            os.chown(codex_home, JOB_UID, JOB_GID)
         # The token goes down this child's stdin, never onto its argv, because
         # an argv is readable by every process in the guest.
         try:
@@ -1676,9 +1800,11 @@ class _AuthCapsule:
                 input=(self.auth["token"] + "\n").encode("utf-8"),
                 env=dict(env), cwd="/", shell=False,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=min(120.0, timeout))
+                timeout=min(120.0, timeout), **_job_subprocess_kwargs())
         except (OSError, subprocess.SubprocessError) as exc:
             raise GuestRunnerError("auth_login_failed") from exc
+        finally:
+            _sweep_job_user_processes()
         if completed.returncode != 0:
             # The provider's own message may quote the token back. It is not
             # reported, and the reason code carries no provider text.
@@ -2034,6 +2160,10 @@ def _execute_auth_probe(request: dict[str, object], call: object,
             return done(PROBE_REJECTED if exc.code == "auth_login_rejected"
                         else PROBE_FAILED)
         os.makedirs(workdir, mode=0o700, exist_ok=True)
+        if os.geteuid() == 0:
+            uid, gid = _job_identity()
+            os.chown(workdir, uid, gid)
+            os.chmod(workdir, 0o700)
         last_message = os.path.join(workdir, ".agent-bridge-probe-message")
         argv = auth_probe_argv(provider, entry["path"], workdir=workdir,
                                last_message_path=last_message)
@@ -2109,54 +2239,46 @@ def _execute_provider_job(request: dict[str, object], call: object,
                 stdout=capped_out, stderr=capped_err, truncated=False,
                 duration_seconds=time.monotonic() - started)
 
-        # The provider's own environment carried the session. Verification
-        # gets a fresh one that never did: a check is not a place a token
-        # belongs, and a check that could read one is a check that could
-        # exfiltrate it.
-        verify_env = build_child_env(dict(request["env"]))  # type: ignore[arg-type]
+    # Leaving the capsule scope is a security transition, not cleanup trivia:
+    # repository-controlled verification must not be able to read the known
+    # tmpfs path, even with a fresh environment.  __exit__ removes and
+    # unmounts the capsule before the first verifier is resolved or run.
+    verify_env = build_child_env(dict(request["env"]))  # type: ignore[arg-type]
 
-        # ...and a check that could reach the network is a check that could
-        # exfiltrate it anyway, token or not: verification runs repository
-        # code written by a model. See VERIFICATION_EGRESS_CONTRACT. Loaded,
-        # read back and probed before the first command, and a failure here
-        # ends the job rather than downgrading to "verified with a network".
-        if verify_commands:
-            try:
-                egress_receipt = enforce_verification_egress()
-            except GuestRunnerError as exc:
-                return build_response(
-                    status="aborted", harness_status=HARNESS_ABORTED,
-                    reason=exc.code, exit_code=returncode,
-                    stdout=capped_out, stderr=capped_err, truncated=False,
-                    duration_seconds=time.monotonic() - started)
-        else:
-            egress_receipt = ""
+    if verify_commands:
+        try:
+            egress_receipt = enforce_verification_egress()
+        except GuestRunnerError as exc:
+            return build_response(
+                status="aborted", harness_status=HARNESS_ABORTED,
+                reason=exc.code, exit_code=returncode,
+                stdout=capped_out, stderr=capped_err, truncated=False,
+                duration_seconds=time.monotonic() - started)
+    else:
+        egress_receipt = ""
 
-        evidence: list[dict[str, object]] = []
-        failed = False
-        for command in verify_commands:
-            program = verify_program_path(command[0])
-            check_started = time.monotonic()
-            code, check_out, check_err = call(  # type: ignore[operator]
-                [program] + list(command[1:]), workdir, verify_env, "",
-                verify_timeout)
-            check_out = redact(check_out, auth)  # type: ignore[arg-type]
-            check_err = redact(check_err, auth)  # type: ignore[arg-type]
-            evidence.append({
-                "program": command[0],
-                "returncode": code,
-                "stdout_sha256": hashlib.sha256(check_out).hexdigest(),
-                "stderr_sha256": hashlib.sha256(check_err).hexdigest(),
-                "duration_seconds": round(time.monotonic() - check_started, 6),
-                # Which network posture this check actually ran under, on the
-                # receipt rather than in a comment. An empty value would mean
-                # the check ran without one, which cannot happen above.
-                "egress": egress_receipt,
-            })
-            if code != 0:
-                failed = True
+    evidence: list[dict[str, object]] = []
+    failed = False
+    for command in verify_commands:
+        program = verify_program_path(command[0])
+        check_started = time.monotonic()
+        code, check_out, check_err = call(  # type: ignore[operator]
+            [program] + list(command[1:]), workdir, verify_env, "",
+            verify_timeout)
+        check_out = redact(check_out, auth)  # type: ignore[arg-type]
+        check_err = redact(check_err, auth)  # type: ignore[arg-type]
+        evidence.append({
+            "program": command[0],
+            "returncode": code,
+            "stdout_sha256": hashlib.sha256(check_out).hexdigest(),
+            "stderr_sha256": hashlib.sha256(check_err).hexdigest(),
+            "duration_seconds": round(time.monotonic() - check_started, 6),
+            "egress": egress_receipt,
+        })
+        if code != 0:
+            failed = True
 
-        diff = redact(capture_diff(workdir), auth)  # type: ignore[arg-type]
+    diff = redact(capture_diff(workdir), auth)  # type: ignore[arg-type]
 
     if failed:
         return build_response(
@@ -2184,7 +2306,7 @@ def execute(request: dict[str, object],
 
     tools = read_versions()
     started_at = time.monotonic()
-    call_seam = runner if runner is not None else _subprocess_runner
+    call_seam = runner if runner is not None else _untrusted_subprocess_runner
     if request.get("mode") == MODE_AUTH_PROBE:
         try:
             return _execute_auth_probe(request, call_seam, tools, started_at)
@@ -2221,7 +2343,7 @@ def execute(request: dict[str, object],
     argv = [entry["path"]] + list(request["args"])  # type: ignore[arg-type]
     auth = request.get("auth")  # type: ignore[assignment]
     started = time.monotonic()
-    call = runner if runner is not None else _subprocess_runner
+    call = runner if runner is not None else _untrusted_subprocess_runner
     workspace = request.get("workspace_tar_b64")
     workdir = str(request["workdir"])
     diff = b""
@@ -2341,13 +2463,15 @@ def _write_stdin(process: object, payload: bytes) -> None:
 
 
 def _subprocess_runner(argv: list[str], cwd: str, env: dict[str, str],
-                       stdin_data: str, timeout: float):
+                       stdin_data: str, timeout: float, *,
+                       drop_privileges: bool = False):
     if not os.path.isdir(cwd):
         raise GuestRunnerError("workdir_missing")
     process = subprocess.Popen(  # noqa: S603 - fixed argv, shell explicitly off
         argv, cwd=cwd, env=env, shell=False,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        start_new_session=True,
+        **(_job_subprocess_kwargs() if drop_privileges else {}))
 
     try:
         pgid = os.getpgid(process.pid)
@@ -2414,6 +2538,18 @@ def _subprocess_runner(argv: list[str], cwd: str, env: dict[str, str],
     if out.overflowed or err.overflowed:
         raise GuestRunnerError("output_too_large")
     return process.returncode, bytes(out.data), bytes(err.data)
+
+
+def _untrusted_subprocess_runner(argv: list[str], cwd: str,
+                                 env: dict[str, str], stdin_data: str,
+                                 timeout: float):
+    """Run provider or repository-controlled work without guest root."""
+
+    try:
+        return _subprocess_runner(argv, cwd, env, stdin_data, timeout,
+                                  drop_privileges=(os.geteuid() == 0))
+    finally:
+        _sweep_job_user_processes()
 
 
 def read_request(stream: object) -> dict[str, object]:

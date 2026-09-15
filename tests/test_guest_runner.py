@@ -491,10 +491,52 @@ class EntryPointTests(unittest.TestCase):
             raise OSError(2, "No such file or directory: '/root/.secret-path'")
 
         with mock.patch.object(gr, "read_versions", return_value=VERSIONS["tools"]), \
-                mock.patch.object(gr, "_subprocess_runner", side_effect=runner):
+                mock.patch.object(gr, "_untrusted_subprocess_runner",
+                                  side_effect=runner):
             code, output = self._run(["--run"], json.dumps(_request()).encode())
         self.assertNotIn("secret-path", output.decode())
         self.assertEqual(json.loads(output)["reason"], "spawn_failed")
+
+
+class LeastPrivilegeTests(unittest.TestCase):
+    def test_production_child_wrapper_requests_privilege_drop(self):
+        seen = {}
+
+        def base(*args, **kwargs):
+            seen.update(kwargs)
+            return 0, b"", b""
+
+        with mock.patch.object(gr, "_subprocess_runner", base), \
+             mock.patch.object(gr.os, "geteuid", return_value=0), \
+             mock.patch.object(gr, "_sweep_job_user_processes"):
+            gr._untrusted_subprocess_runner(
+                ["/bin/true"], "/tmp", {}, "", 1.0)
+        self.assertIs(seen.get("drop_privileges"), True)
+
+    def test_job_identity_is_fixed_and_not_root(self):
+        entry = mock.Mock(pw_uid=gr.JOB_UID, pw_gid=gr.JOB_GID)
+        fake_pwd = mock.Mock(getpwnam=mock.Mock(return_value=entry))
+        with mock.patch.dict(sys.modules, {"pwd": fake_pwd}):
+            self.assertEqual(gr._job_identity(), (gr.JOB_UID, gr.JOB_GID))
+        self.assertNotEqual(gr.JOB_UID, 0)
+
+    def test_privilege_drop_uses_native_popen_fields_not_preexec(self):
+        entry = mock.Mock(pw_uid=gr.JOB_UID, pw_gid=gr.JOB_GID)
+        fake_pwd = mock.Mock(getpwnam=mock.Mock(return_value=entry))
+        with mock.patch.dict(sys.modules, {"pwd": fake_pwd}), \
+             mock.patch.object(gr.os, "geteuid", return_value=0):
+            fields = gr._job_subprocess_kwargs()
+        self.assertEqual(fields, {"user": gr.JOB_UID, "group": gr.JOB_GID,
+                                  "extra_groups": ()})
+        self.assertNotIn("preexec_fn", fields)
+
+    def test_untrusted_wrapper_sweeps_daemonised_descendants(self):
+        with mock.patch.object(gr, "_subprocess_runner",
+                               return_value=(0, b"", b"")), \
+             mock.patch.object(gr, "_sweep_job_user_processes") as sweep:
+            gr._untrusted_subprocess_runner(
+                ["/bin/true"], "/tmp", {}, "", 1.0)
+        sweep.assert_called_once_with()
 
 
 class AuthCapsuleTests(unittest.TestCase):

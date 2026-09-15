@@ -177,6 +177,13 @@ class BoundedGitLifecycleTests(unittest.TestCase):
                 gr._bounded_git(["-c", "yes AAAAAAAA"], self.temp.name,
                                 limit=64 * 1024, timeout=20.0)
 
+    def test_stderr_above_the_limit_also_fails_closed(self):
+        with mock.patch.object(gr, "GIT_PATH", "/bin/sh"), \
+             mock.patch.object(gr, "MAX_OUTPUT_BYTES", 64 * 1024):
+            with self.assertRaises(gr._OutputTooLarge):
+                gr._bounded_git(["-c", "yes ERROR 1>&2"], self.temp.name,
+                                limit=64 * 1024, timeout=20.0)
+
     def test_a_bounded_run_never_inherits_this_processes_environment(self):
         os.environ["AGENT_BRIDGE_LEAK_CANARY"] = "leaked"
         self.addCleanup(os.environ.pop, "AGENT_BRIDGE_LEAK_CANARY", None)
