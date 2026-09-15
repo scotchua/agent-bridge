@@ -603,6 +603,7 @@ class TreePlatform:
         self.writes_seen: list[str] = []
         self.opened_roots: list[tuple[str, bool, bool]] = []
         self.child_opens: list[tuple[str, str, bool, bool]] = []
+        self.pins: list[bool] = []
 
     def _caller_sid(self):
         return self.caller
@@ -620,10 +621,11 @@ class TreePlatform:
         observed = self.objects.get(".")
         return self._new_handle("."), bool(observed and observed.is_directory), {}
 
-    def _open_child(self, parent, name, *, write, listing):
+    def _open_child(self, parent, name, *, write, listing, pin=False):
         prefix = self.handles[parent]
         label = name if prefix == "." else f"{prefix}\\{name}"
         self.child_opens.append((prefix, name, write, listing))
+        self.pins.append(pin)
         self.test.assertNotIn("\\", name)
         if label in self.unopenable or label not in self.objects:
             return None, False, {"open_status": "0xC0000034"}
@@ -771,10 +773,10 @@ class TreeEnforcementTests(unittest.TestCase):
 
     def test_a_reparse_point_inside_the_tree_refuses_the_tree(self):
         class ReparsePlatform(TreePlatform):
-            def _open_child(self, parent, name, *, write, listing):
+            def _open_child(self, parent, name, *, write, listing, pin=False):
                 if name == "jx":
                     return None, False, {"refused": "reparse point"}
-                return super()._open_child(parent, name, write=write, listing=listing)
+                return super()._open_child(parent, name, write=write, listing=listing, pin=pin)
 
         objects = {".": state(directory=True), "f": state()}
         platform = ReparsePlatform(self, objects, {".": [("f", FILE), ("jx", DIRECTORY | 0x400)]})
@@ -844,6 +846,18 @@ class TreeEnforcementTests(unittest.TestCase):
         self.enforce(platform, r"C:\store")
         self.assertEqual(platform.opened_roots,
                          [(r"C:\store", False, True), (r"C:\store", True, True)])
+
+    def test_only_the_proving_pass_pins_files(self):
+        """Codex re-review of d1699c9: the read-only pass asks read access
+        on every child so a file keeps its name until judged; enforcement
+        does not, so a file the owner cannot read can still be repaired."""
+        objects = {".": state(directory=True), "f": state()}
+        platform = self.platform(objects, {".": [("f", FILE)]})
+        self.observe(platform, r"C:\store")
+        self.assertEqual(platform.pins, [True])
+        platform = self.platform(objects, {".": [("f", FILE)]})
+        self.enforce(platform, r"C:\store")
+        self.assertEqual(platform.pins, [False])
 
 
 class HandleBoundSourceTests(unittest.TestCase):
@@ -938,6 +952,13 @@ class HandleBoundSourceTests(unittest.TestCase):
         for name in ("_open_securable", "_open_child", "_reopen_descriptor"):
             self.assertIn("FILE_SHARE_KEEP_NAME", method_source(name), name)
 
+    def test_the_proving_pass_asks_read_access_so_files_are_pinned(self):
+        child = method_source("_open_child")
+        self.assertIn("FILE_READ_DATA if pin else 0", child)
+        self.assertIn("pin=True", method_source("observe_owner_only_tree"))
+        self.assertNotIn("pin=True", method_source("enforce_owner_only_tree"))
+        self.assertIn("pin=pin", method_source("_walk_tree"))
+
     def test_child_names_are_measured_in_utf16_bytes(self):
         child = method_source("_open_child")
         self.assertIn("encode_object_name(", child)
@@ -1031,6 +1052,43 @@ class NativeTreeTests(unittest.TestCase):
         self.assertTrue(verified, evidence)
         self.assertIsInstance(attempts[0], PermissionError, attempts)
         self.assertTrue(self.root.exists())
+
+    def test_a_file_cannot_be_replaced_while_the_proving_pass_holds_it(self):
+        """Codex re-review of d1699c9: with the file's handle open in the
+        read-only pass, renaming it away (the first half of swapping in a
+        permissive file under its name) fails with a sharing violation."""
+        from platform_support import make_permissive
+        target = self.root / "private.txt"
+        target.write_bytes(b"p")
+        protected, evidence = self.host.enforce_owner_only_tree(str(self.root))
+        self.assertTrue(protected, evidence)
+        attempts: list[BaseException | None] = []
+        original = self.host._read_security
+
+        def read_security(handle, is_directory):
+            if not is_directory and not attempts:
+                try:
+                    os.rename(target, self.root / "private.old")
+                    replacement = self.root / "private.txt"
+                    replacement.write_bytes(b"x")
+                    make_permissive(replacement)
+                    attempts.append(None)
+                except OSError as exc:
+                    attempts.append(exc)
+            return original(handle, is_directory)
+
+        with mock.patch.object(self.host, "_read_security", read_security):
+            verified, evidence = self.host.observe_owner_only_tree(str(self.root))
+        self.assertEqual(len(attempts), 1, attempts)
+        self.assertIsInstance(attempts[0], PermissionError, attempts)
+        self.assertTrue(verified, evidence)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["private.txt"])
+        # Enforcement does not pin files: the same rename succeeds under it.
+        attempts.clear()
+        with mock.patch.object(self.host, "_read_security", read_security):
+            protected, evidence = self.host.enforce_owner_only_tree(str(self.root))
+        self.assertEqual(attempts, [None], attempts)
+        self.assertTrue((self.root / "private.old").exists())
 
     def test_a_supplementary_character_name_opens_that_name_and_no_shorter_one(self):
         """Acceptance for B3: with ``\U0001f9ea.tx`` owner-only beside a

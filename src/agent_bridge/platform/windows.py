@@ -248,6 +248,7 @@ ERROR_NO_MORE_FILES = 18
 READ_CONTROL = 0x00020000
 WRITE_DAC = 0x00040000
 FILE_LIST_DIRECTORY = 0x00000001
+FILE_READ_DATA = 0x00000001  # the same bit, named for a file
 FILE_READ_ATTRIBUTES = 0x00000080
 #: The share mode every security open here uses: readers and writers may
 #: keep working, but the object may not be deleted or renamed while the
@@ -259,15 +260,18 @@ FILE_READ_ATTRIBUTES = 0x00000080
 #: under it keep their names and existence for the whole tree pass: a
 #: directory cannot be swapped for another under the same name between
 #: its open and the judgment of what its handle lists (Codex review of
-#: ccb85ef..2e9ed0f, B1; shown live by NativeTreeTests). A file open asks
-#: for no data access, so a file is not pinned: pinning one would need
-#: FILE_READ_DATA, which the pass neither has nor needs, and which would
-#: make a file we own but cannot read unrepairable. Whatever happens to a
-#: name after a pass ends is outside what that pass proved; the read-only
-#: pass that follows enforcement enumerates afresh, and its result is
-#: what the lane relies on. Conversely, our own open fails if another
-#: handle already holds a directory with DELETE access; that refusal is
-#: fail-closed and reported.
+#: ccb85ef..2e9ed0f, B1; shown live by NativeTreeTests). Files differ by
+#: pass. The enforcement pass opens a file with no data access, so it is
+#: not pinned there, and a file we own but cannot read stays repairable.
+#: The read-only pass that proves the store asks FILE_READ_DATA on every
+#: file as well (``pin``), so for the whole of that pass files are pinned
+#: like directories: a file cannot be renamed away and replaced under its
+#: name between its open and its judgment, and a file we cannot read
+#: fails the pass instead of passing unread (Codex re-review of d1699c9).
+#: Whatever happens to a name after that pass ends is outside what it
+#: proved. Conversely, our own open fails if another handle already holds
+#: the object with DELETE access, or a pinned file with its read access
+#: unshared; that refusal is fail-closed and reported.
 FILE_SHARE_KEEP_NAME = 0x00000003
 OPEN_EXISTING = 3
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -929,9 +933,12 @@ class WindowsPlatform:
             return None, False, {"open_error": ctypes.get_last_error()}
         return self._examine_handle(handle)
 
-    def _open_child(self, parent: int, name: str, *, write: bool, listing: bool
-                    ) -> tuple[int | None, bool, dict[str, Any]]:
+    def _open_child(self, parent: int, name: str, *, write: bool, listing: bool,
+                    pin: bool = False) -> tuple[int | None, bool, dict[str, Any]]:
         """Open one name inside an open directory, relative to its handle.
+
+        ``pin`` asks FILE_READ_DATA for a file too, so the open takes part
+        in sharing and the file keeps its name while the handle is held.
 
         NtCreateFile with RootDirectory set resolves ``name`` inside that
         directory and nowhere else, whatever any ancestor has become since
@@ -943,7 +950,7 @@ class WindowsPlatform:
         if not name or name in (".", "..") or any(ch in name for ch in "\\/\0:"):
             return None, False, {"refused": "not a single path component"}
         access = READ_CONTROL | FILE_READ_ATTRIBUTES | (WRITE_DAC if write else 0)
-        access |= FILE_LIST_DIRECTORY if listing else 0
+        access |= FILE_LIST_DIRECTORY if listing else (FILE_READ_DATA if pin else 0)
         # Length is the UTF-16 byte count, which len(name) * 2 understates
         # for a supplementary character; the understated length would open
         # a shorter name. MaximumLength is the buffer's real capacity.
@@ -1193,7 +1200,8 @@ class WindowsPlatform:
         evidence["path"] = path
         return evidence
 
-    def _walk_tree(self, root_handle: int, *, write: bool, max_objects: int
+    def _walk_tree(self, root_handle: int, *, write: bool, max_objects: int,
+                   pin: bool = False
                    ) -> tuple[list[tuple[str, int, bool, int]], dict[str, Any]]:
         """Open every object under an open root, each relative to its parent.
 
@@ -1222,7 +1230,7 @@ class WindowsPlatform:
                     return objects, {"error": "tree holds more objects than the lane creates",
                                      "path": label}
                 handle, is_directory, error = self._open_child(
-                    parent, entry.name, write=write, listing=entry.is_directory)
+                    parent, entry.name, write=write, listing=entry.is_directory, pin=pin)
                 if handle is None:
                     return objects, {**error, "path": label}
                 objects.append((label, handle, is_directory, depth + 1))
@@ -1233,7 +1241,8 @@ class WindowsPlatform:
                     pending.append((handle, label, depth + 1))
         return objects, {}
 
-    def _open_tree(self, root: str, *, write: bool, max_objects: int
+    def _open_tree(self, root: str, *, write: bool, max_objects: int,
+                   pin: bool = False
                    ) -> tuple[list[tuple[str, int, bool, int]], dict[str, Any]]:
         """The root by path, then everything under it by handle."""
         handle, is_directory, error = self._open_securable(
@@ -1243,7 +1252,7 @@ class WindowsPlatform:
         if not is_directory:
             kernel32.CloseHandle(handle)
             return [], {"error": "root is not a directory", "path": "."}
-        return self._walk_tree(handle, write=write, max_objects=max_objects)
+        return self._walk_tree(handle, write=write, max_objects=max_objects, pin=pin)
 
     def observe_owner_only_tree(self, root: str, *,
                                 max_objects: int = MAX_TREE_OBJECTS
@@ -1251,8 +1260,11 @@ class WindowsPlatform:
         """Judge every object under ``root``, each through its own handle.
 
         Changes nothing. The tree is enumerated now, from the root handle,
-        so what is judged is what is there, extra objects included. The
-        root must be strictly owner-only (protected, no inherited entry);
+        so what is judged is what is there, extra objects included, and
+        every object, files included, is held pinned (no delete sharing,
+        with read access asked) from its open to its judgment, so nothing
+        judged here is swapped for another object under its name
+        meanwhile. The root must be strictly owner-only (protected, no inherited entry);
         each descendant must be owned by the caller and carry only
         permitted principals with the caller among them, inherited entries
         allowed, because with the root protected an inherited entry can
@@ -1269,7 +1281,7 @@ class WindowsPlatform:
         default_owner = self._default_owner_sid()
         evidence["caller_sid"] = caller
         objects, walk_error = self._open_tree(root, write=False,
-                                              max_objects=max_objects)
+                                              max_objects=max_objects, pin=True)
         failed: list[str] = []
         try:
             for label, handle, is_directory, depth in objects:
@@ -1301,8 +1313,10 @@ class WindowsPlatform:
         lane must not use a store holding one. Every directory handle,
         the root's included, is held without delete sharing until the
         pass ends, so no directory judged here can be renamed away or
-        replaced meanwhile (files are not pinned; see
-        FILE_SHARE_KEEP_NAME). Otherwise the root is judged strictly
+        replaced meanwhile (files are not pinned by this pass, so a file we
+        own but cannot read stays repairable; the read-only pass that
+        proves the result pins them; see FILE_SHARE_KEEP_NAME). Otherwise
+        the root is judged strictly
         and each descendant with inherited entries allowed; an object that
         passes is left alone, and one that fails has its DACL replaced, in
         a single write to that object only, with the exact owner-only DACL
