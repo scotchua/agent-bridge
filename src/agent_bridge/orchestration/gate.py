@@ -332,6 +332,22 @@ _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
 _SHELL_COMMAND_FLAGS = re.compile(r"^-[a-zA-Z]*c[a-zA-Z]*$")
 
 
+def _shell_words(command: str) -> list[str]:
+    """Split a command the way its shell would, keeping backslashes on
+    Windows. Non-POSIX ``shlex`` does not protect a space inside a quote
+    that opens mid-word (``--flag='a b'``), so both platforms use the POSIX
+    lexer; on Windows the backslash is a path separator, not an escape."""
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    if os.name == "nt":
+        lexer.escape = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return command.split()
+
+
 def _command_paths(command: str, cwd: str) -> list[str]:
     """Every operand of a shell command, resolved against ``cwd``: absolute
     and relative paths alike (a bare ``build`` is ``cwd/build``), the value
@@ -344,10 +360,7 @@ def _command_paths(command: str, cwd: str) -> list[str]:
     changes nothing for the repository they are in. A best-effort reading,
     used to bind a write to the repositories it names and to refuse writes
     aimed at protected locations."""
-    try:
-        words = shlex.split(command, posix=os.name != "nt")
-    except ValueError:
-        words = command.split()
+    words = _shell_words(command)
     found: list[str] = []
     previous: list[str] = []
     for word in words:

@@ -212,6 +212,23 @@ class ClassificationTests(GateCase):
             self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w")[0], "shell_read", command)
 
 
+class ShellWordTests(unittest.TestCase):
+    def test_a_quote_opening_mid_word_protects_its_spaces(self):
+        self.assertEqual(gate._shell_words("git --git-dir='/a b/.git' commit -m x"),
+                         ["git", "--git-dir=/a b/.git", "commit", "-m", "x"])
+        self.assertEqual(gate._shell_words('cp "x y" \'z w\''), ["cp", "x y", "z w"])
+
+    def test_windows_keeps_backslashes_as_separators(self):
+        with mock.patch.object(gate.os, "name", "nt"):
+            self.assertEqual(gate._shell_words(r"echo {} > C:\Users\me\a.json"),
+                             ["echo", "{}", ">", r"C:\Users\me\a.json"])
+            self.assertEqual(gate._shell_words(r"git --git-dir='C:\p q\.git' commit"),
+                             ["git", r"--git-dir=C:\p q\.git", "commit"])
+
+    def test_an_unbalanced_quote_falls_back_to_whitespace(self):
+        self.assertEqual(gate._shell_words("echo 'oops"), ["echo", "'oops"])
+
+
 class JudgmentTests(GateCase):
     def test_no_receipt_is_a_deny_that_says_how_to_proceed(self):
         decision = self.judge("claude", "Edit", {"file_path": str(self.repo / "src" / "a.py")})
