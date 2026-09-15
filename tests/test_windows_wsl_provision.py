@@ -116,10 +116,12 @@ class NextStageTests(unittest.TestCase):
             self.assertEqual(step.actor, wp.ACTOR_USER, stage)
             self.assertEqual(step.argv, (), stage)
 
-    def test_the_firmware_stage_says_plainly_that_no_program_can_do_it(self):
+    def test_the_firmware_stage_explains_physical_and_virtual_hosts(self):
         step = wp.next_stage(_state(firmware_virtualization=False))
-        self.assertIn("No program can change that setting", step.detail)
+        self.assertIn("installer cannot change", step.detail)
         self.assertIn("BIOS/UEFI", step.detail)
+        self.assertIn("nested virtualization", step.detail)
+        self.assertIn("Parallels on Apple silicon", step.detail)
 
     def test_only_machine_wide_stages_require_administrator(self):
         elevated = {wp.STAGE_WINDOWS_FEATURES, wp.STAGE_WSL_KERNEL, wp.STAGE_WSL_UPDATE}

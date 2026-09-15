@@ -303,13 +303,14 @@ def next_stage(state: ProvisionState) -> Stage:
     if stage == STAGE_FIRMWARE_VIRTUALIZATION:
         return Stage(
             stage=stage,
-            title="Turn on virtualization in your PC's firmware",
-            detail=("Virtualization is switched off in this PC's BIOS/UEFI "
-                    "settings. No program can change that setting, including "
-                    "this one: restart, open the firmware settings screen, "
-                    "enable virtualization (often called SVM, VT-x, or "
-                    "Intel Virtualization Technology), save, and run setup "
-                    "again."),
+            title="Make virtualization available to Windows",
+            detail=("Windows cannot use the processor features WSL2 needs. "
+                    "On a physical PC, enable virtualization in BIOS/UEFI "
+                    "(often SVM, VT-x, or Intel Virtualization Technology). "
+                    "Inside a virtual machine, the host must support and "
+                    "expose nested virtualization; some hosts, including "
+                    "Parallels on Apple silicon, cannot currently do that. "
+                    "This installer cannot change either limitation."),
             actor=ACTOR_USER, requires_admin=False, reboots=True)
 
     if stage == STAGE_WINDOWS_FEATURES:
