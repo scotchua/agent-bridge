@@ -182,6 +182,17 @@ class FeatureStateTests(unittest.TestCase):
 
 
 class FirmwareVirtualizationTests(unittest.TestCase):
+    def test_active_hypervisor_summary_is_enabled(self):
+        output = (
+            "Hyper-V Requirements:          A hypervisor has been detected. "
+            "Features required for Hyper-V will not be displayed.\n"
+        )
+        with mock.patch.object(wp, "_run_argv") as run_argv:
+            run_argv.return_value = wp.CommandOutcome(True, "ok", output)
+            result = wp.collect_firmware_virtualization()
+            self.assertTrue(result.passed)
+            self.assertEqual(result.value, "Yes")
+
     def test_enabled(self):
         output = "Some line\nVirtualization Enabled In Firmware:        Yes\nOther\n"
         with mock.patch.object(wp, "_run_argv") as run_argv:

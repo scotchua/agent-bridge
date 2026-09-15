@@ -214,6 +214,7 @@ def collect_virtual_machine_platform() -> PrerequisiteCheckResult:
 
 
 _FIRMWARE_VIRT_LABEL = "Virtualization Enabled In Firmware"
+_ACTIVE_HYPERVISOR_MARKER = "A hypervisor has been detected."
 
 
 def collect_firmware_virtualization() -> PrerequisiteCheckResult:
@@ -226,6 +227,15 @@ def collect_firmware_virtualization() -> PrerequisiteCheckResult:
     if not outcome.ok:
         return PrerequisiteCheckResult(False, outcome.detail, None)
     stdout = outcome.stdout or ""
+    # Once Hyper-V (including nested Hyper-V in a VM) is active, Windows
+    # deliberately replaces the individual firmware-requirement lines with
+    # this summary.  Seeing it proves the virtualization boundary is already
+    # available; treating the omitted legacy line as disabled strands valid
+    # Windows hosts at the firmware stage.
+    if _ACTIVE_HYPERVISOR_MARKER in stdout:
+        return PrerequisiteCheckResult(
+            True, "active hypervisor confirms firmware virtualization", "Yes"
+        )
     matching_lines = [
         line.strip() for line in stdout.splitlines() if _FIRMWARE_VIRT_LABEL in line
     ]

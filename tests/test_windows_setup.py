@@ -225,6 +225,13 @@ class ResumeCommandTests(SetupTestCase):
         self.assertEqual(result.returncode, ws.EXIT_OK, result.stderr[:400])
         self.assertEqual(json.loads(result.stdout)["command"], "plan")
 
+    def test_launcher_install_refuses_an_unverified_user_acl(self):
+        with mock.patch.object(
+                ws.store.platform, "verify_owner_only_path",
+                return_value=(False, {"mechanism": "test"})):
+            with self.assertRaisesRegex(PermissionError, "owner-only"):
+                ws.install_resume_launcher(str(self.runtime))
+
     def test_production_resume_command_uses_the_stable_runtime_copy(self):
         root = "C:\\Users\\sam\\AppData\\Local\\agent-bridge\\windows"
         stable = root + "\\bootstrap\\agent-bridge-resume.pyz"

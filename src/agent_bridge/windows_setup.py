@@ -258,6 +258,16 @@ def install_resume_launcher(runtime_root: str) -> str:
                              path.read_bytes())
     target = stable_resume_launcher(runtime_root)
     store.atomic_write_bytes(target, output.getvalue())
+    # This function can run after UAC elevation.  On Windows, a directory
+    # created by an elevated administrator token may otherwise be owned by the
+    # Administrators group and unreadable by the same person's ordinary logon
+    # token.  The scheduled task deliberately runs without elevation, so prove
+    # the final directory and file ACL in the identity that will own the task
+    # before promising a resumable reboot.
+    verified, _evidence = store.platform.verify_owner_only_path(
+        str(Path(target).parent), target)
+    if not verified:
+        raise PermissionError("resume launcher is not readable owner-only state")
     return target
 
 
