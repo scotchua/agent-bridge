@@ -264,6 +264,13 @@ class JudgmentTests(GateCase):
         relative = self.judge("claude", "Bash", {"command": "git -C other commit -m x"}, cwd=str(self.base))
         self.assertEqual(relative.code, "no_routing_receipt")
         self.assertIn(os.path.realpath(self.other), relative.repos)
+        # The value of an inline option names its repository too.
+        for command in (f"git --git-dir={self.other}/.git --work-tree={self.other} commit -m x",
+                        f"git --git-dir='{spaced}/.git' commit -m x"):
+            decision = self.judge("claude", "Bash", {"command": command})
+            self.assertEqual(decision.code, "no_routing_receipt", (command, decision))
+            self.assertTrue(decision.repos and set(decision.repos) & {os.path.realpath(self.other), os.path.realpath(spaced)},
+                            (command, decision.repos))
         codex = gate.judge("codex", "Bash", {"command": f"git -C {self.other} push"}, str(self.repo),
                            state_root=str(self.state), clock=self.clock)
         self.assertEqual(codex.code, "no_routing_receipt")
@@ -303,6 +310,8 @@ class JudgmentTests(GateCase):
                  ("claude", "Bash", {"command": f"mv {self.base / 'elsewhere'} {self.base / 'gone'}"}),
                  ("claude", "Bash", {"command": f"rm -rf {self.base / 'elsewhere'}"}),
                  ("claude", "Bash", {"command": f"cd {self.base} && rm -rf elsewhere"}),
+                 ("claude", "Bash", {"command": f"tar --directory={self.base / 'elsewhere'} -xf a.tar"}),
+                 ("claude", "Bash", {"command": f"rsync -a --delete mine/ --link-dest={self.base}/elsewhere/ {self.base}/x/"}),
                  ("claude", "Bash", {"command": f"cp -r {self.base / 'mine'} {self.base}/"}),
                  ("codex", "local_shell", {"command": ["rsync", "-a", "--delete", "mine/", str(self.base) + "/"]}),
                  ("codex", "apply_patch", {"input": f"*** Begin Patch\n*** Add File: {hooks}\n+x\n*** End Patch"}),

@@ -96,17 +96,20 @@ _PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\*
 
 #: Command shapes that write to the working tree or repository. A heuristic,
 #: matched against the command text; see the module docstring.
+#: One shell word: quoted (spaces allowed) or bare.
+_WORD = r"('[^']*'|\"[^\"]*\"|\S+)"
+
 _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(?<![<>])>{1,2}(?!&)",                 # redirection into a file
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+('[^']*'|\"[^\"]*\"|\S+)|--[\w-]+(=\S+)?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
     r"<<-?\s*['\"]?\w+['\"]?",                # here-document
-    r"(^|[\s;&|('\"])tar(\s+-C\s+\S+)?\s+(-?[A-Za-z]*[xc][A-Za-z]*|--extract|--create|--get|--update|--append)(\s|$)",
+    r"(^|[\s;&|('\"])tar(\s+(-C\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(-?[A-Za-z]*[xc][A-Za-z]*|--extract|--create|--get|--update|--append)(\s|$)",
     r"(^|[\s;&|('\"])(unzip|zip|gunzip|gzip|bunzip2|bzip2|xz|unxz)(\s|$)",
     r"(^|[\s;&|('\"])find\s.*(\s-delete(\s|$)|\s-exec\s+(rm|mv|cp|sed\s+-i|chmod|chown|truncate)(\s|$))",
     r"(^|[\s;&|('\"])(gofmt\s+-w|rustfmt|eslint\s+--fix|ruff\s+format|ruff\s+(check\s+)?--fix)(\s|$)",
@@ -335,8 +338,9 @@ def _command_paths(command: str, cwd: str) -> list[str]:
     of ``--flag=path``, the parts of ``a:b``, and the target of ``>out``.
     Quoting is undone where the shell would, so a quoted path with spaces
     stays one path; only the string handed to ``sh -c`` (or another shell's
-    ``-c``) is read as a nested command. Words that are flags or shell
-    operators are dropped. Command names resolve under ``cwd`` too, which
+    ``-c``) is read as a nested command. A flag without a value and the
+    shell operators are dropped; a flag's inline value (``--git-dir=path``,
+    ``--directory=path``) is kept. Command names resolve under ``cwd`` too, which
     changes nothing for the repository they are in. A best-effort reading,
     used to bind a write to the repositories it names and to refuse writes
     aimed at protected locations."""
@@ -356,8 +360,12 @@ def _command_paths(command: str, cwd: str) -> list[str]:
             found.extend(_command_paths(word, cwd))
             continue
         word = word.lstrip("<>&|;")
-        if not word or word.startswith("-") or word in ("&&", "||", "|", ";", "&", ">", ">>", "<"):
+        if not word or word in ("&&", "||", "|", ";", "&", ">", ">>", "<"):
             continue
+        if word.startswith("-"):
+            if "=" not in word:
+                continue                                  # a bare flag names nothing
+            word = word.split("=", 1)[1]                  # ``--flag=path`` names its value
         candidates = [word]
         if "=" in word:
             candidates.append(word.split("=", 1)[1])
