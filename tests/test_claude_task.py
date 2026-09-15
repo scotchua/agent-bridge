@@ -122,6 +122,18 @@ class ClaudeTaskTests(unittest.TestCase):
         self.assertFalse((Path(result["job_dir"]) / "generation-worktree").exists())
         self.assertFalse((Path(result["job_dir"]) / "verification-worktree").exists())
 
+    def test_a_bom_prefixed_brief_is_not_rejected(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to a brief file this project never wrote itself.
+        requires_confinement(self)
+        self.brief.write_bytes(b"\xef\xbb\xbf" + b"Replace the fixture value.\n")
+        result = run_task(brief=self.brief, repo=self.repo,
+                          task_root=self.root / "tasks", claude_bin=self.fake,
+                          claude_config_dir=self.store,
+                     classification="synthetic", model="fake", effort="low",
+                          verify_argv=[["git", "diff", "--check"]])
+        self.assertEqual(result["status"], "complete")
+
     def test_a_verify_command_cannot_swap_the_delivered_patch(self):
         """Confinement stops this; this check does not depend on confinement.
 

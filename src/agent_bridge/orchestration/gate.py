@@ -1179,7 +1179,7 @@ def codex_hooks_flag_update(path: str, *, remove: bool = False) -> bytes | None:
     text = ""
     if os.path.exists(path):
         with open(path, "rb") as handle:
-            text = handle.read().decode("utf-8")
+            text = handle.read().decode("utf-8-sig")
     begin, end = BEGIN.format(name=HOOKS_FLAG_NAME), END.format(name=HOOKS_FLAG_NAME)
     if text.count(begin) != text.count(end) or text.count(begin) > 1:
         raise ValueError(f"{path} has damaged agent-bridge managed markers")
@@ -1349,7 +1349,7 @@ def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     if not os.path.exists(codex_toml):
         return "needs_review"
     with open(codex_toml, "rb") as handle:
-        parsed = tomllib.loads(handle.read().decode("utf-8"))
+        parsed = tomllib.loads(handle.read().decode("utf-8-sig"))
     state = parsed.get("hooks", {}) if isinstance(parsed.get("hooks"), dict) else {}
     key = f"{os.path.realpath(hooks_path)}:pre_tool_use:{index}:0"
     entry = state.get("state", {}).get(key) if isinstance(state.get("state"), dict) else None

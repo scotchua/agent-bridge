@@ -39,5 +39,28 @@ class AtomicWriteOwnerOnlyTests(unittest.TestCase):
             self.assertEqual(Path(path).read_bytes(), b"data")
 
 
+class ReadJsonBomTests(unittest.TestCase):
+    # A Windows editor or PowerShell's default encoding can prepend a UTF-8
+    # BOM to a file this project never wrote itself. Strict utf-8 decoding
+    # turns that into a JSONDecodeError on an otherwise-valid file.
+    def test_read_json_strips_a_leading_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            Path(path).write_bytes(b"\xef\xbb\xbf" + b'{"a": 1}')
+            self.assertEqual(store.read_json(path), {"a": 1})
+
+    def test_read_json_without_a_bom_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            Path(path).write_bytes(b'{"a": 1}')
+            self.assertEqual(store.read_json(path), {"a": 1})
+
+    def test_read_json_or_none_strips_a_leading_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            Path(path).write_bytes(b"\xef\xbb\xbf" + b'{"a": 1}')
+            self.assertEqual(store.read_json_or_none(path), {"a": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

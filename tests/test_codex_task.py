@@ -154,6 +154,14 @@ class CodexTaskTests(unittest.TestCase):
         kwargs.update(overrides)
         return run_task(**kwargs)
 
+    def test_a_bom_prefixed_brief_is_not_rejected(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to a brief file this project never wrote itself.
+        requires_confinement(self)
+        self.brief.write_bytes(b"\xef\xbb\xbf" + b"Append the verification marker.\n")
+        result = self.run_default()
+        self.assertEqual(result["status"], "complete")
+
     def test_returns_patch_and_does_not_touch_source(self):
         requires_confinement(self)
         result = self.run_default()

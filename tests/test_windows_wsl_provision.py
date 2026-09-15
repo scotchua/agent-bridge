@@ -663,6 +663,17 @@ class ResumeRecordReadTests(unittest.TestCase):
             wp.read_resume_record(self.path)
         self.assertEqual(caught.exception.reason, "resume_malformed")
 
+    def test_a_bom_prefixed_record_is_still_valid_json(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to this file; it must still round-trip, not read as
+        # resume_malformed.
+        self._write()
+        raw = Path(self.path).read_bytes()
+        platform_support.write_private_bytes(self.path, b"\xef\xbb\xbf" + raw)
+        record, identity = wp.read_resume_record(self.path)
+        self.assertEqual(record["stage"], wp.STAGE_WSL_KERNEL)
+        self.assertIsNotNone(identity)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_a_record_another_account_could_write_is_refused(self):
         self._write()

@@ -448,7 +448,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     if not claude_bin.is_file() or not os.access(claude_bin,os.X_OK): raise TaskError("Claude executable unavailable")
     raw=brief.read_bytes()
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
-    try: brief_text=raw.decode()
+    try: brief_text=raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
     checks=_verify_argv(verify_argv); env=_env(claude_config_dir); source_before=_source_state(repo,env)
     # The host is probed only after the REQUEST has been validated. Ordering

@@ -107,7 +107,7 @@ class DelegationConfig:
 
 def load_manifest(path: str) -> ww.PinnedBaseImageManifest:
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise DelegationRefused("manifest_unreadable", type(exc).__name__) from exc
     except ValueError as exc:
@@ -124,7 +124,7 @@ def load_sidecar(path: str | None) -> Mapping[str, Any] | None:
     if not path:
         return None
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise DelegationRefused("sidecar_unreadable", type(exc).__name__) from exc
     except ValueError as exc:

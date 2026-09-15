@@ -313,5 +313,26 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(names, {"local_worker_info", "local_worker_process"})
 
 
+class ReadTextBomTests(unittest.TestCase):
+    # A BOM-prefixed hooks.json/config.toml (Windows editor, PowerShell
+    # default encoding) must not surface as U+FEFF inside the text handed to
+    # tomllib.loads or the managed-marker scan.
+    def test_strips_a_leading_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.toml")
+            Path(path).write_bytes(b"\xef\xbb\xbf" + b'key = "value"\n')
+            self.assertEqual(onboard._read_text(path), 'key = "value"\n')
+
+    def test_without_a_bom_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.toml")
+            Path(path).write_bytes(b'key = "value"\n')
+            self.assertEqual(onboard._read_text(path), 'key = "value"\n')
+
+    def test_missing_file_is_still_empty_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(onboard._read_text(os.path.join(tmp, "absent.toml")), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -541,7 +541,7 @@ def read_resume_record(path: str, *, platform: Any = None
             return None
         raise ResumeError(f"resume_{exc.reason}") from None
     try:
-        raw = json.loads(payload.decode("utf-8"))
+        raw = json.loads(payload.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError):
         raise ResumeError("resume_malformed") from None
     try:

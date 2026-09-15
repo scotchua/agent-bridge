@@ -1049,6 +1049,24 @@ class VerifiedExecutorTests(unittest.TestCase):
                          "provisioning_unverified:evidence_canaries_incomplete")
 
 
+class ABomPrefixedManifestOrSidecarIsStillValidJson(unittest.TestCase):
+    # A Windows editor or PowerShell's default encoding can prepend a UTF-8
+    # BOM to manifest.json/sidecar.json. Both files are read with
+    # Path.read_text(encoding=...); the BOM must be stripped there, not left
+    # for json.loads to reject.
+    def test_load_manifest_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps(MANIFEST).encode())
+            manifest = wd.load_manifest(str(path))
+            self.assertEqual(manifest.node_version, MANIFEST["node_version"])
+
+    def test_load_sidecar_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sidecar.json"
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"a": 1}).encode())
+            self.assertEqual(wd.load_sidecar(str(path)), {"a": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

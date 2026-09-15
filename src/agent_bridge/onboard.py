@@ -739,7 +739,8 @@ def _owned_file_update(path: str, content: bytes, previous_sha256: str | None) -
 def _read_text(path: str) -> str:
     if not os.path.exists(path):
         return ""
-    with open(path, encoding="utf-8", newline="") as handle:
+    # utf-8-sig: strip a leading BOM instead of feeding it to tomllib/callers.
+    with open(path, encoding="utf-8-sig", newline="") as handle:
         return handle.read()
 
 

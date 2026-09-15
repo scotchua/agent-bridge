@@ -1329,5 +1329,30 @@ class TheSqliteUriEscapesEveryReservedCharacter(unittest.TestCase):
         self.assertNotIn("%2525", escaped)
 
 
+class ABomPrefixedCodexTomlIsStillValidToml(unittest.TestCase):
+    # A Windows editor or PowerShell's default encoding can prepend a UTF-8
+    # BOM to config.toml. tomllib.loads sees the raw bytes only after this
+    # module's own decode, so the BOM must already be gone by then.
+    def test_codex_hooks_flag_update_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b"\xef\xbb\xbf" + b'[other]\nkey = "value"\n')
+            updated = gate.codex_hooks_flag_update(str(path))
+            self.assertIsNotNone(updated)
+            self.assertIn(b'key = "value"', updated)
+
+    def test_codex_trust_state_reads_a_bom_prefixed_toml(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hooks_path = Path(temporary) / "hooks.json"
+            ours = {"hooks": [{"command": f"...{gate.HOOK_NAME}..."}]}
+            hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": [ours]}}))
+            codex_toml = Path(temporary) / "config.toml"
+            # No matching trusted_hash entry: BOM-prefixed but otherwise-valid
+            # TOML must parse (not raise) and yield "needs_review", never a
+            # TOMLDecodeError from the leading BOM.
+            codex_toml.write_bytes(b"\xef\xbb\xbf" + b'[hooks]\n')
+            self.assertEqual(gate.codex_trust_state(str(codex_toml), str(hooks_path)), "needs_review")
+
+
 if __name__ == "__main__":
     unittest.main()

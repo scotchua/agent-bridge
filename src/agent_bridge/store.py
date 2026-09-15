@@ -141,7 +141,9 @@ def atomic_write_json(path: str, obj: Any) -> None:
 
 def read_json(path: str) -> Any:
     with open(path, "rb") as handle:
-        return json.loads(handle.read().decode("utf-8"))
+        # utf-8-sig: a leading BOM (Windows editors, PowerShell defaults) is
+        # stripped instead of raising; plain utf-8 files decode unchanged.
+        return json.loads(handle.read().decode("utf-8-sig"))
 
 
 # Long enough to cover a replace, short enough that a genuinely missing file
