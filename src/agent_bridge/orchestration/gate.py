@@ -411,10 +411,17 @@ def _under(path: str, root: str) -> bool:
     stays exact on POSIX, where ``/etc/Passwd`` really is a different file
     from ``/etc/passwd``.
 
-    Unverified on a live Windows host, like everything else Windows here.
+    Both sides also go through ``os.path.realpath``. Only ``path`` did, and
+    that asymmetry was an undocumented precondition on every caller: a root
+    that had not been resolved compared unequal to the same directory reached
+    through a symlink, or, on Windows, through a short 8.3 name, which is the
+    form ``tempfile.gettempdir`` can return. ``protected_paths`` happened to
+    resolve its roots, so production was correct by coincidence rather than
+    by construction. A predicate this one is the wrong place for a
+    precondition nobody states.
     """
     real = os.path.normcase(os.path.realpath(path))
-    root = os.path.normcase(root)
+    root = os.path.normcase(os.path.realpath(root))
     return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
 
 

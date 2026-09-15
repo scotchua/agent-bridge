@@ -848,37 +848,51 @@ class TheWindowsHookCommandQuoting(unittest.TestCase):
         for command in ("dir", "Get-Content x", "type x"):
             self.assertFalse(gate._TREE_VERBS.search(command), command)
 
-    def test_the_protected_path_check_normalises_case_on_both_sides(self):
+    def test_the_protected_path_check_resolves_and_folds_both_sides(self):
         r"""Windows paths are case-insensitive and take either separator.
 
         Without normalisation, a protected path named in a different case, or
         with forward slashes, compared unequal to the same path and the
-        protected-path rule did not fire. This asserts the function uses
-        ``normcase`` on both sides; it does not claim anything about a
-        Windows host, which is still untested.
+        protected-path rule did not fire.
         """
         import inspect
         source = inspect.getsource(gate._under)
         self.assertIn("os.path.normcase(os.path.realpath(path))", source)
-        self.assertIn("os.path.normcase(root)", source)
+        self.assertIn("os.path.normcase(os.path.realpath(root))", source)
 
-    def test_posix_comparison_stays_exact(self):
-        """On POSIX /etc/Passwd really is a different file from /etc/passwd."""
+    def test_a_path_inside_the_root_is_under_it_on_any_platform(self):
+        """The first version of this test failed on Windows CI, and was right
+        to: it passed an unresolved root, and only ``path`` was resolved. On a
+        Windows runner ``gettempdir`` can return a short 8.3 name, so the two
+        sides were different spellings of one directory. Both are resolved
+        now, so the caller no longer has to know."""
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "state")
             os.makedirs(os.path.join(root, "routing"))
             self.assertTrue(gate._under(os.path.join(root, "routing", "x.json"), root))
-            self.assertFalse(gate._under(os.path.join(tmp, "STATE", "x.json"), root))
+            self.assertTrue(gate._under(root, root))
+            self.assertFalse(gate._under(os.path.join(tmp, "elsewhere", "x"), root))
 
-    def test_a_differently_cased_path_matches_where_normcase_folds_it(self):
-        """The Windows semantics, exercised as a property of the function."""
+    @unittest.skipUnless(os.name == "posix", "POSIX case semantics")
+    def test_case_is_significant_on_posix(self):
+        """/etc/Passwd really is a different file from /etc/passwd."""
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "state")
             os.makedirs(root)
-            target = os.path.join(tmp, "STATE", "x.json")
-            self.assertFalse(gate._under(target, root))
-            with mock.patch.object(gate.os.path, "normcase", str.lower):
-                self.assertTrue(gate._under(target, root))
+            self.assertFalse(gate._under(os.path.join(tmp, "STATE", "x.json"), root))
+
+    @unittest.skipUnless(os.name == "nt", "Windows case semantics")
+    def test_case_is_not_significant_on_windows(self):
+        """The actual fix, verified by the Windows runners rather than mocked.
+
+        A protected path named in a different case is the same file on
+        Windows, so it has to reach the protected-path rule.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "state")
+            os.makedirs(root)
+            self.assertTrue(gate._under(os.path.join(tmp, "STATE", "x.json"), root))
+            self.assertTrue(gate._under(os.path.join(tmp, "state/x.json"), root))
 
     def test_flattening_an_argv_for_the_heuristic_is_a_different_direction(self):
         r"""``shlex.join`` elsewhere in this module is not the same defect.

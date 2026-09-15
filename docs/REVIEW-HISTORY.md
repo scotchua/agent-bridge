@@ -1198,6 +1198,28 @@ whole round in miniature, so it goes first.
     was found when had silently become inaccurate, and nothing in the
     repository checks that. An anchor that is not unique is not an anchor.
 
+59. **The protected-path predicate resolved one of its two arguments, and CI
+    on two platforms said so.** `_under(path, root)` ran `realpath` on
+    `path` and not on `root`. That is an undocumented precondition on every
+    caller: a root reached through a symlink, or on Windows through a short
+    8.3 name, is a different spelling of the same directory and compared
+    unequal. `protected_paths` happens to resolve its roots, so production
+    was correct by coincidence rather than by construction.
+
+    It surfaced because the test I wrote for the case-folding fix passed an
+    unresolved root. It passed on Linux, whose `/tmp` is neither a symlink
+    nor a short name, and failed on both macOS runners, where `/var` is a
+    symlink to `/private/var`, and both Windows runners, where
+    `gettempdir` can return the 8.3 form. Both arguments are resolved now,
+    so the predicate has no precondition to forget.
+
+    Two things worth keeping. A predicate is the wrong place for a
+    precondition nobody states; it will be correct until a caller is added.
+    And the platform-split tests are better evidence than the mock they
+    replaced: the Windows case-folding behaviour is now asserted **by the
+    Windows runners**, which is the difference between a claim and a
+    measurement, and it is the reviewer's standard applied to my own work.
+
 ### What is still not true, after this round
 
 * **The two desktop products and Codex on the web cannot be intercepted.**
