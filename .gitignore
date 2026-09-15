@@ -18,3 +18,9 @@ config/com.agent-bridge.execution-worker.plist
 /build/
 *.tar
 !tests/**/*.tar
+
+# Claude Code's own scratch area, including the transient git worktrees the
+# Workflow tool creates for isolated subagents. Tooling state, never project
+# content, and a worktree checked into the repository it lives in is a mess to
+# undo. Untracked was not enough: one `git add -A` would have committed it.
+.claude/
