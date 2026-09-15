@@ -813,70 +813,6 @@ the key, and the tool verifies it before printing an anchor. It refuses a file
 that is a key by name or by content, and its `scan` subcommand checks the
 whole working tree and runs in CI.
 
-55. **My fix for the staleness gap livelocked the two clients, and its own
-    regression test could not have caught it.** Finding 50's digest
-    subtracted the asking client's own presence row, on the reasoning that a
-    client's own presence is not news to itself. That reasoning is fine and
-    the conclusion was wrong, because **a receipt is one shared
-    per-repository artifact**. Claude and Codex therefore computed different
-    digests from the identical ledger, each found the other's receipt
-    overtaken, each re-decided it to route the work to the other, and both
-    ended up permanently denied, each holding an instruction to dispatch to
-    the other. Worse than the four-hour staleness it replaced.
-
-    The general rule, which I did not have before this: anything compared
-    against a shared artifact has to be computed identically by everyone who
-    compares it. Route names only already solved the churn the subtraction
-    was for, so the subtraction was buying nothing and costing everything.
-
-    The part worth dwelling on is how it survived. The test written to guard
-    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
-    tool, so the gate classified the call as not gated and allowed it without
-    reading the receipt. **The test passed while exercising nothing**, and it
-    was the only test standing between this defect and a merge. A test that
-    asserts the right thing about the wrong call is not a weaker test than
-    none; it is worse, because it reports coverage.
-
-    Found by walking `INSTALL.md` by hand again, which is now three for three
-    on finding what the suites did not (findings 44, 45 and this one).
-
-56. **Two wrong causes for one intermittent check, and then a third.** The
-    orphan-process checks were attributed to machine load (finding 46,
-    corrected), then to zombie accounting (finding 46's correction, also
-    incomplete). A run after the zombie filter landed reported a survivor
-    that was not a zombie.
-
-    The check samples once, half a second after the group kill, and asks
-    whether a live process survived. SIGKILL is asynchronous, the kernel
-    still has to run the exit path, and a parent still has to reap, so one
-    sample at a fixed instant measures scheduling, not containment. It now
-    polls until the groups drain or five seconds pass, and reports each
-    survivor's actual process state, because a pid on its own does not say
-    whether it is running, sleeping uninterruptibly, stopped or already dead,
-    and those have different causes. A process that genuinely leaked stays
-    forever, so the deadline costs nothing and the old single sample cost
-    false failures.
-
-    I have now been wrong about this check three times, each time from a
-    message that printed pids and nothing else. The diagnostic was the fix
-    that mattered.
-
-57. **The Windows hook command could not have run on most Windows accounts.**
-    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
-    quoting. It wraps a value containing a space in *single* quotes, and
-    `cmd.exe` does not treat single quotes as quoting at all: it would look
-    for a program literally named `'C:\Users\First`. So on any Windows
-    account whose home contains a space, which is the ordinary shape of a
-    Windows home, the installed command was malformed, the hook never ran,
-    and nothing said so. A hook that never runs is a gate that never gates.
-
-    Found by static reading while working the review's "live-test the Windows
-    launcher and command quoting" item, which I cannot do from here. The
-    quoting is fixed and tested as a function; the launcher still has not
-    been run under either host on Windows, and the installer's `not_covered`
-    list still says exactly that. A cross-platform string built with one
-    platform's quoting rules is worth looking for wherever else it appears.
-
 ### What is still not true, after this round
 
 No step of this has run on Windows. No image has been imported, no canary has
@@ -979,70 +915,6 @@ pinned at a value carrying the digits. Beside it is the property that envelope
 is an instance of: ten thousand random session ids, none of which may change a
 verdict. A fixed envelope proves one id is handled; the property proves the id
 cannot be what decides.
-
-55. **My fix for the staleness gap livelocked the two clients, and its own
-    regression test could not have caught it.** Finding 50's digest
-    subtracted the asking client's own presence row, on the reasoning that a
-    client's own presence is not news to itself. That reasoning is fine and
-    the conclusion was wrong, because **a receipt is one shared
-    per-repository artifact**. Claude and Codex therefore computed different
-    digests from the identical ledger, each found the other's receipt
-    overtaken, each re-decided it to route the work to the other, and both
-    ended up permanently denied, each holding an instruction to dispatch to
-    the other. Worse than the four-hour staleness it replaced.
-
-    The general rule, which I did not have before this: anything compared
-    against a shared artifact has to be computed identically by everyone who
-    compares it. Route names only already solved the churn the subtraction
-    was for, so the subtraction was buying nothing and costing everything.
-
-    The part worth dwelling on is how it survived. The test written to guard
-    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
-    tool, so the gate classified the call as not gated and allowed it without
-    reading the receipt. **The test passed while exercising nothing**, and it
-    was the only test standing between this defect and a merge. A test that
-    asserts the right thing about the wrong call is not a weaker test than
-    none; it is worse, because it reports coverage.
-
-    Found by walking `INSTALL.md` by hand again, which is now three for three
-    on finding what the suites did not (findings 44, 45 and this one).
-
-56. **Two wrong causes for one intermittent check, and then a third.** The
-    orphan-process checks were attributed to machine load (finding 46,
-    corrected), then to zombie accounting (finding 46's correction, also
-    incomplete). A run after the zombie filter landed reported a survivor
-    that was not a zombie.
-
-    The check samples once, half a second after the group kill, and asks
-    whether a live process survived. SIGKILL is asynchronous, the kernel
-    still has to run the exit path, and a parent still has to reap, so one
-    sample at a fixed instant measures scheduling, not containment. It now
-    polls until the groups drain or five seconds pass, and reports each
-    survivor's actual process state, because a pid on its own does not say
-    whether it is running, sleeping uninterruptibly, stopped or already dead,
-    and those have different causes. A process that genuinely leaked stays
-    forever, so the deadline costs nothing and the old single sample cost
-    false failures.
-
-    I have now been wrong about this check three times, each time from a
-    message that printed pids and nothing else. The diagnostic was the fix
-    that mattered.
-
-57. **The Windows hook command could not have run on most Windows accounts.**
-    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
-    quoting. It wraps a value containing a space in *single* quotes, and
-    `cmd.exe` does not treat single quotes as quoting at all: it would look
-    for a program literally named `'C:\Users\First`. So on any Windows
-    account whose home contains a space, which is the ordinary shape of a
-    Windows home, the installed command was malformed, the hook never ran,
-    and nothing said so. A hook that never runs is a gate that never gates.
-
-    Found by static reading while working the review's "live-test the Windows
-    launcher and command quoting" item, which I cannot do from here. The
-    quoting is fixed and tested as a function; the launcher still has not
-    been run under either host on Windows, and the installer's `not_covered`
-    list still says exactly that. A cross-platform string built with one
-    platform's quoting rules is worth looking for wherever else it appears.
 
 ### What is still not true, after this round
 
@@ -1295,7 +1167,36 @@ whole round in miniature, so it goes first.
     quoting is fixed and tested as a function; the launcher still has not
     been run under either host on Windows, and the installer's `not_covered`
     list still says exactly that. A cross-platform string built with one
-    platform's quoting rules is worth looking for wherever else it appears.
+    platform's quoting rules is worth looking for wherever else it appears,
+    and pulling that thread found three more of the same shape, all in the
+    gate:
+
+    * **the write heuristic listed only POSIX verbs**, so on Windows a
+      `cmd.exe` call that wrote with a built-in (`del`, `move`, `ren`, `rd`)
+      or a PowerShell cmdlet (`Remove-Item`, `Set-Content`, `Out-File`) read
+      as a read;
+    * **the tree-verb list had the same gap**, so a recursive delete of the
+      directory holding the gate's own state read as touching only that
+      directory;
+    * **the protected-path comparison was case- and separator-sensitive**,
+      and Windows paths are neither, so the same path named in a different
+      case or with forward slashes compared unequal and the rule did not
+      fire. Both sides go through `os.path.normcase` now, a no-op on POSIX.
+
+    None of the four is verified on a live Windows host, and that is the
+    honest summary of the Windows position: the code is now written for the
+    platform instead of assuming the other one, and nobody has run it there.
+
+58. **I duplicated three findings into two earlier rounds while writing
+    them up.** `str.replace` on the heading "What is still not true, after
+    this round", which appears once per round, inserted findings 55 to 57
+    under the consolidation round and the slicing round as well as this
+    one. Three rounds each claimed to have found the same three things.
+
+    Caught by reading the file rather than by anything automated, which is
+    the point: a document whose whole purpose is an accurate record of what
+    was found when had silently become inaccurate, and nothing in the
+    repository checks that. An anchor that is not unique is not an anchor.
 
 ### What is still not true, after this round
 
