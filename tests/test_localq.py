@@ -110,6 +110,11 @@ class LocalQueueTests(unittest.TestCase):
         caps = dataclasses.replace(self.caps, timeout_seconds=30)
         for command, reason in (
                 ("import sys; sys.exit(3)", "child exited unsuccessfully"),
+                ("import sys; print('{\"ok\": false, \"error\": \"ValueError\", "
+                 "\"error_detail\": \"queue provenance unavailable\"}'); sys.exit(1)",
+                 "child exited unsuccessfully: ValueError: queue provenance unavailable"),
+                ("import sys; print('{\"ok\": false, \"error\": \"x\\\\u0007y\"}'); sys.exit(1)",
+                 "child exited unsuccessfully: xy"),
                 ("print('not json')", "child did not return a JSON object")):
             with self.subTest(reason):
                 queue = LocalQueue(self.temp.name, sampler=self.sampler, caps=caps,

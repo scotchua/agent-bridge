@@ -98,6 +98,27 @@ class FakeBackend:
         return self.fn(payload)
 
 
+def _child_failure_suffix(output: str) -> str:
+    """``: <error>: <detail>`` when a failed child left its own fixed
+    diagnostics on stdout (``{"ok": false, "error": ..., "error_detail":
+    ...}``, the shape worker_child prints); empty otherwise. Printable
+    characters only, bounded, so a child cannot put a payload in the record."""
+    try:
+        value = json.loads(output or "")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(value, dict) or value.get("ok") is not False:
+        return ""
+    parts = []
+    for key in ("error", "error_detail"):
+        text = value.get(key)
+        if isinstance(text, str):
+            text = "".join(char for char in text if char.isprintable())[:FAILURE_TEXT_LIMIT]
+            if text:
+                parts.append(text)
+    return ": " + ": ".join(parts) if parts else ""
+
+
 class SubprocessBackend:
     """Run one side-effect-free child command with a hard timeout.
 
@@ -133,7 +154,7 @@ class SubprocessBackend:
             with self._lock:
                 self._processes.pop(job_id, None)
         if proc.returncode != 0:
-            raise RuntimeError("child exited unsuccessfully")
+            raise RuntimeError("child exited unsuccessfully" + _child_failure_suffix(output))
         try:
             value = json.loads(output)
         except (TypeError, ValueError) as exc:
