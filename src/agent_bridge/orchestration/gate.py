@@ -29,6 +29,20 @@ switch hooks off; a Codex hook that has not been trusted once in its
 the command text and is stated as such: it catches the ordinary ways a
 shell writes a file and can be evaded by an agent that means to. The
 editing tools are the deterministic part.
+
+Two more things the hook does so the receipt means what it says. It
+refuses the editing tools on the gate's own state (the receipts, the
+ledgers, the orchestration configuration) and on the hook files
+themselves (Claude's settings.json, Codex's hooks.json and config.toml),
+so an agent cannot write itself a receipt or unhook itself with the same
+tools the gate covers; a shell command that the text heuristic already
+reads as a write is refused when it names one of those paths. And on every allow it re-reads the
+stage router's database (read-only) and requires the stage the receipt
+names to be owned, now, by the same owner on the same route with an unexpired lease: a receipt is a pointer to live
+ownership, not a token. A forged receipt therefore has to name a stage the
+router really assigned to this route, which is the delegation-first flow
+itself. Whatever the shell heuristic misses is logged when it is seen and
+stated as not covered.
 """
 
 from __future__ import annotations
@@ -36,9 +50,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -83,13 +99,20 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
     r"(^|[\s;&|('\"])(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM]|tag)(\s|$)",
+    r"(^|[\s;&|('\"])git\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
     r"<<-?\s*['\"]?\w+['\"]?",                # here-document
-    r"(^|[\s;&|('\"])(black|ruff|isort|prettier|gofmt|rustfmt|autopep8|eslint\s+--fix)(\s|$)",
+    r"(^|[\s;&|('\"])(gofmt\s+-w|rustfmt|eslint\s+--fix|ruff\s+format|ruff\s+(check\s+)?--fix)(\s|$)",
 ))
+#: Formatters that write unless asked only to report.
+_FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")
+_FORMATTER_REPORT_ONLY = re.compile(r"(^|\s)(--check(-only)?|--diff|--dry-run|-l|--list-different)(\s|$)")
+#: ``git tag`` writes unless it only lists or inspects.
+_GIT_TAG = re.compile(r"(^|[\s;&|('\"])git\s+tag(\s+(?P<rest>[^;&|]*))?")
+_GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at",
+                       "--merged", "--no-merged", "--sort", "--format", "--verify", "-v", "--column")
 
 
 @dataclass(frozen=True)
@@ -171,9 +194,13 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
             or stage_record.get("owner_route") not in ("claude", "codex", "local"):
         raise RoutingError("execution_stage_binding_invalid")
     now = float(clock())
+    if not math.isfinite(now):
+        raise RoutingError("clock_invalid")
     valid_until = now + ttl_seconds
     lease_until = stage_record.get("lease_until")
-    if isinstance(lease_until, (int, float)):
+    if isinstance(lease_until, (int, float)) and not isinstance(lease_until, bool):
+        if not math.isfinite(float(lease_until)):
+            raise RoutingError("execution_stage_binding_invalid")
         valid_until = min(valid_until, float(lease_until))
     if valid_until <= now:
         raise RoutingError("stage_lease_expired")
@@ -191,9 +218,12 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         "decided_at": now,
         "valid_until": valid_until,
     }
-    store.atomic_write_json(receipt_path(state_root, repo_root), receipt)
+    # The audit line first: a receipt that exists is always accounted for,
+    # while an audit line without a receipt is only a decision that failed
+    # to take effect.
     store.append_ledger(os.path.join(receipt_dir(state_root), AUDIT_LEDGER),
                         {"event": "routing_decided", **receipt})
+    store.atomic_write_json(receipt_path(state_root, repo_root), receipt)
     return receipt
 
 
@@ -203,12 +233,97 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     if not os.path.exists(path):
         return None
     loaded = store.read_json(path)
+    valid_until = loaded.get("valid_until") if isinstance(loaded, dict) else None
     if not isinstance(loaded, dict) or loaded.get("version") != RECEIPT_VERSION \
-            or not isinstance(loaded.get("valid_until"), (int, float)) \
+            or not isinstance(valid_until, (int, float)) or isinstance(valid_until, bool) \
+            or not math.isfinite(float(valid_until)) \
             or loaded.get("owner_route") not in ("claude", "codex", "local") \
-            or loaded.get("repo") != os.path.realpath(repo):
+            or loaded.get("repo") != os.path.realpath(repo) \
+            or not isinstance(loaded.get("item_id"), str) or not isinstance(loaded.get("stage"), str) \
+            or not isinstance(loaded.get("owner_id"), str) \
+            or not isinstance(loaded.get("stage_revision"), int) or isinstance(loaded.get("stage_revision"), bool):
         raise ValueError("routing receipt is not one this gate wrote")
     return loaded
+
+
+def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str | None:
+    """None when the stage router still shows the receipt's stage owned by
+    the receipt's owner on its route with an unexpired lease; otherwise the
+    code naming what changed. The revision is not compared: a renewal bumps
+    it without changing who owns the stage. The database is opened
+    read-only: the hook never writes the router's state. An unreadable
+    database is ``stage_db_unavailable`` (a deny, fail closed)."""
+    uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return "stage_db_unavailable"
+    try:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT state, owner_id, owner_route, revision, lease_until FROM stages "
+                         "WHERE item_id=? AND stage=?", (receipt["item_id"], receipt["stage"])).fetchone()
+    except sqlite3.Error:
+        return "stage_db_unavailable"
+    finally:
+        db.close()
+    if row is None:
+        return "stage_not_found"
+    if row["state"] != "owned":
+        return "stage_not_owned"
+    if row["owner_id"] != receipt["owner_id"] or row["owner_route"] != receipt["owner_route"]:
+        return "stage_reassigned"
+    lease = row["lease_until"]
+    if not isinstance(lease, (int, float)) or not math.isfinite(float(lease)) or float(lease) <= now:
+        return "stage_lease_expired"
+    return None
+
+
+def protected_paths(state_root: str, config_path: str | None, home: str) -> tuple[str, ...]:
+    """The gate's own state and the files that install or disable the hook.
+    An editing tool aimed under any of these is refused whatever repository
+    they are in, so a client cannot write itself a receipt or unhook itself
+    with a covered tool."""
+    paths = [state_root]
+    if config_path:
+        paths.append(config_path)
+    paths.extend(install_paths(home).values())
+    return tuple(sorted({os.path.realpath(path) for path in paths}))
+
+
+def _under(path: str, root: str) -> bool:
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _command_paths(command: str, cwd: str) -> list[str]:
+    """Path-looking words of a shell command, resolved against ``cwd``.
+    Quoting is undone where the shell would; ``>out``, ``--flag=path`` and
+    ``a:b`` forms give up their path part. Words that name no path are
+    dropped, so this is a best-effort reading, used to refuse writes aimed at
+    protected locations (a miss there is an allow the receipt still judges)."""
+    try:
+        words = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        words = command.split()
+    found: list[str] = []
+    for word in words:
+        word = word.strip("'\"")
+        if any(ch.isspace() for ch in word.strip()):
+            found.extend(_command_paths(word, cwd))       # ``sh -c '...'`` carries a command
+            continue
+        word = word.lstrip("<>&|;")
+        candidates = [word]
+        if "=" in word:
+            candidates.append(word.split("=", 1)[1])
+        if ":" in word and not re.match(r"^[A-Za-z]:[\\/]", word):
+            candidates.extend(word.split(":"))
+        for part in candidates:
+            part = part.strip("'\"")
+            if not part or ("/" not in part and "\\" not in part and not part.startswith("~")):
+                continue
+            expanded = os.path.expanduser(part)
+            found.append(expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded))
+    return found
 
 
 def list_receipts(state_root: str) -> list[dict[str, Any]]:
@@ -241,9 +356,27 @@ def patch_paths(text: str) -> list[str]:
     return paths
 
 
+def _git_tag_writes(command: str) -> bool:
+    for match in _GIT_TAG.finditer(command):
+        rest = (match.group("rest") or "").strip()
+        if not rest:
+            continue                       # bare ``git tag`` lists
+        words = rest.split()
+        if any(word == flag or word.startswith(flag + "=") or (flag == "-n" and word.startswith("-n"))
+               for word in words for flag in _GIT_TAG_READ_FLAGS):
+            continue
+        return True
+    return False
+
+
+def _formatter_writes(command: str) -> bool:
+    return bool(_FORMATTERS.search(command)) and not _FORMATTER_REPORT_ONLY.search(command)
+
+
 def shell_writes(command: str) -> bool:
     """Whether ``command`` looks like it writes. A heuristic; see the module docstring."""
-    return any(pattern.search(command) for pattern in _WRITE_PATTERNS)
+    return (any(pattern.search(command) for pattern in _WRITE_PATTERNS)
+            or _git_tag_writes(command) or _formatter_writes(command))
 
 
 def _command_text(tool_input: Any) -> str:
@@ -296,9 +429,12 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
 
 
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
-          state_root: str, clock: Any = time.time) -> Decision:
+          state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
+          capacity_db: str | None = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
-    cannot be read."""
+    cannot be read. ``protected`` paths refuse the editing tools outright;
+    with ``capacity_db`` every allow also requires the receipt's stage to be
+    owned right now (:func:`stage_binding`)."""
     if client not in CLIENTS:
         return Decision("deny", "client_invalid", "gate configured with an unknown client")
     kind, paths = classify(client, tool_name, tool_input, cwd)
@@ -307,6 +443,15 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     if kind == "shell_read":
         return Decision("allow", "shell_read_only_heuristic",
                         "command does not look like it writes (heuristic)", logged=False)
+    if kind == "edit":
+        hit = [path for path in paths if any(_under(path, root) for root in protected)]
+    else:
+        named = _command_paths(_command_text(tool_input), cwd)
+        hit = [root for root in protected if any(_under(path, root) for path in named)]
+    if hit:
+        return Decision("deny", "gate_state_protected",
+                        "delegation-first gate: the target is the gate's own state or a hook file; "
+                        "nothing may write them through this client", tuple(sorted(set(hit))))
     repos = tuple(sorted({repo for repo in (repo_key(path) for path in paths) if repo}))
     if not repos:
         return Decision("allow", "outside_repository",
@@ -339,6 +484,15 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                 f"in {repo} is owned by route {receipt['owner_route']}; this client does not "
                 f"implement it. Dispatch through execution_dispatch or wait for that stage to "
                 f"complete.", repos, receipt)
+        if capacity_db is not None:
+            stale = stage_binding(capacity_db, receipt, now)
+            if stale is not None:
+                return Decision(
+                    "deny", stale,
+                    f"delegation-first gate: the routing receipt for {repo} names stage "
+                    f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
+                    f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
+                    f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
     receipt = read_receipt(state_root, repos[0])
     return Decision("allow", "routing_receipt_valid",
                     f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
@@ -352,7 +506,7 @@ def hook_output(decision: Decision) -> dict[str, Any]:
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": decision.reason,
+        "permissionDecisionReason": f"{decision.reason} [{decision.code}]",
     }}
 
 
@@ -369,20 +523,28 @@ def record_event(state_root: str, client: str, tool_name: str, decision: Decisio
 
 
 def state_root_from_config(config_path: str) -> str:
+    return gate_paths_from_config(config_path)[0]
+
+
+def gate_paths_from_config(config_path: str) -> tuple[str, str]:
+    """``(state_root, capacity_db)`` from the private orchestration config."""
     loaded = store.read_json(config_path)
     if not isinstance(loaded, dict) or not isinstance(loaded.get("state_root"), str):
         raise ValueError("orchestration config has no state_root")
-    return loaded["state_root"]
+    if not isinstance(loaded.get("capacity_db"), str):
+        raise ValueError("orchestration config has no capacity_db")
+    return loaded["state_root"], loaded["capacity_db"]
 
 
 def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
-             clock: Any = time.time) -> Decision:
+             clock: Any = time.time, capacity_db: str | None = None,
+             protected: tuple[str, ...] = ()) -> Decision:
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str):
         return Decision("deny", "hook_input_invalid", "delegation-first gate: hook input has no tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     decision = judge(client, tool_name, payload.get("tool_input"), cwd,
-                     state_root=state_root, clock=clock)
+                     state_root=state_root, clock=clock, protected=protected, capacity_db=capacity_db)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -489,8 +651,6 @@ def codex_hooks_flag_update(path: str, *, remove: bool = False) -> bytes | None:
         tomllib.loads(updated)
         return updated.encode("utf-8") if updated != text else None
     parsed = tomllib.loads(text) if text else {}
-    if begin in text:
-        return None
     features = parsed.get("features")
     if features is not None and not isinstance(features, dict):
         raise ValueError(f"{path} sets features to something other than a table")
@@ -498,6 +658,8 @@ def codex_hooks_flag_update(path: str, *, remove: bool = False) -> bytes | None:
         if features["hooks"] is True:
             return None
         raise ValueError(f"{path} sets features.hooks to something other than true; enable hooks explicitly first")
+    if begin in text:
+        raise ValueError(f"{path} holds the agent-bridge hooks block but hooks are not enabled; repair by hand")
     lines = text.split(newline) if text else []
     header = next((i for i, line in enumerate(lines) if line.strip() == "[features]"), None)
     block = [begin, "hooks = true", end]
@@ -539,7 +701,6 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
         raise ValueError("unrecognized gate installation receipt; preserve it for review")
     previous = receipt.get("entries", {}) if isinstance(receipt.get("entries"), dict) else {}
     updates: dict[str, bytes] = {}
-    entries: dict[str, Any] = {}
     for client in clients:
         if client not in CLIENTS:
             raise ValueError("client_invalid")
@@ -548,13 +709,16 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
         content = hooks_file_update(target, entry, previous.get(client), remove=remove)
         if content is not None:
             updates[target] = content
-        if not remove:
-            entries[client] = entry
         if client == "codex":
             flag = codex_hooks_flag_update(paths["codex_toml"], remove=remove)
             if flag is not None:
                 updates[paths["codex_toml"]] = flag
+    # Entries for clients this run does not touch are carried forward, so a
+    # one-client install or removal does not forget what the other holds.
+    entries = {client: value for client, value in previous.items() if client not in clients}
     if not remove:
+        entries.update({client: hook_entry(root, client, config_path) for client in clients})
+    if entries:
         new_receipt = (json.dumps({"version": 1, "entries": entries, "config": os.path.realpath(config_path)},
                                   indent=2, sort_keys=True) + "\n").encode("utf-8")
         if receipt_raw != new_receipt:
@@ -570,7 +734,7 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
                               "remove": remove, "clients": list(clients)}
     if apply:
         report["backups"] = _commit_updates(updates, originals)
-        if remove and os.path.exists(paths["receipt"]):
+        if remove and os.path.exists(paths["receipt"]) and paths["receipt"] not in updates:
             os.unlink(paths["receipt"])
         report["applied"] = True
     report["codex_note"] = (
@@ -586,7 +750,9 @@ NOT_COVERED = [
     "a person editing files in a terminal or editor",
     "Claude Code started with --safe-mode or with disableAllHooks set",
     "Codex started with --dangerously-bypass-hook-trust, or a hook not yet trusted in /hooks",
-    "shell commands that write in a way the text heuristic does not recognise",
+    "shell commands that write in a way the text heuristic does not recognise, including one that "
+    "reaches the gate's own state or the hook files without naming their paths",
+    "installation on Windows: the .cmd launcher is written but has not been run under either host",
 ]
 
 
@@ -594,7 +760,13 @@ NOT_COVERED = [
 
 
 def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
-    """``trusted``, ``needs_review`` or ``not_installed`` for our Codex entry."""
+    """``recorded``, ``needs_review`` or ``not_installed`` for our Codex entry.
+
+    ``recorded`` means Codex has written a trusted_hash for our entry's
+    position in hooks.json. Codex computes and checks that hash itself;
+    this report does not recompute it, so ``recorded`` says trust was given
+    to some definition at this position, not that it matches the current
+    one. Codex shows "review required" again when it does not."""
     import tomllib
     if not os.path.exists(hooks_path):
         return "not_installed"
@@ -614,7 +786,7 @@ def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     key = f"{os.path.realpath(hooks_path)}:pre_tool_use:{index}:0"
     entry = state.get("state", {}).get(key) if isinstance(state.get("state"), dict) else None
     if isinstance(entry, dict) and entry.get("trusted_hash"):
-        return "trusted"
+        return "recorded"
     return "needs_review"
 
 
@@ -674,7 +846,17 @@ def main(argv: list[str] | None = None) -> int:
     rep = sub.add_parser("report", help="receipts, recent gate events, installation and trust state")
     rep.add_argument("--home"); rep.add_argument("--config"); rep.add_argument("--state-root")
     rep.add_argument("--events", type=int, default=20)
-    args = parser.parse_args(argv)
+    words = sys.argv[1:] if argv is None else argv
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code in (0, None) or any(word in ("install", "report", "-h", "--help") for word in words):
+            raise
+        # Hook mode with unusable arguments: the host must still read a deny.
+        sys.stdout.write(json.dumps(hook_output(Decision(
+            "deny", "gate_error", "delegation-first gate: the hook was started with arguments it "
+            "cannot use; nothing is implemented until the installation is repaired")), sort_keys=True) + "\n")
+        return 0
     home = os.path.expanduser("~")
     if args.command == "install":
         clients = tuple(part.strip() for part in args.clients.split(",") if part.strip())
@@ -693,11 +875,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.client:
             raise ValueError("--client is required in hook mode")
-        state_root = args.state_root or state_root_from_config(args.config or "")
+        if args.state_root:
+            state_root, capacity_db = args.state_root, os.path.join(args.state_root, "capacity.sqlite3")
+        else:
+            state_root, capacity_db = gate_paths_from_config(args.config or "")
+        protected = protected_paths(state_root, args.config, home)
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
-        decision = run_hook(args.client, state_root, payload)
+        decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db, protected=protected)
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "

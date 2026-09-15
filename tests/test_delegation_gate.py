@@ -130,6 +130,29 @@ class ReceiptTests(GateCase):
             gate.read_receipt(str(self.state), str(self.repo))
 
 
+class ReceiptIntegrityTests(GateCase):
+    def test_the_audit_line_is_written_before_the_receipt(self):
+        with mock.patch.object(gate.store, "append_ledger", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.receipt()
+        self.assertFalse(Path(gate.receipt_path(str(self.state), str(self.repo))).exists())
+        self.assertIsNone(gate.read_receipt(str(self.state), str(self.repo)))
+
+    def test_non_finite_times_are_refused_on_both_sides(self):
+        with self.assertRaisesRegex(RoutingError, "execution_stage_binding_invalid"):
+            self.receipt(lease_until=float("inf"))
+        with self.assertRaisesRegex(RoutingError, "clock_invalid"):
+            gate.record_decision(str(self.state), caller="claude", stage_record=owned_stage(),
+                                 repo=str(self.repo), reason="r", ttl_seconds=600, clock=lambda: float("nan"))
+        written = self.receipt()
+        path = Path(gate.receipt_path(str(self.state), str(self.repo)))
+        path.write_text(json.dumps({**written, "valid_until": float("inf")}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            gate.read_receipt(str(self.state), str(self.repo))
+        decision = self.judge("claude", "Edit", {"file_path": str(self.repo / "a")})
+        self.assertEqual((decision.allowed, decision.code), (False, "gate_state_unavailable"))
+
+
 class ClassificationTests(GateCase):
     def test_claude_edit_tools_name_their_files(self):
         cwd = os.path.abspath(os.sep + "w")
@@ -159,9 +182,13 @@ class ClassificationTests(GateCase):
         writes = ["echo hi > out.txt", "cat a >> b", "sed -i 's/a/b/' f", "rm -rf build",
                   "git commit -m x", "git apply p.diff", "git push", "python3 - <<'EOF'\nprint(1)\nEOF",
                   "npm install left-pad", "mkdir -p x && touch y", "tee f", "black .", "python -c 'open(\"f\",\"w\")'",
-                  ["bash", "-lc", "mv a b"]]
+                  ["bash", "-lc", "mv a b"], "ruff format src", "ruff check --fix src", "isort .",
+                  "git tag v1.2.0", "git tag -a v1 -m x", "git tag -d v1", "prettier --write ."]
         reads = ["git status", "git diff", "ls -la", "cat file", "grep -rn foo src", "python3 -m pytest -q",
-                 "echo 2>&1 | head", "git log --oneline -3", "pytest tests/test_x.py"]
+                 "echo 2>&1 | head", "git log --oneline -3", "pytest tests/test_x.py",
+                 "ruff check src", "black --check .", "black --diff src/a.py", "isort --check-only .",
+                 "git tag", "git tag --list 'v*'", "git tag -l", "git tag -n3", "git tag --contains abc",
+                 "prettier --check ."]
         for command in writes:
             self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w"),
                              ("shell", ["/w"]), command)
@@ -219,6 +246,33 @@ class JudgmentTests(GateCase):
         status = self.judge("claude", "Bash", {"command": "git status"})
         self.assertEqual((status.allowed, status.code), (True, "shell_read_only_heuristic"))
 
+    def test_the_gates_own_state_and_hook_files_are_protected_from_covered_tools(self):
+        self.receipt()
+        home = self.base / "home"
+        protected = gate.protected_paths(str(self.state), str(self.base / "cfg.json"), str(home))
+        forged = gate.receipt_path(str(self.state), str(self.repo))
+        settings = os.path.join(str(home), ".claude", "settings.json")
+        hooks = os.path.join(str(home), ".codex", "hooks.json")
+        for root in (str(self.state), str(self.base / "cfg.json"), settings, hooks):
+            self.assertIn(os.path.realpath(root), protected)
+        cases = [("claude", "Write", {"file_path": forged}),
+                 ("claude", "Edit", {"file_path": settings}),
+                 ("claude", "Bash", {"command": f"echo '{{}}' > {forged}"}),
+                 ("codex", "apply_patch", {"input": f"*** Begin Patch\n*** Add File: {hooks}\n+x\n*** End Patch"}),
+                 ("codex", "local_shell", {"command": ["sh", "-c", f"rm -f {hooks}"]})]
+        for client, tool, tool_input in cases:
+            decision = gate.judge(client, tool, tool_input, str(self.repo), state_root=str(self.state),
+                                  clock=self.clock, protected=protected)
+            self.assertEqual(decision.code, "gate_state_protected", (tool, decision))
+            self.assertFalse(decision.allowed)
+        # Reading the state is fine, and the repository itself is still judged by receipt.
+        reading = gate.judge("claude", "Bash", {"command": f"cat {forged}"}, str(self.repo),
+                             state_root=str(self.state), clock=self.clock, protected=protected)
+        self.assertTrue(reading.allowed)
+        normal = gate.judge("claude", "Edit", {"file_path": str(self.repo / "a")}, str(self.repo),
+                            state_root=str(self.state), clock=self.clock, protected=protected)
+        self.assertEqual(normal.code, "routing_receipt_valid")
+
     def test_unreadable_gate_state_fails_closed(self):
         path = Path(gate.receipt_path(str(self.state), str(self.repo)))
         path.parent.mkdir(parents=True)
@@ -231,22 +285,96 @@ class JudgmentTests(GateCase):
         deny = gate.hook_output(gate.Decision("deny", "x", "why"))
         self.assertEqual(deny["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(deny["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        self.assertEqual(deny["hookSpecificOutput"]["permissionDecisionReason"], "why")
+        self.assertEqual(deny["hookSpecificOutput"]["permissionDecisionReason"], "why [x]")
         self.assertEqual(gate.hook_output(gate.Decision("allow", "x", "y")), {})
+
+
+class StageBindingTests(GateCase):
+    """The receipt points at live ownership; the router is asked on every allow."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = str(self.base / "capacity.sqlite3")
+        self.router = StageRouter(self.db, clock=self.clock)
+        self.router.observe_capacity(CapacityObservation(
+            route="claude", observed_at=1000.0, fresh_until=5000.0, available=True, source="test"))
+        self.router.register("item-1", "implement", allowed_routes=["claude"])
+        self.owned = self.router.assign("item-1", "implement", owner_id="claude-session",
+                                        lease_seconds=600, expected_revision=0)
+        self.written = gate.record_decision(str(self.state), caller="claude", stage_record=self.owned,
+                                            repo=str(self.repo), reason="r", ttl_seconds=600, clock=self.clock)
+
+    def live(self, db=None, clock=None):
+        return gate.judge("claude", "Edit", {"file_path": str(self.repo / "a")}, str(self.repo),
+                          state_root=str(self.state), clock=clock or self.clock, capacity_db=db or self.db)
+
+    def test_live_ownership_allows_and_survives_a_renewal(self):
+        self.assertEqual(self.live().code, "routing_receipt_valid")
+        self.router.renew("item-1", "implement", owner_id="claude-session", lease_seconds=600,
+                          expected_revision=self.owned["revision"])
+        self.assertEqual(self.live().code, "routing_receipt_valid")
+
+    def test_a_completed_stage_no_longer_allows(self):
+        self.router.complete("item-1", "implement", owner_id="claude-session",
+                             expected_revision=self.owned["revision"])
+        decision = self.live()
+        self.assertEqual((decision.allowed, decision.code), (False, "stage_not_owned"))
+        self.assertIn("routing_decide", decision.reason)
+
+    def test_a_forged_receipt_for_a_stage_the_router_never_assigned_denies(self):
+        gate.record_decision(str(self.state), caller="claude", stage_record=owned_stage(item_id="ghost"),
+                             repo=str(self.other), reason="forged", ttl_seconds=600, clock=self.clock)
+        decision = gate.judge("claude", "Write", {"file_path": str(self.other / "a")}, str(self.other),
+                              state_root=str(self.state), clock=self.clock, capacity_db=self.db)
+        self.assertEqual((decision.allowed, decision.code), (False, "stage_not_found"))
+
+    def test_another_owner_on_the_row_denies(self):
+        self.assertEqual(gate.stage_binding(self.db, {**self.written, "owner_id": "someone"}, 1000.0),
+                         "stage_reassigned")
+        self.assertEqual(gate.stage_binding(self.db, {**self.written, "owner_route": "codex"}, 1000.0),
+                         "stage_reassigned")
+        self.assertEqual(gate.stage_binding(self.db, self.written, 1000.0 + 601), "stage_lease_expired")
+        self.assertIsNone(gate.stage_binding(self.db, self.written, 1000.0))
+
+    def test_an_unreadable_router_database_denies(self):
+        absent = self.live(db=str(self.base / "absent.sqlite3"))
+        self.assertEqual((absent.allowed, absent.code), (False, "stage_db_unavailable"))
+        garbage = self.base / "garbage.sqlite3"
+        garbage.write_bytes(b"not a database at all, not even close, just bytes\n" * 40)
+        broken = self.live(db=str(garbage))
+        self.assertEqual((broken.allowed, broken.code), (False, "stage_db_unavailable"))
+        self.assertTrue(garbage.exists())     # opened read-only; nothing was created or changed
 
 
 class HookProcessTests(GateCase):
     """The launcher end to end: stdin in, one JSON line out, exit 0 always."""
 
     def run_hook(self, client, payload, *args):
-        config = self.base / "orchestration.json"
-        config.write_text(json.dumps({"state_root": str(self.state)}), encoding="utf-8")
+        config = self.write_config()
         completed = subprocess.run(
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
              "--client", client, "--config", str(config), *args],
             input=json.dumps(payload).encode("utf-8"), capture_output=True, timeout=60,
             env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
         return completed
+
+    def write_config(self):
+        config = self.base / "orchestration.json"
+        config.write_text(json.dumps({"state_root": str(self.state),
+                                      "capacity_db": str(self.state / "capacity.sqlite3")}), encoding="utf-8")
+        return config
+
+    def owned_now(self):
+        """A stage the router really owns on the claude route, plus its receipt."""
+        router = StageRouter(str(self.state / "capacity.sqlite3"))
+        router.observe_capacity(CapacityObservation(route="claude", observed_at=time.time(),
+                                                    fresh_until=time.time() + 3600, available=True, source="test"))
+        router.register("item-1", "implement", allowed_routes=["claude"])
+        owned = router.assign("item-1", "implement", owner_id="claude-session", lease_seconds=600,
+                              expected_revision=0)
+        gate.record_decision(str(self.state), caller="claude", stage_record=owned,
+                             repo=str(self.repo), reason="live", ttl_seconds=600, clock=time.time)
+        return router, owned
 
     def test_a_denied_edit_is_reported_on_stdout_and_logged(self):
         completed = self.run_hook("claude", {"hook_event_name": "PreToolUse", "tool_name": "Edit",
@@ -259,16 +387,44 @@ class HookProcessTests(GateCase):
         self.assertEqual(json.loads(events[-1])["code"], "no_routing_receipt")
 
     def test_an_allowed_edit_prints_an_empty_object(self):
-        gate.record_decision(str(self.state), caller="claude", stage_record=owned_stage(lease_until=time.time() + 600),
-                             repo=str(self.repo), reason="live", ttl_seconds=600, clock=time.time)
+        self.owned_now()
         completed = self.run_hook("claude", {"tool_name": "Edit",
                                              "tool_input": {"file_path": str(self.repo / "a.py")},
                                              "cwd": str(self.repo)})
-        self.assertEqual(json.loads(completed.stdout), {})
+        self.assertEqual(completed.stdout.strip(), b"{}", completed.stderr)
+
+    def test_a_receipt_without_a_live_stage_is_refused_by_the_process(self):
+        # The receipt alone, written the way the tool writes it, but the stage router
+        # was never told: the file is a pointer to ownership the router does not hold.
+        gate.record_decision(str(self.state), caller="claude", stage_record=owned_stage(lease_until=time.time() + 600),
+                             repo=str(self.repo), reason="forged", ttl_seconds=600, clock=time.time)
+        completed = self.run_hook("claude", {"tool_name": "Edit",
+                                             "tool_input": {"file_path": str(self.repo / "a.py")},
+                                             "cwd": str(self.repo)})
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("[stage_db_unavailable]", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_the_installed_launcher_runs_the_same_judgment(self):
+        if os.name == "nt":
+            self.skipTest("the sh launcher is for POSIX hosts; the .cmd launcher is not exercised here")
+        self.owned_now()
+        config = self.write_config()
+        command = gate.hook_command(str(ROOT), "claude", str(config))
+        denied = subprocess.run(command, shell=True, input=json.dumps({
+            "tool_name": "Write", "tool_input": {"file_path": str(self.other / "b.py")},
+            "cwd": str(self.other)}).encode(), capture_output=True, timeout=60)
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        out = json.loads(denied.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("[no_routing_receipt]", out["hookSpecificOutput"]["permissionDecisionReason"])
+        allowed = subprocess.run(command, shell=True, input=json.dumps({
+            "tool_name": "Write", "tool_input": {"file_path": str(self.repo / "b.py")},
+            "cwd": str(self.repo)}).encode(), capture_output=True, timeout=60)
+        self.assertEqual(allowed.stdout.strip(), b"{}", allowed.stderr)
 
     def test_garbage_input_denies_rather_than_crashing(self):
-        config = self.base / "orchestration.json"
-        config.write_text(json.dumps({"state_root": str(self.state)}), encoding="utf-8")
+        config = self.write_config()
         completed = subprocess.run(
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "codex",
              "--config", str(config)], input=b"not json", capture_output=True, timeout=60,
@@ -276,8 +432,32 @@ class HookProcessTests(GateCase):
         self.assertEqual(completed.returncode, 0)
         out = json.loads(completed.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn("gate_error", json.dumps(out) + "gate_error")  # reason names the class only
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("[gate_error]", reason)
+        self.assertIn("(JSONDecodeError)", reason)     # the class, never the traceback
         self.assertNotIn("Traceback", completed.stdout.decode())
+
+    def test_unusable_arguments_still_produce_a_deny(self):
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "nobody"],
+            input=b"{}", capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("[gate_error]", out["hookSpecificOutput"]["permissionDecisionReason"])
+        usage = subprocess.run([sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "install"],
+                               capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(usage.returncode, 2)         # a person at the terminal still sees usage
+
+    def test_a_config_without_a_capacity_db_denies(self):
+        config = self.base / "orchestration.json"
+        config.write_text(json.dumps({"state_root": str(self.state)}), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "claude",
+             "--config", str(config)],
+            input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(self.repo / "a")}}).encode(),
+            capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(json.loads(completed.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_a_missing_config_denies(self):
         completed = subprocess.run(
@@ -322,9 +502,18 @@ class RoutingDecideToolTests(GateCase):
         self.assertEqual(result["receipt"]["owner_route"], owned["owner_route"])
         self.assertEqual(result["receipt"]["caller"], "claude")
         self.assertLessEqual(result["receipt"]["valid_until"], owned["lease_until"])
-        decision = gate.judge(owned["owner_route"], "Edit", {"file_path": str(self.repo / "a")},
-                              str(self.repo), state_root=str(self.state), clock=self.clock)
-        self.assertTrue(decision.allowed, decision)
+        edit_tool = {"claude": ("Edit", {"file_path": str(self.repo / "a")}),
+                     "codex": ("apply_patch", {"input": "*** Begin Patch\n*** Update File: a\n*** End Patch"})}
+        tool, tool_input = edit_tool[owned["owner_route"]]
+        decision = gate.judge(owned["owner_route"], tool, tool_input, str(self.repo),
+                              state_root=str(self.state), clock=self.clock,
+                              capacity_db=str(self.base / "capacity.sqlite3"))
+        self.assertEqual((decision.allowed, decision.code), (True, "routing_receipt_valid"), decision)
+        other = "codex" if owned["owner_route"] == "claude" else "claude"
+        tool, tool_input = edit_tool[other]
+        refused = gate.judge(other, tool, tool_input, str(self.repo), state_root=str(self.state),
+                             clock=self.clock, capacity_db=str(self.base / "capacity.sqlite3"))
+        self.assertEqual(refused.code, "routed_elsewhere")
 
     def test_without_a_state_root_the_tool_refuses(self):
         server = Server("codex", self.service, self.router, interval=0.01)
@@ -342,7 +531,8 @@ class InstallTests(GateCase):
         (self.home / ".claude").mkdir(parents=True)
         (self.home / ".codex").mkdir()
         self.config = self.base / "orchestration.json"
-        self.config.write_text(json.dumps({"state_root": str(self.state)}), encoding="utf-8")
+        self.config.write_text(json.dumps({"state_root": str(self.state),
+                                           "capacity_db": str(self.state / "capacity.sqlite3")}), encoding="utf-8")
         self.settings = self.home / ".claude" / "settings.json"
         self.hooks = self.home / ".codex" / "hooks.json"
         self.toml = self.home / ".codex" / "config.toml"
@@ -387,6 +577,27 @@ class InstallTests(GateCase):
         with self.assertRaisesRegex(ValueError, "enable hooks explicitly"):
             self.install(apply=False)
         self.assertFalse(self.settings.exists())
+        # Our own markers do not excuse a disabled flag either.
+        from agent_bridge.onboard import BEGIN, END
+        block = f"{BEGIN.format(name=gate.HOOKS_FLAG_NAME)}\n{END.format(name=gate.HOOKS_FLAG_NAME)}\n"
+        self.toml.write_text("[features]\nhooks = false\n" + block, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "enable hooks explicitly"):
+            self.install(apply=False)
+
+    def test_a_one_client_run_keeps_the_other_clients_record(self):
+        self.install(apply=True)
+        receipt_path = self.home / ".agent-bridge" / "onboarding" / "gate-installation.json"
+        both = json.loads(receipt_path.read_text(encoding="utf-8"))["entries"]
+        self.assertEqual(sorted(both), ["claude", "codex"])
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            gate.install(str(self.home), str(ROOT), str(self.config), ("claude",), apply=True)
+        self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["entries"], both)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            gate.install(str(self.home), str(ROOT), str(self.config), ("claude",), apply=True, remove=True)
+        after = json.loads(receipt_path.read_text(encoding="utf-8"))["entries"]
+        self.assertEqual(sorted(after), ["codex"])
+        self.assertNotIn("hooks", json.loads(self.settings.read_text(encoding="utf-8")))
+        self.assertIn(gate.HOOK_NAME, self.hooks.read_text(encoding="utf-8"))
 
     def test_remove_takes_only_our_entries_and_the_flag_block(self):
         self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [
@@ -413,7 +624,7 @@ class InstallTests(GateCase):
         with open(self.toml, "a", encoding="utf-8") as handle:
             handle.write(f'\n[hooks.state."{key}"]\ntrusted_hash = "sha256:abc"\n')
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
-            self.assertEqual(gate.report(str(self.home), str(self.state), clock=self.clock)["codex_trust"], "trusted")
+            self.assertEqual(gate.report(str(self.home), str(self.state), clock=self.clock)["codex_trust"], "recorded")
 
 
 if __name__ == "__main__":
