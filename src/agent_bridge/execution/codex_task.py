@@ -334,23 +334,61 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
                backend:hostenv.Confinement|None=None):
     """Run one verification command under this host's confinement backend."""
     backend=backend or _require_confinement("synthetic")
-    if backend.name==hostenv.LINUX_NETNS_SYNTHETIC:
+    if backend.name==hostenv.LINUX_USERNS:
         return _netns_confined(command,tree,scratch,env,timeout,backend)
     return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
 
 def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
                     backend:hostenv.Confinement):
-    """Network denied through a private namespace. Reads are not confined."""
+    """Network denied and writes confined by a mount namespace. Reads are not.
+
+    See the Claude lane for the full note. The boundary re-proves itself for this worktree on every command: the
+    helper refuses to exec anything until a write to each canary path has
+    actually failed. A failed boundary is a refusal with its own name, never a
+    verification result, because a command that did not run under the
+    confinement it claims has told us nothing."""
     scratch.mkdir(mode=0o700)
     sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
     sandbox_env.pop("CODEX_HOME",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
-    result=_run(hostenv.netns_argv(command),cwd=tree,env=sandbox_env,timeout=timeout)
+    result=_run(hostenv.confined_argv(command,tree=tree,scratch=scratch,
+                                      canaries=_confinement_canaries(tree)),
+                cwd=tree,env=sandbox_env,timeout=timeout)
+    if result.returncode==hostenv.CONFINEMENT_SELFTEST_EXIT:
+        raise TaskError("verification confinement failed its own canary check on this host "
+                        "[confinement_selftest_failed]")
     result.sandbox_backend=backend.name
     result.sandbox_profile_sha256=None
     result.duration_seconds=time.monotonic()-started
     return result
+
+def _confinement_canaries(tree:Path)->list[str]:
+    """Paths a verification command must not be able to write.
+
+    The source repository is first because a write there is the exact damage
+    the old post-run snapshot was supposed to catch and could only report
+    after the fact. The job directory is next: the scratch directory inside it
+    is deliberately writable, the directory itself is not. Then the two places
+    any escape would naturally aim for."""
+    canaries=[str(tree.parent)]
+    marker=tree/".git"
+    try:
+        text=marker.read_text().strip() if marker.is_file() else ""
+    except OSError:
+        text=""
+    if text.startswith("gitdir: "):
+        gitdir=Path(text[8:])
+        try:
+            commondir=(gitdir/(gitdir/"commondir").read_text().strip()).resolve()
+        except OSError:
+            commondir=None
+        if commondir is not None and commondir.parent.is_dir():
+            canaries.append(str(commondir.parent))
+    for extra in (str(Path.home()),tempfile.gettempdir()):
+        if extra not in canaries and os.path.isdir(extra):
+            canaries.append(extra)
+    return canaries
 
 def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
                            backend:hostenv.Confinement):
@@ -414,7 +452,6 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
              classification:str,model:str|None=None,reasoning_effort:str|None=None,
              verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
-    backend=_require_confinement(classification)
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
@@ -423,6 +460,13 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
     try: brief_text=raw.decode()
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
     checks=_verify_argv(verify_argv or []); env=_env(); source_before=_source_state(repo,env)
+    # The host is probed only after the REQUEST has been validated. Ordering
+    # matters for the message an operator sees: with the probe first, a
+    # refused verification command on a host with no confinement backend
+    # reported the host refusal and buried the real mistake, which broke a
+    # pre-existing test and would have misdirected anybody reading the
+    # receipt. Validate what was asked, then interrogate the machine.
+    backend=_require_confinement(classification)
     base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(codex_bin),"--version"],cwd=codex_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Codex executable")

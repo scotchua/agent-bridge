@@ -19,6 +19,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import codex_task as module
 from agent_bridge.execution import hostenv
+
+
+def requires_confinement(case):
+    """Skip, by name, a test that needs a verification confinement backend.
+
+    GitHub's Ubuntu runners cannot enter an unprivileged network namespace and
+    a Mac without sandbox-exec is equally unserved, so on those hosts
+    ``hostenv.confinement`` refuses and the lane cannot run verification at
+    all. These tests exercise the lane end to end, or the boundary itself, so
+    they genuinely need one. Saying so and skipping is how this project
+    already treats a host that cannot satisfy a fixture (see
+    tests/platform_support.py); failing would report a defect in the code
+    when the fact is a property of the machine.
+
+    It is deliberately NOT applied to tests about request validation. Those
+    must pass everywhere, which is why ``run_task`` validates the request
+    before it probes the host.
+    """
+    try:
+        hostenv.confinement("synthetic")
+    except hostenv.HostCapabilityError as exc:
+        case.skipTest("no verification confinement backend on this host: " + exc.code)
+
 from agent_bridge.execution.codex_task import (
     TaskError, _env, _git, _relevant_paths, _remove, _run, _sandboxed,
     _source_state, main, run_task)
@@ -132,6 +155,7 @@ class CodexTaskTests(unittest.TestCase):
         return run_task(**kwargs)
 
     def test_returns_patch_and_does_not_touch_source(self):
+        requires_confinement(self)
         result = self.run_default()
         error_log = Path(result["job_dir"]) / "verify-1.stderr"
         self.assertEqual(result["status"], "complete",
@@ -153,6 +177,7 @@ class CodexTaskTests(unittest.TestCase):
         self.assertFalse((self.root / "tasks").exists())
 
     def test_verify_argv_empty_is_permitted_for_codex(self):
+        requires_confinement(self)
         result = self.run_default(verify_argv=[])
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["verification"], [])
@@ -175,6 +200,7 @@ class CodexTaskTests(unittest.TestCase):
                                    "error_detail": "verification executable is not allowlisted"})
 
     def test_refuses_api_key_auth(self):
+        requires_confinement(self)
         self._write_fake(login="apikey")
         with self.assertRaises(TaskError):
             self.run_default()
@@ -241,6 +267,7 @@ class CodexTaskTests(unittest.TestCase):
 
     def test_selected_backend_denies_network(self):
         """Every backend must deny network. None is selected if it cannot."""
+        requires_confinement(self)
         backend = hostenv.confinement("synthetic")
         tree = self.root / "net-tree"; tree.mkdir()
         code = ("import socket,sys\n"
@@ -257,6 +284,7 @@ class CodexTaskTests(unittest.TestCase):
 
     def test_backend_write_confinement_matches_its_claim(self):
         """A write above the worktree is refused exactly when claimed."""
+        requires_confinement(self)
         backend = hostenv.confinement("synthetic")
         tree = self.root / "write-tree"; tree.mkdir()
         outside = self.root / "outside"
@@ -273,6 +301,7 @@ class CodexTaskTests(unittest.TestCase):
             self.assertTrue(outside.exists())
 
     def test_backend_read_confinement_matches_its_claim(self):
+        requires_confinement(self)
         backend = hostenv.confinement("synthetic")
         tree = self.root / "read-tree"; tree.mkdir()
         protected = self.root / "client-secret"; protected.write_text("canary-secret")
@@ -287,6 +316,7 @@ class CodexTaskTests(unittest.TestCase):
             self.assertEqual(backend.classifications, frozenset({"synthetic"}))
 
     def test_a_backend_that_confines_no_reads_refuses_real_material(self):
+        requires_confinement(self)
         backend = hostenv.confinement("synthetic")
         if backend.confines_reads:
             self.assertTrue(backend.permits("internal_nonclient"))
@@ -305,6 +335,7 @@ class CodexTaskTests(unittest.TestCase):
             self.assertFalse(_remove(self.repo, tree, _env()))
 
     def test_detects_source_checkout_mutation(self):
+        requires_confinement(self)
         self._write_fake(mode="corrupt", corrupt_target=str(self.repo / "value.txt"))
         with self.assertRaises(TaskError):
             self.run_default()
@@ -329,6 +360,7 @@ class CodexTaskTests(unittest.TestCase):
             (self.root / "AGENTS.md").unlink()
 
     def test_isolated_codex_home_is_created_owner_only_and_never_shared_desktop_home(self):
+        requires_confinement(self)
         result = self.run_default()
         self.assertTrue(self.codex_home.is_dir())
         if os.name != "nt":
@@ -361,18 +393,21 @@ class CodexExitStatusTests(CodexTaskTests):
         return code, json.loads(lines[-1])
 
     def test_a_clean_run_reports_ok_and_exits_zero(self):
+        requires_confinement(self)
         code, payload = self._main(["git", "diff", "--check"])
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "complete")
 
     def test_a_failed_verification_exits_nonzero(self):
+        requires_confinement(self)
         code, payload = self._main(["git", "diff", "--exit-code"])
         self.assertNotEqual(code, 0)
         self.assertFalse(payload["ok"], payload)
         self.assertEqual(payload["status"], "verification_failed", payload)
 
     def test_the_failing_check_is_recorded_in_the_receipt(self):
+        requires_confinement(self)
         _, payload = self._main(["git", "diff", "--exit-code"])
         self.assertTrue(any(entry["returncode"] != 0
                             for entry in payload["verification"]))

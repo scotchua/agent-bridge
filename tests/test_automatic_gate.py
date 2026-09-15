@@ -489,6 +489,98 @@ class TheOperatorsPolicyTakesEffectAtOnce(AutoCase):
         self.assertEqual(missing, autoroute.NO_POLICY)
 
 
+class TheRoutingEscapeAnAdversarialReviewFound(AutoCase):
+    """A nested .git could shadow an outer routed decision.
+
+    Found by an adversarial review of commit 58e4d8c and confirmed still
+    reachable four commits later, by a different mechanism than the one
+    reported. ``gate.repo_key`` returns the NEAREST ancestor holding .git, so
+    a client denied at a routed repository root could edit under a nested
+    repository whose own receipt said retained_repo_unclassified. It was
+    reachable end to end with gate-allowed commands only, because ``git
+    init`` was not in the shell write verbs, and reachable with NO command at
+    all when a submodule or a linked worktree already existed.
+
+    Both halves are tested because either alone leaves a hole: judging the
+    whole chain without gating creation still lets a client make nested repos
+    for other reasons, and gating creation without judging the chain leaves
+    every pre-existing submodule open.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.observe("codex")
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src" / "existing.py").write_text("a = 1\n", encoding="utf-8")
+
+    def bash(self, client, command, cwd=None):
+        payload = {"tool_name": "Bash", "tool_input": {"command": command},
+                   "cwd": str(cwd or self.repo)}
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", client, "--config", str(self.config)],
+            input=json.dumps(payload).encode("utf-8"), capture_output=True,
+            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def nest(self):
+        """A nested repository, as a submodule or a stray git init leaves one."""
+        subprocess.run(["git", "init", "-q", str(self.repo / "src")],
+                       check=True, timeout=60, capture_output=True)
+
+    def test_the_root_is_routed_away_to_begin_with(self):
+        self.assertDenied(self.hook("claude", self.repo, "app.py"), "routed_elsewhere")
+
+    def test_creating_a_nested_repository_is_itself_a_gated_write(self):
+        self.assertDenied(self.bash("claude", f"git init -q {self.repo / 'src'}"),
+                          "routed_elsewhere")
+
+    def test_an_edit_under_a_pre_existing_nested_repository_is_still_denied(self):
+        """The case needing no command at all: a submodule already there."""
+        self.nest()
+        self.assertDenied(self.hook("claude", self.repo, "src/existing.py"),
+                          "routed_elsewhere")
+
+    def test_a_shell_write_under_a_nested_repository_is_still_denied(self):
+        self.nest()
+        self.assertDenied(
+            self.bash("claude", f"sed -i s/a/z/ {self.repo / 'src' / 'existing.py'}",
+                      cwd=self.repo / "src"),
+            "routed_elsewhere")
+
+    def test_the_route_the_decision_chose_may_still_edit_the_nested_repository(self):
+        """The fix must not over-block: codex owns this work."""
+        self.nest()
+        self.assertAllowed(self.hook("codex", self.repo, "src/existing.py"))
+
+    def test_judgment_sees_every_enclosing_repository(self):
+        self.nest()
+        seen = gate.enclosing_repos(str(self.repo / "src" / "existing.py"))
+        self.assertEqual([os.path.realpath(str(self.repo / "src")),
+                          os.path.realpath(str(self.repo))], seen)
+
+    def test_repository_creation_reads_as_a_write_and_reads_still_read(self):
+        for command in ("git init -q vendor", "git clone /r /out",
+                        "git -C /r init sub", "git submodule add x y"):
+            self.assertTrue(gate.shell_writes(command), command)
+        for command in ("git init-db-not-a-verb", "git status", "git log --oneline",
+                        "git diff --check"):
+            self.assertFalse(gate.shell_writes(command), command)
+
+    def test_an_unclassified_parent_does_not_block_its_own_nested_repository(self):
+        """Judging the chain must not break the ordinary nested-repo case."""
+        other = git_repo(self.base / "plain")
+        (other / "lib").mkdir()
+        (other / "lib" / "f.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(other / "lib")], check=True,
+                       timeout=60, capture_output=True)
+        self.assertAllowed(self.hook("claude", other, "lib/f.py"))
+
+
 class RestartAndReuse(AutoCase):
     def test_the_decision_survives_into_the_next_hook_process(self):
         """Each tool call is a new process; the decision must be on disk."""

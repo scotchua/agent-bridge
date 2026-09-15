@@ -105,7 +105,11 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
+    # ``init``, ``clone`` and ``submodule`` are here because creating a
+    # repository is how the nested-.git routing escape was manufactured: a
+    # second receipt key inside a repository the caller was routed away from.
+    # The trailing (\s|$) keeps ``git init-db-not-a-verb`` a read.
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|init|clone|submodule|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
@@ -152,6 +156,37 @@ def repo_key(path: str) -> str | None:
         parent = os.path.dirname(current)
         if parent == current:
             return None
+        current = parent
+
+
+def enclosing_repos(path: str) -> list[str]:
+    """EVERY ancestor of ``path`` that holds ``.git``, outermost last.
+
+    ``repo_key`` returns the nearest one, which is the right answer for
+    *keying* a receipt and the wrong answer for *judging* a call. An
+    adversarial review found the gap and it was reachable end to end with
+    gate-allowed commands only: a client denied at a routed repository root
+    ran ``git init vendor``, which the shell heuristic did not read as a
+    write, and ``vendor`` became its own receipt key. That key had no policy
+    entry, so the automatic decision retained it, and the client then edited
+    and overwrote files inside the very repository it had been routed away
+    from, including files that already existed. Worse, a repository that
+    already contains a submodule or a linked worktree has the same hole with
+    no command at all.
+
+    So judgment considers the whole chain. ``repo_key`` is deliberately left
+    alone: it is also what ``record_decision`` and ``read_receipt`` key
+    receipts by, and repointing it would re-key every receipt already on
+    disk.
+    """
+    found: list[str] = []
+    current = os.path.realpath(os.path.abspath(path))
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            found.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return found
         current = parent
 
 
@@ -626,7 +661,9 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
         return Decision("deny", "gate_state_protected",
                         "delegation-first gate: the target is the gate's own state or a hook file; "
                         "nothing may write them through this client", tuple(sorted(set(hit))))
-    repos = tuple(sorted({repo for repo in (repo_key(path) for path in paths) if repo}))
+    # Every enclosing repository, so a nested .git cannot shadow an outer
+    # routed decision. See enclosing_repos for the escape this closes.
+    repos = tuple(sorted({repo for path in paths for repo in enclosing_repos(path)}))
     if not repos:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")

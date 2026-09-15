@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -135,6 +137,22 @@ class ConfinementSelection(unittest.TestCase):
         self.assertFalse(hostenv.LINUX_CONFINEMENT.permits("internal_nonclient"))
         self.assertFalse(hostenv.LINUX_CONFINEMENT.permits("public"))
 
+    def test_every_selectable_backend_confines_writes(self):
+        """The property an adversarial review rejected this file for lacking.
+
+        The first version of the Linux backend denied network and nothing
+        else, and leaned on the harness's post-run snapshot of the source
+        repository as the write boundary. That snapshot cannot see a write to
+        $HOME or to another checkout, so it was not a boundary. No backend is
+        offered now unless it confines writes.
+        """
+        for backend in (hostenv.MACOS_CONFINEMENT, hostenv.LINUX_CONFINEMENT):
+            self.assertTrue(backend.confines_writes, backend.name)
+
+    def test_only_an_independently_verified_backend_says_so(self):
+        self.assertTrue(hostenv.MACOS_CONFINEMENT.independently_verified)
+        self.assertFalse(hostenv.LINUX_CONFINEMENT.independently_verified)
+
     def test_the_verified_backend_carries_every_allowed_classification(self):
         for classification in ("synthetic", "public", "internal_nonclient"):
             self.assertTrue(hostenv.MACOS_CONFINEMENT.permits(classification))
@@ -147,7 +165,7 @@ class ConfinementSelection(unittest.TestCase):
                                      "verification_confinement_insufficient"})
             return
         self.assertIn(backend.name, {hostenv.MACOS_SANDBOX_EXEC,
-                                     hostenv.LINUX_NETNS_SYNTHETIC})
+                                     hostenv.LINUX_USERNS})
 
     def test_a_lane_turns_a_host_refusal_into_a_lane_refusal_with_the_code(self):
         """The code survives into the harness's own error text."""
@@ -161,6 +179,166 @@ class ConfinementSelection(unittest.TestCase):
             finally:
                 hostenv.confinement = original
             self.assertIn("verification_confinement_unavailable", str(caught.exception))
+
+
+class TheLinuxBoundaryProvesItself(unittest.TestCase):
+    """The probe runs the real confinement, so these exercise the real thing.
+
+    Every one of these was a live failure while the boundary was being built,
+    which is why each is asserted rather than reasoned about:
+
+    * the mount order was wrong, and the kernel refuses to remount a bind
+      read-write when its source is already read-only, so sealing the
+      filesystem before binding the worktree left the worktree UNWRITABLE and
+      every verification command failing;
+    * the working directory was inherited from before the namespace, so a
+      relative write got EROFS while an absolute write to the same file
+      worked;
+    * the payload was mapped root with CAP_SYS_ADMIN and could simply remount
+      / read-write, which made the whole boundary decorative;
+    * os.execv does not search PATH, so an allowlisted bare program name such
+      as "pytest" never ran at all.
+    """
+
+    def setUp(self):
+        if not hostenv._userns_usable():
+            self.skipTest("this host cannot establish the Linux write boundary")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.tree = self.base / "tree"
+        self.scratch = self.base / "scratch"
+        self.outside = self.base / "outside"
+        for path in (self.tree, self.scratch, self.outside):
+            path.mkdir()
+
+    def confined(self, program, canaries=None):
+        argv = hostenv.confined_argv(
+            [sys.executable, "-c", program], tree=self.tree, scratch=self.scratch,
+            canaries=canaries if canaries is not None else [str(self.outside)])
+        return subprocess.run(argv, cwd=str(self.tree), capture_output=True,
+                              timeout=60, check=False)
+
+    def test_a_relative_write_in_the_worktree_succeeds(self):
+        """The stale working directory bug: this failed with EROFS."""
+        completed = self.confined("open('inside.txt','w').write('ok')")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((self.tree / "inside.txt").exists())
+
+    def test_a_write_outside_the_worktree_is_refused(self):
+        target = self.outside / "escape.txt"
+        completed = self.confined(f"open({str(target)!r},'w').write('bad')")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(target.exists())
+
+    def test_a_write_to_the_home_directory_is_refused(self):
+        target = Path.home() / "agent-bridge-confinement-escape-probe"
+        self.addCleanup(lambda: target.unlink() if target.exists() else None)
+        completed = self.confined(f"open({str(target)!r},'w').write('bad')",
+                                  canaries=[str(Path.home())])
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(target.exists())
+
+    def test_the_payload_cannot_remount_the_filesystem_read_write(self):
+        """Without dropping capabilities this returned 0 and the boundary was void."""
+        completed = self.confined(
+            "import ctypes,sys;l=ctypes.CDLL(None,use_errno=True);"
+            "sys.exit(0 if l.mount(b'/',b'/',None,32|4096,None)==0 else 7)")
+        self.assertEqual(completed.returncode, 7, completed.stderr)
+
+    def test_a_nested_namespace_buys_the_payload_nothing(self):
+        target = self.outside / "nested.txt"
+        completed = self.confined(
+            "import ctypes;l=ctypes.CDLL(None,use_errno=True);"
+            "l.unshare(0x00020000|0x10000000);"
+            "l.mount(b'/',b'/',None,32|4096,None);"
+            f"open({str(target)!r},'w').write('bad')")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(target.exists())
+
+    def test_the_network_is_denied(self):
+        completed = self.confined(
+            "import socket,sys\n"
+            "try:\n"
+            "    socket.create_connection(('1.1.1.1', 443), timeout=3)\n"
+            "except OSError:\n"
+            "    sys.exit(0)\n"
+            "sys.exit(9)\n")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_a_bare_program_name_is_resolved_on_path(self):
+        """os.execv treated the name as a path, so nothing ran."""
+        argv = hostenv.confined_argv(["python3", "-c", "print('ran')"],
+                                     tree=self.tree, scratch=self.scratch,
+                                     canaries=[str(self.outside)])
+        completed = subprocess.run(argv, cwd=str(self.tree), capture_output=True,
+                                   timeout=60, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"ran", completed.stdout)
+
+    def test_a_canary_that_is_writable_refuses_to_run_the_command(self):
+        """The self-check is the whole point: no boundary, no work."""
+        completed = subprocess.run(
+            hostenv.confined_argv([sys.executable, "-c", "print('SHOULD NOT RUN')"],
+                                  tree=self.tree, scratch=self.scratch,
+                                  # The scratch directory is writable by
+                                  # design, so naming it as a canary is a
+                                  # contradiction the helper must catch.
+                                  canaries=[str(self.scratch)]),
+            cwd=str(self.tree), capture_output=True, timeout=60, check=False)
+        self.assertEqual(completed.returncode, hostenv.CONFINEMENT_SELFTEST_EXIT)
+        self.assertNotIn(b"SHOULD NOT RUN", completed.stdout)
+        self.assertIn(b"self-check failed", completed.stderr)
+
+    def test_a_missing_writable_root_is_named_not_a_traceback(self):
+        completed = subprocess.run(
+            hostenv.confined_argv([sys.executable, "-c", "print('SHOULD NOT RUN')"],
+                                  tree=self.tree, scratch=self.base / "never-created",
+                                  canaries=[str(self.outside)]),
+            cwd=str(self.tree), capture_output=True, timeout=60, check=False)
+        self.assertEqual(completed.returncode, hostenv.CONFINEMENT_SELFTEST_EXIT)
+        self.assertIn(b"is not a directory", completed.stderr)
+        self.assertNotIn(b"SHOULD NOT RUN", completed.stdout)
+
+    def test_a_worktree_path_with_a_space_is_one_argument(self):
+        """No shell anywhere, so an awkward path is just an argument."""
+        awkward = self.base / "a tree with spaces"
+        awkward.mkdir()
+        argv = hostenv.confined_argv([sys.executable, "-c", "open('f.txt','w').write('ok')"],
+                                     tree=awkward, scratch=self.scratch,
+                                     canaries=[str(self.outside)])
+        completed = subprocess.run(argv, cwd=str(awkward), capture_output=True,
+                                   timeout=60, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((awkward / "f.txt").exists())
+
+    def test_git_still_works_with_a_read_only_git_directory(self):
+        """The harness runs git verification commands inside the boundary."""
+        source = self.base / "source"
+        source.mkdir()
+        for command in (["git", "init", "-q", str(source)],
+                        ["git", "-C", str(source), "config", "user.email", "a@b.invalid"],
+                        ["git", "-C", str(source), "config", "user.name", "A"]):
+            subprocess.run(command, check=True, capture_output=True, timeout=60)
+        (source / "f.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "-A"], check=True,
+                       capture_output=True, timeout=60)
+        subprocess.run(["git", "-C", str(source), "commit", "-qm", "seed"], check=True,
+                       capture_output=True, timeout=60)
+        linked = self.base / "linked"
+        subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", "--detach",
+                        str(linked)], check=True, capture_output=True, timeout=60)
+        (linked / "f.py").write_text("x = 2\n", encoding="utf-8")
+        for index, command in enumerate((["git", "status", "--porcelain"],
+                                         ["git", "diff", "--check"])):
+            scratch = self.base / f"git-scratch-{index}"
+            scratch.mkdir()
+            argv = hostenv.confined_argv(command, tree=linked, scratch=scratch,
+                                         canaries=[str(self.outside)])
+            completed = subprocess.run(argv, cwd=str(linked), capture_output=True,
+                                       timeout=60, check=False)
+            self.assertEqual(completed.returncode, 0,
+                             (command, completed.stderr))
 
 
 class Describe(unittest.TestCase):
