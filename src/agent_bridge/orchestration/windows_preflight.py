@@ -55,6 +55,19 @@ _WSL_VERSION_ARGV = ["wsl.exe", "--version"]
 _FIRMWARE_VIRT_ARGV = [
     "systeminfo.exe",
 ]
+_NESTED_VIRT_ARGV = [
+    "powershell.exe", "-NoProfile", "-NonInteractive", "-NoLogo", "-Command",
+    "$c=Get-CimInstance Win32_ComputerSystem;"
+    "$p=Get-CimInstance Win32_Processor | Select-Object -First 1;"
+    "Write-Output ('Manufacturer=' + [string]$c.Manufacturer);"
+    "Write-Output ('Model=' + [string]$c.Model);"
+    "Write-Output ('VirtualizationFirmwareEnabled=' + "
+    "[string]$p.VirtualizationFirmwareEnabled);"
+    "Write-Output ('VMMonitorModeExtensions=' + "
+    "[string]$p.VMMonitorModeExtensions);"
+    "Write-Output ('SecondLevelAddressTranslationExtensions=' + "
+    "[string]$p.SecondLevelAddressTranslationExtensions)",
+]
 
 
 @dataclass(frozen=True)
@@ -215,6 +228,57 @@ def collect_virtual_machine_platform() -> PrerequisiteCheckResult:
 
 _FIRMWARE_VIRT_LABEL = "Virtualization Enabled In Firmware"
 _ACTIVE_HYPERVISOR_MARKER = "A hypervisor has been detected."
+_VIRTUAL_MACHINE_MARKERS = (
+    "virtual machine", "vmware", "virtualbox", "parallels", "qemu", "kvm",
+)
+
+
+def _collect_nested_virtualization() -> PrerequisiteCheckResult:
+    """Reject a VM whose virtual CPU lacks the extensions WSL2 needs.
+
+    ``systeminfo`` hides its ordinary requirement lines once any hypervisor is
+    active.  That is sufficient on a physical Hyper-V root, but not inside a
+    VM: an outer hypervisor may be visible while the CPU extensions needed to
+    create the WSL2 utility VM are not exposed.  Limit the stricter processor
+    check to machines whose manufacturer/model identifies them as virtual so
+    a valid physical Hyper-V host is not rejected for masked WMI properties.
+    """
+
+    outcome = _run_argv(_NESTED_VIRT_ARGV)
+    if not outcome.ok:
+        return PrerequisiteCheckResult(False, outcome.detail, None)
+    values: dict[str, str] = {}
+    for line in (outcome.stdout or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    identity = " ".join((values.get("Manufacturer", ""), values.get("Model", ""))).lower()
+    if not any(marker in identity for marker in _VIRTUAL_MACHINE_MARKERS):
+        # On a physical Hyper-V root, systeminfo's active-hypervisor marker is
+        # Microsoft's supported positive signal. WMI CPU flags can be masked
+        # after Hyper-V starts, so they must not override it there.
+        return PrerequisiteCheckResult(
+            True, "active hypervisor detected on a non-virtual host", "Yes"
+        )
+    required = (
+        "VirtualizationFirmwareEnabled",
+        "VMMonitorModeExtensions",
+        "SecondLevelAddressTranslationExtensions",
+    )
+    states = [values.get(name, "").lower() for name in required]
+    if any(state not in ("true", "false") for state in states):
+        return PrerequisiteCheckResult(
+            False, "could not determine nested-virtualization processor capabilities", None
+        )
+    if not all(state == "true" for state in states):
+        return PrerequisiteCheckResult(
+            False,
+            "virtual machine does not expose all processor capabilities required for WSL2",
+            "No",
+        )
+    return PrerequisiteCheckResult(
+        True, "virtual machine exposes processor capabilities required for WSL2", "Yes"
+    )
 
 
 def collect_firmware_virtualization() -> PrerequisiteCheckResult:
@@ -233,9 +297,7 @@ def collect_firmware_virtualization() -> PrerequisiteCheckResult:
     # available; treating the omitted legacy line as disabled strands valid
     # Windows hosts at the firmware stage.
     if _ACTIVE_HYPERVISOR_MARKER in stdout:
-        return PrerequisiteCheckResult(
-            True, "active hypervisor confirms firmware virtualization", "Yes"
-        )
+        return _collect_nested_virtualization()
     matching_lines = [
         line.strip() for line in stdout.splitlines() if _FIRMWARE_VIRT_LABEL in line
     ]

@@ -53,7 +53,13 @@ is inferred from something else being true.
   appearing finished.
 * **Firmware.** Virtualization in BIOS/UEFI is not something software can
   toggle. It is reported as a stage only the user can perform, with no pretence
-  otherwise.
+  otherwise. Once Windows reports that a hypervisor is active, `systeminfo`
+  hides the ordinary firmware requirement lines. On a physical Hyper-V host
+  that is a valid positive signal. Inside a recognized VM, setup also reads
+  the virtual processor capabilities and requires firmware virtualization,
+  monitor-mode extensions, and second-level address translation to be
+  explicitly exposed. This prevents an outer hypervisor from being mistaken
+  for usable nested virtualization and stops before a WSL image import.
 
 ### Resume
 

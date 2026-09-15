@@ -182,16 +182,80 @@ class FeatureStateTests(unittest.TestCase):
 
 
 class FirmwareVirtualizationTests(unittest.TestCase):
-    def test_active_hypervisor_summary_is_enabled(self):
+    def test_active_hypervisor_on_physical_host_is_enabled(self):
         output = (
             "Hyper-V Requirements:          A hypervisor has been detected. "
             "Features required for Hyper-V will not be displayed.\n"
         )
         with mock.patch.object(wp, "_run_argv") as run_argv:
-            run_argv.return_value = wp.CommandOutcome(True, "ok", output)
+            run_argv.side_effect = (
+                wp.CommandOutcome(True, "ok", output),
+                wp.CommandOutcome(
+                    True, "ok", "Manufacturer=Framework\nModel=Laptop 13\n"
+                    "VirtualizationFirmwareEnabled=False\n"
+                    "VMMonitorModeExtensions=False\n"
+                    "SecondLevelAddressTranslationExtensions=False\n",
+                ),
+            )
             result = wp.collect_firmware_virtualization()
             self.assertTrue(result.passed)
             self.assertEqual(result.value, "Yes")
+
+    def test_active_outer_hypervisor_without_nested_extensions_is_rejected(self):
+        systeminfo = (
+            "Hyper-V Requirements: A hypervisor has been detected. "
+            "Features required for Hyper-V will not be displayed.\n"
+        )
+        processor = (
+            "Manufacturer=Parallels International GmbH.\n"
+            "Model=Parallels ARM Virtual Machine\n"
+            "VirtualizationFirmwareEnabled=False\n"
+            "VMMonitorModeExtensions=False\n"
+            "SecondLevelAddressTranslationExtensions=False\n"
+        )
+        with mock.patch.object(wp, "_run_argv") as run_argv:
+            run_argv.side_effect = (
+                wp.CommandOutcome(True, "ok", systeminfo),
+                wp.CommandOutcome(True, "ok", processor),
+            )
+            result = wp.collect_firmware_virtualization()
+        self.assertFalse(result.passed)
+        self.assertIn("does not expose", result.detail)
+
+    def test_active_outer_hypervisor_with_nested_extensions_is_enabled(self):
+        systeminfo = "A hypervisor has been detected.\n"
+        processor = (
+            "Manufacturer=Microsoft Corporation\nModel=Virtual Machine\n"
+            "VirtualizationFirmwareEnabled=True\nVMMonitorModeExtensions=True\n"
+            "SecondLevelAddressTranslationExtensions=True\n"
+        )
+        with mock.patch.object(wp, "_run_argv") as run_argv:
+            run_argv.side_effect = (
+                wp.CommandOutcome(True, "ok", systeminfo),
+                wp.CommandOutcome(True, "ok", processor),
+            )
+            result = wp.collect_firmware_virtualization()
+        self.assertTrue(result.passed)
+
+    def test_active_virtual_machine_with_unknown_capability_fails_closed(self):
+        with mock.patch.object(wp, "_run_argv") as run_argv:
+            run_argv.side_effect = (
+                wp.CommandOutcome(True, "ok", "A hypervisor has been detected.\n"),
+                wp.CommandOutcome(True, "ok", "Manufacturer=VMware, Inc.\nModel=VMware7,1\n"),
+            )
+            result = wp.collect_firmware_virtualization()
+        self.assertFalse(result.passed)
+        self.assertIn("could not determine", result.detail)
+
+    def test_active_hypervisor_nested_probe_failure_fails_closed(self):
+        with mock.patch.object(wp, "_run_argv") as run_argv:
+            run_argv.side_effect = (
+                wp.CommandOutcome(True, "ok", "A hypervisor has been detected.\n"),
+                wp.CommandOutcome(False, "powershell failed", None),
+            )
+            result = wp.collect_firmware_virtualization()
+        self.assertFalse(result.passed)
+        self.assertIn("powershell failed", result.detail)
 
     def test_enabled(self):
         output = "Some line\nVirtualization Enabled In Firmware:        Yes\nOther\n"
