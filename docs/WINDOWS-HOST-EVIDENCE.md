@@ -12,6 +12,27 @@ suite, plus `test_delegation_gate`, `test_automatic_gate`,
 `test_delegation_audit` and `test_hostenv`. So the gate's *logic* is already
 Windows-tested. This script deliberately covers what that misses.
 
+## Three defects this already found, before the script ever ran on Windows
+
+Sweeping for what to check turned up three real defects, all now fixed and
+all now checked by the script, so a Windows run verifies the fixes there:
+
+ • **The gate allowed every edit, silently, for anyone whose path was not pure
+   ASCII.** Hook mode decoded its payload with the locale encoding, which on
+   Windows is the ANSI code page, while both hosts emit raw UTF-8. A
+   repository path with a non-ASCII character arrived as mojibake, no `.git`
+   was found above it, and the gate returned `allow` with
+   `outside_repository`. Measured: denied under a UTF-8 stdin, allowed under
+   `cp1252`.
+ • **A launcher that could not start Python failed open**, exiting non-zero
+   with no JSON, which a host reads as a non-blocking error before running the
+   tool anyway. On a stock Windows account with no Python, the bare name
+   `python` resolves to the Microsoft Store alias stub, so that was the
+   ordinary path there.
+ • **The quoted-character set for `cmd.exe` had only the obvious delimiters.**
+   A comma, semicolon, equals sign, percent and exclamation mark are legal in
+   a Windows directory name and all significant to `cmd.exe`.
+
 ## What it covers
 
  • **The gate's own `bin/agent-bridge-gate-hook.cmd` launcher**, which has
@@ -49,6 +70,14 @@ you trust a pass, and takes under a second. Then send back
 
 `--list` prints the check ids. `--only <id>` runs one. `--keep-fixtures`
 leaves each check's temporary tree in place.
+
+A launcher check deliberately runs with `PYTHONPATH` pointing somewhere
+useless and `PYTHONDONTWRITEBYTECODE` unset, because those are the two
+variables the `.cmd` exists to set. The first version of this script seeded
+them into every child, so every launcher check would have passed on the
+harness's coat-tails even if the launcher produced nothing usable. Deleting
+the launcher's own `PYTHONPATH` now fails three checks; before, it failed
+none.
 
 ## What it will not touch, and will not spend
 

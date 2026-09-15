@@ -1,11 +1,36 @@
 #!/bin/sh
 # PreToolUse hook for Claude Code and the Codex CLI: allow an implementation
 # write only while a routing receipt says this client's route owns the stage.
-# Also `install` and `report` subcommands. See docs/DELEGATION-GATE.md.
-set -eu
+# Also `install`, `report` and `audit` subcommands. See docs/DELEGATION-GATE.md.
+#
+# Hook mode must never fail open. The gate itself always exits 0 and carries
+# its decision in the JSON on stdout, but that contract only starts once the
+# interpreter is running. If the interpreter cannot start at all, this script
+# used to exit non-zero with nothing on stdout, and a host reads a hook that
+# failed to produce a decision as a non-blocking error and runs the tool
+# anyway. So a launch failure is turned into a deny here.
+set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(dirname -- "$HERE")
 PY=${AGENT_BRIDGE_PYTHON:-python3}
 export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
-exec "$PY" -P -m agent_bridge.orchestration.gate "$@"
+# Both hosts emit raw UTF-8 and the gate decodes its payload as UTF-8
+# explicitly; this covers everything else in the process.
+export PYTHONUTF8=1
+
+# The subcommands are operator tools, not hook mode: their exit status is
+# meaningful and must be passed through rather than turned into a decision.
+case "${1:-}" in
+  install|report|audit|-h|--help)
+    exec "$PY" -P -m agent_bridge.orchestration.gate "$@"
+    ;;
+esac
+
+# `cmd && exit 0` rather than `if cmd; then exit 0; fi`, because POSIX
+# defines $? after an `if` whose branches did not run as zero, so the
+# diagnostic reported "launcher exit 0" for a failure that was exit 1.
+"$PY" -P -m agent_bridge.orchestration.gate "$@" && exit 0
+status=$?
+printf '%s\n' "{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"delegation-first gate: the hook could not start its interpreter (launcher exit ${status}); nothing is implemented until the installation is repaired [gate_launcher_failed]\"}}"
+exit 0

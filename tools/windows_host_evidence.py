@@ -195,7 +195,24 @@ class Fixture:
         (self.state / "routing" / "routing-policy.json").write_text(
             json.dumps({"version": 1, "repos": {}}), encoding="utf-8")
 
-    def env(self) -> dict[str, str]:
+    def env(self, *, for_launcher: bool = False) -> dict[str, str]:
+        """The child environment. Isolated, and for a launcher, bare.
+
+        ``for_launcher`` is the important half, and leaving it out made every
+        launcher check here worthless. The environment seeded ``PYTHONPATH``
+        and ``PYTHONDONTWRITEBYTECODE``, which are **the two variables the
+        ``.cmd`` exists to set**. So all eight launcher checks would have
+        passed on the harness's coat-tails even if ``%~dp0``, the ``..``
+        segment or the quoted ``set`` produced nothing usable: the gate would
+        have imported through the inherited path instead. That is the same
+        shape as the two tests that drove the Codex hook with the wrong tool
+        name and passed while reaching none of the code they named.
+
+        So a launcher invocation gets an environment with those two removed,
+        and with a hostile ``PYTHONPATH`` in their place: if the launcher does
+        not set its own, the gate cannot import at all and the check fails
+        loudly instead of passing quietly.
+        """
         environment = dict(os.environ)
         environment.update({
             "HOME": str(self.home), "USERPROFILE": str(self.home),
@@ -206,6 +223,13 @@ class Fixture:
             "PYTHONDONTWRITEBYTECODE": "1",
         })
         environment.pop("CLAUDE_CONFIG_DIR", None)
+        if for_launcher:
+            hostile = self.base / "not the source tree"
+            hostile.mkdir(exist_ok=True)
+            environment["PYTHONPATH"] = str(hostile)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONUTF8", None)
+            environment.pop("PYTHONIOENCODING", None)
         return environment
 
     def payload(self, client: str, *, relative: str = "app.py") -> str:
@@ -232,7 +256,7 @@ class Fixture:
                      extra: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
         """Through the launcher script, which is the whole point of this file."""
         argv = [str(self.launcher()), "--client", client, "--config", str(self.config), *extra]
-        return run(argv, stdin=payload, env=self.env(),
+        return run(argv, stdin=payload, env=self.env(for_launcher=True),
                    cwd=str(cwd or self.repo), where="launcher", shell_on_windows=True)
 
     def via_module(self, client: str, payload: str, *, cwd: Path | None = None
@@ -251,8 +275,20 @@ class Fixture:
         because the question is whether *the host's shell* can run what the
         installer wrote.
         """
-        return run(command, stdin=payload, env=self.env(), cwd=str(cwd or self.repo),
-                   where="installed command", shell=True)
+        # Explicitly ``cmd.exe /d /s /c``, which is what a Node host uses, and
+        # not Python's ``shell=True``. That formats ``%COMSPEC% /c "..."``
+        # without ``/d``, so an AutoRun value under
+        # HKCU\Software\Microsoft\Command Processor would run first and land
+        # its output on the hook's stdout, and without ``/s``, so cmd applies
+        # its more complicated quote-stripping rules. Testing a different
+        # invocation from the one the host uses would answer a different
+        # question.
+        if os.name == "nt":
+            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+            return run(argv, stdin=payload, env=self.env(for_launcher=True),
+                       cwd=str(cwd or self.repo), where="installed command")
+        return run(command, stdin=payload, env=self.env(for_launcher=True),
+                   cwd=str(cwd or self.repo), where="installed command", shell=True)
 
 
 def run(argv, *, stdin: str | None = None, env: dict[str, str] | None = None,
@@ -291,8 +327,8 @@ def _launcher_report(fx: Fixture) -> dict:
         raise CheckError(f"no launcher at {fx.launcher()}")
     completed = run([str(fx.launcher()), "report", "--home", str(fx.home),
                      "--config", str(fx.config)],
-                    env=fx.env(), cwd=str(REPO), where="launcher report",
-                    shell_on_windows=True)
+                    env=fx.env(for_launcher=True), cwd=str(REPO),
+                    where="launcher report", shell_on_windows=True)
     if completed.returncode != 0:
         raise CheckError(f"launcher report: exit {completed.returncode} "
                          f"stderr={completed.stderr[-2000:]!r}")
@@ -528,6 +564,152 @@ def _repo_keying(fx: Fixture) -> dict:
             "item_id": next(iter(set(items.values())))}
 
 
+@check("launcher-stdin-is-utf8", "a non-ASCII repository path is judged, not silently allowed")
+def _launcher_utf8(fx: Fixture) -> dict:
+    """The worst defect this project has had, verified on the host it bit.
+
+    Hook mode read its payload with ``sys.stdin.read()``, which decodes using
+    the locale encoding. On Windows that is the ANSI code page, and both hosts
+    emit raw UTF-8. So a repository whose path held any non-ASCII character
+    arrived as mojibake, no ``.git`` was found above the mangled path, and the
+    gate returned ``allow`` with ``outside_repository``: a silent, total
+    bypass for every user whose name or project path is not pure ASCII.
+
+    The payload goes in as raw UTF-8 bytes, which is what a host writes, and
+    the environment carries no ``PYTHONUTF8`` or ``PYTHONIOENCODING``, so this
+    measures the default behaviour of this host rather than a forced one.
+    """
+    accented = fx.base / "caf\u00e9-\u9879\u76ee"
+    accented.mkdir()
+    run(["git", "init", "-q", str(accented)], where="git init accented")
+    (accented / "app.py").write_text("x = 1\n", encoding="utf-8")
+    document = {"version": 1, "declared_available": ["codex"],
+                "repos": {str(accented): {"classification": "internal_nonclient",
+                                          "allowed_routes": ["claude", "codex"]}}}
+    (fx.state / "routing" / "routing-policy.json").write_text(
+        json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+    payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Edit",
+                          "tool_input": {"file_path": str(accented / "app.py")},
+                          "cwd": str(accented)}, ensure_ascii=False)
+    argv = [str(fx.launcher()), "--client", "claude", "--config", str(fx.config)]
+    completed = run(argv, stdin=payload, env=fx.env(for_launcher=True),
+                    cwd=str(accented), where="launcher utf-8", shell_on_windows=True)
+    reason = expect_deny(completed, "routed_elsewhere", "launcher utf-8")
+    return {"repository": str(accented),
+            "non_ascii": [c for c in accented.name if ord(c) > 127],
+            "reason": reason[:300]}
+
+
+@check("launcher-failure-is-a-deny", "a launcher that cannot start Python still denies")
+def _launcher_fails_closed(fx: Fixture) -> dict:
+    """The other fail-open, and on Windows it was the default case.
+
+    The gate always exits 0 with its decision in the JSON, but that contract
+    only starts once the interpreter is running. Both launchers used to exit
+    with the interpreter's status and nothing on stdout when it could not
+    start, and a host reads a hook that produced no decision as a
+    non-blocking error and runs the tool anyway. On a stock Windows account
+    with no Python the bare name ``python`` resolves to the Microsoft Store
+    App Execution Alias stub, so this was not an edge case there.
+    """
+    environment = fx.env(for_launcher=True)
+    environment["AGENT_BRIDGE_PYTHON"] = "definitely-not-an-interpreter"
+    argv = [str(fx.launcher()), "--client", "claude", "--config", str(fx.config)]
+    completed = run(argv, stdin=fx.payload("claude"), env=environment,
+                    cwd=str(fx.repo), where="launcher with no interpreter",
+                    shell_on_windows=True)
+    if completed.returncode != 0:
+        raise CheckError(
+            f"a launch failure exited {completed.returncode} rather than 0, so a host "
+            f"would read it as a failed hook and run the tool anyway. "
+            f"stdout={completed.stdout!r} stderr={completed.stderr[-800:]!r}")
+    reason = expect_deny(completed, "gate_launcher_failed", "launcher with no interpreter")
+    return {"reason": reason[:300], "returncode": 0}
+
+
+@check("quoting-survives-the-shell", "a quoted path reaches the program as one argument")
+def _quoting_round_trip(fx: Fixture) -> dict:
+    r"""Asserts each platform's own semantics, not one platform's everywhere.
+
+    On Windows this is the delimiter matrix, because that is what the defect
+    was: NTFS forbids only ``< > : " / \ | ? *``, so a comma, a semicolon, an
+    equals sign, a percent and an exclamation mark are all legal in a
+    directory name and all significant to ``cmd.exe``, and the first version
+    of the quoted set had only the obvious ones. A path like
+    ``C:\dev\a=b\hook.cmd`` came back bare and ``cmd.exe`` truncates the
+    program name at the delimiter.
+
+    On POSIX the matrix would be wrong: a comma needs no quoting in ``sh``,
+    and asserting it did would be this project's recurring mistake pointed the
+    other way. So POSIX gets the property that actually matters instead, and
+    gets it by measurement: the quoted form, handed to the real shell, must
+    come back as exactly one argument equal to the original.
+    """
+    sys.path.insert(0, str(fx.root / "src"))
+    from agent_bridge.orchestration import gate  # noqa: PLC0415
+
+    characters = (" ", "\t", ",", ";", "=", "%", "!", "&", "^", "(", ")", "'")
+    if os.name == "nt":
+        results, bare = {}, []
+        for character in characters:
+            path = "C:\\dev\\a" + character + "b\\hook.cmd"
+            quoted = gate.quote_for_host_shell(path)
+            results[character] = quoted
+            if quoted == path:
+                bare.append(character)
+        if bare:
+            raise CheckError("left bare on Windows, so cmd.exe would break the "
+                             f"command at the delimiter: {bare}")
+        return {"platform": "nt", "quoted": results}
+
+    # POSIX: measure the round trip through the real shell.
+    round_trips = {}
+    for character in characters:
+        path = "/dev/a" + character + "b/hook"
+        quoted = gate.quote_for_host_shell(path)
+        completed = run(["sh", "-c", "printf '%s' " + quoted], where="sh round trip")
+        if completed.returncode != 0 or completed.stdout != path:
+            raise CheckError(
+                f"quoting {path!r} as {quoted!r} did not survive sh: "
+                f"exit {completed.returncode} stdout={completed.stdout!r}")
+        round_trips[character] = quoted
+    return {"platform": "posix", "round_tripped": round_trips}
+
+
+@check("claude-config-dir-observation", "whether install_paths honours CLAUDE_CONFIG_DIR")
+def _claude_config_dir(fx: Fixture) -> dict:
+    """Recorded, not asserted, because it rests on a fact I cannot check here.
+
+    ``gate.install_paths`` computes Claude's settings path as
+    ``<home>/.claude/settings.json`` and never consults ``CLAUDE_CONFIG_DIR``,
+    while the rest of this repository treats that variable as where Claude
+    Code's configuration lives, and ``INSTALL.md`` tells the user to set it.
+    If Claude Code reads ``settings.json`` from there, then on an account that
+    sets it the hook is written to a file the host does not read while the
+    install report and ``gate report`` both say "installed", which is a
+    fail-open.
+
+    Whether Claude Code does read it is a fact about Claude Code, not about
+    this repository, so this check states the mismatch and leaves the
+    conclusion to somebody who can observe the host. It does not fail.
+    """
+    sys.path.insert(0, str(fx.root / "src"))
+    from agent_bridge.orchestration import gate  # noqa: PLC0415
+
+    import inspect
+    source = inspect.getsource(gate.install_paths)
+    paths = gate.install_paths(str(fx.home))
+    return {
+        "install_paths_reads_claude_config_dir": "CLAUDE_CONFIG_DIR" in source,
+        "claude_settings_path": paths["claude_settings"],
+        "claude_config_dir_in_this_environment": os.environ.get("CLAUDE_CONFIG_DIR"),
+        "open_question": ("does Claude Code read settings.json from CLAUDE_CONFIG_DIR? "
+                          "If it does, an account that sets it gets a hook written "
+                          "where the host does not look, reported as installed."),
+    }
+
+
 @check("hostenv-git", "git resolves on this host and the resolved path runs")
 def _hostenv_git(fx: Fixture) -> dict:
     """``GIT_CANDIDATES["Windows"]`` is empty, so resolution falls straight
@@ -637,7 +819,8 @@ def _audit_runs(fx: Fixture) -> dict:
                 "routed_elsewhere", "a decision before the audit")
     rendered = run([str(fx.launcher()), "audit", "--home", str(fx.home),
                     "--config", str(fx.config), "--since-hours", "0", "--json"],
-                   env=fx.env(), cwd=str(REPO), where="audit", shell_on_windows=True)
+                   env=fx.env(for_launcher=True), cwd=str(REPO), where="audit",
+                   shell_on_windows=True)
     if rendered.returncode != 0:
         raise CheckError(f"audit: exit {rendered.returncode} "
                          f"stderr={rendered.stderr[-2000:]!r}")
@@ -744,12 +927,14 @@ def self_test() -> list[dict]:
 SPACED = {"installed-command-runs", "launcher-report", "launcher-allow",
           "launcher-deny", "launcher-chosen-route", "launcher-exit-zero",
           "launcher-foreign-cwd", "launcher-strict-posture",
-          "protected-state", "protected-state-mixed-case", "audit-runs"}
+          "protected-state", "protected-state-mixed-case", "audit-runs",
+          "launcher-stdin-is-utf8", "launcher-failure-is-a-deny"}
 NEEDS_CHECKOUT_COPY = {"launcher-report", "launcher-allow", "launcher-deny",
                        "launcher-chosen-route", "launcher-exit-zero",
                        "launcher-foreign-cwd", "launcher-strict-posture",
                        "installed-command-runs", "protected-state",
-                       "protected-state-mixed-case", "audit-runs"}
+                       "protected-state-mixed-case", "audit-runs",
+                       "launcher-stdin-is-utf8", "launcher-failure-is-a-deny"}
 
 
 def collect(only: tuple[str, ...] = (), keep: bool = False) -> dict:

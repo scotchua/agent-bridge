@@ -1220,6 +1220,91 @@ whole round in miniature, so it goes first.
     Windows runners**, which is the difference between a claim and a
     measurement, and it is the reviewer's standard applied to my own work.
 
+60. **The gate allowed every edit, silently, for anyone whose path was not
+    pure ASCII.** Hook mode read its payload with `sys.stdin.read()`, which
+    decodes using the locale encoding. On Windows that is the ANSI code page,
+    and both hosts emit raw UTF-8: Node's `JSON.stringify` and Rust's
+    `serde_json` do not escape non-ASCII. So for a repository whose path held
+    any non-ASCII character the payload arrived as mojibake,
+    `enclosing_repos` found no `.git` above the mangled path, and `judge`
+    returned `allow` with `outside_repository`. **The gate printed an empty
+    object and the edit proceeded ungated.**
+
+    Measured rather than reasoned: the same payload naming a repository with
+    an e-acute is denied `routed_elsewhere` under a UTF-8 stdin and allowed
+    under `cp1252`. This is the worst defect this project has had. It is not
+    an edge case but a whole population: every user whose name or project
+    path is not pure ASCII, which is most of the world.
+
+    The fix reads bytes and names the encoding, in the gate rather than in a
+    launcher, because a launcher fix would not protect a host that invokes
+    the module directly. Non-UTF-8 bytes are a deny rather than a guess, and
+    a byte-order mark is tolerated because a BOM is not a disagreement about
+    the encoding, only about announcing it. The launchers set `PYTHONUTF8`
+    too, for everything else in the process.
+
+    The general rule: **a decoding default is a platform assumption**, and
+    this codebase had already been caught four times by platform assumptions
+    in cross-platform components. I had been looking for them in path
+    handling and quoting. Encoding is the same class and I did not think of
+    it until a sweep did.
+
+61. **A launcher that could not start Python failed open, and on Windows that
+    was the default case.** The gate always exits 0 and carries its decision
+    in the JSON, but that contract only begins once the interpreter is
+    running. Both launchers exited with the interpreter's status and nothing
+    on stdout when it could not start, and a host reads a hook that produced
+    no decision as a non-blocking error and runs the tool anyway. On a stock
+    Windows account with no Python the bare name `python` resolves to the
+    Microsoft Store App Execution Alias stub, so the fail-open was the
+    ordinary path there, not an unlucky one.
+
+    Both launchers now turn a launch failure into a deny and exit 0, while
+    passing the operator subcommands' own exit status through untouched,
+    because turning `report`'s failure into a fake hook decision would hide
+    it. Writing that fix produced a smaller lesson of its own: `$?` after an
+    `if` whose branches did not run is defined as zero, so the first version
+    reported "launcher exit 0" for a failure that was exit 127.
+
+62. **My quoted-character set for `cmd.exe` had only the obvious delimiters.**
+    Finding 57 fixed the quoting and I chose the set by intuition: space,
+    tab, quote, and the redirection and grouping characters. NTFS forbids
+    only `< > : " / \ | ? *`, so a comma, a semicolon, an equals sign, a
+    percent and an exclamation mark are all legal in a directory name and all
+    significant to `cmd.exe`, which truncates the program name at the
+    delimiter or expands a variable. `C:\dev\a=b\hook.cmd` came back bare.
+
+    Worth noticing that this is a fix to a fix, found by asking a fresh
+    reader to attack the same area rather than by re-reading it myself. The
+    matrix is now asserted per platform: the delimiter set on Windows, and on
+    POSIX a measured round trip through the real shell, because a comma needs
+    no quoting in `sh` and asserting that it did would be the same mistake
+    pointed the other way.
+
+63. **The evidence collector I wrote to test the launcher tested the harness
+    instead.** Its fixture seeded `PYTHONPATH` and `PYTHONDONTWRITEBYTECODE`
+    into every child, including every launcher invocation, and those are
+    precisely the two variables the `.cmd` exists to set. So all eight
+    launcher checks would have passed even if `%~dp0`, the `..` segment or
+    the quoted `set` produced nothing usable, because the gate would have
+    imported through the inherited path. A launcher invocation now gets those
+    removed and a hostile `PYTHONPATH` in their place, and deleting the
+    launcher's own `export PYTHONPATH` now fails three checks where it
+    previously failed none.
+
+    It also ran the installed command string through Python's `shell=True`,
+    which formats `%COMSPEC% /c` without `/d` or `/s`, where a Node host uses
+    `/d /s /c`. Testing a different invocation from the one the host uses
+    answers a different question.
+
+    Third time in this session that the same defect shape has appeared in my
+    own test code. The pattern is stable enough to name as a rule: **ask of
+    every new test what its pass would look like if the mechanism were
+    absent**, and if the answer is "the same", the test is decoration. The
+    collector now carries an assertion self-test whose result is embedded in
+    every record, so the next reader does not have to take the question on
+    trust.
+
 ### What is still not true, after this round
 
 * **The two desktop products and Codex on the web cannot be intercepted.**

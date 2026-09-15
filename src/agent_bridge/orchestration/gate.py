@@ -877,6 +877,41 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str]:
     return loaded["state_root"], loaded["capacity_db"]
 
 
+def _hook_input() -> str:
+    r"""The PreToolUse payload, decoded as UTF-8 whatever the locale says.
+
+    This was ``sys.stdin.read()``, which decodes with the locale encoding. On
+    Windows that is the ANSI code page, and both hosts emit raw UTF-8: Node's
+    ``JSON.stringify`` and Rust's ``serde_json`` do not escape non-ASCII. So a
+    repository whose path contained any non-ASCII character arrived as
+    mojibake, ``enclosing_repos`` found no ``.git`` above the mangled path, and
+    :func:`judge` returned ``allow`` with ``outside_repository``. **The gate
+    printed an empty object and the edit proceeded ungated.**
+
+    Measured, not inferred. The same payload naming a repository with an
+    e-acute in its path is denied ``routed_elsewhere`` under a UTF-8 stdin and
+    allowed under ``cp1252``. That is a silent, total bypass for every user
+    whose name or project path is not pure ASCII, which is most of the world.
+
+    Reading bytes and naming the encoding fixes it here, in the gate, rather
+    than in a launcher: a fix in the launcher would not protect a host that
+    invokes the module directly, and the launchers set ``PYTHONUTF8`` as well
+    for everything else in the process.
+
+    Strict decoding on purpose. A payload that is not valid UTF-8 is not
+    something to guess at; it raises, and hook mode turns that into a deny.
+    A leading byte-order mark is tolerated, because a BOM is not a
+    disagreement about the encoding, only about announcing it.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:                    # a replaced stdin, as in a test
+        return sys.stdin.read()
+    raw = buffer.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8")
+
+
 def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
              protected: tuple[str, ...] = (), decide: Any = None) -> Decision:
@@ -903,10 +938,18 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
 # ------------------------------------------------------------ installation
 
 
-#: Characters that make a Windows command line need quoting. Space is the
-#: one that matters: an ordinary Windows home is ``C:/Users/First Last``,
-#: with backslashes.
-_CMD_NEEDS_QUOTES = ' \t"&|<>^()'
+#: Characters that make a Windows command line need quoting.
+#:
+#: Space is the one that matters, because an ordinary Windows home is
+#: ``C:/Users/First Last`` with backslashes. The rest are here because the
+#: first version of this set had only the obvious ones, and a comma, a
+#: semicolon, an equals sign, a percent and an exclamation mark are every
+#: bit as significant to ``cmd.exe`` while being perfectly legal in a
+#: Windows directory name: NTFS forbids only < > : " / \ | ? * . A path
+#: like ``C:/dev/a=b/hook.cmd`` came back unquoted, and ``cmd.exe`` then
+#: truncates the program name at the delimiter, so the hook never runs.
+#: Percent is variable expansion and exclamation is delayed expansion.
+_CMD_NEEDS_QUOTES = ' \t"&|<>^(),;=%!'
 
 
 def quote_for_host_shell(value: str) -> str:
@@ -1342,7 +1385,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             state_root, capacity_db = gate_paths_from_config(args.config or "")
         protected = protected_paths(state_root, args.config, home, capacity_db)
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
         decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,

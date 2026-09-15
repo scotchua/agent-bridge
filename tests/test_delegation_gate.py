@@ -805,6 +805,24 @@ class TheWindowsHookCommandQuoting(unittest.TestCase):
         """The specific defect: cmd.exe cannot read them."""
         self.assertNotIn("'", self.quoted(r"C:\Users\First Last\x.cmd", "nt"))
 
+    def test_every_cmd_delimiter_legal_in_a_path_is_quoted(self):
+        r"""The first version of the quoted set had only the obvious ones.
+
+        NTFS forbids only < > : " / \ | ? * , so a comma, a semicolon, an
+        equals sign, a percent and an exclamation mark are all legal in a
+        directory name and all significant to cmd.exe: it truncates the
+        program name at the delimiter, or expands a variable, and the hook
+        never runs. Found by sweeping for more instances of the pattern that
+        had already produced four defects.
+        """
+        for character in (" ", "\t", ",", ";", "=", "%", "!", "&", "^", "(", ")"):
+            path = "C:\\dev\\a" + character + "b\\hook.cmd"
+            quoted = self.quoted(path, "nt")
+            with self.subTest(character=character):
+                self.assertNotEqual(quoted, path,
+                                    f"a path containing {character!r} was left bare")
+                self.assertTrue(quoted.startswith('"') and quoted.endswith('"'), quoted)
+
     def test_a_windows_path_without_metacharacters_is_left_alone(self):
         self.assertEqual(self.quoted(r"C:\Users\a\x.cmd", "nt"),
                          r"C:\Users\a\x.cmd")
@@ -913,6 +931,165 @@ class TheWindowsHookCommandQuoting(unittest.TestCase):
         source = inspect.getsource(gate.hook_command)
         self.assertEqual(source.count("quote_for_host_shell"), 2)
         self.assertNotIn("shlex.quote", source)
+
+
+class TheHookPayloadIsUtf8WhateverTheLocaleSays(unittest.TestCase):
+    r"""The worst defect this project has had: a silent, total bypass.
+
+    Hook mode read its payload with ``sys.stdin.read()``, which decodes using
+    the locale encoding. On Windows that is the ANSI code page, and both hosts
+    emit raw UTF-8: Node's ``JSON.stringify`` and Rust's ``serde_json`` do not
+    escape non-ASCII. So for a repository whose path contained any non-ASCII
+    character the payload arrived as mojibake, ``enclosing_repos`` found no
+    ``.git`` above the mangled path, and ``judge`` returned ``allow`` with
+    ``outside_repository``. The gate printed an empty object and the edit
+    proceeded ungated, for every user whose name or project path is not pure
+    ASCII.
+
+    Measured before the fix: the same payload naming a repository with an
+    e-acute was denied ``routed_elsewhere`` under a UTF-8 stdin and allowed
+    under ``cp1252``.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        (self.state / "routing").mkdir(parents=True)
+        self.db = self.state / "capacity.sqlite3"
+        self.config = self.base / "orchestration.json"
+        self.config.write_text(json.dumps(
+            {"state_root": str(self.state), "capacity_db": str(self.db)}), encoding="utf-8")
+        # An e-acute and a CJK character, so the test is not about one codec.
+        self.repo = self.base / "caf\u00e9-\u9879\u76ee"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, timeout=60,
+                       capture_output=True)
+        (self.repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (self.state / "routing" / "routing-policy.json").write_text(
+            json.dumps({"version": 1, "declared_available": ["codex"],
+                        "repos": {str(self.repo): {
+                            "classification": "internal_nonclient",
+                            "allowed_routes": ["claude", "codex"]}}}, ensure_ascii=False),
+            encoding="utf-8")
+
+    def judge_with(self, encoding: str) -> dict:
+        """Drive the gate as a subprocess with its stdio encoding forced.
+
+        ``PYTHONIOENCODING`` is how this test reproduces on Linux what a
+        Windows ANSI code page does by default. The payload goes in as raw
+        UTF-8 bytes, which is what a host writes.
+        """
+        payload = json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+             "tool_input": {"file_path": str(self.repo / "app.py")},
+             "cwd": str(self.repo)}, ensure_ascii=False).encode("utf-8")
+        environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"),
+                       "PYTHONIOENCODING": encoding}
+        environment.pop("PYTHONUTF8", None)
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=payload, capture_output=True, timeout=120, env=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def code(self, payload: dict) -> str:
+        output = payload.get("hookSpecificOutput")
+        if not output:
+            return "ALLOWED"
+        reason = str(output.get("permissionDecisionReason", ""))
+        return reason.rsplit("[", 1)[-1].rstrip("]")
+
+    def test_a_non_ascii_repository_is_judged_under_every_stdio_encoding(self):
+        for encoding in ("utf-8", "cp1252", "latin-1", "ascii"):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(self.code(self.judge_with(encoding)),
+                                 "routed_elsewhere",
+                                 f"the gate did not judge the call under {encoding}")
+
+    def test_the_gate_reads_bytes_rather_than_the_locale(self):
+        """Pinned in the source too, because the defect is invisible in the
+        output on a host whose locale happens to be UTF-8, which is every
+        Linux CI runner this project has."""
+        import inspect
+        source = inspect.getsource(gate._hook_input)
+        self.assertIn('decode("utf-8")', source)
+        self.assertIn("sys.stdin", source)
+        self.assertNotIn("sys.stdin.read()", inspect.getsource(gate.main))
+
+    def test_a_byte_order_mark_is_tolerated(self):
+        payload = b"\xef\xbb\xbf" + json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+             "tool_input": {"file_path": str(self.repo / "app.py")},
+             "cwd": str(self.repo)}).encode("utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=payload, capture_output=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(self.code(json.loads(completed.stdout)), "routed_elsewhere")
+
+    def test_bytes_that_are_not_utf8_are_a_deny_rather_than_a_guess(self):
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=b"\xff\xfe{not even close}", capture_output=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(self.code(json.loads(completed.stdout)), "gate_error")
+
+
+class TheLauncherNeverFailsOpen(unittest.TestCase):
+    """A hook that produces no decision is read as a non-blocking error.
+
+    The gate always exits 0 and carries its decision in the JSON, but that
+    contract only starts once the interpreter is running. Both launchers used
+    to exit with the interpreter's status and nothing on stdout when it could
+    not start, which a host treats as a failed hook and then runs the tool
+    anyway. On a stock Windows account with no Python the bare name ``python``
+    resolves to the Microsoft Store App Execution Alias stub, so this was the
+    default case there, not an edge case.
+    """
+
+    def launcher(self) -> Path:
+        return ROOT / "bin" / ("agent-bridge-gate-hook"
+                               + (".cmd" if os.name == "nt" else ""))
+
+    def run_launcher(self, *args, python: str | None = None):
+        environment = dict(os.environ)
+        if python is not None:
+            environment["AGENT_BRIDGE_PYTHON"] = python
+        argv = [str(self.launcher()), *args]
+        if os.name == "nt":
+            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+                    subprocess.list2cmdline(argv)]
+        return subprocess.run(argv, input="{}", capture_output=True, text=True,
+                              timeout=120, env=environment, cwd=str(ROOT))
+
+    def test_an_interpreter_that_cannot_start_is_a_deny(self):
+        completed = self.run_launcher("--client", "claude", "--state-root",
+                                      "/nonexistent-state-root",
+                                      python="definitely-not-an-interpreter")
+        self.assertEqual(completed.returncode, 0,
+                         f"a launch failure must still exit 0: {completed.stderr[-500:]}")
+        payload = json.loads(completed.stdout)
+        reason = payload["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertTrue(reason.endswith("[gate_launcher_failed]"), reason)
+        self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_subcommand_keeps_its_own_exit_status(self):
+        """The subcommands are operator tools. Turning their failure into a
+        fake hook decision would hide it."""
+        completed = self.run_launcher("report", "--config", "/nonexistent.json")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", completed.stdout)
+
+    def test_both_launchers_set_utf8_mode(self):
+        for name in ("agent-bridge-gate-hook", "agent-bridge-gate-hook.cmd"):
+            text = (ROOT / "bin" / name).read_text(encoding="utf-8")
+            self.assertIn("PYTHONUTF8", text, name)
 
 
 if __name__ == "__main__":
