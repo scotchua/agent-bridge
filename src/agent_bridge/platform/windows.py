@@ -1298,9 +1298,11 @@ class WindowsPlatform:
         account, or any object's descriptor could not be read, or the walk
         could not complete, nothing is written and the pass fails: an
         object whose owner is unknown may be another account's, and this
-        lane must not use a store holding one. Every handle is held
-        without delete sharing until the pass ends, so no object judged
-        here can be renamed away or replaced meanwhile. Otherwise the root is judged strictly
+        lane must not use a store holding one. Every directory handle,
+        the root's included, is held without delete sharing until the
+        pass ends, so no directory judged here can be renamed away or
+        replaced meanwhile (files are not pinned; see
+        FILE_SHARE_KEEP_NAME). Otherwise the root is judged strictly
         and each descendant with inherited entries allowed; an object that
         passes is left alone, and one that fails has its DACL replaced, in
         a single write to that object only, with the exact owner-only DACL
