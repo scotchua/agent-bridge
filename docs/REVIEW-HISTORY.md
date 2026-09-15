@@ -1244,8 +1244,28 @@ whole round in miniature, so it goes first.
   the real `HOME` and its own Read and Write tools inside the generation
   worktree. That is the direct worktree-to-patch channel and confining
   verification does not touch it.
-* **Nothing here has been live-tested on Windows or macOS.** Everything in
-  this round ran on Linux. The Windows `.cmd` hook launcher is written and
-  has never been run under either host, and `INSTALL.md` now says that
-  instead of leaving it to be inferred from a sentence three paragraphs
-  earlier that said automatic delegation was unavailable.
+* **What has and has not run on macOS and Windows.** I said "nothing here
+  has been live-tested on Windows or macOS" several times in this round, and
+  that understated the evidence. Reading the workflow settles it:
+
+  Run and passing on all three runners: the whole offline suite, and
+  `test_delegation_gate`, `test_automatic_gate`, `test_delegation_audit` and
+  `test_hostenv`. So the gate's own logic, including classification,
+  routing, receipts, capacity, dispatch intents, the protected-path rule and
+  the write heuristic, is exercised on real macOS and Windows hosts. The
+  Windows case-folding behaviour above is asserted by the Windows runners
+  rather than by patching `os.path`.
+
+  Run on macOS and Linux, skipped on Windows: `test_claude_task`,
+  `test_codex_task` and the end-to-end workflow. So the macOS
+  `sandbox-exec` confinement is exercised on macOS, and neither execution
+  lane nor the full workflow is exercised on Windows at all.
+
+  Never run anywhere: **the gate hook's own `.cmd` launcher.** The Windows
+  smoke test in CI runs `agent-bridge-windows-setup.cmd`, a different
+  launcher. And on no platform has the hook been invoked by Claude Code or
+  Codex themselves; every test drives the gate module as a subprocess, which
+  is the same interface but not the same integration.
+
+  Being imprecise about this cut both ways: it understated what CI proves
+  and it blurred the one thing that genuinely has no coverage.

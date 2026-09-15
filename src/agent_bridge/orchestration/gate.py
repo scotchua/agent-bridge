@@ -1138,7 +1138,9 @@ NOT_COVERED = [
     "Codex started with --dangerously-bypass-hook-trust, or a hook not yet trusted in /hooks",
     "shell commands that write in a way the text heuristic does not recognise, including one that "
     "reaches the gate's own state or the hook files without naming their paths",
-    "installation on Windows: the .cmd launcher is written but has not been run under either host",
+    "installation on Windows: the gate's own .cmd launcher is written and has never been run. "
+    "The gate's logic is exercised on Windows by CI; this launcher is not, and neither is the "
+    "hook being invoked by Claude Code or Codex rather than as a subprocess",
     "mechanical text work an assistant performs in its own context: it produces no tool "
     "call, so no local mechanism intercepts it. The local worker's automatic intake "
     "covers work an assistant sends it, not work it never sends",

@@ -418,8 +418,15 @@ evidence is the part worth quoting: 544 core tests passed with five
 environmental skips, 118 focused gate, routing and audit tests passed, and
 none of those passing tests covered any of the defects.
 
-Everything below ran on Linux. Nothing here is evidence about macOS or
-Windows, and no provider account was contacted.
+The interactive work below was done on Linux, and no provider account was
+contacted. It is not true, as an earlier draft of this section said, that
+none of it is evidence about macOS or Windows: CI runs the gate suites
+(`test_delegation_gate`, `test_automatic_gate`, `test_delegation_audit`,
+`test_hostenv`) and the whole offline suite on macOS and Windows runners as
+well, and the execution lanes and the end-to-end workflow on macOS. What has
+no coverage on any platform is the gate hook's own `.cmd` launcher and the
+hook being invoked by Claude Code or Codex rather than as a subprocess. The
+per-platform split is in `REVIEW-HISTORY.md` under "What is still not true".
 
 ## Critical: routing could be escaped one directory down
 
