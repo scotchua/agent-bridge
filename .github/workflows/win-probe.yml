@@ -1,0 +1,26 @@
+# Temporary diagnostic. Measures, on the hosted Windows runner, whether an
+# icacls deny ACE on the caller's own SID takes effect under bash and under
+# pwsh, and what the temp directory and token privileges look like in each.
+# Removed before the branch lands.
+name: win-probe
+on:
+  push:
+    branches: [fix/ci-matrix-2026-09-14]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: probe under bash
+        shell: bash
+        run: python3 tests/_win_probe.py
+      - name: probe under pwsh
+        shell: pwsh
+        run: python3 tests/_win_probe.py
+      - name: probe under cmd
+        shell: cmd
+        run: python3 tests\_win_probe.py
