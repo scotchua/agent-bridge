@@ -813,6 +813,54 @@ the key, and the tool verifies it before printing an anchor. It refuses a file
 that is a key by name or by content, and its `scan` subcommand checks the
 whole working tree and runs in CI.
 
+55. **My fix for the staleness gap livelocked the two clients, and its own
+    regression test could not have caught it.** Finding 50's digest
+    subtracted the asking client's own presence row, on the reasoning that a
+    client's own presence is not news to itself. That reasoning is fine and
+    the conclusion was wrong, because **a receipt is one shared
+    per-repository artifact**. Claude and Codex therefore computed different
+    digests from the identical ledger, each found the other's receipt
+    overtaken, each re-decided it to route the work to the other, and both
+    ended up permanently denied, each holding an instruction to dispatch to
+    the other. Worse than the four-hour staleness it replaced.
+
+    The general rule, which I did not have before this: anything compared
+    against a shared artifact has to be computed identically by everyone who
+    compares it. Route names only already solved the churn the subtraction
+    was for, so the subtraction was buying nothing and costing everything.
+
+    The part worth dwelling on is how it survived. The test written to guard
+    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
+    tool, so the gate classified the call as not gated and allowed it without
+    reading the receipt. **The test passed while exercising nothing**, and it
+    was the only test standing between this defect and a merge. A test that
+    asserts the right thing about the wrong call is not a weaker test than
+    none; it is worse, because it reports coverage.
+
+    Found by walking `INSTALL.md` by hand again, which is now three for three
+    on finding what the suites did not (findings 44, 45 and this one).
+
+56. **Two wrong causes for one intermittent check, and then a third.** The
+    orphan-process checks were attributed to machine load (finding 46,
+    corrected), then to zombie accounting (finding 46's correction, also
+    incomplete). A run after the zombie filter landed reported a survivor
+    that was not a zombie.
+
+    The check samples once, half a second after the group kill, and asks
+    whether a live process survived. SIGKILL is asynchronous, the kernel
+    still has to run the exit path, and a parent still has to reap, so one
+    sample at a fixed instant measures scheduling, not containment. It now
+    polls until the groups drain or five seconds pass, and reports each
+    survivor's actual process state, because a pid on its own does not say
+    whether it is running, sleeping uninterruptibly, stopped or already dead,
+    and those have different causes. A process that genuinely leaked stays
+    forever, so the deadline costs nothing and the old single sample cost
+    false failures.
+
+    I have now been wrong about this check three times, each time from a
+    message that printed pids and nothing else. The diagnostic was the fix
+    that mattered.
+
 ### What is still not true, after this round
 
 No step of this has run on Windows. No image has been imported, no canary has
@@ -915,6 +963,54 @@ pinned at a value carrying the digits. Beside it is the property that envelope
 is an instance of: ten thousand random session ids, none of which may change a
 verdict. A fixed envelope proves one id is handled; the property proves the id
 cannot be what decides.
+
+55. **My fix for the staleness gap livelocked the two clients, and its own
+    regression test could not have caught it.** Finding 50's digest
+    subtracted the asking client's own presence row, on the reasoning that a
+    client's own presence is not news to itself. That reasoning is fine and
+    the conclusion was wrong, because **a receipt is one shared
+    per-repository artifact**. Claude and Codex therefore computed different
+    digests from the identical ledger, each found the other's receipt
+    overtaken, each re-decided it to route the work to the other, and both
+    ended up permanently denied, each holding an instruction to dispatch to
+    the other. Worse than the four-hour staleness it replaced.
+
+    The general rule, which I did not have before this: anything compared
+    against a shared artifact has to be computed identically by everyone who
+    compares it. Route names only already solved the churn the subtraction
+    was for, so the subtraction was buying nothing and costing everything.
+
+    The part worth dwelling on is how it survived. The test written to guard
+    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
+    tool, so the gate classified the call as not gated and allowed it without
+    reading the receipt. **The test passed while exercising nothing**, and it
+    was the only test standing between this defect and a merge. A test that
+    asserts the right thing about the wrong call is not a weaker test than
+    none; it is worse, because it reports coverage.
+
+    Found by walking `INSTALL.md` by hand again, which is now three for three
+    on finding what the suites did not (findings 44, 45 and this one).
+
+56. **Two wrong causes for one intermittent check, and then a third.** The
+    orphan-process checks were attributed to machine load (finding 46,
+    corrected), then to zombie accounting (finding 46's correction, also
+    incomplete). A run after the zombie filter landed reported a survivor
+    that was not a zombie.
+
+    The check samples once, half a second after the group kill, and asks
+    whether a live process survived. SIGKILL is asynchronous, the kernel
+    still has to run the exit path, and a parent still has to reap, so one
+    sample at a fixed instant measures scheduling, not containment. It now
+    polls until the groups drain or five seconds pass, and reports each
+    survivor's actual process state, because a pid on its own does not say
+    whether it is running, sleeping uninterruptibly, stopped or already dead,
+    and those have different causes. A process that genuinely leaked stays
+    forever, so the deadline costs nothing and the old single sample cost
+    false failures.
+
+    I have now been wrong about this check three times, each time from a
+    message that printed pids and nothing else. The diagnostic was the fix
+    that mattered.
 
 ### What is still not true, after this round
 
@@ -1104,6 +1200,54 @@ whole round in miniature, so it goes first.
     the check reports a failure that has nothing to do with the code, on the
     same line a real regression would use. They measure whether mode bits
     bind this account and skip by name when they do not.
+
+55. **My fix for the staleness gap livelocked the two clients, and its own
+    regression test could not have caught it.** Finding 50's digest
+    subtracted the asking client's own presence row, on the reasoning that a
+    client's own presence is not news to itself. That reasoning is fine and
+    the conclusion was wrong, because **a receipt is one shared
+    per-repository artifact**. Claude and Codex therefore computed different
+    digests from the identical ledger, each found the other's receipt
+    overtaken, each re-decided it to route the work to the other, and both
+    ended up permanently denied, each holding an instruction to dispatch to
+    the other. Worse than the four-hour staleness it replaced.
+
+    The general rule, which I did not have before this: anything compared
+    against a shared artifact has to be computed identically by everyone who
+    compares it. Route names only already solved the churn the subtraction
+    was for, so the subtraction was buying nothing and costing everything.
+
+    The part worth dwelling on is how it survived. The test written to guard
+    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
+    tool, so the gate classified the call as not gated and allowed it without
+    reading the receipt. **The test passed while exercising nothing**, and it
+    was the only test standing between this defect and a merge. A test that
+    asserts the right thing about the wrong call is not a weaker test than
+    none; it is worse, because it reports coverage.
+
+    Found by walking `INSTALL.md` by hand again, which is now three for three
+    on finding what the suites did not (findings 44, 45 and this one).
+
+56. **Two wrong causes for one intermittent check, and then a third.** The
+    orphan-process checks were attributed to machine load (finding 46,
+    corrected), then to zombie accounting (finding 46's correction, also
+    incomplete). A run after the zombie filter landed reported a survivor
+    that was not a zombie.
+
+    The check samples once, half a second after the group kill, and asks
+    whether a live process survived. SIGKILL is asynchronous, the kernel
+    still has to run the exit path, and a parent still has to reap, so one
+    sample at a fixed instant measures scheduling, not containment. It now
+    polls until the groups drain or five seconds pass, and reports each
+    survivor's actual process state, because a pid on its own does not say
+    whether it is running, sleeping uninterruptibly, stopped or already dead,
+    and those have different causes. A process that genuinely leaked stays
+    forever, so the deadline costs nothing and the old single sample cost
+    false failures.
+
+    I have now been wrong about this check three times, each time from a
+    message that printed pids and nothing else. The diagnostic was the fix
+    that mattered.
 
 ### What is still not true, after this round
 

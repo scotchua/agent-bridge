@@ -208,9 +208,15 @@ in five ordinary cases:
 * **the set of routes with capacity changed.** Recorded the same way, and for
   the same reason: a receipt saying "the peer has no fresh capacity" is
   exactly the one that should stop being true the moment the peer appears.
-  The digest is route names only, and it leaves out the asking client's own
-  presence row, because the hook rewrites that row on every call and a
-  digest over the whole table re-decided every call.
+
+  The digest is **route names only, and identical for both clients**. Names
+  only because the hook rewrites its own presence row on every call, so a
+  digest over the rows would re-decide on every call. Identical for both
+  clients because a receipt is one shared artifact: a version that subtracted
+  the asking client's own presence row made claude and codex compute
+  different values from the same ledger, so each found the other's receipt
+  overtaken and re-decided it to route the work to the other, and both ended
+  up permanently denied.
 * it was decided for a different kind of work;
 * it has expired;
 * the stage it points at is finished, reassigned or its lease has lapsed,

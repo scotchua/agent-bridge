@@ -257,18 +257,27 @@ class TheCapacityFingerprint(unittest.TestCase):
                  for row in self.rows(("codex", "feed"))]
         self.assertEqual(capacity_fingerprint(later, 1500.0), first)
 
-    def test_the_asking_client_own_presence_row_is_left_out(self):
-        rows = self.rows(("claude", PRESENCE_SOURCE), ("codex", "feed"))
-        self.assertEqual(capacity_fingerprint(rows, 1500.0, exclude_client="claude"),
-                         "codex")
-        self.assertEqual(capacity_fingerprint(rows, 1500.0, exclude_client="codex"),
-                         "claude,codex")
+    def test_it_does_not_depend_on_who_is_asking(self):
+        """The property that stops the two clients livelocking each other.
 
-    def test_only_that_row_is_left_out_not_the_route(self):
-        """A route the operator declared stays in even for the asking client."""
-        rows = self.rows(("claude", "policy:operator-declared"))
-        self.assertEqual(capacity_fingerprint(rows, 1500.0, exclude_client="claude"),
-                         "claude")
+        An earlier version subtracted the asking client's own presence row, so
+        the two clients computed different digests from the identical ledger,
+        each found the other's receipt overtaken, and each re-decided it to
+        route the work to the other. Both were then permanently denied. A
+        receipt is one shared artifact, so its digest takes no client.
+        """
+        rows = self.rows(("claude", PRESENCE_SOURCE), ("codex", "feed"))
+        self.assertEqual(capacity_fingerprint(rows, 1500.0), "claude,codex")
+        import inspect
+        self.assertNotIn(
+            "client", inspect.signature(capacity_fingerprint).parameters,
+            "the digest must not be computable differently per client")
+
+    def test_a_presence_row_counts_like_any_other(self):
+        """Presence is what makes an undeclared peer eligible, so it counts."""
+        self.assertEqual(
+            capacity_fingerprint(self.rows(("codex", PRESENCE_SOURCE)), 1500.0),
+            "codex")
 
     def test_stale_untrusted_and_unavailable_rows_are_all_out(self):
         rows = self.rows(("codex", "feed"), ("local", "feed"), ("claude", "feed"))

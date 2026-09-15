@@ -199,6 +199,54 @@ def _zombies(pids: list[str]) -> set[str]:
     return found
 
 
+#: How long to let a killed group finish emptying before calling it a leak.
+#: The property under test is that the group does not survive termination, not
+#: that it is empty at one particular instant: SIGKILL is asynchronous, the
+#: kernel still has to run the exit path, and a parent still has to reap. A
+#: process that genuinely leaked stays forever, so a generous deadline costs
+#: nothing and a single sample costs a false failure.
+GROUP_DRAIN_SECONDS = 5.0
+
+
+def process_state(pid: str) -> str:
+    """This pid's `ps` state letter, or "gone"/"unknown". For diagnosis only."""
+    try:
+        probe = subprocess.run(["ps", "-o", "stat=", "-p", pid],
+                               capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    text = probe.stdout.decode("utf-8", "replace").strip()
+    return text or "gone"
+
+
+def wait_for_empty_groups(pgids: list[int]) -> list[tuple[int, list[str]]]:
+    """Poll until every group is empty of live processes, or time out.
+
+    Returns the groups that still hold something, so the caller reports a real
+    leak. Returns empty as soon as they drain, so an ordinary exit path taking
+    longer than one sample is not reported as a containment failure.
+    """
+    deadline = time.monotonic() + GROUP_DRAIN_SECONDS
+    while True:
+        remaining = [(pgid, group_survivors(pgid)) for pgid in pgids]
+        remaining = [(pgid, members) for pgid, members in remaining if members]
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(0.1)
+
+
+def describe_survivors(survivors: list[tuple[int, list[str]]]) -> str:
+    """Name each survivor's state, so a failure is diagnosable from the line.
+
+    This check was misattributed twice from its old message, which printed
+    pids and nothing else: first to machine load, then to zombie accounting.
+    A pid on its own does not say whether the process is running, sleeping
+    uninterruptibly, stopped or already dead, and those have different causes.
+    """
+    return str([(pgid, [(pid, process_state(pid)) for pid in members])
+                for pgid, members in survivors])
+
+
 def group_survivors(pgid: int) -> list[str]:
     """Pids still *alive* in a process group or Job Object. Zombies excluded.
 
@@ -674,11 +722,9 @@ def test_timeout_and_process_group_cleanup() -> None:
                 skip(f"{caller}->{peer}: no orphan processes survive in the killed groups",
                      "this platform cannot enumerate isolated process groups")
             else:
-                time.sleep(0.5)
-                survivors = [(p, group_survivors(p)) for p in pgids]
-                survivors = [(p, s) for p, s in survivors if s]
+                survivors = wait_for_empty_groups(pgids)
                 check(f"{caller}->{peer}: no orphan processes survive in the killed groups",
-                      not survivors, str(survivors))
+                      not survivors, describe_survivors(survivors))
             check(f"{caller}->{peer}: timeout is not retried into a second hang",
                   prov["attempt_count"] <= 2, str(prov["attempt_count"]))
         finally:

@@ -190,15 +190,16 @@ def _observe_declared_routes(router: StageRouter, policy: autoroute.Policy,
             available=True, source=DECLARED_SOURCE), trusted=True)
 
 
-def capacity_fingerprint(router: StageRouter, *, client: str) -> str:
+def capacity_fingerprint(router: StageRouter) -> str:
     """The digest of eligible capacity this decision depends on.
 
     Thin on purpose: the arithmetic lives in ``capacity_router`` so that the
     gate hook, which reads the same table read-only, computes the identical
-    value from the identical code.
+    value from the identical code. It takes no client for the same reason:
+    a receipt is shared, so everyone who compares against it has to compute
+    it the same way.
     """
-    return _fingerprint(router.capacity_rows(), float(router.clock()),
-                        exclude_client=client)
+    return _fingerprint(router.capacity_rows(), float(router.clock()))
 
 
 def _own_stage(router: StageRouter, *, item_id: str, stage: str, route: str,
@@ -474,7 +475,7 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                                 load=reading)
     # Read after the decision, from the same ledger the decision read, so the
     # receipt records the capacity it was actually made under.
-    capacity_digest = capacity_fingerprint(router, client=client)
+    capacity_digest = capacity_fingerprint(router)
     route = client if decision.route == autoroute.RETAIN else decision.route
     item_id = item_id_for(repo_root)
     owner = owner_id_for(client)

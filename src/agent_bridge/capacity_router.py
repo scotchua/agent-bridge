@@ -389,8 +389,7 @@ class StageRouter:
         return {"states": states, "capacity": capacities, "blocked": blocked}
 
 
-def capacity_fingerprint(rows: Iterable[Mapping], now: float, *,
-                         exclude_client: str | None = None) -> str:
+def capacity_fingerprint(rows: Iterable[Mapping], now: float) -> str:
     """A digest of the capacity a routing decision actually depended on.
 
     Recorded in every automatic receipt for the same reason the policy
@@ -398,17 +397,25 @@ def capacity_fingerprint(rows: Iterable[Mapping], now: float, *,
     re-made when it becomes available, not whenever the receipt happens to
     expire four hours later.
 
-    Two deliberate narrowings, both measured:
+    **Route names only, no timestamps, and nothing about who is asking.**
+    Both halves of that are load-bearing, and the second was learned the hard
+    way.
 
-    * **Route names only, no timestamps.**  A digest of the whole table
-      changes on every hook call, because the gate refreshes its own presence
-      row on every hook call, so every call would re-decide.
-    * **Minus the asking client's own presence row.**  That row exists because
-      this client is running, which is not news to this client and cannot
-      change its decision.  Leaving it in makes a receipt written by one
-      client never match the fingerprint computed by the other, so the two
-      re-decide each other's work for no reason.  In the same workload this
-      cut re-decisions from eight to three.
+    Names only, because the gate refreshes its own presence row on every hook
+    call.  A digest over the rows themselves changes every call, so every call
+    re-decides: measured at eight decisions where one was correct.  A set of
+    names does not move when a timestamp does, which is the whole fix.
+
+    Nothing about who is asking, because **a receipt is one shared
+    per-repository artifact**.  An earlier version subtracted the asking
+    client's own presence row, on the reasoning that a client's own presence
+    is not news to itself.  That made the digest client-relative, so the two
+    clients computed different values from the identical ledger, each found
+    the other's receipt overtaken, and each re-decided it to route the work to
+    the other.  Both were then permanently denied, each holding an instruction
+    to dispatch to the other.  A livelock, not churn, and worse than the
+    staleness the digest exists to fix.  Anything compared against a shared
+    artifact has to be computed the same way by everyone who compares it.
 
     Pure, and shared: the gate hook reads the table read-only and
     ``autodecide`` reads it through the router, and both call this, so the
@@ -419,7 +426,5 @@ def capacity_fingerprint(rows: Iterable[Mapping], now: float, *,
         str(row["route"]) for row in rows
         if row.get("available") and row.get("trusted")
         and float(row.get("observed_at", 0.0)) <= now + 1
-        and float(row.get("fresh_until", 0.0)) >= now
-        and not (row["route"] == exclude_client
-                 and row.get("source") == PRESENCE_SOURCE))
+        and float(row.get("fresh_until", 0.0)) >= now)
     return ",".join(eligible) if eligible else CAPACITY_NONE

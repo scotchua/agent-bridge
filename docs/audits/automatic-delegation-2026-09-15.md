@@ -359,8 +359,12 @@ error_detail:    Claude is not authenticated through a supported claude.ai subsc
   solo run 3   passed: 558   failed: 3     (one orphan check)
   ```
 
-  The mechanism is understood and reproduces standalone, in code this branch
-  does not touch. `group_survivors` calls `process_group_members`, which
+  The mechanism below is one of at least two, and naming it as the whole
+  story was the third wrong attribution of this check. See the review round
+  for the correction: a single sample taken half a second after the group
+  kill is not a measurement of whether the group survived, and the survivor
+  a later run reported was not a zombie at all. `group_survivors` calls
+  `process_group_members`, which
   enumerates with `ps -A -o pid=,pgid=` and counts **any** process in the
   group, and the check runs 0.5 seconds after the group kill. A SIGKILLed
   grandchild is a zombie until reaped, and reaping in this container lands
@@ -501,11 +505,37 @@ decision that retained work because the peer was unavailable is re-made the
 moment the peer appears. Measured, with the policy untouched between the two
 calls, so only the capacity digest can be what noticed.
 
-The first version of the digest re-decided on every call, because the hook
+The digest took two attempts, and the second mistake was worse than the
+staleness it was fixing.
+
+Attempt one digested the rows, and re-decided on every call, because the hook
 rewrites its own presence row every time it runs: eight decisions where one
-was correct. The digest is route names only, minus the asking client's own
-presence row. Confirmed at one decision across four consecutive hook calls,
-and a receipt written by one client no longer forces the other to re-decide.
+was correct. Attempt two fixed that by digesting route names only and
+subtracting the asking client's own presence row. That made the digest
+client-relative, and a receipt is one shared per-repository artifact, so
+claude and codex computed different values from the identical ledger, each
+found the other's receipt overtaken, and each re-decided it to route the work
+to the other. Both were then permanently denied, each holding an instruction
+to dispatch to the other. A livelock.
+
+The digest is now route names only and identical for both clients. Measured
+through the real hook, alternating the two clients four times with codex
+declared available:
+
+```text
+ round 1   claude: DENY routed_elsewhere      codex: ALLOW
+ round 2   claude: DENY routed_elsewhere      codex: ALLOW
+ round 3   claude: DENY routed_elsewhere      codex: ALLOW
+ round 4   claude: DENY routed_elsewhere      codex: ALLOW
+ decisions recorded: 1
+```
+
+**How the livelock survived its own regression test.** The test written to
+guard it drove the codex hook with `tool="Edit"`. Codex has no `Edit` tool,
+so the gate classified the call as not gated and allowed it without reading
+the receipt at all. The test passed while exercising nothing. The fixture now
+picks each client's real editing tool, and the same walk that found the
+livelock also found the test defect.
 
 ## High: the red head, and the hardcoded interpreter
 

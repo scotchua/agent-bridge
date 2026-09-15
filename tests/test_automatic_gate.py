@@ -80,10 +80,23 @@ class AutoCase(unittest.TestCase):
             route=route, observed_at=now, fresh_until=now + seconds,
             available=available, source=source), trusted=trusted)
 
+    #: Each client's own editing tool. Codex does not have an "Edit" tool, so
+    #: a codex call naming one classifies as "not gated" and is allowed
+    #: without ever reaching the receipt. A test that drove codex that way
+    #: passed while exercising nothing, and it was the test guarding against
+    #: the two clients livelocking each other.
+    EDIT_TOOL = {"claude": "Edit", "codex": "apply_patch"}
+
     def hook(self, client: str, repo: Path, relative: str = "app.py",
-             tool: str = "Edit", *args) -> dict:
+             tool: str | None = None, *args) -> dict:
+        tool = tool if tool is not None else self.EDIT_TOOL[client]
+        if tool == "apply_patch":
+            tool_input = {"input": "*** Begin Patch\n*** Update File: "
+                                   f"{relative}\n@@\n-x = 1\n+x = 2\n*** End Patch\n"}
+        else:
+            tool_input = {"file_path": str(repo / relative)}
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool,
-                   "tool_input": {"file_path": str(repo / relative)},
+                   "tool_input": tool_input,
                    "cwd": str(repo)}
         completed = subprocess.run(
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
@@ -823,7 +836,11 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
     def test_the_receipt_records_the_capacity_it_was_decided_under(self):
         self.observe("codex")
         self.hook("claude", self.repo)
-        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"], "codex")
+        # Both routes: codex from the fixture, claude from the hook's own
+        # first-hand presence. The digest names every eligible route and says
+        # nothing about who asked, which is what keeps it comparable.
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex")
 
     def test_nothing_re_decides_while_nothing_changes(self):
         """The narrowing that makes this affordable.
@@ -837,12 +854,19 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
             self.hook("claude", self.repo)
         self.assertEqual(self.decisions(), 1)
 
-    def test_the_other_client_does_not_re_decide_our_receipt_for_free(self):
-        """A receipt one client wrote stays valid for the other.
+    def test_the_route_the_decision_chose_may_act_on_it(self):
+        """The livelock guard, and the reason the digest takes no client.
 
-        The asking client's own presence row is excluded from the digest for
-        this reason: leaving it in made every claude receipt disagree with
-        every codex reading of it.
+        A receipt is one shared per-repository artifact. While the digest
+        subtracted the asking client's own presence row it was
+        client-relative, so claude and codex computed different values from
+        the identical ledger, each found the other's receipt overtaken, and
+        each re-decided it to route the work to the other. Both ended up
+        permanently denied, each holding an instruction to dispatch to the
+        other.
+
+        This test previously drove codex with ``tool="Edit"``, which Codex
+        does not gate, so it passed without reaching any of this.
         """
         self.observe("codex")
         self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
@@ -850,6 +874,18 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
         self.assertAllowed(self.hook("codex", self.repo))
         self.assertEqual(self.decisions(), decided,
                          "codex re-decided a receipt that already named codex")
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "codex")
+
+    def test_neither_client_can_route_the_work_at_the_other_forever(self):
+        """Alternate the two clients and require the work to land somewhere."""
+        self.observe("codex")
+        outcomes = []
+        for _ in range(4):
+            outcomes.append(self.hook("claude", self.repo) == {})
+            outcomes.append(self.hook("codex", self.repo) == {})
+        self.assertTrue(any(outcomes), "both clients were denied on every call")
+        # And the denials are all the same client, the one routed away.
+        self.assertEqual(outcomes, [False, True] * 4)
 
 
 class ReviewIsNeverRoutedBackToItsAuthor(unittest.TestCase):

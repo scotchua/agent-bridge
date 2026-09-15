@@ -309,7 +309,7 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     return loaded
 
 
-def capacity_digest(capacity_db: str, now: float, *, client: str) -> str | None:
+def capacity_digest(capacity_db: str, now: float) -> str | None:
     """The capacity fingerprint as the hook sees it, or None if unreadable.
 
     Read-only, like :func:`stage_binding`: the hook never writes the router's
@@ -317,6 +317,9 @@ def capacity_digest(capacity_db: str, now: float, *, client: str) -> str | None:
     re-decide over this": an unreadable router is an infrastructure failure
     that ``stage_binding`` turns into a deny, and a decision made without the
     ledger would be worse than the stale one.
+
+    Takes no client, deliberately. See :func:`capacity_router.capacity_fingerprint`
+    for the livelock that a client-relative version caused.
     """
     uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
     try:
@@ -330,7 +333,7 @@ def capacity_digest(capacity_db: str, now: float, *, client: str) -> str | None:
         return None
     finally:
         db.close()
-    return capacity_fingerprint(rows, now, exclude_client=client)
+    return capacity_fingerprint(rows, now)
 
 
 def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str | None:
@@ -718,7 +721,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                     receipt, now, capacity_db, task_type,
                     autoroute.policy_fingerprint(state_root),
                     None if capacity_db is None
-                    else capacity_digest(capacity_db, now, client=client))):
+                    else capacity_digest(capacity_db, now))):
             receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and
