@@ -280,10 +280,25 @@ class Workflow(unittest.TestCase):
         return json.loads(completed.stdout)
 
     def edit_attempt(self, client, relative="calc.py"):
+        """One gated edit, using the editing tool that client actually has.
+
+        Codex has no ``Edit`` tool: its editing tool is ``apply_patch``. This
+        helper sent ``Edit`` for both clients, so every codex call classified
+        as not gated and was allowed without the receipt being read at all.
+        Two assertions elsewhere in this file rested on that, and both were
+        vacuous: that codex may edit a repository whose stage it owns, and
+        that the allowed edit was judged against the existing receipt rather
+        than producing a second decision.
+        """
+        if client == "codex":
+            payload = {"tool_name": "apply_patch", "tool_input": {
+                "input": f"*** Begin Patch\n*** Update File: {relative}\n"
+                         "@@\n-x\n+y\n*** End Patch\n"}}
+        else:
+            payload = {"tool_name": "Edit",
+                       "tool_input": {"file_path": str(self.repo / relative)}}
         return self.run_installed_hook(client, {
-            "hook_event_name": "PreToolUse", "tool_name": "Edit",
-            "tool_input": {"file_path": str(self.repo / relative)},
-            "cwd": str(self.repo)})
+            "hook_event_name": "PreToolUse", **payload, "cwd": str(self.repo)})
 
     def mcp(self, caller, calls):
         """The orchestration MCP server as a subprocess over stdio."""
@@ -439,7 +454,9 @@ class TheUserWorkflow(Workflow):
         self.assertTrue(lane["cleanup"]["generation_removed"])
         self.assertTrue(lane["cleanup"]["verification_removed"])
 
-        # 9. Codex, which owns the stage, may edit the repository.
+        # 9. Codex, which owns the stage, may edit the repository. Through
+        # apply_patch, which is the editing tool Codex actually has: driven
+        # with "Edit" this call was not gated at all and proved nothing.
         self.assertEqual(self.edit_attempt("codex"), {})
 
         # 10. The audit accounts for all of it.
