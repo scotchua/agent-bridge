@@ -20,6 +20,23 @@ owned by another account and carrying ``OWNER RIGHTS:(F)`` is readable by
 that account while looking owner-only. The judgment therefore requires
 the object's owner to be the calling account before any entry is
 credited, and refuses to count an entry for anyone else at all.
+
+"The calling account" has two SIDs, not one. Windows makes the creator
+of a new object its owner, except that an elevated member of
+Administrators gets the Administrators group as the default owner of
+everything it creates (the hosted Windows runner, run 34940818792, showed
+every temporary file owned by S-1-5-32-544). The token reports that
+default owner directly (TokenOwner), so the judgment accepts an object
+owned by either the token's user or the token's default owner and
+refuses every other owner. A non-elevated account's default owner is
+itself, so for it nothing changes: an Administrators-owned file is still
+another account's.
+
+Beyond the descriptor itself, this module also decodes two other byte
+formats the platform layer reads through handles: the self-relative
+security descriptor ``NtQuerySecurityObject`` returns, and the
+``FILE_FULL_DIR_INFO`` records a directory handle enumerates. Both are
+decoded here so that the decoding is tested on every platform.
 """
 
 from __future__ import annotations
@@ -50,11 +67,29 @@ NO_PROPAGATE_INHERIT_ACE = 0x04
 INHERIT_ONLY_ACE = 0x08
 INHERITED_ACE = 0x10
 
-# Security descriptor control bits the judgment reads.
+# Security descriptor control bits the judgment reads and the writer sets.
 SE_DACL_PRESENT = 0x0004
 SE_DACL_PROTECTED = 0x1000
+SE_SELF_RELATIVE = 0x8000
+SECURITY_DESCRIPTOR_REVISION = 1
 
+# Access masks. FILE_ALL_ACCESS is what the writer grants. The generic
+# read and write masks are the least an entry must grant, once
+# inherit-only entries are set aside, for the caller to actually be able
+# to read and write the object: an entry with a zero mask, or one that
+# applies only to future children, names the caller without letting the
+# caller in, and a store whose owner cannot read it is not ready.
 FILE_ALL_ACCESS = 0x001F01FF
+FILE_GENERIC_READ = 0x00120089
+FILE_GENERIC_WRITE = 0x00120116
+REQUIRED_OWNER_ACCESS = FILE_GENERIC_READ | FILE_GENERIC_WRITE
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+GENERIC_ALL = 0x10000000
+
+# File attribute bits a directory listing reports.
+FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 
 ACL_REVISION = 2
 SID_REVISION = 1
@@ -203,8 +238,13 @@ def parse_acl(data: bytes) -> tuple[Ace, ...]:
         else:
             aces.append(Ace(ace_type, ace_flags, 0, None))
         offset += ace_size
-    if offset != size:
-        raise ValueError("ACL holds bytes after its last ACE")
+    # AclSize is the allocation, not the used length: Windows may leave
+    # unused space after the last ACE, and a valid descriptor with such
+    # slack must decode (Codex review of ccb85ef, R3). An ACE running past
+    # the allocation was refused above; bytes after the last ACE are not
+    # an ACE and are not interpreted.
+    if offset > size:
+        raise ValueError("ACEs run past the ACL")
     return tuple(aces)
 
 
@@ -230,20 +270,174 @@ def build_owner_only_acl(owner_sid: str, *, directory: bool) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Self-relative security descriptor codec
+# ---------------------------------------------------------------------------
+
+_SD_HEADER = struct.Struct("<BBHIIII")
+
+
+def parse_security_descriptor(data: bytes, *, is_directory: bool,
+                              sddl: str = "") -> SecurityState:
+    """Decode the self-relative descriptor ``NtQuerySecurityObject`` returns.
+
+    Strict, like :func:`parse_acl`: an offset outside the buffer, a
+    descriptor that is not self-relative, or an owner or DACL that does
+    not decode raises ValueError rather than producing a guess. Only the
+    owner and the DACL are read; the group and SACL offsets are ignored.
+    """
+    if len(data) < _SD_HEADER.size:
+        raise ValueError("security descriptor shorter than its header")
+    revision, _sbz1, control, owner_offset, _group, _sacl, dacl_offset = (
+        _SD_HEADER.unpack_from(data))
+    if revision != SECURITY_DESCRIPTOR_REVISION:
+        raise ValueError(f"unsupported security descriptor revision {revision}")
+    if not control & SE_SELF_RELATIVE:
+        raise ValueError("security descriptor is not self-relative")
+    owner_sid = ""
+    if owner_offset:
+        if owner_offset + 8 > len(data):
+            raise ValueError("owner SID runs past the descriptor")
+        owner_length = 8 + 4 * data[owner_offset + 1]
+        if owner_offset + owner_length > len(data):
+            raise ValueError("owner SID runs past the descriptor")
+        owner_sid = parse_sid(data[owner_offset:owner_offset + owner_length])
+    dacl = None
+    if control & SE_DACL_PRESENT and dacl_offset:
+        if dacl_offset + _ACL_HEADER.size > len(data):
+            raise ValueError("DACL runs past the descriptor")
+        size = acl_size(data[dacl_offset:dacl_offset + _ACL_HEADER.size])
+        if dacl_offset + size > len(data):
+            raise ValueError("DACL runs past the descriptor")
+        dacl = parse_acl(data[dacl_offset:dacl_offset + size])
+    return SecurityState(owner_sid=owner_sid,
+                         protected=bool(control & SE_DACL_PROTECTED),
+                         dacl=dacl, is_directory=is_directory, sddl=sddl)
+
+
+def build_owner_only_descriptor(owner_sid: str, *, directory: bool) -> bytes:
+    """A self-relative descriptor carrying only the owner-only DACL, protected.
+
+    This is what ``NtSetSecurityObject`` is handed with
+    ``DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION``.
+    The control word says protected as well, so both routes to the
+    protected bit agree. No owner, group or SACL is carried: the call
+    replaces the DACL of one object and touches nothing else about it.
+    """
+    acl = build_owner_only_acl(owner_sid, directory=directory)
+    control = SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_SELF_RELATIVE
+    return _SD_HEADER.pack(SECURITY_DESCRIPTOR_REVISION, 0, control,
+                           0, 0, 0, _SD_HEADER.size) + acl
+
+
+# ---------------------------------------------------------------------------
+# Directory listing codec (FILE_FULL_DIR_INFO)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DirectoryEntry:
+    """One record from a directory handle's enumeration."""
+
+    name: str
+    attributes: int
+
+    @property
+    def is_directory(self) -> bool:
+        return bool(self.attributes & FILE_ATTRIBUTE_DIRECTORY)
+
+    @property
+    def is_reparse_point(self) -> bool:
+        return bool(self.attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+# FILE_FULL_DIR_INFO: NextEntryOffset at 0, FileAttributes at 56,
+# FileNameLength (bytes) at 60, FileName (UTF-16-LE, unterminated) at 68.
+_DIR_NEXT = struct.Struct("<I")
+_DIR_ATTRIBUTES_OFFSET = 56
+_DIR_NAME_LENGTH_OFFSET = 60
+_DIR_NAME_OFFSET = 68
+
+
+def parse_directory_listing(data: bytes) -> tuple[DirectoryEntry, ...]:
+    """Decode one buffer of ``FILE_FULL_DIR_INFO`` records.
+
+    The ``.`` and ``..`` entries are dropped. A name that is not a single
+    path component (a separator, a NUL, an alternate-stream colon) is
+    refused, because the platform layer opens each name relative to the
+    directory it was listed in and a name that could resolve anywhere else
+    must not reach that open. A record that runs past the buffer, or a
+    chain that does not move forward, is refused rather than guessed at.
+    """
+    entries: list[DirectoryEntry] = []
+    offset = 0
+    seen: set[str] = set()
+    while True:
+        if offset + _DIR_NAME_OFFSET > len(data):
+            raise ValueError("directory record runs past the buffer")
+        next_offset = _DIR_NEXT.unpack_from(data, offset)[0]
+        attributes = _DIR_NEXT.unpack_from(data, offset + _DIR_ATTRIBUTES_OFFSET)[0]
+        name_length = _DIR_NEXT.unpack_from(data, offset + _DIR_NAME_LENGTH_OFFSET)[0]
+        start = offset + _DIR_NAME_OFFSET
+        if name_length % 2 or start + name_length > len(data):
+            raise ValueError("directory entry name runs past the buffer")
+        if next_offset and (next_offset < _DIR_NAME_OFFSET + name_length
+                            or next_offset % 4):
+            raise ValueError("directory record chain does not move forward")
+        name = data[start:start + name_length].decode("utf-16-le")
+        if name not in (".", ".."):
+            if not name or any(ch in name for ch in "\\/\0:"):
+                raise ValueError(f"directory entry is not a single component: {name!r}")
+            folded = name.casefold()
+            if folded in seen:
+                raise ValueError(f"directory entry listed twice: {name!r}")
+            seen.add(folded)
+            entries.append(DirectoryEntry(name, attributes))
+        if not next_offset:
+            return tuple(entries)
+        offset += next_offset
+
+
+# ---------------------------------------------------------------------------
 # Judgment
 # ---------------------------------------------------------------------------
 
 
+def accepted_owners(caller_sid: str, default_owner_sid: str | None = None
+                    ) -> frozenset[str]:
+    """The SIDs an object may be owned by and still be the caller's own.
+
+    The token user always; the token's default owner as well when it is
+    known, which is the Administrators group for an elevated administrator
+    and the user itself for everyone else. ValueError if either is not a
+    SID.
+    """
+    owners = {canonical_sid(caller_sid)}
+    if default_owner_sid:
+        owners.add(canonical_sid(default_owner_sid))
+    return frozenset(owners)
+
+
+def grants_effective_access(mask: int) -> bool:
+    """Whether the accumulated rights let the holder read and write the object."""
+    if mask & GENERIC_ALL:
+        return True
+    if mask & GENERIC_READ and mask & GENERIC_WRITE:
+        return True
+    return mask & REQUIRED_OWNER_ACCESS == REQUIRED_OWNER_ACCESS
+
+
 def judge_security(state: SecurityState, caller_sid: str, *,
-                   allow_inherited: bool = False) -> list[str]:
+                   allow_inherited: bool = False,
+                   default_owner_sid: str | None = None) -> list[str]:
     """Every reason ``state`` is not owner-only for ``caller_sid``. Empty is a pass.
 
     The rules, in the order they are checked:
 
-    * The object must be owned by the caller. Not "an administrator", not
-      "somebody with OWNER RIGHTS": an object another account owns inside
-      the caller's store is that account's to read, whatever the DACL
-      says, and is refused as such.
+    * The object must be owned by the caller: the token user, or the
+      token's default owner when ``default_owner_sid`` gives one (see the
+      module docstring). Not "an administrator", not "somebody with OWNER
+      RIGHTS": an object another account owns inside the caller's store is
+      that account's to read, whatever the DACL says, and is refused.
     * There must be a DACL and it must not be NULL (which is "everyone").
       An empty DACL is refused too: nobody can open it, and it is never
       the state this module writes.
@@ -258,14 +452,19 @@ def judge_security(state: SecurityState, caller_sid: str, *,
       entry of a type this module does not decode, or any other principal,
       including an inherit-only entry that grants nothing on this object
       but would on its children, is refused.
-    * The caller must actually appear, directly or as OWNER RIGHTS.
+    * The caller must actually appear, directly or as OWNER RIGHTS, and
+      the entries that apply to this object (not inherit-only ones) must
+      together grant at least generic read and write. An entry with an
+      empty mask, or one that applies only to future children, names the
+      caller without admitting the caller (Codex review of ccb85ef, R4).
     """
     try:
         caller = canonical_sid(caller_sid)
+        owners = accepted_owners(caller_sid, default_owner_sid)
     except ValueError:
         return ["caller identity unknown"]
     problems: list[str] = []
-    if state.owner_sid != caller:
+    if state.owner_sid not in owners:
         problems.append(f"owned by {state.owner_sid or 'nobody'}, not the caller")
     if state.dacl is None:
         problems.append("no DACL (everyone has every access)")
@@ -274,7 +473,8 @@ def judge_security(state: SecurityState, caller_sid: str, *,
         problems.append("empty DACL")
     if not allow_inherited and not state.protected:
         problems.append("DACL inherits from the parent")
-    owner_present = False
+    owner_named = False
+    effective = 0
     for ace in state.dacl:
         if ace.sid is None:
             problems.append(f"ACE type 0x{ace.type:02X} is not interpreted")
@@ -286,24 +486,30 @@ def judge_security(state: SecurityState, caller_sid: str, *,
         if ace.flags & INHERITED_ACE and not allow_inherited:
             problems.append(f"{sid} entry is inherited")
         if sid in (caller, SID_OWNER_RIGHTS):
-            owner_present = True
+            owner_named = True
+            if not ace.flags & INHERIT_ONLY_ACE:
+                effective |= ace.mask
         elif sid in (SID_SYSTEM, SID_ADMINISTRATORS):
             continue
         else:
             problems.append(f"{sid} has access")
-    if state.dacl and not owner_present:
-        problems.append("the caller has no entry")
+    if state.dacl:
+        if not owner_named:
+            problems.append("the caller has no entry")
+        elif not grants_effective_access(effective):
+            problems.append("the caller's entries grant no effective access")
     return problems
 
 
-def is_exactly_owner_only(state: SecurityState, caller_sid: str) -> bool:
+def is_exactly_owner_only(state: SecurityState, caller_sid: str, *,
+                          default_owner_sid: str | None = None) -> bool:
     """Whether ``state`` is exactly the DACL :func:`build_owner_only_acl` writes.
 
     The read-back after protecting an object is held to this, stricter
     than :func:`judge_security`: what was written is what must be there,
     and nothing else, on an object the caller owns.
     """
-    if judge_security(state, caller_sid) != []:
+    if judge_security(state, caller_sid, default_owner_sid=default_owner_sid) != []:
         return False
     return bool(state.protected and state.dacl is not None
                 and tuple(state.dacl) == owner_only_aces(

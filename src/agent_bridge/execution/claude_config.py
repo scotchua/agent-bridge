@@ -220,37 +220,6 @@ def _refuse_links(info: os.stat_result) -> None:
 MAX_STORE_OBJECTS = 20000
 
 
-def _walk_store(directory: Path) -> tuple[list[str], list[str]]:
-    """Every directory and file under the store, links refused, bounded.
-
-    Enumerated with ``os.scandir`` and each entry examined with
-    ``DirEntry.stat(follow_symlinks=False)``, so a link or alias anywhere in
-    the tree refuses the store before anything is applied through it. The
-    platform layer opens each name again for its ACL and refuses a reparse
-    point at that open too; this walk is the first check, not the only one.
-    """
-
-    directories: list[str] = []
-    files: list[str] = []
-    pending = [str(directory)]
-    while pending:
-        current = pending.pop()
-        with os.scandir(current) as entries:
-            for entry in entries:
-                info = entry.stat(follow_symlinks=False)
-                _refuse_links(info)
-                if len(directories) + len(files) >= MAX_STORE_OBJECTS:
-                    raise ConfigDirError(
-                        "Claude configuration directory holds more files than "
-                        "this lane created")
-                if stat.S_ISDIR(info.st_mode):
-                    directories.append(entry.path)
-                    pending.append(entry.path)
-                else:
-                    files.append(entry.path)
-    return directories, files
-
-
 def _enforce_private_nt(directory: Path) -> Path:
     """The Windows half of :func:`enforce_private`: ACLs, not mode bits.
 
@@ -258,59 +227,62 @@ def _enforce_private_nt(directory: Path) -> Path:
     traversed, so nothing inside it is reachable by name. Windows grants
     every account "bypass traverse checking" by default: a nested file with
     its own permissive entry is readable by anyone who knows its path,
-    whatever its parents allow. So the whole tree is enforced: the root is
-    protected first, every walked object is then judged through its own
-    handle and, where it fails, has its DACL replaced in one write with the
-    exact owner-only DACL, and one read-only pass proves every object
-    afterwards, so that "enforced" and "verified" remain two observations.
-    An object owned by another account is never touched and refuses the
-    store. Every refusal keeps the fixed operator text this module promises.
+    whatever its parents allow. So the whole tree is enforced, by the
+    platform layer and through handles: the root is opened once, every
+    object under it is enumerated and opened relative to its parent's
+    handle, every object's owner is read before anything is written, and
+    only then is each failing object's DACL replaced, in one write to that
+    object alone, with the exact owner-only DACL. One read-only pass proves
+    every object afterwards, so that "enforced" and "verified" remain two
+    observations. An object owned by another account is never touched and
+    refuses the store. Every refusal keeps the fixed operator text this
+    module promises.
     """
 
-    from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.platform import platform as host
 
-    try:
-        wpv.require_private_directory(directory)
-    except wpv.PrivacyError:
-        raise ConfigDirError(
-            "Claude configuration directory permissions could not be set") from None
-    try:
-        directories, files = _walk_store(directory)
-    except ConfigDirError:
-        raise
-    except OSError:
-        raise ConfigDirError(
-            "Claude configuration directory could not be read") from None
-    if len([path for path in directories + files
-            if os.path.dirname(path) == str(directory)]) > MAX_STORE_ENTRIES:
-        raise ConfigDirError(
-            "Claude configuration directory holds more files than this lane "
-            "created")
+    _store_entries(directory)
     try:
         protected, evidence = host.enforce_owner_only_tree(
-            str(directory), directories + files)
+            str(directory), max_objects=MAX_STORE_OBJECTS)
     except OSError:
         protected, evidence = False, {}
     if not protected:
-        if evidence.get("objects_foreign_owned"):
+        _refuse_nt(evidence)
+        if "." in (evidence.get("objects_failed") or []):
             raise ConfigDirError(
-                "Claude configuration directory contains a file owned by "
-                "another account")
+                "Claude configuration directory permissions could not be set")
         raise ConfigDirError(
             "Claude configuration directory contents could not be protected")
 
     verified, evidence = host.observe_owner_only_tree(
-        str(directory), directories + files)
+        str(directory), max_objects=MAX_STORE_OBJECTS)
     if not verified:
+        _refuse_nt(evidence)
         failed = evidence.get("objects_failed") or []
-        if not failed or str(directory) in failed:
+        if not failed or "." in failed:
             raise ConfigDirError(
                 "Claude configuration directory is readable by other accounts")
         raise ConfigDirError(
             "Claude configuration directory contains a file readable by "
             "other accounts")
     return directory
+
+
+def _refuse_nt(evidence: dict[str, object]) -> None:
+    """The refusals a tree pass can report that have their own fixed text."""
+
+    if evidence.get("objects_foreign_owned"):
+        raise ConfigDirError(
+            "Claude configuration directory contains a file owned by "
+            "another account")
+    if evidence.get("refused") == "reparse point":
+        raise ConfigDirError(
+            "Claude configuration directory contains a link or alias")
+    if "than the lane creates" in str(evidence.get("error", "")):
+        raise ConfigDirError(
+            "Claude configuration directory holds more files than this lane "
+            "created")
 
 
 def checked_config_dir(value: Path | str | None, *,
@@ -345,11 +317,10 @@ def is_ready(value: object, *, home: Path | str | None = None) -> bool:
         # a store that is not ready, wherever it sits.
         from agent_bridge.platform import platform as host
         try:
-            directories, files = _walk_store(directory)
-        except (ConfigDirError, OSError):
+            verified, _evidence = host.observe_owner_only_tree(
+                str(directory), max_objects=MAX_STORE_OBJECTS)
+        except OSError:
             return False
-        verified, _evidence = host.observe_owner_only_tree(
-            str(directory), directories + files)
         return bool(verified)
     if info.st_mode & 0o077:
         return False

@@ -3577,9 +3577,10 @@ def test_windows_acl_parser_adversarial() -> None:
         return wacl.Ace(wacl.ACCESS_ALLOWED_ACE_TYPE, flags, mask, principal)
 
     def judged(owner=sid, protected=True, directory=True, dacl=None, caller=sid,
-               allow_inherited=False):
+               allow_inherited=False, default_owner=None):
         observed = wacl.SecurityState(owner, protected, dacl, directory)
-        return wacl.judge_security(observed, caller, allow_inherited=allow_inherited) == []
+        return wacl.judge_security(observed, caller, allow_inherited=allow_inherited,
+                                   default_owner_sid=default_owner) == []
 
     real = (allow(wacl.SID_SYSTEM, oici), allow(wacl.SID_ADMINISTRATORS, oici),
             allow(wacl.SID_OWNER_RIGHTS, oici))
@@ -3620,6 +3621,26 @@ def test_windows_acl_parser_adversarial() -> None:
         ("the owner alone is accepted", judged(directory=False, dacl=(allow(sid),)), True),
         ("a different account with the same shape is refused",
          judged(directory=False, dacl=(allow(other),)), False),
+        # Codex review of ccb85ef and CI run 34940818792: an elevated
+        # administrator's own files are owned by the Administrators group.
+        ("an Administrators-owned object is accepted when the token's default owner is Administrators",
+         judged(owner=wacl.SID_ADMINISTRATORS, directory=False, dacl=(allow(sid),),
+                default_owner=wacl.SID_ADMINISTRATORS), True),
+        ("and refused when the token's default owner is the user (not elevated)",
+         judged(owner=wacl.SID_ADMINISTRATORS, directory=False, dacl=(allow(sid),)), False),
+        ("another user's object is refused whatever the default owner",
+         judged(owner=other, directory=False, dacl=(allow(sid),),
+                default_owner=wacl.SID_ADMINISTRATORS), False),
+        # Codex review of ccb85ef, R4: naming the caller is not admitting the caller.
+        ("a caller entry with an empty mask is refused",
+         judged(directory=False, dacl=(allow(sid, mask=0),)), False),
+        ("a caller entry that applies only to children is refused",
+         judged(dacl=(allow(sid, wacl.INHERIT_ONLY_ACE | oici),)), False),
+        ("read alone is not effective access",
+         judged(directory=False, dacl=(allow(sid, mask=wacl.FILE_GENERIC_READ),)), False),
+        ("read and write across two entries is",
+         judged(directory=False, dacl=(allow(sid, mask=wacl.FILE_GENERIC_READ),
+                                       allow(sid, mask=wacl.FILE_GENERIC_WRITE))), True),
     ]
     for label, observed, expect in cases:
         check(f"ACL: {label}", observed is expect, f"got {observed}, want {expect}")

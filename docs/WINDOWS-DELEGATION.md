@@ -218,23 +218,38 @@ canaries run last, so a cheaper structural proof fails first.
   roughly 1028:1, which makes it decorative. 500 is between the two, and
   `tests/test_workspace_unpacking.py` asserts both measurements rather than
   leaving the choice as an opinion.
-* **Owner-only ACLs**, applied and verified through Win32 security calls on
-  an open handle rather than through `icacls` text. The object is opened once
-  (refused if it is a reparse point), its owner and DACL are read through that
-  handle, the DACL is replaced in a single `SetSecurityInfo` call with the exact
-  owner-only DACL, and the result is read back through the same handle and
-  decoded byte for byte. There is no intermediate DACL between the one found
-  and the one written, so nothing is ever broader than either. An object owned
-  by another account is refused untouched: an `OWNER RIGHTS` entry grants
-  whoever owns the object, so ownership is checked before any entry counts.
-  Read paths only observe; they never repair, so a record another account
-  could read stays visible as exactly that. The Claude lane's store is
-  enforced and observed as a whole tree, because Windows grants every account
-  "bypass traverse checking": a nested file with its own permissive entry is
-  readable by name whatever its parents allow. Stated limitation: a tree is
-  enumerated by name and each entry opened by name; an object swapped between
-  those steps is caught by the reparse refusal and the ownership check on the
-  handle actually opened, not by a file-identity comparison.
+* **Owner-only ACLs**, applied and verified through Win32 and ntdll security
+  calls on an open handle rather than through `icacls` text. A single object
+  is opened once (refused if it is a reparse point), its owner and DACL are
+  read through that handle, the DACL is replaced in one `NtSetSecurityObject`
+  call with the exact owner-only DACL, and the result is read back through the
+  same handle and decoded byte for byte. `NtSetSecurityObject` sets the
+  descriptor of that one object and does not propagate to descendants;
+  advapi32's handle-based writer does propagate, which on the ARM64 VM rewrote
+  a child's DACL before the child's own ownership check, so it is not used
+  anywhere in the module. An object owned by another account is refused
+  untouched: an `OWNER RIGHTS` entry grants whoever owns the object, so
+  ownership is checked before any entry counts. "The caller" is the token's
+  user or the token's default owner (`TokenOwner`), because an elevated
+  administrator's own files are owned by the Administrators group; a
+  non-elevated account's default owner is itself. Naming the caller is not
+  admitting the caller: the entries that apply to the object must together
+  grant at least generic read and write. Read paths only observe; they never
+  repair, so a record another account could read stays visible as exactly
+  that. The Claude lane's store is enforced and observed as a whole tree,
+  because Windows grants every account "bypass traverse checking": a nested
+  file with its own permissive entry is readable by name whatever its parents
+  allow. The tree is walked from the root handle: each directory is
+  enumerated through its own handle and each entry opened relative to that
+  handle (`NtCreateFile` with `RootDirectory`), so nothing below the root is
+  ever resolved by absolute path, an entry that is a junction is opened as
+  the junction and refused, and a directory replaced wholesale is seen as it
+  is now, extra objects included. Every object's owner is read before
+  anything is written; one foreign-owned object anywhere stops every write.
+  Stated limitation: the root itself is opened once by its resolved absolute
+  path, so a component above the root swapped for a junction between that
+  resolution and the open points the pass at a different tree, which it can
+  only touch if the caller owns it.
 * **Fail-closed cleanup.** Registration is a tri-state (`none`, `created`,
   `unproven`), proven by listing the distro name immediately before and after
   the import. A name is never unregistered unless this run positively created

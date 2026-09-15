@@ -1,11 +1,11 @@
-"""Host-independent tests for the Windows owner-only ACL guarantee.
+"""The Windows owner-only guarantee, tested where it can be: on the bytes.
 
-The policy half (SID and ACL codecs, the owner-only judgment) is pure and
-runs everywhere. The Windows half is bound to an open handle and cannot be
-imported off Windows, so its methods are lifted from the source by AST and
-driven against a scripted ``self``; that keeps the tests bound to the
-shipped code rather than to a paraphrase of it. Nothing here mocks Windows
-itself: the live read-back runs on the Windows VM and the hosted runner.
+The policy half (``windows_acl``) is pure and imported directly. The Win32
+half (``windows.py``) cannot be imported off Windows, so its methods are
+lifted from the source by AST and exercised against scripted platforms,
+and structural facts about the source (what it calls, what it never calls,
+in what order) are asserted as text. Live Windows evidence comes from the
+CI matrix and the ARM64 VM runs recorded in the task record, not from here.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import ast
 import contextlib
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from typing import Any
@@ -26,11 +27,15 @@ from agent_bridge import store
 from agent_bridge.platform import windows_acl as acl
 from agent_bridge.platform.windows_acl import (
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, CONTAINER_INHERIT_ACE,
-    FILE_ALL_ACCESS, INHERIT_ONLY_ACE, INHERITED_ACE, OBJECT_INHERIT_ACE,
-    SID_ADMINISTRATORS, SID_OWNER_RIGHTS, SID_SYSTEM,
-    WINDOWS_OWNER_ONLY_GUARANTEE, Ace, SecurityState, build_owner_only_acl,
-    encode_sid, is_exactly_owner_only, judge_security, owner_only_aces,
-    parse_acl, parse_sid,
+    FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, GENERIC_ALL, GENERIC_READ,
+    GENERIC_WRITE, INHERIT_ONLY_ACE, INHERITED_ACE, OBJECT_INHERIT_ACE,
+    SE_DACL_PRESENT, SE_DACL_PROTECTED, SE_SELF_RELATIVE, SID_ADMINISTRATORS,
+    SID_OWNER_RIGHTS, SID_SYSTEM, WINDOWS_OWNER_ONLY_GUARANTEE, Ace,
+    DirectoryEntry, SecurityState, accepted_owners, build_owner_only_acl,
+    build_owner_only_descriptor, encode_sid, grants_effective_access,
+    is_exactly_owner_only, judge_security, owner_only_aces, parse_acl,
+    parse_directory_listing, parse_security_descriptor, parse_sid,
 )
 
 
@@ -57,6 +62,22 @@ def state(owner: str = OWNER_SID, *, protected: bool = True, directory: bool = F
         dacl = owner_only_aces(owner, directory=directory)
     return SecurityState(owner_sid=owner, protected=protected, dacl=dacl,
                          is_directory=directory)
+
+
+def directory_records(*entries: tuple[str, int]) -> bytes:
+    """A FILE_FULL_DIR_INFO buffer as GetFileInformationByHandleEx fills it."""
+    out = b""
+    for index, (name, attributes) in enumerate(entries):
+        encoded = name.encode("utf-16-le")
+        record = bytearray(68) + encoded
+        struct.pack_into("<I", record, 56, attributes)
+        struct.pack_into("<I", record, 60, len(encoded))
+        if index < len(entries) - 1:
+            padding = (-len(record)) % 8
+            struct.pack_into("<I", record, 0, len(record) + padding)
+            record += b"\0" * padding
+        out += bytes(record)
+    return out
 
 
 def windows_method(name: str, scope: dict[str, object]):
@@ -128,7 +149,7 @@ class AclCodecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_acl(bytes(data[:-1]))               # size disagrees with bytes
         with self.assertRaises(ValueError):
-            parse_acl(bytes(data) + b"\0\0\0\0")      # trailing bytes
+            parse_acl(bytes(data) + b"\0\0\0\0")      # bytes the size does not claim
         truncated = bytearray(data)
         truncated[10] = 8                             # ACE claims only a header
         with self.assertRaises(ValueError):
@@ -137,6 +158,16 @@ class AclCodecTests(unittest.TestCase):
         oversize[10] = 0xFF                           # ACE runs past the ACL
         with self.assertRaises(ValueError):
             parse_acl(bytes(oversize))
+
+    def test_valid_allocation_slack_after_the_last_ace_decodes(self):
+        """Codex review of ccb85ef, R3: AclSize is the allocation, and Windows
+        may leave unused space after the last ACE. Such an ACL is valid and
+        must receive the same judgment as its compact form."""
+        compact = build_owner_only_acl(OWNER_SID, directory=False)
+        padded = bytearray(compact + b"\0" * 8)
+        struct.pack_into("<H", padded, 2, len(padded))
+        self.assertEqual(parse_acl(bytes(padded)), parse_acl(compact))
+        self.assertEqual(judge_security(state(dacl=parse_acl(bytes(padded))), OWNER_SID), [])
 
     def test_an_uninterpreted_ace_type_is_kept_without_a_principal(self):
         # A callback (conditional) allow ACE, type 0x09: kept, not decoded.
@@ -153,6 +184,73 @@ class AclCodecTests(unittest.TestCase):
         ace = bytes([0, 0]) + (4 + len(body)).to_bytes(2, "little") + body
         header = bytes([2, 0]) + (8 + len(ace)).to_bytes(2, "little") + b"\1\0\0\0"
         self.assertEqual(parse_acl(header + ace), owner_only_aces(OWNER_SID, directory=False))
+
+
+class SecurityDescriptorCodecTests(unittest.TestCase):
+    """The self-relative descriptor NtQuerySecurityObject returns and
+    NtSetSecurityObject is handed."""
+
+    def test_the_written_descriptor_decodes_to_the_protected_owner_only_state(self):
+        for directory in (False, True):
+            raw = build_owner_only_descriptor(OWNER_SID, directory=directory)
+            decoded = parse_security_descriptor(raw, is_directory=directory)
+            self.assertTrue(decoded.protected)
+            self.assertEqual(decoded.dacl, owner_only_aces(OWNER_SID, directory=directory))
+            self.assertEqual(decoded.owner_sid, "")   # the write carries no owner
+            control = struct.unpack_from("<H", raw, 2)[0]
+            self.assertEqual(control & (SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_SELF_RELATIVE),
+                             SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_SELF_RELATIVE)
+
+    def test_a_descriptor_with_an_owner_decodes_the_owner(self):
+        dacl = build_owner_only_acl(OWNER_SID, directory=False)
+        owner = encode_sid(OTHER_SID)
+        header = struct.pack("<BBHIIII", 1, 0, SE_DACL_PRESENT | SE_SELF_RELATIVE,
+                             20 + len(dacl), 0, 0, 20)
+        decoded = parse_security_descriptor(header + dacl + owner, is_directory=False)
+        self.assertEqual(decoded.owner_sid, OTHER_SID)
+        self.assertFalse(decoded.protected)
+        self.assertEqual(decoded.dacl, owner_only_aces(OWNER_SID, directory=False))
+
+    def test_an_absent_dacl_is_null_and_malformed_descriptors_are_refused(self):
+        header = struct.pack("<BBHIIII", 1, 0, SE_SELF_RELATIVE, 0, 0, 0, 0)
+        self.assertIsNone(parse_security_descriptor(header, is_directory=False).dacl)
+        dacl = build_owner_only_acl(OWNER_SID, directory=False)
+        for bad in (
+            struct.pack("<BBHIIII", 2, 0, SE_SELF_RELATIVE, 0, 0, 0, 0),      # revision
+            struct.pack("<BBHIIII", 1, 0, 0, 0, 0, 0, 0),                     # not self-relative
+            struct.pack("<BBHIIII", 1, 0, SE_DACL_PRESENT | SE_SELF_RELATIVE,
+                        0, 0, 0, 200) + dacl,                                 # DACL offset outside
+            struct.pack("<BBHIIII", 1, 0, SE_SELF_RELATIVE, 200, 0, 0, 0),    # owner offset outside
+            header[:10],                                                      # truncated
+        ):
+            with self.assertRaises(ValueError):
+                parse_security_descriptor(bad, is_directory=False)
+
+
+class DirectoryListingCodecTests(unittest.TestCase):
+    def test_entries_decode_with_their_attributes_and_dot_entries_are_dropped(self):
+        raw = directory_records((".", 0x10), ("..", 0x10), ("f.txt", 0x20),
+                                ("jx", 0x10 | FILE_ATTRIBUTE_REPARSE_POINT), ("sub", 0x10))
+        entries = parse_directory_listing(raw)
+        self.assertEqual([entry.name for entry in entries], ["f.txt", "jx", "sub"])
+        self.assertTrue(entries[2].is_directory)
+        self.assertTrue(entries[1].is_reparse_point and entries[1].is_directory)
+        self.assertFalse(entries[0].is_directory)
+
+    def test_a_name_that_is_not_one_component_is_refused(self):
+        for name in ("a\\b", "a/b", "a\0b", "f.txt:stream", ""):
+            with self.assertRaises(ValueError):
+                parse_directory_listing(directory_records((name, 0x20)))
+
+    def test_a_broken_chain_or_truncated_record_is_refused(self):
+        good = bytearray(directory_records(("a", 0x20), ("b", 0x20)))
+        struct.pack_into("<I", good, 0, 4)                 # next entry inside this one
+        with self.assertRaises(ValueError):
+            parse_directory_listing(bytes(good))
+        with self.assertRaises(ValueError):
+            parse_directory_listing(directory_records(("abc", 0x20))[:-2])
+        with self.assertRaises(ValueError):
+            parse_directory_listing(directory_records(("a", 0x20), ("A", 0x20)))
 
 
 class OwnerOnlyJudgmentTests(unittest.TestCase):
@@ -189,6 +287,53 @@ class OwnerOnlyJudgmentTests(unittest.TestCase):
         observed = state(OTHER_SID, dacl=owner_only_aces(OWNER_SID, directory=False))
         self.assertTrue(judge_security(observed, OWNER_SID))
         self.assertFalse(is_exactly_owner_only(observed, OWNER_SID))
+
+    def test_the_tokens_default_owner_is_the_callers_own(self):
+        """CI run 34940818792: an elevated administrator's freshly created
+        files are owned by Administrators, and the token says so
+        (TokenOwner). Such an object is the caller's own; the same object
+        seen by a token whose default owner is the user is not."""
+        theirs = state(SID_ADMINISTRATORS, dacl=(allow(OWNER_SID),))
+        self.assertEqual(judge_security(theirs, OWNER_SID,
+                                        default_owner_sid=SID_ADMINISTRATORS), [])
+        self.assertTrue(is_exactly_owner_only(theirs, OWNER_SID,
+                                              default_owner_sid=SID_ADMINISTRATORS))
+        self.assertTrue(judge_security(theirs, OWNER_SID))
+        self.assertTrue(judge_security(theirs, OWNER_SID, default_owner_sid=OWNER_SID))
+        self.assertEqual(accepted_owners(OWNER_SID, SID_ADMINISTRATORS),
+                         frozenset({OWNER_SID, SID_ADMINISTRATORS}))
+        self.assertEqual(accepted_owners(OWNER_SID, None), frozenset({OWNER_SID}))
+
+    def test_a_default_owner_never_admits_a_third_account(self):
+        observed = state(OTHER_SID, dacl=(allow(OWNER_SID),))
+        self.assertTrue(judge_security(observed, OWNER_SID,
+                                       default_owner_sid=SID_ADMINISTRATORS))
+        with self.assertRaises(ValueError):
+            accepted_owners(OWNER_SID, "nonsense")
+        self.assertEqual(judge_security(state(), OWNER_SID, default_owner_sid="nonsense"),
+                         ["caller identity unknown"])
+
+    def test_naming_the_caller_is_not_admitting_the_caller(self):
+        """Codex review of ccb85ef, R4: an entry with an empty mask, or one
+        that applies only to future children, names the caller without
+        granting any access to this object."""
+        empty = state(dacl=(allow(OWNER_SID, mask=0),))
+        self.assertIn("the caller's entries grant no effective access",
+                      judge_security(empty, OWNER_SID))
+        children_only = state(directory=True, dacl=(
+            allow(OWNER_SID, flags=INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),))
+        self.assertIn("the caller's entries grant no effective access",
+                      judge_security(children_only, OWNER_SID))
+        read_only = state(dacl=(allow(OWNER_SID, mask=FILE_GENERIC_READ),))
+        self.assertTrue(judge_security(read_only, OWNER_SID))
+        split = state(dacl=(allow(OWNER_SID, mask=FILE_GENERIC_READ),
+                            allow(OWNER_SID, mask=FILE_GENERIC_WRITE)))
+        self.assertEqual(judge_security(split, OWNER_SID), [])
+        owner_rights = state(dacl=(allow(SID_OWNER_RIGHTS, mask=GENERIC_ALL),))
+        self.assertEqual(judge_security(owner_rights, OWNER_SID), [])
+        self.assertTrue(grants_effective_access(GENERIC_READ | GENERIC_WRITE))
+        self.assertFalse(grants_effective_access(GENERIC_READ))
+        self.assertFalse(grants_effective_access(FILE_GENERIC_WRITE))
 
     def test_other_principals_are_refused_whatever_their_rights(self):
         for stranger in (EVERYONE, USERS, OTHER_SID):
@@ -254,13 +399,18 @@ class ScriptedPlatform:
     scripts what the object looked like before and after the write.
     """
 
-    def __init__(self, states: list[SecurityState | None], caller: str | None = OWNER_SID):
+    def __init__(self, states: list[SecurityState | None],
+                 caller: str | None = OWNER_SID, default_owner: str | None = None):
         self.states = list(states)
         self.caller = caller
+        self.default_owner = default_owner if default_owner is not None else caller
         self.writes: list[tuple[int, str, bool]] = []
 
     def _caller_sid(self):
         return self.caller
+
+    def _default_owner_sid(self):
+        return self.default_owner
 
     def _read_security(self, handle, is_directory):
         observed = self.states.pop(0)
@@ -274,7 +424,11 @@ class ScriptedPlatform:
 PROTECT_SCOPE: dict[str, object] = {
     "judge_security": judge_security,
     "is_exactly_owner_only": is_exactly_owner_only,
+    "accepted_owners": accepted_owners,
     "WINDOWS_OWNER_ONLY_GUARANTEE": WINDOWS_OWNER_ONLY_GUARANTEE,
+    "SecurityState": SecurityState,
+    "MAX_TREE_OBJECTS": 20000,
+    "MAX_TREE_DEPTH": 32,
     "Any": Any,
 }
 
@@ -292,6 +446,21 @@ class ProtectHandleTests(unittest.TestCase):
         self.assertTrue(verified, evidence)
         self.assertEqual(platform.writes, [(42, OWNER_SID, False)])
         self.assertEqual(evidence["problems"], [])
+        self.assertNotIn("default_owner_sid", evidence)
+
+    def test_an_elevated_administrators_own_object_is_protected_for_the_user(self):
+        """The hosted runner's case: owner Administrators, token default
+        owner Administrators. The write grants the user SID, and the exact
+        read-back is judged with the same default owner."""
+        before = state(SID_ADMINISTRATORS, protected=False, dacl=(
+            allow(SID_SYSTEM, flags=INHERITED_ACE), allow(SID_ADMINISTRATORS, flags=INHERITED_ACE),
+            allow(OWNER_SID, flags=INHERITED_ACE)))
+        after = state(SID_ADMINISTRATORS, dacl=owner_only_aces(OWNER_SID, directory=False))
+        platform = ScriptedPlatform([before, after], default_owner=SID_ADMINISTRATORS)
+        verified, evidence = self.protect(platform, 42, False)
+        self.assertTrue(verified, evidence)
+        self.assertEqual(platform.writes, [(42, OWNER_SID, False)])
+        self.assertEqual(evidence["default_owner_sid"], SID_ADMINISTRATORS)
 
     def test_a_foreign_owned_object_is_refused_before_anything_is_written(self):
         platform = ScriptedPlatform([state(OTHER_SID, dacl=(allow(SID_OWNER_RIGHTS),))])
@@ -300,6 +469,13 @@ class ProtectHandleTests(unittest.TestCase):
         self.assertEqual(platform.writes, [])
         self.assertEqual(evidence["refused"], "owned by another account")
         self.assertEqual(evidence["owner_sid"], OTHER_SID)
+
+    def test_an_administrators_owned_object_is_foreign_to_a_non_elevated_user(self):
+        platform = ScriptedPlatform([state(SID_ADMINISTRATORS, dacl=(allow(OWNER_SID),))])
+        verified, evidence = self.protect(platform, 42, False)
+        self.assertFalse(verified)
+        self.assertEqual(platform.writes, [])
+        self.assertEqual(evidence["refused"], "owned by another account")
 
     def test_a_readback_that_is_not_the_written_dacl_fails_closed(self):
         survived = state(dacl=(allow(OWNER_SID), allow(EVERYONE, mask=0x1)))
@@ -321,11 +497,11 @@ class ProtectHandleTests(unittest.TestCase):
     def test_a_failed_write_or_read_fails_closed(self):
         class FailingWrite(ScriptedPlatform):
             def _write_owner_only(self, handle, caller, is_directory):
-                return "SetSecurityInfo failed with 5"
+                return "NtSetSecurityObject failed with 0xC0000022"
 
         verified, evidence = self.protect(FailingWrite([state()]), 42, False)
         self.assertFalse(verified)
-        self.assertEqual(evidence["error"], "SetSecurityInfo failed with 5")
+        self.assertEqual(evidence["error"], "NtSetSecurityObject failed with 0xC0000022")
         verified, evidence = self.protect(ScriptedPlatform([None]), 42, False)
         self.assertFalse(verified)
         self.assertEqual(evidence["read_error"], 5)
@@ -338,101 +514,243 @@ class ProtectHandleTests(unittest.TestCase):
         self.assertEqual(evidence["error"], "caller identity unavailable")
 
 
+class FakeKernel32:
+    def __init__(self, closed: list[int]):
+        self.closed = closed
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+class TreePlatform:
+    """A scripted tree: ``objects`` maps a label to its decoded state (or
+    None for an unreadable one), and ``children`` maps a directory label to
+    the entries its handle enumerates. Root label is ``"."``."""
+
+    def __init__(self, test: unittest.TestCase, objects: dict[str, SecurityState | None],
+                 children: dict[str, list[tuple[str, int]]], *,
+                 caller: str | None = OWNER_SID, default_owner: str | None = None,
+                 unopenable: frozenset[str] = frozenset(),
+                 sticky: frozenset[str] = frozenset()):
+        self.test = test
+        self.objects = objects
+        self.children = children
+        self.caller = caller
+        self.default_owner = default_owner if default_owner is not None else caller
+        self.unopenable = unopenable
+        self.sticky = sticky
+        self.handles: dict[int, str] = {}
+        self.protected: list[str] = []
+        self.writes_seen: list[str] = []
+        self.opened_roots: list[tuple[str, bool, bool]] = []
+        self.child_opens: list[tuple[str, str, bool, bool]] = []
+
+    def _caller_sid(self):
+        return self.caller
+
+    def _default_owner_sid(self):
+        return self.default_owner
+
+    def _new_handle(self, label: str) -> int:
+        handle = 100 + len(self.handles)
+        self.handles[handle] = label
+        return handle
+
+    def _open_securable(self, path, *, write, listing=False):
+        self.opened_roots.append((path, write, listing))
+        observed = self.objects.get(".")
+        return self._new_handle("."), bool(observed and observed.is_directory), {}
+
+    def _open_child(self, parent, name, *, write, listing):
+        prefix = self.handles[parent]
+        label = name if prefix == "." else f"{prefix}\\{name}"
+        self.child_opens.append((prefix, name, write, listing))
+        self.test.assertNotIn("\\", name)
+        if label in self.unopenable or label not in self.objects:
+            return None, False, {"open_status": "0xC0000034"}
+        observed = self.objects[label]
+        return self._new_handle(label), bool(observed and observed.is_directory), {}
+
+    def _list_directory(self, handle):
+        label = self.handles[handle]
+        return tuple(DirectoryEntry(name, attributes)
+                     for name, attributes in self.children.get(label, [])), {}
+
+    def _read_security(self, handle, is_directory):
+        observed = self.objects[self.handles[handle]]
+        return (observed, {}) if observed is not None else (None, {"read_status": "0xC0000022"})
+
+    def _protect_handle(self, handle, is_directory):
+        label = self.handles[handle]
+        self.protected.append(label)
+        return label not in self.sticky, {}
+
+
+DIRECTORY = FILE_ATTRIBUTE_DIRECTORY
+FILE = 0x20
+
+
 class TreeEnforcementTests(unittest.TestCase):
-    """Per-object, handle-bound tree enforcement against scripted objects."""
+    """Per-object, handle-relative tree enforcement against a scripted tree."""
 
     def setUp(self):
         self.closed: list[int] = []
-        closer = self
+        scope = dict(PROTECT_SCOPE, kernel32=FakeKernel32(self.closed))
+        self.enforce = windows_method("enforce_owner_only_tree", scope)
+        self.observe = windows_method("observe_owner_only_tree", scope)
+        for name in ("_walk_tree", "_open_tree"):
+            windows_method(name, scope)
+        self.scope = scope
 
-        class FakeKernel32:
-            def CloseHandle(self, handle):
-                closer.closed.append(handle)
-                return 1
-
-        self.scope = dict(PROTECT_SCOPE, kernel32=FakeKernel32())
-        self.enforce = windows_method("enforce_owner_only_tree", self.scope)
-
-    def platform(self, objects: dict[str, SecurityState | None]):
-        tests = self
-
-        class TreePlatform:
-            def __init__(self):
-                self.protected: list[str] = []
-                self.handles: dict[int, str] = {}
-
-            def _caller_sid(self):
-                return OWNER_SID
-
-            def _open_securable(self, path, *, write):
-                tests.assertTrue(write)
-                if path not in objects:
-                    return None, False, {"open_error": 2}
-                handle = 100 + len(self.handles)
-                self.handles[handle] = path
-                observed = objects[path]
-                return handle, bool(observed and observed.is_directory), {}
-
-            def _read_security(self, handle, is_directory):
-                observed = objects[self.handles[handle]]
-                return (observed, {}) if observed is not None else (None, {"read_error": 5})
-
-            def _protect_handle(self, handle, is_directory):
-                path = self.handles[handle]
-                self.protected.append(path)
-                return path != r"C:\store\sticky", {}
-
-        return TreePlatform()
+    def platform(self, objects, children, **kwargs) -> TreePlatform:
+        platform = TreePlatform(self, objects, children, **kwargs)
+        # The lifted methods call each other through ``self``; bind them.
+        for name in ("_walk_tree", "_open_tree"):
+            setattr(platform, name, self.scope[name].__get__(platform))
+        return platform
 
     def test_clean_objects_are_left_alone_and_failing_ones_replaced(self):
-        root = r"C:\store"
         objects = {
-            root: state(directory=True),
-            root + r"\ok": state(protected=False,
-                                 dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
-            root + r"\leaky": state(protected=False, dacl=(
+            ".": state(directory=True),
+            "ok": state(protected=False, dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
+            "leaky": state(protected=False, dacl=(
                 allow(OWNER_SID, flags=INHERITED_ACE), allow(EVERYONE, mask=0x1))),
         }
-        platform = self.platform(objects)
-        verified, evidence = self.enforce(platform, root, list(objects)[1:])
+        platform = self.platform(objects, {".": [("ok", FILE), ("leaky", FILE)]})
+        verified, evidence = self.enforce(platform, r"C:\store")
         self.assertTrue(verified, evidence)
-        self.assertEqual(platform.protected, [root + r"\leaky"])
+        self.assertEqual(platform.protected, ["leaky"])
         self.assertEqual(evidence["objects_repaired"], 1)
+        self.assertEqual(evidence["objects_seen"], 3)
         self.assertEqual(sorted(self.closed), sorted(platform.handles))
 
-    def test_the_root_is_judged_strictly_and_descendants_leniently(self):
-        root = r"C:\store"
+    def test_every_descendant_is_opened_relative_to_its_parent_and_enumerated_now(self):
+        """Codex review of ccb85ef, R1: no absolute path is resolved below
+        the root, and what is judged is what the directory handle lists
+        now, so a directory replaced wholesale is seen with its extra
+        objects included."""
         objects = {
-            root: state(protected=False, directory=True,
-                        dacl=(allow(OWNER_SID, flags=INHERITED_ACE | 3),)),
-            root + r"\child": state(protected=False,
-                                    dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
+            ".": state(directory=True),
+            "sub": state(directory=True, protected=False,
+                         dacl=(allow(OWNER_SID, flags=INHERITED_ACE | 3),)),
+            "sub\\deep": state(protected=False, dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
+            "sub\\extra": state(protected=False, dacl=(
+                allow(OWNER_SID, flags=INHERITED_ACE), allow(EVERYONE, mask=0x1))),
         }
-        platform = self.platform(objects)
-        verified, _ = self.enforce(platform, root, [root + r"\child"])
-        self.assertTrue(verified)
-        self.assertEqual(platform.protected, [root])
+        children = {".": [("sub", DIRECTORY)], "sub": [("deep", FILE), ("extra", FILE)]}
+        platform = self.platform(objects, children)
+        verified, evidence = self.observe(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(evidence["objects_failed"], ["sub\\extra"])
+        self.assertEqual(evidence["objects_seen"], 4)
+        self.assertEqual(platform.opened_roots, [(r"C:\store", False, True)])
+        self.assertEqual([(parent, name) for parent, name, _w, _l in platform.child_opens],
+                         [(".", "sub"), ("sub", "deep"), ("sub", "extra")])
+        self.assertEqual([listing for _p, name, _w, listing in platform.child_opens],
+                         [True, False, False])
 
-    def test_a_foreign_owned_object_is_never_touched_and_fails_the_pass(self):
-        root = r"C:\store"
-        theirs = root + r"\theirs"
-        objects = {root: state(directory=True),
-                   theirs: state(OTHER_SID, dacl=(allow(SID_OWNER_RIGHTS),))}
-        platform = self.platform(objects)
-        verified, evidence = self.enforce(platform, root, [theirs])
+    def test_the_root_is_judged_strictly_and_descendants_leniently(self):
+        objects = {
+            ".": state(protected=False, directory=True,
+                       dacl=(allow(OWNER_SID, flags=INHERITED_ACE | 3),)),
+            "child": state(protected=False, dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
+        }
+        platform = self.platform(objects, {".": [("child", FILE)]})
+        verified, _ = self.enforce(platform, r"C:\store")
+        self.assertTrue(verified)
+        self.assertEqual(platform.protected, ["."])
+
+    def test_a_foreign_owned_object_anywhere_stops_every_write(self):
+        """Codex review of ccb85ef, R2: ownership of the whole tree is read
+        before anything is written, so a parent that needs repair is not
+        written while a foreign-owned child sits under it."""
+        objects = {
+            ".": state(protected=False, directory=True, dacl=(allow(EVERYONE),)),
+            "theirs": state(OTHER_SID, dacl=(allow(SID_OWNER_RIGHTS),)),
+        }
+        platform = self.platform(objects, {".": [("theirs", FILE)]})
+        verified, evidence = self.enforce(platform, r"C:\store")
         self.assertFalse(verified)
         self.assertEqual(platform.protected, [])
-        self.assertEqual(evidence["objects_foreign_owned"], [theirs])
+        self.assertEqual(evidence["objects_foreign_owned"], ["theirs"])
+        self.assertEqual(sorted(self.closed), sorted(platform.handles))
+
+    def test_an_administrators_owned_tree_is_the_elevated_callers_own(self):
+        objects = {
+            ".": state(SID_ADMINISTRATORS, protected=False, directory=True,
+                       dacl=(allow(SID_SYSTEM, flags=3), allow(SID_ADMINISTRATORS, flags=3),
+                             allow(OWNER_SID, flags=3))),
+            "f": state(SID_ADMINISTRATORS, protected=False,
+                       dacl=(allow(OWNER_SID, flags=INHERITED_ACE),)),
+        }
+        platform = self.platform(objects, {".": [("f", FILE)]},
+                                 default_owner=SID_ADMINISTRATORS)
+        verified, evidence = self.enforce(platform, r"C:\store")
+        self.assertTrue(verified, evidence)
+        self.assertEqual(platform.protected, ["."])
+        self.assertEqual(evidence["objects_foreign_owned"], [])
+        platform = self.platform(objects, {".": [("f", FILE)]})
+        verified, evidence = self.enforce(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(evidence["objects_foreign_owned"], [".", "f"])
 
     def test_an_object_that_cannot_be_opened_or_repaired_fails_the_pass(self):
-        root = r"C:\store"
-        sticky = root + r"\sticky"
-        objects = {root: state(directory=True),
-                   sticky: state(dacl=(allow(OWNER_SID), allow(EVERYONE, mask=0x1)))}
-        platform = self.platform(objects)
-        verified, evidence = self.enforce(platform, root, [sticky, root + r"\gone"])
+        objects = {".": state(directory=True),
+                   "sticky": state(dacl=(allow(OWNER_SID), allow(EVERYONE, mask=0x1)))}
+        platform = self.platform(objects, {".": [("sticky", FILE)]}, sticky=frozenset({"sticky"}))
+        verified, evidence = self.enforce(platform, r"C:\store")
         self.assertFalse(verified)
-        self.assertEqual(evidence["objects_failed"], [sticky, root + r"\gone"])
+        self.assertEqual(evidence["objects_failed"], ["sticky"])
+        objects = {".": state(directory=True), "gone": state()}
+        platform = self.platform(objects, {".": [("gone", FILE), ("later", FILE)]},
+                                 unopenable=frozenset({"gone"}))
+        verified, evidence = self.enforce(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(evidence["objects_failed"], ["gone"])
+        self.assertEqual(evidence["open_status"], "0xC0000034")
+        self.assertEqual(platform.protected, [])
+
+    def test_a_reparse_point_inside_the_tree_refuses_the_tree(self):
+        class ReparsePlatform(TreePlatform):
+            def _open_child(self, parent, name, *, write, listing):
+                if name == "jx":
+                    return None, False, {"refused": "reparse point"}
+                return super()._open_child(parent, name, write=write, listing=listing)
+
+        objects = {".": state(directory=True), "f": state()}
+        platform = ReparsePlatform(self, objects, {".": [("f", FILE), ("jx", DIRECTORY | 0x400)]})
+        for name in ("_walk_tree", "_open_tree"):
+            setattr(platform, name, self.scope[name].__get__(platform))
+        verified, evidence = self.observe(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(evidence["refused"], "reparse point")
+        self.assertIn("jx", evidence["objects_failed"])
+
+    def test_an_object_that_changes_kind_between_listing_and_open_stops_the_walk(self):
+        objects = {".": state(directory=True), "swap": state(directory=False)}
+        platform = self.platform(objects, {".": [("swap", DIRECTORY)]})
+        verified, evidence = self.enforce(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(evidence["error"], "object changed kind between listing and open")
+        self.assertEqual(platform.protected, [])
+
+    def test_a_tree_larger_than_the_lane_creates_is_refused(self):
+        objects = {".": state(directory=True), **{f"f{i}": state() for i in range(5)}}
+        platform = self.platform(objects, {".": [(f"f{i}", FILE) for i in range(5)]})
+        verified, evidence = self.enforce(platform, r"C:\store", max_objects=3)
+        self.assertFalse(verified)
+        self.assertIn("more objects than the lane creates", evidence["error"])
+        self.assertEqual(platform.protected, [])
+        self.assertEqual(sorted(self.closed), sorted(platform.handles))
+
+    def test_the_root_open_asks_for_write_only_when_enforcing(self):
+        objects = {".": state(directory=True)}
+        platform = self.platform(objects, {".": []})
+        self.observe(platform, r"C:\store")
+        self.enforce(platform, r"C:\store")
+        self.assertEqual(platform.opened_roots,
+                         [(r"C:\store", False, True), (r"C:\store", True, True)])
 
 
 class HandleBoundSourceTests(unittest.TestCase):
@@ -440,12 +758,14 @@ class HandleBoundSourceTests(unittest.TestCase):
     tests above cannot see: what it calls and what it never calls."""
 
     ACL_METHODS = (
-        "enforce_owner_only_file", "verify_owner_only_path", "_caller_sid",
-        "_examine_handle", "_open_securable", "_reopen_descriptor",
-        "_read_security", "_write_owner_only", "_protect_handle",
-        "_protect_path", "_protect_descriptor", "_set_and_verify_owner_acl",
-        "_observe_handle", "observe_owner_only_acl", "acl_diagnostics",
-        "observe_owner_only_tree", "enforce_owner_only_tree",
+        "enforce_owner_only_file", "verify_owner_only_path", "_token_sid",
+        "_caller_sid", "_default_owner_sid", "_examine_handle",
+        "_open_securable", "_open_child", "_reopen_descriptor",
+        "_list_directory", "_read_security", "_write_owner_only",
+        "_protect_handle", "_protect_path", "_protect_descriptor",
+        "_set_and_verify_owner_acl", "_observe_handle",
+        "observe_owner_only_acl", "acl_diagnostics", "_walk_tree",
+        "_open_tree", "observe_owner_only_tree", "enforce_owner_only_tree",
     )
 
     def test_no_helper_program_and_no_text_parsing_remain_on_the_acl_path(self):
@@ -454,24 +774,45 @@ class HandleBoundSourceTests(unittest.TestCase):
             self.assertNotIn("subprocess", source, name)
             self.assertNotIn("icacls", source, name)
             self.assertNotIn("whoami", source, name)
+            self.assertNotIn("scandir", source, name)
+            self.assertNotIn("os.path.join", source, name)
 
-    def test_the_dacl_is_written_by_exactly_one_protected_single_call(self):
+    def test_the_dacl_is_written_by_exactly_one_non_propagating_call(self):
         writers = [name for name in self.ACL_METHODS
-                   if "SetSecurityInfo" in method_source(name)]
+                   if "NtSetSecurityObject" in method_source(name)]
         self.assertEqual(writers, ["_write_owner_only"])
         writer = method_source("_write_owner_only")
         self.assertIn("PROTECTED_DACL_SECURITY_INFORMATION", writer)
-        self.assertEqual(writer.count("advapi32.SetSecurityInfo("), 1)
+        self.assertEqual(writer.count("ntdll.NtSetSecurityObject("), 1)
+        # advapi32's handle-based writer propagates inheritable entries to
+        # existing descendants; it must not appear anywhere in the module.
+        self.assertNotIn("SetSecurityInfo", WINDOWS_SOURCE)
+        self.assertNotIn("SetNamedSecurityInfo", WINDOWS_SOURCE)
         self.assertNotIn("UNPROTECTED_DACL_SECURITY_INFORMATION", WINDOWS_SOURCE)
         self.assertNotIn("/remove", WINDOWS_SOURCE)
         self.assertNotIn("/reset", WINDOWS_SOURCE)
 
     def test_every_open_refuses_reparse_points_and_goes_through_one_examiner(self):
-        for name in ("_open_securable", "_reopen_descriptor"):
+        for name in ("_open_securable", "_open_child", "_reopen_descriptor"):
             self.assertIn("_examine_handle", method_source(name), name)
         self.assertIn("FILE_FLAG_OPEN_REPARSE_POINT", method_source("_open_securable"))
+        self.assertIn("FILE_FLAG_OPEN_REPARSE_POINT", method_source("_reopen_descriptor"))
+        self.assertIn("FILE_OPEN_REPARSE_POINT", method_source("_open_child"))
         self.assertIn("FILE_ATTRIBUTE_REPARSE_POINT", method_source("_examine_handle"))
         self.assertEqual(WINDOWS_SOURCE.count("kernel32.CreateFileW("), 1)
+        self.assertEqual(WINDOWS_SOURCE.count("ntdll.NtCreateFile("), 1)
+
+    def test_descendants_are_opened_relative_to_their_parent_handle(self):
+        child = method_source("_open_child")
+        self.assertIn("RootDirectory", WINDOWS_SOURCE)
+        self.assertIn("_OBJECT_ATTRIBUTES(", child)
+        self.assertIn("parent", child)
+        walk = method_source("_walk_tree")
+        self.assertIn("_open_child(", walk)
+        self.assertIn("_list_directory(", walk)
+        self.assertNotIn("_open_securable", walk)
+        self.assertNotIn("CreateFileW", walk)
+        self.assertEqual(method_source("_open_tree").count("_open_securable("), 1)
 
     def test_the_open_file_is_protected_through_its_own_handle(self):
         source = method_source("enforce_owner_only_file")
@@ -481,21 +822,24 @@ class HandleBoundSourceTests(unittest.TestCase):
 
     def test_ownership_is_checked_before_the_write(self):
         source = method_source("_protect_handle")
-        self.assertLess(source.index("owner_sid != caller"),
+        self.assertLess(source.index("owner_sid not in owners"),
                         source.index("_write_owner_only"))
 
-    def test_the_tree_pass_touches_only_objects_that_fail_judgment(self):
+    def test_the_tree_pass_reads_every_owner_before_it_writes_anything(self):
         source = method_source("enforce_owner_only_tree")
         self.assertIn("judge_security", source)
-        self.assertLess(source.index("owner_sid != caller"),
+        self.assertLess(source.index("owner_sid not in owners"),
                         source.index("_protect_handle"))
+        self.assertRegex(source, r"if not foreign_owned and \(?not walk_error\)?:")
 
     def test_the_caller_identity_comes_from_the_token_not_from_a_name(self):
-        source = method_source("_caller_sid")
+        source = method_source("_token_sid")
         self.assertIn("OpenProcessToken", source)
         self.assertIn("GetTokenInformation", source)
         self.assertNotIn("environ", source)
         self.assertNotIn("getlogin", source)
+        self.assertIn("TOKEN_USER_CLASS", method_source("_caller_sid"))
+        self.assertIn("TOKEN_OWNER_CLASS", method_source("_default_owner_sid"))
 
 
 class RejectingWindowsPlatform:
@@ -529,18 +873,14 @@ class WriteBoundaryTests(unittest.TestCase):
         self.assertIn(TARGET, str(caught.exception))
         self.assertIn("synthetic", str(caught.exception))
 
-        with tempfile.TemporaryDirectory() as directory:
-            target = os.path.join(directory, "must-not-exist")
-            store.atomic_write_bytes(target, b"original")
-            rejecting = RejectingFilePlatform()
-            with mock.patch.object(store, "platform", rejecting):
+    def test_store_never_writes_bytes_through_a_rejected_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = os.path.join(temp, "state.json")
+            with mock.patch.object(store, "platform", RejectingFilePlatform()):
                 with self.assertRaises(PermissionError):
-                    store.atomic_write_bytes(target, b"blocked")
-            self.assertEqual(Path(target).read_bytes(), b"original")
-            self.assertFalse(any(
-                entry.name.startswith(".tmp-") for entry in Path(directory).iterdir()))
-            with self.assertRaises(OSError):
-                os.fstat(rejecting.fd)
+                    store.atomic_write_bytes(target, b"secret")
+            self.assertFalse(os.path.exists(target))
+            self.assertEqual(os.listdir(temp), [])
 
 
 if __name__ == "__main__":
