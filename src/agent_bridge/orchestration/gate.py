@@ -554,16 +554,11 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
             flag = codex_hooks_flag_update(paths["codex_toml"], remove=remove)
             if flag is not None:
                 updates[paths["codex_toml"]] = flag
-    if remove:
-        if receipt_raw is not None:
-            new_receipt = None
-        else:
-            new_receipt = None
-    else:
+    if not remove:
         new_receipt = (json.dumps({"version": 1, "entries": entries, "config": os.path.realpath(config_path)},
                                   indent=2, sort_keys=True) + "\n").encode("utf-8")
-    if new_receipt is not None and receipt_raw != new_receipt:
-        updates[paths["receipt"]] = new_receipt
+        if receipt_raw != new_receipt:
+            updates[paths["receipt"]] = new_receipt
     return updates, originals, paths
 
 

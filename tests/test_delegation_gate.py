@@ -1,7 +1,6 @@
 """The delegation-first gate: receipts, judgment, hook wire, installation."""
 from __future__ import annotations
 
-import io
 import json
 import os
 import subprocess
