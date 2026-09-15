@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -62,6 +63,8 @@ class SetupTestCase(DriverTestCase):
         for fragment, response in self.responses.items():
             if any(fragment in str(item) for item in argv):
                 return response
+        if "/Query" in argv:
+            return _Captured(1)
         return _Captured(0)
 
     def _factory(self):
@@ -96,6 +99,13 @@ class SetupTestCase(DriverTestCase):
             stage=stage, stage_completed=None, awaiting_reboot=True,
             updated_at="2026-01-01T00:00:00+00:00", attempts=attempts)
         wp.write_resume_record(self._record_path(), record)
+
+    def _set_owned_task(self):
+        args = ws.build_parser().parse_args(
+            ["plan", "--runtime-root", str(self.runtime)])
+        action = wact.build_action(self._factory()(args).resume_command)
+        self.responses["/Query"] = _Captured(
+            0, f"Status: Ready\r\nTask To Run: {action}\r\n".encode())
 
     def _made_ready(self):
         """Boundary and lane recorded, so the ladder's last gate opens."""
@@ -199,6 +209,27 @@ class ResumeCommandTests(SetupTestCase):
         self.assertIn("windows-setup", source)
         self.assertIn("windows_setup.main", source)
 
+    def test_the_installed_resume_launcher_is_self_contained(self):
+        target = ws.install_resume_launcher(str(self.runtime))
+        self.assertTrue(Path(target).is_file())
+        result = subprocess.run(
+            [sys.executable, target, "plan", "--runtime-root", str(self.runtime)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(result.returncode, ws.EXIT_OK, result.stderr[:400])
+        self.assertEqual(json.loads(result.stdout)["command"], "plan")
+
+    def test_production_resume_command_uses_the_stable_runtime_copy(self):
+        root = "C:\\Users\\sam\\AppData\\Local\\agent-bridge\\windows"
+        stable = root + "\\bootstrap\\agent-bridge-resume.pyz"
+        with mock.patch.object(ws.wpf, "is_windows", return_value=False), \
+                mock.patch.object(ws, "stable_resume_launcher", return_value=stable), \
+                mock.patch.object(ws.sys, "executable", "C:\\Python\\python.exe"):
+            args = ws.build_parser().parse_args(
+                ["plan", "--runtime-root", root])
+            context = ws.build_context(args, run=self._run)
+        self.assertEqual(context.resume_command[1], stable)
+        self.assertNotIn("setup_bridge.py", " ".join(context.resume_command))
+
 
 class ContextAssemblyTests(SetupTestCase):
     """The real ``build_context``, without the factory seam."""
@@ -254,8 +285,12 @@ class ContextAssemblyTests(SetupTestCase):
         self.assertTrue(ws.reboot_pending(run=self._run))
 
     def test_absent_reboot_flags_mean_not_pending(self):
-        self.responses["reg.exe"] = _Captured(1, b"")
+        self.responses["Test-Path"] = _Captured(2, b"")
         self.assertFalse(ws.reboot_pending(run=self._run))
+
+    def test_a_registry_probe_failure_fails_towards_pending(self):
+        self.responses["Test-Path"] = _Captured(1, b"")
+        self.assertTrue(ws.reboot_pending(run=self._run))
 
     def test_a_detection_that_cannot_run_fails_towards_pending(self):
         def broken(argv):
@@ -273,7 +308,15 @@ class RebootAndResumeLifecycleTests(SetupTestCase):
         self.context_overrides["reboot_pending"] = True
 
     def _take_the_reboot(self):
-        return self._main("step", "--admin-consent", "--reboot-consent")
+        result = self._main("step", "--admin-consent", "--reboot-consent")
+        if result[1].get("status") == dr.STEP_REBOOT_SCHEDULED \
+                and "/Query" not in self.responses:
+            args = ws.build_parser().parse_args(
+                ["plan", "--runtime-root", str(self.runtime)])
+            action = wact.build_action(self._factory()(args).resume_command)
+            self.responses["/Query"] = _Captured(
+                0, f"Status: Ready\r\nTask To Run: {action}\r\n".encode())
+        return result
 
     # -- the reboot ------------------------------------------------------
 
@@ -394,6 +437,7 @@ class RebootAndResumeLifecycleTests(SetupTestCase):
 
     def test_reaching_ready_retires_the_record_and_the_task(self):
         self._write_record()
+        self._set_owned_task()
         self._made_ready()
         self.context_overrides.update(
             reboot_pending=False, anchors=self._anchor(),
@@ -407,6 +451,7 @@ class RebootAndResumeLifecycleTests(SetupTestCase):
 
     def test_an_exhausted_stage_stops_instead_of_rebooting_again(self):
         self._write_record(attempts=wp.MAX_STAGE_ATTEMPTS)
+        self._set_owned_task()
         self.context_overrides["reboot_pending"] = False
         code, payload = self._main("resume")
         self.assertEqual(code, ws.EXIT_OK)
@@ -425,11 +470,41 @@ class RebootAndResumeLifecycleTests(SetupTestCase):
 
     def test_an_orphan_task_left_behind_is_reported_as_a_failure(self):
         self._write_record(attempts=wp.MAX_STAGE_ATTEMPTS)
+        self._set_owned_task()
         self.responses["/Delete"] = _Captured(1, b"")
         self.context_overrides["reboot_pending"] = False
         code, payload = self._main("resume")
         self.assertEqual(code, ws.EXIT_FAILED)
         self.assertEqual(payload["reason"], "resume_task_not_removed")
+
+    def test_cleanup_refuses_a_task_replaced_after_registration(self):
+        self._write_record(attempts=wp.MAX_STAGE_ATTEMPTS)
+        self.responses["/Query"] = _Captured(
+            0, b"Status: Ready\r\nTask To Run: C:\\Python\\python.exe other.py\r\n")
+        self.context_overrides["reboot_pending"] = False
+        code, payload = self._main("resume")
+        self.assertEqual(code, ws.EXIT_BLOCKED)
+        self.assertEqual(payload["reason"], "resume_task_not_ours")
+        self.assertEqual(self._schtasks("/Delete"), [])
+        self.assertTrue(self._record_path().exists())
+
+    def test_manual_ready_step_retires_reboot_machinery(self):
+        self._write_record()
+        self._made_ready()
+        args = ws.build_parser().parse_args(
+            ["plan", "--runtime-root", str(self.runtime)])
+        command = self._factory()(args).resume_command
+        self.responses["/Query"] = _Captured(
+            0, ("Status: Ready\r\nTask To Run: " +
+                wact.build_action(command) + "\r\n").encode())
+        self.context_overrides.update(
+            reboot_pending=False, anchors=self._anchor(),
+            verify_signature=lambda *args: True)
+        code, payload = self._main("step")
+        self.assertEqual(code, ws.EXIT_OK)
+        self.assertEqual(payload["finish"]["terminal"], "ready")
+        self.assertFalse(self._record_path().exists())
+        self.assertEqual(len(self._schtasks("/Delete")), 1)
 
     # -- what a person can look at ---------------------------------------
 

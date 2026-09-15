@@ -905,15 +905,30 @@ def finish_resume(context: DriverContext) -> dict[str, Any]:
         return _step("resume_finish", STEP_BLOCKED, "still_provisioning",
                      stage=wp.current_stage(state))
 
-    argv = wp.unregister_resume_argv()
-    result = context.run(argv)
-    removed_task = getattr(result, "returncode", None) == 0
+    # Re-read the task immediately before cleanup.  The name alone is not
+    # ownership and another program may have replaced it since registration.
+    status = _resume_task_status(context)
+    if status.registered:
+        blocker = wp.resume_ownership_blocker(
+            status, [str(item) for item in (context.resume_command or ())])
+        if blocker:
+            return _step("resume_finish", STEP_BLOCKED,
+                         "resume_task_not_ours", detail=blocker)
+
+    # Clear state first.  If this fails, the still-registered task provides a
+    # recovery path at the next logon.  The reverse order strands a record
+    # that says setup will resume after its only trigger has been deleted.
     try:
         wp.clear_resume_record(wp.resume_record_path(context.config.runtime_root))
     except wp.ResumeError as exc:
         return _step("resume_finish", STEP_FAILED, exc.reason,
-                     task_removed=removed_task)
-    if not removed_task:
+                     task_removed=False)
+    if not status.registered:
+        return _step("resume_finish", STEP_OK, "",
+                     terminal=("ready" if ready else "stopped"))
+
+    result = context.run(wp.unregister_resume_argv())
+    if getattr(result, "returncode", None) != 0:
         # The record is gone, so nothing will act on a stale stage, but a
         # logon task nobody removed is an orphan and is reported as one.
         return _step("resume_finish", STEP_FAILED, "resume_task_not_removed")

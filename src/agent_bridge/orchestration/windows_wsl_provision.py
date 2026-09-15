@@ -680,7 +680,21 @@ def resume_ownership_blocker(status: wact.ActivationStatus,
     the name, so a collision must be proven to be ours first.
     """
 
-    return wact.proves_ownership(status, [str(item) for item in command])
+    if not status.registered:
+        return "" if status.state == "absent" else "task_status_unavailable"
+    if not status.action:
+        return "task_action_unreadable"
+    try:
+        expected = wact.build_action([str(item) for item in command])
+    except wact.ActivationError:
+        return "task_action_invalid"
+    # A resume action normally starts with the user's Python interpreter.
+    # Matching only that executable would treat every unrelated Python task
+    # with our fixed task name as ours.  Resume ownership is therefore the
+    # complete action, including launcher, subcommand and runtime root.
+    if status.action.strip() != expected:
+        return "task_action_mismatch"
+    return ""
 
 
 # ---------------------------------------------------------------------------

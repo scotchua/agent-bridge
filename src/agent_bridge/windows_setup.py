@@ -17,10 +17,11 @@ rest:
 * **What the OS says right now.** Preflight, the two optional-feature states,
   and whether a restart is pending. All read-only, all bounded, none of them
   inferred from a previous run of this process.
-* **The argv the resume task will run.** The same interpreter, this same
-  module, the same runtime root, with ``resume``. It has to be an absolute
-  local path (``windows_activation.validate_executable``), which is why it is
-  built from :data:`sys.executable` and checked before any reboot is taken.
+* **The argv the resume task will run.** The same interpreter and a protected,
+  self-contained copy of this package under the runtime root, with ``resume``.
+  It has to be an absolute local path
+  (``windows_activation.validate_executable``), and must survive the source
+  checkout being moved or updated after the restart is scheduled.
 
 Subcommands
 -----------
@@ -48,6 +49,7 @@ driver's own gates refuse, which is the intended behaviour and not a mock.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import ntpath
 import os
@@ -55,7 +57,10 @@ from pathlib import Path
 import platform as platform_module
 import subprocess
 import sys
+import zipfile
 from typing import Any, Callable, Sequence
+
+from . import store
 
 from .orchestration import windows_activation as wact
 from .orchestration import windows_delegation as wd
@@ -97,9 +102,9 @@ COMMAND_TIMEOUT_SECONDS = 600.0
 #: The registry locations Windows itself uses to record a pending restart.
 #: Queried, never written.
 _REBOOT_PENDING_KEYS = (
-    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
     r"\RebootPending",
-    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
     r"\RebootRequired",
 )
 
@@ -201,13 +206,17 @@ def reboot_pending(*, run: Callable[[Sequence[str]], Any]) -> bool:
     restart prompt, which is bounded by the stage attempt budget.
     """
 
-    reg = ntpath.join("C:\\Windows\\System32", "reg.exe")
+    powershell = ntpath.join("C:\\Windows\\System32", "WindowsPowerShell",
+                            "v1.0", "powershell.exe")
     for key in _REBOOT_PENDING_KEYS:
-        result = run([reg, "query", key])
+        script = ("try { if (Test-Path -LiteralPath 'Registry::" + key +
+                  "' -ErrorAction Stop) { exit 0 }; exit 2 } catch { exit 1 }")
+        result = run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                      "-Command", script])
         code = getattr(result, "returncode", None)
         if code == 0:
             return True
-        if code is None:
+        if code != 2:
             return True
     return False
 
@@ -218,18 +227,38 @@ def reboot_pending(*, run: Callable[[Sequence[str]], Any]) -> bool:
 
 
 def launcher_script() -> str | None:
-    """The repository's portable entry script, if this is a source checkout.
+    """The repository's portable entry script, for direct interactive use.
 
-    It matters because of where the resume task runs. A logon task inherits
-    the user's environment, not the shell that started setup, so a
-    ``python -m agent_bridge.windows_setup`` task would import nothing unless
-    the package is installed on the interpreter's own path. ``setup_bridge.py``
-    puts ``src`` on ``sys.path`` itself, so naming it makes the task work in a
-    checkout without depending on ``PYTHONPATH`` surviving a restart.
+    Scheduled resume does not use this path; it uses the self-contained copy
+    installed by :func:`install_resume_launcher`.  Keeping this helper allows
+    the ordinary checkout command and its tests to share one discovery rule.
     """
 
     script = Path(__file__).resolve().parents[2] / "setup_bridge.py"
     return str(script) if script.is_file() else None
+
+
+def stable_resume_launcher(runtime_root: str) -> str:
+    return str(Path(runtime_root) / "bootstrap" / "agent-bridge-resume.pyz")
+
+
+def install_resume_launcher(runtime_root: str) -> str:
+    """Install a self-contained, owner-only launcher that survives checkout moves."""
+
+    source = Path(__file__).resolve().parent
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("__main__.py", (
+            "from agent_bridge.windows_setup import main\n"
+            "raise SystemExit(main())\n"))
+        for path in sorted(source.rglob("*.py")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            archive.writestr(str(Path("agent_bridge") / path.relative_to(source)),
+                             path.read_bytes())
+    target = stable_resume_launcher(runtime_root)
+    store.atomic_write_bytes(target, output.getvalue())
+    return target
 
 
 def resume_command(runtime_root: str, *, executable: str | None = None,
@@ -264,7 +293,7 @@ def build_context(args: argparse.Namespace, *,
     features = collect_feature_states(run=runner) if on_windows else {}
     pending = reboot_pending(run=runner) if on_windows else False
     try:
-        command = resume_command(runtime_root)
+        command = resume_command(runtime_root, script=stable_resume_launcher(runtime_root))
     except wact.ActivationError:
         # Reported as an absent command rather than raised: the driver refuses
         # a rebooting stage without one, which is the outcome either way, and
@@ -295,10 +324,27 @@ def command_plan(context: dr.DriverContext, args: argparse.Namespace
 
 def command_step(context: dr.DriverContext, args: argparse.Namespace
                  ) -> tuple[dict[str, Any], int]:
+    # Install the durable launcher only once the user has consented to the
+    # rebooting step.  Read-only planning and refused consent remain read-only.
+    if (args.admin_consent and args.reboot_consent and context.resume_command
+            and len(context.resume_command) > 1
+            and str(context.resume_command[1]).endswith(".pyz")):
+        try:
+            install_resume_launcher(context.config.runtime_root)
+        except OSError:
+            result = {"step": "resume_schedule", "status": dr.STEP_FAILED,
+                      "reason": "resume_launcher_install_failed"}
+            return dict(result, command="step"), EXIT_FAILED
     result = dr.step(context, admin_consent=args.admin_consent,
                      reboot_consent=args.reboot_consent,
                      image_consent=args.image_consent,
                      provider_consent=args.provider_consent)
+    if result["status"] == dr.STEP_OK and result["step"] == wp.STAGE_READY:
+        finished = dr.finish_resume(context)
+        result = dict(result, finish=finished)
+        if finished["status"] not in (dr.STEP_OK,):
+            return dict(result, command="step"), _EXIT_FOR_STATUS.get(
+                finished["status"], EXIT_FAILED)
     return dict(result, command="step"), _EXIT_FOR_STATUS.get(result["status"],
                                                               EXIT_FAILED)
 
@@ -371,9 +417,9 @@ def command_resume(context: dr.DriverContext, args: argparse.Namespace
         payload["status"] = (last or {}).get("status", dr.STEP_BLOCKED)
         payload["reason"] = (last or {}).get("reason", "still_provisioning")
         return payload, _EXIT_FOR_STATUS.get(payload["status"], EXIT_BLOCKED)
-    payload["status"] = dr.STEP_FAILED
+    payload["status"] = finished["status"]
     payload["reason"] = finished["reason"]
-    return payload, EXIT_FAILED
+    return payload, _EXIT_FOR_STATUS.get(finished["status"], EXIT_FAILED)
 
 
 def command_validate(context: dr.DriverContext, args: argparse.Namespace

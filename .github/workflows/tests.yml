@@ -147,6 +147,13 @@ jobs:
           python3 -m unittest discover -s tests -p "test_claude_task.py"
           python3 -m unittest discover -s tests -p "test_codex_task.py"
 
+      - name: Windows command launcher smoke test
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          bin\agent-bridge-windows-setup.cmd plan --runtime-root "%TEMP%\agent-bridge-ci" > windows-setup.json
+          python -c "import json; d=json.load(open('windows-setup.json')); assert d['command']=='plan'"
+
       - name: Deterministic Windows validation and signing regressions
         run: |
           python3 -m unittest discover -s tests -p "test_windows_validation.py"

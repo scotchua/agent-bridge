@@ -532,19 +532,38 @@ class ResumeHardeningTests(unittest.TestCase):
         status = wact.ActivationStatus(True, "Ready", "",
                                        "C:\\Windows\\System32\\calc.exe")
         self.assertEqual(wp.resume_ownership_blocker(status, [self.WORKER]),
-                         "task_not_owned_by_agent_bridge")
+                         "task_action_mismatch")
 
     def test_our_own_resume_task_may_be_replaced(self):
         from agent_bridge.orchestration import windows_activation as wact
-        status = wact.ActivationStatus(True, "Ready", "",
-                                       f'"{self.WORKER}" --resume')
-        self.assertEqual(wp.resume_ownership_blocker(status, [self.WORKER]), "")
+        status = wact.ActivationStatus(
+            True, "Ready", "", wact.build_action([self.WORKER, "--resume"]))
+        self.assertEqual(wp.resume_ownership_blocker(
+            status, [self.WORKER, "--resume"]), "")
+
+    def test_same_python_with_different_arguments_is_not_ours(self):
+        from agent_bridge.orchestration import windows_activation as wact
+        python = "C:\\Python\\python.exe"
+        status = wact.ActivationStatus(
+            True, "Ready", "", f'"{python}" C:\\other\\task.py')
+        self.assertEqual(
+            wp.resume_ownership_blocker(
+                status, [python, "C:\\agent-bridge\\setup.py", "resume"]),
+            "task_action_mismatch")
 
     def test_an_absent_resume_task_blocks_nothing(self):
         from agent_bridge.orchestration import windows_activation as wact
         self.assertEqual(
-            wp.resume_ownership_blocker(wact.ActivationStatus(False),
+            wp.resume_ownership_blocker(
+                wact.ActivationStatus(False, "absent"),
                                         [self.WORKER]), "")
+
+    def test_an_unreadable_task_status_fails_closed(self):
+        from agent_bridge.orchestration import windows_activation as wact
+        self.assertEqual(
+            wp.resume_ownership_blocker(wact.ActivationStatus(False, "unknown"),
+                                        [self.WORKER]),
+            "task_status_unavailable")
 
 
 class ResumeRecordWriteTests(unittest.TestCase):

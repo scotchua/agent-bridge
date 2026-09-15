@@ -17,12 +17,14 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import guest_runner as gr
 from agent_bridge.orchestration import windows_auth as wa
+from agent_bridge.orchestration import windows_activation as wact
 from agent_bridge.orchestration import windows_delegation as wd
 from agent_bridge.orchestration import windows_evidence as wev
 from agent_bridge.orchestration import windows_provision_driver as dr
@@ -449,8 +451,13 @@ class LadderTests(DriverTestCase):
     def test_a_restart_registers_the_task_and_the_record_before_it_happens(self):
         """The record alone was the old bug: a note nothing would ever read."""
 
+        def absent_then_success(argv):
+            self.commands.append(list(argv))
+            return _TaskResult(1) if "/Query" in argv else _TaskResult(0)
+
         context = self._context(reboot_pending=True,
-                                resume_command=RESUME_COMMAND)
+                                resume_command=RESUME_COMMAND,
+                                run=absent_then_success)
         result = dr.step(context, admin_consent=True, reboot_consent=True)
         self.assertEqual(result["status"], dr.STEP_REBOOT_SCHEDULED)
         record = Path(wp.resume_record_path(str(self.runtime)))
@@ -705,6 +712,7 @@ class ResumeMachineTests(DriverTestCase):
             return answer(list(argv))
 
         context = self._context(run=run)
+        context.resume_command = list(self.COMMAND)
         return context, calls
 
     def _stage(self):
@@ -803,7 +811,13 @@ class ResumeMachineTests(DriverTestCase):
             wp.resume_record_path(str(self.runtime))))
 
     def test_an_exhausted_stage_is_a_safe_failure_that_cleans_up(self):
-        context, calls = self._context_with()
+        action = wact.build_action(self.COMMAND)
+        def responses(argv):
+            if "/Query" in argv:
+                return _TaskResult(0, stdout=(
+                    f"Status: Ready\r\nTask To Run: {action}\r\n").encode())
+            return _TaskResult(0)
+        context, calls = self._context_with(responses)
         stage = self._stage()
         wp.write_resume_record(
             wp.resume_record_path(str(self.runtime)),
@@ -818,8 +832,13 @@ class ResumeMachineTests(DriverTestCase):
             wp.resume_record_path(str(self.runtime))))
 
     def test_a_task_that_could_not_be_removed_is_reported_as_an_orphan(self):
-        context, _calls = self._context_with(lambda argv: _TaskResult(1))
-        # every command fails, including the delete
+        action = wact.build_action(self.COMMAND)
+        def responses(argv):
+            if "/Query" in argv:
+                return _TaskResult(0, stdout=(
+                    f"Status: Ready\r\nTask To Run: {action}\r\n").encode())
+            return _TaskResult(1)
+        context, _calls = self._context_with(responses)
         stage = self._stage()
         wp.write_resume_record(
             wp.resume_record_path(str(self.runtime)),
@@ -829,6 +848,26 @@ class ResumeMachineTests(DriverTestCase):
         result = dr.finish_resume(context)
         self.assertEqual(result["status"], dr.STEP_FAILED)
         self.assertEqual(result["reason"], "resume_task_not_removed")
+
+    def test_record_clear_failure_keeps_the_owned_task_for_recovery(self):
+        action = wact.build_action(self.COMMAND)
+        def responses(argv):
+            if "/Query" in argv:
+                return _TaskResult(0, stdout=(
+                    f"Status: Ready\r\nTask To Run: {action}\r\n").encode())
+            return _TaskResult(0)
+        context, calls = self._context_with(responses)
+        stage = self._stage()
+        wp.write_resume_record(
+            wp.resume_record_path(str(self.runtime)),
+            wp.build_resume_record(stage=stage.stage, stage_completed=None,
+                                   awaiting_reboot=True, updated_at="now",
+                                   attempts=wp.MAX_STAGE_ATTEMPTS))
+        with mock.patch.object(wp, "clear_resume_record",
+                               side_effect=wp.ResumeError("resume_not_removable")):
+            result = dr.finish_resume(context)
+        self.assertEqual(result["status"], dr.STEP_FAILED)
+        self.assertFalse(any("/Delete" in argv for argv in calls))
 
 
 if __name__ == "__main__":
