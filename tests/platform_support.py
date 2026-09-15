@@ -162,6 +162,25 @@ def drop_acl_bypass_privileges() -> list[str]:
         _fields_ = [("PrivilegeCount", wintypes.DWORD),
                     ("Privileges", LUID_AND_ATTRIBUTES * 1)]
 
+    # Prototypes, not defaults. GetCurrentProcess returns the pseudo-handle
+    # -1; with ctypes' default int return and int argument it reaches
+    # OpenProcessToken as 0xFFFFFFFF on x64, not 0xFFFFFFFFFFFFFFFF, and the
+    # call fails with ERROR_INVALID_HANDLE (seen on the hosted x64 runner,
+    # run 34938146871, while the ARM64 VM happened to sign-extend it).
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.LookupPrivilegeValueW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
                                      TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
