@@ -734,5 +734,44 @@ class InstallTests(GateCase):
             self.assertEqual(gate.report(str(self.home), str(self.state), clock=self.clock)["codex_trust"], "recorded")
 
 
+class EachClientHasItsOwnEditingTool(unittest.TestCase):
+    """The trap that hid a livelock, stated where a test author will see it.
+
+    Claude edits through ``Edit`` and friends; Codex edits through
+    ``apply_patch``. Naming the wrong one does not fail: the gate classifies
+    the call as not gated and allows it, which is correct behaviour and a
+    silent trap for a test. Two tests were written that way, one of them the
+    only guard against the two clients routing work at each other forever,
+    and both passed while reaching none of the code they named.
+    """
+
+    def test_each_client_gates_its_own_editing_tool(self):
+        for client, tool in (("claude", "Edit"), ("codex", "apply_patch")):
+            kind, _ = gate.classify(client, tool, {"file_path": "/tmp/a.py",
+                                                   "input": "*** Begin Patch\n"
+                                                            "*** Update File: a.py\n"
+                                                            "*** End Patch\n"},
+                                    "/tmp")
+            self.assertEqual(kind, "edit", f"{client} does not gate {tool}")
+
+    def test_the_other_client_editing_tool_is_not_gated_at_all(self):
+        """Not a defect. The reason a test must use the right name."""
+        for client, foreign in (("claude", "apply_patch"), ("codex", "Edit")):
+            kind, _ = gate.classify(client, foreign, {"file_path": "/tmp/a.py"},
+                                    "/tmp")
+            self.assertEqual(kind, "other",
+                             f"{foreign} is unexpectedly gated for {client}; "
+                             f"if that changed, the fixtures that rely on this "
+                             f"asymmetry need revisiting")
+
+    def test_the_two_edit_tool_sets_do_not_overlap(self):
+        self.assertFalse(gate.EDIT_TOOLS["claude"] & gate.EDIT_TOOLS["codex"])
+
+    def test_both_clients_gate_the_same_shell_tool(self):
+        """Bash is shared, which is why shell fixtures work for both."""
+        self.assertIn("Bash", gate.SHELL_TOOLS["claude"])
+        self.assertIn("Bash", gate.SHELL_TOOLS["codex"])
+
+
 if __name__ == "__main__":
     unittest.main()
