@@ -164,7 +164,7 @@ def run_command(argv: Sequence[str]) -> Any:
     try:
         return subprocess.run(list(argv), stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, timeout=COMMAND_TIMEOUT_SECONDS,
-                              check=False)
+                              check=False, shell=False)
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(list(argv), 1, b"", b"")
 
