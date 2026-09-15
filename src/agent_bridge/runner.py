@@ -106,6 +106,12 @@ def run(
 
     try:
         if env.get(MARKER_FAULT_PHASE_ENV) == "spawn_failed":
+            # This fault mode is exercised from another process.  Keep the
+            # pre-spawn marker observable long enough for the crash-injection
+            # test to prove it saw the marker before it watches the confirmed
+            # failure retire it; otherwise a fast host can confuse the two
+            # marker-absent states on either side of this transition.
+            time.sleep(0.25)
             raise OSError("injected peer spawn failure")
         proc = platform.spawn_isolated(argv, cwd=cwd, env=env)
     except (OSError, ValueError):

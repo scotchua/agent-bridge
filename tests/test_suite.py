@@ -2859,13 +2859,21 @@ def test_attempt_marker_crash_injection() -> None:
                                   registry.INFLIGHT_MARKER)
             deadline = time.time() + 15
             reached = False
+            saw_pre_spawn = False
             while time.time() < deadline:
                 status = registry.read_status(sb.cfg, job_id)
                 worker_pid = status.get("worker_pid") or worker_pid
                 if phase == "committed":
                     reached = os.path.isfile(marker + ".committed")
                 elif phase == "spawn_failed":
-                    reached = os.path.isdir(os.path.dirname(marker)) \
+                    # The attempts directory exists before the worker writes
+                    # the pre-spawn marker.  Requiring an observed marker
+                    # prevents a fast Windows runner from mistaking that
+                    # earlier, also-marker-absent state for the later
+                    # confirmed-spawn-failure transition.
+                    saw_pre_spawn = saw_pre_spawn or os.path.exists(marker)
+                    reached = saw_pre_spawn \
+                        and os.path.isdir(os.path.dirname(marker)) \
                         and not os.path.exists(marker)
                 else:
                     current = store.read_json_or_none(marker) or {}
