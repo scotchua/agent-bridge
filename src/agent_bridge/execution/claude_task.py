@@ -60,6 +60,16 @@ def _env(claude_config_dir:Path|None=None):
        "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
+    if os.name=="nt":
+        # Measured on a live Windows 11 VM: without SYSTEMROOT in the child's
+        # environment, plain `git --version` still succeeds, but any git
+        # operation that touches the network (ls-remote, clone, fetch) fails
+        # with "Could not resolve host" -- Windows's resolver needs it to load
+        # its own DLLs. USERPROFILE is included because ntpath.expanduser
+        # checks it, not HOME, so Path.home() above resolves correctly but a
+        # git subprocess doing its own home lookup would not see HOME either.
+        for k in ("SYSTEMROOT","COMSPEC","PATHEXT","USERPROFILE"):
+            if os.environ.get(k): e[k]=os.environ[k]
     # A store selector, never a token. Without it the CLI resolves ~/.claude,
     # the store the desktop app and interactive sessions also refresh; a
     # concurrent invalid-grant cleanup there blanks the tokens and this lane

@@ -108,6 +108,11 @@ def _env():
        "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
+    if os.name=="nt":
+        # See claude_task._env for the measured cause: without SYSTEMROOT a
+        # network-touching git operation fails with "Could not resolve host".
+        for k in ("SYSTEMROOT","COMSPEC","PATHEXT","USERPROFILE"):
+            if os.environ.get(k): e[k]=os.environ[k]
     return e
 
 def _git(repo:Path,*args:str,timeout:int=30,env=None):

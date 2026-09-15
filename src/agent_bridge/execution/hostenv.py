@@ -69,7 +69,18 @@ GIT_CANDIDATES: dict[str, tuple[str, ...]] = {
                "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
                "/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"),
     "Linux": ("/usr/bin/git", "/usr/local/bin/git", "/bin/git"),
-    "Windows": (),
+    # Measured on a live Windows 11 install: Git for Windows puts git.exe in
+    # both cmd\ and bin\ under Program Files. An empty tuple here fell
+    # straight through to shutil.which(), whose Windows implementation
+    # prepends the current directory to the search path -- a git.exe placed
+    # in a worktree would be preferred over the real one. Not confirmed
+    # reachable in this codebase's own call graph today (the process's cwd
+    # is fixed at launch and never chdir'd into a worktree before the first
+    # resolve_git() call), but every other platform gets explicit trusted
+    # candidates first and PATH only as fallback; Windows should not be the
+    # one platform relying on that analysis staying true forever.
+    "Windows": (r"C:\Program Files\Git\cmd\git.exe", r"C:\Program Files\Git\bin\git.exe",
+                r"C:\Program Files (x86)\Git\cmd\git.exe", r"C:\Program Files (x86)\Git\bin\git.exe"),
 }
 
 #: Exit status the confinement helper uses when its own self-check fails. A
