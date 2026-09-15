@@ -320,6 +320,22 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     return loaded
 
 
+def _sqlite_uri_path(path: str) -> str:
+    """A filesystem path as the path part of a SQLite ``file:`` URI.
+
+    Percent first, and that ordering is the fix: SQLite percent-decodes the
+    path, so a directory named ``App%20Data`` was rewritten and the open
+    failed with "unable to open database file". Escaping percent after the
+    question mark and hash would have mangled this function's own escapes.
+
+    The consequence was fail-closed and unusable: ``stage_binding`` returned
+    ``stage_db_unavailable``, which denies every gated call in both clients,
+    and ``capacity_digest`` returned None.
+    """
+    return (os.path.realpath(path).replace("%", "%25")
+            .replace("?", "%3F").replace("#", "%23"))
+
+
 def capacity_digest(capacity_db: str, now: float) -> str | None:
     """The capacity fingerprint as the hook sees it, or None if unreadable.
 
@@ -332,7 +348,7 @@ def capacity_digest(capacity_db: str, now: float) -> str | None:
     Takes no client, deliberately. See :func:`capacity_router.capacity_fingerprint`
     for the livelock that a client-relative version caused.
     """
-    uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=ro"
     try:
         db = sqlite3.connect(uri, uri=True, timeout=5.0)
     except sqlite3.Error:
@@ -354,7 +370,7 @@ def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str 
     it without changing who owns the stage. The database is opened
     read-only: the hook never writes the router's state. An unreadable
     database is ``stage_db_unavailable`` (a deny, fail closed)."""
-    uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=ro"
     try:
         db = sqlite3.connect(uri, uri=True, timeout=5.0)
     except sqlite3.Error:
@@ -446,8 +462,38 @@ def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
     return through_ancestors and _under(root, os.path.realpath(path))
 
 
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
-_SHELL_COMMAND_FLAGS = re.compile(r"^-[a-zA-Z]*c[a-zA-Z]*$")
+#: Programs whose command argument is another command to read.
+#:
+#: The POSIX names were the whole list, and on Windows that left three
+#: ordinary spellings unread, each of them a way past the protected-path rule.
+#: Reproduced with ntpath in place: ``bash.exe -c "rm -rf C:/Users/me/
+#: .agent-bridge"`` was ALLOWED where the identical ``bash -c`` was refused,
+#: because the basename still carried ``.exe``; ``powershell -Command "..."``
+#: and ``cmd /c "..."`` were allowed because neither the program nor the flag
+#: was recognised at all. Claude Code's Bash tool on Windows runs through Git
+#: for Windows, so these are the spellings that actually occur there.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish",
+                     "cmd", "powershell", "pwsh"})
+#: Extensions Windows appends to an executable, stripped before matching the
+#: name above. PATHEXT holds more; these are the ones a shell is spelled with.
+_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+#: ``sh -c`` and the Windows equivalents: ``cmd /c`` and ``/k``, PowerShell's
+#: ``-Command`` and ``-EncodedCommand``. Case-insensitive, because Windows
+#: flags are. ``-File`` is deliberately absent: it names a script to run, not
+#: a command to read, so recursing into it would be reading a path as a
+#: command.
+_SHELL_COMMAND_FLAGS = re.compile(
+    r"^(?:-[a-zA-Z]*c[a-zA-Z]*|[-/](?i:c|k|command|encodedcommand))$")
+
+
+def _program_name(word: str) -> str:
+    """The basename of ``word`` with any Windows executable suffix removed."""
+    name = os.path.basename(word)
+    lowered = name.lower()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def _shell_words(command: str) -> list[str]:
@@ -485,10 +531,19 @@ def _command_paths(command: str, cwd: str) -> list[str]:
         raw = word
         word = word.strip("'\"")
         nested = (len(previous) >= 2 and _SHELL_COMMAND_FLAGS.match(previous[-1])
-                  and os.path.basename(previous[-2]) in _SHELLS)
+                  and _program_name(previous[-2]).lower() in _SHELLS)
+        # A shell's own command flag names nothing. ``/c`` looks like a path
+        # on Windows and ``-c`` does not look like one anywhere, so only the
+        # Windows spelling caused trouble, and it caused plenty: translated as
+        # a drive it became ``C:\``, an ancestor of every protected path, so
+        # every ``cmd /c`` carrying a tree verb was refused.
+        consumed_flag = (previous and _SHELL_COMMAND_FLAGS.match(word)
+                         and _program_name(previous[-1]).lower() in _SHELLS)
         previous.append(raw)
         if nested:
             found.extend(_command_paths(word, cwd))
+            continue
+        if consumed_flag:
             continue
         word = word.lstrip("<>&|;")
         if not word or word in ("&&", "||", "|", ";", "&", ">", ">>", "<"):
@@ -500,15 +555,49 @@ def _command_paths(command: str, cwd: str) -> list[str]:
         candidates = [word]
         if "=" in word:
             candidates.append(word.split("=", 1)[1])
-        if ":" in word and not re.match(r"^[A-Za-z]:[\\/]", word):
+        # ``a:b`` can be two operands on POSIX, so it is split there. Not on
+        # Windows, where a colon is only ever a drive specification or an NTFS
+        # stream name, and where splitting severed the drive letter out of any
+        # path not at the start of the word. Reproduced: the nested command in
+        # ``cmd /c "del C:/Users/me/.agent-bridge/routing/x.json"`` produced a
+        # candidate with the drive gone, so the protected-path rule missed it.
+        if os.name != "nt" and ":" in word and not re.match(r"^[A-Za-z]:[\\/]", word):
             candidates.extend(word.split(":"))
         for part in candidates:
             part = part.strip("'\"")
             if not part:
                 continue
-            expanded = os.path.expanduser(part)
+            expanded = _windows_drive_path(os.path.expanduser(part))
             found.append(expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded))
     return found
+
+
+#: ``/c/Users/...`` and ``/cygdrive/c/Users/...``, the two ways a POSIX-style
+#: shell on Windows spells a drive.
+_MSYS_DRIVE = re.compile(r"^/{1,2}(?:cygdrive/)?([A-Za-z])(?=/)")
+
+
+def _windows_drive_path(path: str) -> str:
+    r"""``/c/Users/me`` as ``C:\Users\me``, on Windows only.
+
+    Claude Code's Bash tool on Windows runs through Git for Windows, so this
+    is the spelling that shell produces and accepts. ``ntpath.isabs`` calls
+    ``/c/Users/me`` absolute, so the value was kept verbatim and later
+    resolved against whatever the current drive happened to be, giving
+    ``C:\c\Users\me``: a different directory, so the protected-path rule did
+    not fire. Reproduced: ``rm -rf /c/Users/me/.agent-bridge`` was allowed
+    where all three Windows spellings of the same directory were refused.
+
+    A translation, not a validation. On POSIX ``/c/Users/me`` really is that
+    path and comes back untouched.
+    """
+    if os.name != "nt":
+        return path
+    match = _MSYS_DRIVE.match(path)
+    if match is None:
+        return path
+    remainder = path[match.end():]
+    return match.group(1).upper() + ":\\" + remainder.lstrip("/").replace("/", "\\")
 
 
 def list_receipts(state_root: str) -> list[dict[str, Any]]:

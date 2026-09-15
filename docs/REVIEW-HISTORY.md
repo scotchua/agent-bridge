@@ -1305,6 +1305,112 @@ whole round in miniature, so it goes first.
     every record, so the next reader does not have to take the question on
     trust.
 
+64. **Four Windows spellings walked straight through the protected-path
+    rule.** The rule reads a command's operands and refuses one that reaches
+    the gate's own state. Every mechanism it used to do that was written for
+    POSIX, so on Windows the ordinary spellings were invisible to it. All four
+    reproduced with `ntpath` in place, all four now refused:
+
+    * `cmd /c "del C:\Users\me\.agent-bridge\routing\x.json"` was
+      **allowed**, because `cmd` was not a recognised shell, so the quoted
+      command stayed one word, and the colon split then severed the drive
+      letter out of it;
+    * `bash.exe -c "..."` was **allowed** where the identical `bash -c "..."`
+      was refused, because the basename still carried `.exe`;
+    * `powershell -Command "..."` was **allowed**, because neither the program
+      nor the flag was recognised at all;
+    * `rm -rf /c/Users/me/.agent-bridge` was **allowed**, because
+      `ntpath.isabs` calls that absolute, so it was kept verbatim and later
+      resolved against the current drive as `C:\c\Users\me\...`, a
+      different directory.
+
+    The last is the one that matters most: **Claude Code's Bash tool on
+    Windows runs through Git for Windows**, so `/c/...` is the spelling that
+    shell actually produces. The gate covered `sh -c` and nothing else.
+
+    Fixing it produced a false positive of exactly the kind that makes a rule
+    worthless in the other direction. Translating a Git-Bash drive turned a
+    bare `/c`, which is `cmd.exe`'s own command flag, into `C:\`, an
+    ancestor of every protected path, so with a tree verb in the command
+    every `cmd /c` was refused. Caught by the test that asks whether an
+    unrelated write is *still allowed*, which is why that test exists: a rule
+    that refuses everything is not a rule, and it fails safe, so nothing else
+    would have complained.
+
+65. **A percent in the database path denied every call in both clients.**
+    SQLite percent-decodes a `file:` URI path, and the read-only URI escaped
+    `?` and `#` but not `%`. With the database under a directory named
+    `App%20Data` the open failed, `stage_binding` returned
+    `stage_db_unavailable`, which is a deny on every gated call, and
+    `capacity_digest` returned None. Fail-closed, and unusable. The ordering
+    is the fix: `%` has to be escaped first, or the function mangles its own
+    escapes.
+
+66. **The sweep that found these was cheap and I should have run it earlier.**
+    Findings 60 to 65 all came from asking five fresh readers to attack one
+    dimension each of the Windows surface, in order to decide what a Windows
+    VM should test. Between them they produced a silent total bypass for
+    non-ASCII paths, two fail-opens, four bypasses of the protected-path
+    rule, a fix to one of my own fixes, and two vacuity bugs in the collector
+    I had just written to test all of it.
+
+    I had been reading the same code myself for a long stretch and had found
+    the last of my own defects some time before. The asymmetry is worth
+    naming: **re-reading my own work has sharply diminishing returns, and
+    handing one narrow dimension to a reader with no memory of writing it does
+    not.** Several of the findings were demonstrated by execution in the
+    report rather than argued, which is also what made them quick to confirm
+    and impossible to wave away.
+
+### Still open from that sweep, recorded rather than fixed
+
+Nine further defects were reported with reasoning I found credible but have
+not yet verified or fixed. They are listed here so they are not lost, in the
+order I would take them:
+
+ • **The execution lanes would not run on Windows at all.** `os.fchmod` in
+   `_atomic_json` does not exist there, `os.set_blocking` is Unix-only
+   through 3.11, `_hash_regular_file` omits `O_BINARY` so the descriptor is
+   opened in text mode, and `_env()` passes none of `SYSTEMROOT`, `COMSPEC`
+   or `PATHEXT`, which `runner.scrubbed_env` in this same repository keeps
+   and explains why. Masked today only by ordering: `_require_confinement`
+   refuses on Windows before the first receipt is written. CI skips both lane
+   modules there, so nothing says so.
+ • **`shutil.which` puts the current directory first on Windows**, and with
+   `GIT_CANDIDATES["Windows"]` empty every Windows git resolution goes
+   through that line, so a `git.cmd` in the working directory beats a real
+   `git.exe` on PATH.
+ • **The keying asymmetry.** `receipt_name`, `item_id_for` and the policy
+   lookup hash or match `realpath` with no `normcase`, while `_under`
+   normcases both sides. So the same module treats Windows as
+   case-insensitive for refusing a write and case-sensitive for identifying a
+   repository: two spellings of one repository produce two receipts, and only
+   the spelling the operator typed matches their own policy entry. The
+   collector's `repo-keying-is-stable` check will fail on Windows if this is
+   right.
+ • **`own_home` is plain string equality** between two Windows paths, so
+   three ordinary spellings of one home flip the branch and `CODEX_HOME` is
+   silently dropped, which writes the Codex hook where Codex never reads it
+   while the report says installed.
+ • **`codex_trust_state` compares an exact dict key** across a process
+   boundary on a platform where one file has many spellings, so trust can
+   read as `needs_review` forever and the audit then prints that the Codex
+   half of the gate does not run.
+ • **`read_receipt` uses `os.path.exists` then `read_json`**, where
+   `store.py`'s own docstring says to use `read_json_atomic` on Windows
+   because a reader can arrive mid-replace.
+ • **Job directories and artefacts are protected with mode bits only**, which
+   Windows ignores; this project already owns the ACL seam
+   (`store.secure_mkdir`, `platform.enforce_owner_only_file`).
+ • **`store.atomic_write_bytes` plus `os.replace`** may carry an
+   inheritance-blocked owner-only DACL onto the user's own `settings.json`.
+ • **BOM and mixed line endings** in an existing `config.toml` or
+   `settings.json` abort the install with a message that names neither cause.
+
+Each needs verifying before it is believed, which is the standard the rest of
+this document is held to and the reason they are here rather than in the list
+above.
+
 ### What is still not true, after this round
 
 * **The two desktop products and Codex on the web cannot be intercepted.**

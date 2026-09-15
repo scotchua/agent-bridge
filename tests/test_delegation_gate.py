@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1090,6 +1092,173 @@ class TheLauncherNeverFailsOpen(unittest.TestCase):
         for name in ("agent-bridge-gate-hook", "agent-bridge-gate-hook.cmd"):
             text = (ROOT / "bin" / name).read_text(encoding="utf-8")
             self.assertIn("PYTHONUTF8", text, name)
+
+
+class WindowsSpellingsOfAProtectedWrite(unittest.TestCase):
+    r"""Four ways past the protected-path rule, all on Windows, all measured.
+
+    The rule reads a command's operands and refuses one that reaches the
+    gate's own state. Every mechanism it used to do that was written for
+    POSIX, so on Windows the ordinary spellings walked through it:
+
+    * ``cmd /c "del C:\Users\me\.agent-bridge\..."`` was allowed, because
+      ``cmd`` was not a recognised shell, so the quoted command was treated as
+      one word, and the colon split then severed the drive letter out of it;
+    * ``bash.exe -c "..."`` was allowed where ``bash -c "..."`` was refused,
+      because the basename still carried ``.exe``;
+    * ``powershell -Command "..."`` was allowed, because neither the program
+      nor the flag was recognised;
+    * ``rm -rf /c/Users/me/.agent-bridge`` was allowed, because
+      ``ntpath.isabs`` calls that absolute, so it was kept verbatim and later
+      resolved against the current drive as ``C:\c\Users\me\...``, a
+      different directory. This is the one that matters most: Claude Code's
+      Bash tool on Windows runs through Git for Windows, so that is the
+      spelling that shell produces.
+
+    These tests run everywhere, with ``ntpath`` and ``os.name`` standing in
+    for the platform, because the whole lesson of this round is that a
+    Windows-only test which only ever runs on one runner is a test that stops
+    being read. The gate's own Windows CI runners exercise the same code with
+    the real ``ntpath``.
+    """
+
+    PROTECTED = (ntpath.normpath(r"C:\Users\me\.agent-bridge"),)
+
+    def verdict(self, command: str, cwd: str = r"C:\proj") -> str:
+        """Whether the protected-path branch of judge() would refuse."""
+        with mock.patch.object(gate, "os") as fake:
+            for attribute in dir(os):
+                if not attribute.startswith("_"):
+                    try:
+                        setattr(fake, attribute, getattr(os, attribute))
+                    except Exception:      # noqa: BLE001  a few are read-only
+                        pass
+            fake.path = ntpath
+            fake.name = "nt"
+            fake.sep = "\\"
+            named = gate._command_paths(command, cwd)
+            trees = bool(gate._TREE_VERBS.search(command))
+            hit = [root for root in self.PROTECTED
+                   if any(gate._reaches(path, root, through_ancestors=trees)
+                          for path in named)]
+        return "refused" if hit else "allowed"
+
+    def test_a_nested_command_under_cmd_is_read(self):
+        for command in (r'cmd /c "del C:\Users\me\.agent-bridge\routing\x.json"',
+                        r'cmd.exe /C "del C:\Users\me\.agent-bridge\routing\x.json"',
+                        r'cmd /k "del C:\Users\me\.agent-bridge\routing\x.json"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_an_executable_suffix_does_not_hide_a_shell(self):
+        for command in (r'bash.exe -c "rm -rf C:\Users\me\.agent-bridge"',
+                        r'sh.exe -c "rm -rf C:\Users\me\.agent-bridge"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_powershell_is_a_shell(self):
+        for command in (
+                r'powershell -Command "Remove-Item -Recurse C:\Users\me\.agent-bridge"',
+                r'powershell.exe -command "Remove-Item C:\Users\me\.agent-bridge\x"',
+                r'pwsh -Command "Remove-Item C:\Users\me\.agent-bridge\x"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_a_git_bash_drive_path_names_the_same_directory(self):
+        for command in (r"rm -rf /c/Users/me/.agent-bridge",
+                        r"rm -rf //c/Users/me/.agent-bridge",
+                        r"rm -rf /cygdrive/c/Users/me/.agent-bridge",
+                        r"rm -rf /C/Users/me/.agent-bridge"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_the_plain_windows_spellings_still_work(self):
+        """The cases that were already refused, so a fix cannot have traded
+        one spelling for another."""
+        for command in (r"del C:\Users\me\.agent-bridge\routing\x.json",
+                        r"rm -rf c:\users\me\.agent-bridge",
+                        r'del "C:\Users\me\.agent-bridge\routing\x.json"',
+                        r"del C:/Users/me/.agent-bridge/routing/x.json"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_an_unrelated_write_is_still_allowed(self):
+        """A rule that refuses everything is not a rule."""
+        for command in (r"del C:\proj\app.py", r"rm -rf /c/other/place",
+                        r'cmd /c "del C:\proj\build"', "type app.py"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "allowed")
+
+    def test_a_shell_command_flag_is_not_an_operand(self):
+        r"""``cmd /c`` is a flag, not the drive root.
+
+        The first version of the Git-Bash translation turned a bare ``/c``
+        into ``C:\``, which is an ancestor of every protected path, so with a
+        tree verb in the command every ``cmd /c`` was refused. Caught by the
+        test that asks whether an unrelated write is still allowed, which is
+        why that test is there.
+        """
+        self.assertEqual(gate._windows_drive_path("/c"), "/c")
+        for command in (r'cmd /c "del C:\proj\build"',
+                        r'cmd /k "rm -rf C:\proj\build"',
+                        r'powershell -Command "Remove-Item C:\proj\build"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "allowed")
+
+    def test_the_msys_translation_is_windows_only(self):
+        """On POSIX, /c/Users/me really is that path."""
+        self.assertEqual(gate._windows_drive_path("/c/Users/me"), "/c/Users/me")
+
+    def test_a_posix_colon_operand_is_still_split(self):
+        """The colon split is right on POSIX and was only wrong on Windows."""
+        found = gate._command_paths("cp a:b /tmp/x", "/cwd")
+        self.assertIn("/cwd/a", found)
+        self.assertIn("/cwd/b", found)
+
+
+class TheSqliteUriEscapesEveryReservedCharacter(unittest.TestCase):
+    """A percent in the database path made the gate deny every call.
+
+    SQLite percent-decodes a ``file:`` URI path, so a directory named
+    ``App%20Data`` was rewritten and the open failed. ``stage_binding`` turns
+    that into ``stage_db_unavailable``, which is a deny on every gated call in
+    both clients, and ``capacity_digest`` returns None. Fail-closed, and
+    unusable. The ordering is the fix: percent must be escaped before the
+    question mark and hash, or this function mangles its own escapes.
+    """
+
+    def test_a_percent_in_the_path_opens(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            awkward = Path(temporary) / "App%20Data"
+            awkward.mkdir()
+            database = awkward / "capacity.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE capacity (route TEXT)")
+            connection.commit()
+            connection.close()
+            uri = "file:" + gate._sqlite_uri_path(str(database)) + "?mode=ro"
+            opened = sqlite3.connect(uri, uri=True)
+            try:
+                self.assertEqual(opened.execute("SELECT count(*) FROM capacity")
+                                 .fetchone()[0], 0)
+            finally:
+                opened.close()
+
+    def test_the_unescaped_form_is_what_used_to_fail(self):
+        """Stated so the test cannot pass by the path simply working anyway."""
+        with tempfile.TemporaryDirectory() as temporary:
+            awkward = Path(temporary) / "App%20Data"
+            awkward.mkdir()
+            database = awkward / "capacity.sqlite3"
+            sqlite3.connect(database).close()
+            naive = "file:" + str(database) + "?mode=ro"
+            with self.assertRaises(sqlite3.OperationalError):
+                sqlite3.connect(naive, uri=True)
+
+    def test_percent_is_escaped_before_the_others(self):
+        escaped = gate._sqlite_uri_path("/tmp/a%b")
+        self.assertIn("%25", escaped)
+        self.assertNotIn("%2525", escaped)
 
 
 if __name__ == "__main__":
