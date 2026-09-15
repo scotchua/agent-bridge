@@ -334,5 +334,61 @@ class Hygiene(AuditCase):
             self.assertTrue(check(completed.stdout.decode("utf-8")))
 
 
+class TheAuditNamesWhoSaidARouteWasAvailable(unittest.TestCase):
+    """Capacity provenance is reportable because it is now recorded.
+
+    The removed ``capacity_observe`` tool left no way to tell an operator's
+    statement from a model's assertion: every row looked the same. There are
+    two writers now and the report names them.
+    """
+
+    def test_the_render_names_the_source_of_each_row(self):
+        rendered = audit.render({
+            "window_hours": 24,
+            "policy": {"readable": True, "classified_repositories": 1},
+            "automatic_share": {"decisions": 1, "made_automatically": 1,
+                                "made_by_an_agent_calling_routing_decide": 0},
+            "eligible": {"count": 1}, "routed": {"count": 1, "by_route": {"codex": 1}},
+            "retained": {"count": 0},
+            "bypasses": {"warning": "w", "observed": {
+                "routed_but_never_dispatched": {"count": 0},
+                "clients_without_the_hook": [],
+                "writes_aimed_at_the_gate_itself": {"count": 0}}},
+            "failures": {"gate": {"count": 0, "by_code": {}},
+                         "execution_queue": {"present": False},
+                         "local_queue": {"present": False}},
+            "hook_coverage": {"claude": {"installed": True, "automatic_routing": True},
+                              "codex": {"installed": True, "automatic_routing": True},
+                              "codex_trust": "trusted"},
+            "stages": {"available": True, "capacity": {
+                "codex": {"status": "available", "trusted": True,
+                          "source": "policy:operator-declared"},
+                "local": {"status": "untrusted", "trusted": False,
+                          "source": "something-else"}}},
+        })
+        self.assertIn("policy:operator-declared", rendered)
+        self.assertIn("untrusted", rendered)
+
+    def test_an_empty_table_says_what_that_means(self):
+        rendered = audit.render({
+            "window_hours": 24,
+            "policy": {"readable": True, "classified_repositories": 0},
+            "automatic_share": {"decisions": 0, "made_automatically": 0,
+                                "made_by_an_agent_calling_routing_decide": 0},
+            "eligible": {"count": 0}, "routed": {"count": 0, "by_route": {}},
+            "retained": {"count": 0},
+            "bypasses": {"warning": "w", "observed": {
+                "routed_but_never_dispatched": {"count": 0},
+                "clients_without_the_hook": [],
+                "writes_aimed_at_the_gate_itself": {"count": 0}}},
+            "failures": {"gate": {"count": 0, "by_code": {}},
+                         "execution_queue": {"present": False},
+                         "local_queue": {"present": False}},
+            "hook_coverage": {"claude": {}, "codex": {}, "codex_trust": "unknown"},
+            "stages": {"available": False},
+        })
+        self.assertIn("no peer is dispatched to", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

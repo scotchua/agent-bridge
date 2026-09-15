@@ -1159,8 +1159,13 @@ def _routing_policy_scaffold() -> bytes:
             "prefer: empty means no preference, so when both providers are "
             "eligible the work goes to the peer. Name a route here to keep "
             "work with it instead.",
+            "declared_available: the routes installed on this machine. This "
+            "is the only standing statement of availability; no assistant "
+            "can make one. A route left out is dispatched to only while it "
+            "has itself run the gate hook in the last fifteen minutes.",
         ],
         "prefer": [],
+        "declared_available": [],
         "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
         "repos": {},
         "_example": {
@@ -1219,8 +1224,10 @@ def _install_gate(home: str, root: str, config_path: str,
         "and nothing is dispatched.",
         "Start Codex once and accept the new hook in its /hooks view. Until "
         "then the Codex half of the gate does not run.",
-        "Record capacity for a route (capacity_observe) before work will be "
-        "dispatched to it; a stale observation never makes a route eligible.",
+        "List the routes installed on this machine under \"declared_available\" "
+        "in that same file. A peer is dispatched to only when the operator "
+        "has declared it there or it has itself run the gate hook recently; "
+        "there is no tool an assistant can call to declare itself available.",
         "Read bin/agent-bridge-gate-hook audit --config "
         f"{config_path} for what was eligible, routed, retained and bypassed.",
     ]

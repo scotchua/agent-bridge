@@ -31,6 +31,7 @@ express one: ``ROUTES`` is the complete set.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -118,6 +119,16 @@ class Policy:
     #: Codex client handed every one of them over. An asymmetry nobody chose
     #: does not belong in a default.
     prefer: tuple[str, ...] = ()
+    #: Routes the operator states are installed and may receive work on this
+    #: machine. This is the honest replacement for the ``capacity_observe``
+    #: tool, which let an assistant declare any route available for as long
+    #: as it liked. It is a *standing declaration*, not a live health check,
+    #: and it is recorded as one: ``autodecide`` replays it into the capacity
+    #: ledger on every decision with the ledger's ordinary short freshness,
+    #: so removing a route from this list stops routing to it rather than
+    #: waiting for an observation to age out. An empty list means the only
+    #: capacity evidence is a peer that has itself run the hook recently.
+    declared_routes: tuple[str, ...] = ()
 
     def for_repo(self, repo: str) -> RepoPolicy:
         """The entry for ``repo``, matched on the real path, else the default."""
@@ -441,9 +452,25 @@ def parse_policy(document: object) -> Policy:
     prefer = document.get("prefer", [])
     if not isinstance(prefer, list) or any(route not in ROUTES for route in prefer):
         raise PolicyError("prefer must be a list of known routes")
+    declared = document.get("declared_available", [])
+    if not isinstance(declared, list) or any(route not in ROUTES for route in declared):
+        raise PolicyError("declared_available must be a list of known routes")
+    # Fail closed on shape here too. A misspelled ``declaredAvailable`` that
+    # parsed silently would leave the operator believing they had declared a
+    # route available when they had not. An underscore-prefixed key is a
+    # comment: the scaffold the installer writes uses ``_comment`` and
+    # ``_example`` to show the shape, and JSON has nowhere else to put them.
+    unknown_top = {key for key in document
+                   if not key.startswith("_")} - {"version", "repos",
+                                                  "max_local_load_ratio", "prefer",
+                                                  "declared_available"}
+    if unknown_top:
+        raise PolicyError("routing policy has unknown keys: "
+                          + ", ".join(sorted(unknown_top)))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
                   peer_classifications=PEER_CLASSIFICATIONS,
-                  max_local_load_ratio=float(ceiling), prefer=tuple(prefer))
+                  max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
+                  declared_routes=tuple(dict.fromkeys(declared)))
 
 
 def load_policy(state_root: str) -> Policy:
@@ -455,9 +482,31 @@ def load_policy(state_root: str) -> Policy:
     malformed file *is* an error, and it propagates: the gate turns it into a
     deny rather than proceeding under a policy it could not read.
     """
-    from .. import store
+    return load_policy_and_fingerprint(state_root)[0]
+
+
+def load_policy_and_fingerprint(state_root: str) -> tuple[Policy, str]:
+    """The policy and the digest of the exact bytes it was parsed from.
+
+    One read, because two were a real defect. ``ensure_decision`` used to call
+    ``load_policy`` and then ``policy_fingerprint``, each opening the file
+    separately, so an operator saving the file between the two produced a
+    receipt stamped with the digest of one policy and decided under another.
+    The receipt then looked current for four hours while describing a decision
+    the policy on disk would not have made. A single read cannot disagree with
+    itself.
+    """
+    import hashlib
 
     path = policy_path(state_root)
-    if not os.path.exists(path):
-        return Policy()
-    return parse_policy(store.read_json(path))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return Policy(), NO_POLICY
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PolicyError(f"routing policy is not readable JSON: {type(exc).__name__}") from None
+    return parse_policy(document), digest

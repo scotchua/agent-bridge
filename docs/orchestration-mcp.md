@@ -43,9 +43,24 @@ bin/agent-bridge-orchestration --caller claude --config /absolute/private/orches
 bin/agent-bridge-orchestration --caller codex --config /absolute/private/orchestration.json
 ```
 
-`capacity_observe` accepts only time-bounded observations. Missing, stale or
-unavailable capacity never grants a stage claim. Capacity remains advisory:
-it does not expand task authority, permitted data routes, or review rules.
+**There is no tool for declaring capacity.** There was one, `capacity_observe`,
+and it was the wrong shape: the assistant chose the route, the availability,
+the source string and the freshness window, so "a fresh observation from an
+authorized source" meant whatever the model typed, for as long as it liked.
+
+Capacity has exactly two writers now, neither of them on the wire:
+
+ • the gate hook records that the client calling it is running. First-hand,
+   its own route only, fifteen minutes.
+ • `declared_available` in `routing-policy.json` lists the routes installed
+   on this machine. That is a standing operator declaration, not a health
+   check, and it is recorded as one: the ledger shows the source, and
+   removing a route from the list withdraws it on the next decision.
+
+Missing, stale, untrusted or unavailable capacity never grants a stage claim,
+and no observation may claim a window longer than the routing lease. Capacity
+remains advisory: it does not expand task authority, permitted data routes, or
+review rules.
 
 The local Ollama executor runs in the server's background thread while either
 app is connected. A local result is an untrusted draft until its supervising

@@ -374,7 +374,8 @@ class StageBindingTests(GateCase):
         self.db = str(self.base / "capacity.sqlite3")
         self.router = StageRouter(self.db, clock=self.clock)
         self.router.observe_capacity(CapacityObservation(
-            route="claude", observed_at=1000.0, fresh_until=5000.0, available=True, source="test"))
+            route="claude", observed_at=1000.0, fresh_until=5000.0, available=True,
+            source="test"), trusted=True)
         self.router.register("item-1", "implement", allowed_routes=["claude"])
         self.owned = self.router.assign("item-1", "implement", owner_id="claude-session",
                                         lease_seconds=600, expected_revision=0)
@@ -445,7 +446,8 @@ class HookProcessTests(GateCase):
         """A stage the router really owns on the claude route, plus its receipt."""
         router = StageRouter(str(self.state / "capacity.sqlite3"))
         router.observe_capacity(CapacityObservation(route="claude", observed_at=time.time(),
-                                                    fresh_until=time.time() + 3600, available=True, source="test"))
+                                                    fresh_until=time.time() + 3600, available=True,
+                                                    source="test"), trusted=True)
         router.register("item-1", "implement", allowed_routes=["claude"])
         owned = router.assign("item-1", "implement", owner_id="claude-session", lease_seconds=600,
                               expected_revision=0)
@@ -573,7 +575,8 @@ class RoutingDecideToolTests(GateCase):
         self.router = StageRouter(str(self.base / "capacity.sqlite3"), clock=self.clock)
         for route in ("claude", "codex"):
             self.router.observe_capacity(CapacityObservation(
-                route=route, observed_at=1000.0, fresh_until=5000.0, available=True, source="test"))
+                route=route, observed_at=1000.0, fresh_until=5000.0, available=True,
+                source="test"), trusted=True)
 
     def call(self, server, name, arguments):
         reply = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

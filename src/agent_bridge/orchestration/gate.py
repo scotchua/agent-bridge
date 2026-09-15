@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import store
-from ..capacity_router import RoutingError
+from ..capacity_router import RoutingError, capacity_fingerprint
 from . import autoroute
 
 CLIENTS = ("claude", "codex")
@@ -215,7 +215,8 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
                     clock: Any = time.time, code: str | None = None,
                     considered: dict[str, Any] | None = None,
                     automatic: bool = False,
-                    policy_fingerprint: str | None = None) -> dict[str, Any]:
+                    policy_fingerprint: str | None = None,
+                    capacity_fingerprint: str | None = None) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
 
     ``stage_record`` is the router's current view of the stage, already
@@ -278,6 +279,8 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         receipt["considered"] = considered
     if policy_fingerprint is not None:
         receipt["policy_fingerprint"] = policy_fingerprint
+    if capacity_fingerprint is not None:
+        receipt["capacity_fingerprint"] = capacity_fingerprint
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
@@ -304,6 +307,30 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
             or not isinstance(loaded.get("stage_revision"), int) or isinstance(loaded.get("stage_revision"), bool):
         raise ValueError("routing receipt is not one this gate wrote")
     return loaded
+
+
+def capacity_digest(capacity_db: str, now: float, *, client: str) -> str | None:
+    """The capacity fingerprint as the hook sees it, or None if unreadable.
+
+    Read-only, like :func:`stage_binding`: the hook never writes the router's
+    state. ``None`` on an unreadable table on purpose, and it means "do not
+    re-decide over this": an unreadable router is an infrastructure failure
+    that ``stage_binding`` turns into a deny, and a decision made without the
+    ledger would be worse than the stale one.
+    """
+    uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        db.row_factory = sqlite3.Row
+        rows = [dict(row) for row in db.execute("SELECT * FROM capacity")]
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    return capacity_fingerprint(rows, now, exclude_client=client)
 
 
 def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str | None:
@@ -589,14 +616,18 @@ _OVERTAKEN = frozenset({"stage_not_found", "stage_not_owned", "stage_reassigned"
 
 def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
                                 capacity_db: str | None, task_type: str,
-                                policy_fingerprint: str | None = None) -> bool:
+                                policy_fingerprint: str | None = None,
+                                capacity_fingerprint: str | None = None) -> bool:
     """Whether an automatic receipt should be replaced by a fresh decision.
 
-    Four ways a recorded decision stops describing the call in front of it,
+    Five ways a recorded decision stops describing the call in front of it,
     all of them ordinary rather than exceptional:
 
     * the operator's routing policy has changed since it was decided, so the
       decision was made under rules that no longer apply;
+    * the set of routes with eligible capacity has changed, so a decision
+      that retained the work because the peer was unavailable is re-made now
+      that it is, and one that routed to a peer is re-made when it goes away;
     * it was decided for a different kind of work (one receipt per
       repository, but a repository holds work of more than one kind);
     * it has expired;
@@ -608,10 +639,16 @@ def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
     instruction to claim a stage by hand, which is the opposite of automatic.
     Before the policy case was handled, classifying a repository took effect
     whenever its receipt happened to expire, up to four hours later, which
-    made the operator's own document look inert.
+    made the operator's own document look inert. Capacity had the same
+    four-hour lag for the same reason, and a receipt that says "the peer has
+    no fresh capacity observation" is exactly the one that should stop being
+    true the moment the peer appears.
     """
     if (policy_fingerprint is not None
             and receipt.get("policy_fingerprint") != policy_fingerprint):
+        return True
+    if (capacity_fingerprint is not None
+            and receipt.get("capacity_fingerprint") != capacity_fingerprint):
         return True
     if str(receipt.get("stage", "")).split("#")[0] != task_type:
         return True
@@ -677,8 +714,11 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
         task_type = infer_task_type(paths)
         if (receipt is not None and decide is not None and receipt.get("automatic")
-                and automatic_receipt_overtaken(receipt, now, capacity_db, task_type,
-                                                autoroute.policy_fingerprint(state_root))):
+                and automatic_receipt_overtaken(
+                    receipt, now, capacity_db, task_type,
+                    autoroute.policy_fingerprint(state_root),
+                    None if capacity_db is None
+                    else capacity_digest(capacity_db, now, client=client))):
             receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and

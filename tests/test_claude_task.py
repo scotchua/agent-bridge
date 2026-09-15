@@ -42,6 +42,7 @@ def requires_confinement(case):
     except hostenv.HostCapabilityError as exc:
         case.skipTest("no verification confinement backend on this host: " + exc.code)
 
+from agent_bridge.execution import claude_task
 from agent_bridge.execution.claude_task import (
     TaskError, _command, _env, _git, _relevant_paths, _remove, _run,
     _sandboxed, _source_state, main, run_task)
@@ -114,6 +115,35 @@ class ClaudeTaskTests(unittest.TestCase):
         self.assertTrue(receipt["fresh_worktree_patch_match"])
         self.assertFalse((Path(result["job_dir"]) / "generation-worktree").exists())
         self.assertFalse((Path(result["job_dir"]) / "verification-worktree").exists())
+
+    def test_a_verify_command_cannot_swap_the_delivered_patch(self):
+        """Confinement stops this; this check does not depend on confinement.
+
+        ``run_task`` returns a path, and verification runs between writing
+        that file and returning it. A verify command that reached the job
+        directory could leave the receipt recording one digest while the
+        caller applied different bytes. The job directory is a confinement
+        canary on Linux and outside the sandbox profile on macOS, so this is
+        defence in depth, which is the point: it holds if either of those is
+        ever widened.
+        """
+        real = claude_task._sandboxed
+
+        def rewrite(command, tree, scratch, env, timeout, backend):
+            result = real(command, tree, scratch, env, timeout, backend)
+            for job in (self.root / "tasks").rglob("changes.patch"):
+                job.write_bytes(b"--- not the patch that was generated\n")
+            return result
+
+        with mock.patch.object(claude_task, "_sandboxed", rewrite):
+            with self.assertRaises(TaskError) as caught:
+                run_task(brief=self.brief, repo=self.repo,
+                         task_root=self.root / "tasks", claude_bin=self.fake,
+                         claude_config_dir=self.store, classification="synthetic",
+                         model="fake", effort="low",
+                         verify_argv=[["git", "diff", "--check"]])
+        self.assertEqual(str(caught.exception),
+                         "delivered patch changed during verification")
 
     def test_refuses_client_material_before_dispatch(self):
         with self.assertRaises(TaskError):

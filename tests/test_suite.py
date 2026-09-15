@@ -40,6 +40,40 @@ GROUP_OF_TWO = ("import subprocess,sys,time;"
                 "time.sleep(120)")
 
 
+_MODE_BITS_BIND: bool | None = None
+
+
+def mode_bits_bind() -> bool:
+    """Whether a directory's mode bits actually restrict *this* account.
+
+    Measured, once, rather than assumed. Two checks below prove the bridge
+    fails closed when a directory cannot be listed or written, and both use
+    ``restrict_dir`` to create that condition. For uid 0 the condition cannot
+    be created at all: root bypasses the mode bits, the restriction is a
+    no-op, and the check then reports a failure that is about the account
+    rather than about the code. That is worse than not running it, because it
+    hides a real regression in the same line.
+
+    So: make a directory unwritable and try to write in it. If the write
+    succeeds, mode bits do not bind here and the checks that depend on them
+    skip by name.
+    """
+    global _MODE_BITS_BIND
+    if _MODE_BITS_BIND is None:
+        probe = tempfile.mkdtemp(prefix="ab-modebits-")
+        try:
+            os.chmod(probe, 0o500)
+            try:
+                os.mkdir(os.path.join(probe, "inner"))
+                _MODE_BITS_BIND = False
+            except OSError:
+                _MODE_BITS_BIND = True
+        finally:
+            os.chmod(probe, 0o700)
+            shutil.rmtree(probe, ignore_errors=True)
+    return _MODE_BITS_BIND
+
+
 def restrict_dir(path: str, kind: str):
     """Make a directory unlistable or unwritable, on either platform.
 
@@ -1485,15 +1519,20 @@ def test_round_two_regressions() -> None:
         blocked = os.path.join(sb.root, "blocked")
         inner = os.path.join(blocked, "ws")
         os.makedirs(inner, exist_ok=True)
-        restore_blocked = restrict_dir(blocked, "unlistable")
-        try:
-            preflight.assert_workspace_clean(inner)
-            check("R5: an unenumerable ancestor fails closed", False, "it passed")
-        except BrokerError as exc:
-            check("R5: an unenumerable ancestor fails closed",
-                  exc.category == ErrorCategory.WORKSPACE_UNVERIFIABLE, exc.category.value)
-        finally:
-            restore_blocked()
+        if not mode_bits_bind():
+            skip("R5: an unenumerable ancestor fails closed",
+                 "mode bits do not bind this account, so the condition "
+                 "cannot be created here")
+        else:
+            restore_blocked = restrict_dir(blocked, "unlistable")
+            try:
+                preflight.assert_workspace_clean(inner)
+                check("R5: an unenumerable ancestor fails closed", False, "it passed")
+            except BrokerError as exc:
+                check("R5: an unenumerable ancestor fails closed",
+                      exc.category == ErrorCategory.WORKSPACE_UNVERIFIABLE, exc.category.value)
+            finally:
+                restore_blocked()
         check("R5: the walk resolves the real path, not the lexical one",
               "os.path.realpath(workspace)" in inspect.getsource(
                   preflight.assert_workspace_clean))
@@ -2698,20 +2737,25 @@ def test_attempt_marker_lifecycle() -> None:
     # Found by CI: the write was best-effort and silently swallowed failure, so
     # on any machine where the path was not writable the bridge would have
     # spawned a peer with no durable evidence of it.
-    base = os.path.join(tempfile.gettempdir(), "ab-ro-%d" % os.getpid())
-    os.makedirs(base, exist_ok=True)
-    restore_base = restrict_dir(base, "unwritable")
-    try:
-        blocked = runner.run([sys.executable, "-c", "print('should-not-run')"],
-                             cwd=tempfile.gettempdir(),
-                             env=runner.scrubbed_env(), stdin_data="", timeout=10,
-                             grace=1, stdout_cap=100, stderr_cap=100,
-                             pgid_file=os.path.join(base, "nested", "marker.json"))
-        check("LC: an unwritable marker refuses the run rather than spawning blind",
-              blocked.spawn_failed and blocked.marker_write_failed
-              and blocked.stdout == b"", f"stdout={blocked.stdout!r}")
-    finally:
-        restore_base()
+    if not mode_bits_bind():
+        skip("LC: an unwritable marker refuses the run rather than spawning blind",
+             "mode bits do not bind this account, so an unwritable directory "
+             "cannot be created here")
+    else:
+        base = os.path.join(tempfile.gettempdir(), "ab-ro-%d" % os.getpid())
+        os.makedirs(base, exist_ok=True)
+        restore_base = restrict_dir(base, "unwritable")
+        try:
+            blocked = runner.run([sys.executable, "-c", "print('should-not-run')"],
+                                 cwd=tempfile.gettempdir(),
+                                 env=runner.scrubbed_env(), stdin_data="", timeout=10,
+                                 grace=1, stdout_cap=100, stderr_cap=100,
+                                 pgid_file=os.path.join(base, "nested", "marker.json"))
+            check("LC: an unwritable marker refuses the run rather than spawning blind",
+                  blocked.spawn_failed and blocked.marker_write_failed
+                  and blocked.stdout == b"", f"stdout={blocked.stdout!r}")
+        finally:
+            restore_base()
         shutil.rmtree(base, ignore_errors=True)
 
     # Retirement must be gated on the release SUCCEEDING, not merely ordered

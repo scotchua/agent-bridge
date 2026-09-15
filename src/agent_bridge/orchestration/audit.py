@@ -454,6 +454,16 @@ def render(document: dict[str, Any]) -> str:
                  f"{observed['writes_aimed_at_the_gate_itself']['count']}")
     lines.append(f"  {document['bypasses']['warning']}")
     lines.append("")
+    capacity = (document.get("stages") or {}).get("capacity") or {}
+    if capacity:
+        lines.append("  capacity, and who said so:")
+        for route in sorted(capacity):
+            entry = capacity[route]
+            lines.append(f"    {route}: {entry.get('status')} "
+                         f"(source {entry.get('source')})")
+    else:
+        lines.append("  capacity: nothing recorded, so no peer is dispatched to")
+    lines.append("")
     lines.append(f"  gate failures: {document['failures']['gate']['count']} "
                  f"{document['failures']['gate']['by_code'] or ''}")
     for name in ("execution_queue", "local_queue"):

@@ -53,9 +53,33 @@ from agent_bridge.orchestration import audit, autodecide, autoroute, gate  # noq
 from agent_bridge.orchestration.execution_queue import (  # noqa: E402
     ExecutionQueue, Harnesses, SubprocessHarnessExecutor)
 
+def _verify_python() -> str | None:
+    """The interpreter name to verify with, or None if this host has neither.
+
+    ``sys.executable`` cannot be used: ``verify_policy`` requires a program
+    named without a path, on purpose. So the name has to be bare, and which
+    bare name exists is a property of the host. This was hardcoded to
+    ``python``, which cost a reviewer three failures on macOS, where a bare
+    ``python`` has not existed since the system Python 2 was removed and the
+    setup documentation says ``python3`` for that reason. Some Windows
+    installs are the other way round. Probing is the only honest answer, and
+    a host with neither skips rather than reporting a failure that is about
+    the machine instead of the code.
+    """
+    for name in ("python3", "python"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+VERIFY_PYTHON = _verify_python()
 #: A verification command the allowlist accepts and that needs no third-party
 #: package, so the synthetic repository can actually be verified anywhere.
-VERIFY = ["python", "-m", "unittest", "discover", "-s", ".", "-p", "test_calc.py"]
+VERIFY = [VERIFY_PYTHON or "python3", "-m", "unittest", "discover", "-s", ".",
+          "-p", "test_calc.py"]
+#: Applied to every test whose assertion depends on verification running.
+needs_python = unittest.skipUnless(
+    VERIFY_PYTHON, "no bare python3 or python on PATH; verification cannot run")
 
 BUGGY = "def add(a, b):\n    return a - b\n"
 FIXED = "def add(a, b):\n    return a + b\n"
@@ -232,7 +256,7 @@ class Workflow(unittest.TestCase):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route=route, observed_at=now, fresh_until=now + seconds,
-            available=True, source="e2e-operator-observation"))
+            available=True, source="e2e-operator-observation"), trusted=True)
 
     def env(self):
         return {**os.environ, "HOME": str(self.home),
@@ -451,7 +475,7 @@ class BothDirections(Workflow):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route=provider, observed_at=now, fresh_until=now + 3600,
-            available=True, source="e2e-operator-observation"))
+            available=True, source="e2e-operator-observation"), trusted=True)
         item = f"e2e-{item_suffix}"
         router.register(item, "implement", allowed_routes=[provider])
         owned = router.assign(item, "implement", owner_id=f"{caller}-session",
@@ -499,7 +523,7 @@ class BothDirections(Workflow):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route="claude", observed_at=now, fresh_until=now + 3600,
-            available=True, source="e2e-operator-observation"))
+            available=True, source="e2e-operator-observation"), trusted=True)
         router.register("self-dispatch", "implement", allowed_routes=["claude"])
         owned = router.assign("self-dispatch", "implement", owner_id="claude-session",
                               lease_seconds=1800, expected_revision=0)
@@ -518,7 +542,7 @@ class BothDirections(Workflow):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route="codex", observed_at=now, fresh_until=now + 3600,
-            available=True, source="e2e-operator-observation"))
+            available=True, source="e2e-operator-observation"), trusted=True)
         router.register("paid", "implement", allowed_routes=["codex"])
         owned = router.assign("paid", "implement", owner_id="claude-session",
                               lease_seconds=1800, expected_revision=0)
@@ -615,7 +639,7 @@ class RestartRecovery(Workflow):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route="codex", observed_at=now, fresh_until=now + 3600,
-            available=True, source="e2e-operator-observation"))
+            available=True, source="e2e-operator-observation"), trusted=True)
         router.register("restart", "implement", allowed_routes=["codex"])
         owned = router.assign("restart", "implement", owner_id="claude-session",
                               lease_seconds=1800, expected_revision=0)

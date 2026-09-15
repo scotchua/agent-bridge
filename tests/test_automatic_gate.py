@@ -32,7 +32,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_bridge.capacity_router import CapacityObservation, StageRouter  # noqa: E402
+from agent_bridge.capacity_router import (  # noqa: E402
+    MAX_FRESHNESS_SECONDS, CapacityObservation, RoutingError, StageRouter)
 from agent_bridge.orchestration import autodecide, autoroute, gate  # noqa: E402
 
 
@@ -71,12 +72,13 @@ class AutoCase(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="utf-8")
         os.chmod(path, 0o600)
 
-    def observe(self, route: str, available: bool = True, seconds: float = 3600):
+    def observe(self, route: str, available: bool = True, seconds: float = 3600,
+                trusted: bool = True, source: str = "test-operator"):
         router = StageRouter(str(self.db))
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route=route, observed_at=now, fresh_until=now + seconds,
-            available=available, source="test-operator"))
+            available=available, source=source), trusted=trusted)
 
     def hook(self, client: str, repo: Path, relative: str = "app.py",
              tool: str = "Edit", *args) -> dict:
@@ -180,7 +182,7 @@ class PrivacyIsCheckedBeforeEverythingElse(AutoCase):
         """Every route fresh and available still does not move the work."""
         self.write_policy({str(self.repo): {"classification": "client_derived",
                                             "allowed_routes": ["codex"]}})
-        self.observe("codex", seconds=86400)
+        self.observe("codex", seconds=MAX_FRESHNESS_SECONDS)
         self.assertAllowed(self.hook("claude", self.repo))
         self.assertEqual(self.receipt_for(self.repo)["code"],
                          "retained_classification_ineligible")
@@ -225,7 +227,7 @@ class CapacityEvidenceIsFirstHandOnly(AutoCase):
         now = time.time()
         router.observe_capacity(CapacityObservation(
             route="codex", observed_at=now - 7200, fresh_until=now - 3600,
-            available=True, source="test-operator"))
+            available=True, source="test-operator"), trusted=True)
         self.assertAllowed(self.hook("claude", self.repo))
         self.assertEqual(self.receipt_for(self.repo)["code"],
                          "retained_no_fresh_capacity")
@@ -696,6 +698,158 @@ class PolicyParsing(unittest.TestCase):
             autoroute.parse_policy({"version": 1, "repos": {
                 "/tmp": {"allowed_routes": ["anthropic_api"]}}})
         self.assertEqual(autoroute.ROUTES, ("claude", "codex", "local"))
+
+
+class CapacityIsNotSomethingTheAssistantSays(AutoCase):
+    """The review's third finding: capacity evidence was model-controlled.
+
+    ``capacity_observe`` let either assistant report arbitrary availability
+    for any route, name its own source, and make it last years. The tool is
+    gone. What is left is the operator's standing declaration in
+    ``routing-policy.json`` and the gate hook's own first-hand presence, and
+    these tests exercise both through the real hook rather than the library.
+    """
+
+    def audit_decisions(self) -> list[dict]:
+        path = self.state / "routing" / gate.AUDIT_LEDGER
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines() if line.strip()
+                and json.loads(line).get("event") == "routing_decided"]
+
+    def classify(self, **extra):
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, **extra)
+
+    def test_the_operator_declaration_alone_makes_the_peer_eligible(self):
+        """No observation, no tool call, no user asking: the file is enough."""
+        self.classify(declared_available=["codex"])
+        reason = self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIn("routed to codex", reason)
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "codex")
+
+    def test_the_declaration_is_recorded_as_a_declaration(self):
+        """It must not be able to pass itself off as a measurement."""
+        self.classify(declared_available=["codex"])
+        self.hook("claude", self.repo)
+        entry = StageRouter(str(self.db)).report()["capacity"]["codex"]
+        self.assertEqual(entry["source"], autodecide.DECLARED_SOURCE)
+        self.assertTrue(entry["trusted"])
+
+    def test_an_untrusted_row_routes_nothing(self):
+        """A row written without trust is exactly what the removed tool wrote."""
+        self.classify()
+        self.observe("codex", trusted=False)
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+
+    def test_a_declaration_cannot_outlast_the_operator_removing_it(self):
+        """Writing it with a short life was not enough on its own.
+
+        The row the last replay wrote stayed eligible until it aged out, so
+        deleting a route from the file took up to fifteen minutes to mean
+        anything. The withdrawal is replayed as well.
+        """
+        self.classify(declared_available=["codex"])
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.classify()
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+
+    def test_withdrawal_cannot_erase_a_peer_that_really_is_running(self):
+        """The withdrawal names its own source for this reason.
+
+        A peer that has itself run the gate hook is first-hand evidence and
+        has nothing to do with the operator's list. A withdrawal that swept
+        the route rather than its own row would silently retain work the
+        peer was available for.
+        """
+        self.classify()
+        self.observe("codex", source=autodecide.CLIENT_PRESENCE_SOURCE)
+        reason = self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIn("routed to codex", reason)
+        entry = StageRouter(str(self.db)).report()["capacity"]["codex"]
+        self.assertEqual(entry["source"], autodecide.CLIENT_PRESENCE_SOURCE)
+
+
+class ACapacityChangeReDecidesAtOnce(AutoCase):
+    """The review's fourth finding: decisions went stale for four hours.
+
+    A receipt that says "the peer has no fresh capacity observation" is the
+    one that should stop being true the moment the peer appears. These tests
+    change capacity *without touching the policy*, so only the capacity
+    fingerprint can be what notices.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+
+    def decisions(self) -> int:
+        path = self.state / "routing" / gate.AUDIT_LEDGER
+        if not path.exists():
+            return 0
+        return sum(1 for line in path.read_text(encoding="utf-8").splitlines()
+                   if line.strip() and json.loads(line).get("event") == "routing_decided")
+
+    def test_a_peer_appearing_re_decides_with_the_policy_untouched(self):
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+        before = self.receipt_for(self.repo)["policy_fingerprint"]
+
+        self.observe("codex")
+        reason = self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIn("routed to codex", reason)
+        receipt = self.receipt_for(self.repo)
+        self.assertEqual(receipt["owner_route"], "codex")
+        self.assertEqual(receipt["policy_fingerprint"], before,
+                         "the policy did not change, so only capacity can have")
+
+    def test_a_peer_going_away_re_decides_too(self):
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.observe("codex", available=False)
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+
+    def test_the_receipt_records_the_capacity_it_was_decided_under(self):
+        self.observe("codex")
+        self.hook("claude", self.repo)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"], "codex")
+
+    def test_nothing_re_decides_while_nothing_changes(self):
+        """The narrowing that makes this affordable.
+
+        The hook refreshes this client's own presence row on every call. A
+        fingerprint over the whole table would therefore differ on every
+        call, and every call would re-decide: measured at eight decisions
+        for this workload instead of one.
+        """
+        for _ in range(4):
+            self.hook("claude", self.repo)
+        self.assertEqual(self.decisions(), 1)
+
+    def test_the_other_client_does_not_re_decide_our_receipt_for_free(self):
+        """A receipt one client wrote stays valid for the other.
+
+        The asking client's own presence row is excluded from the digest for
+        this reason: leaving it in made every claude receipt disagree with
+        every codex reading of it.
+        """
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        decided = self.decisions()
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertEqual(self.decisions(), decided,
+                         "codex re-decided a receipt that already named codex")
 
 
 if __name__ == "__main__":

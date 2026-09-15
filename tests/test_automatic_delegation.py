@@ -618,7 +618,7 @@ class GateInstallationWiringTests(ApplyHarness):
         with tempfile.TemporaryDirectory() as tmp:
             _, _, report = self._apply_enabled(tmp)
             steps = " ".join(report["automatic_delegation"]["gate"]["next_steps"]).lower()
-            for expected in ("classify", "/hooks", "capacity", "audit"):
+            for expected in ("classify", "/hooks", "declared_available", "audit"):
                 self.assertIn(expected, steps)
 
     def test_opting_out_installs_no_gate_at_all(self):

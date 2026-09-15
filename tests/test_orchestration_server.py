@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_bridge.capacity_router import StageRouter
+from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.mcp_server import build_tools as build_consultation_tools
 from agent_bridge.orchestration.config import OrchestrationConfigError, load
@@ -87,13 +87,29 @@ class OrchestrationServerTests(unittest.TestCase):
         self.assertTrue(routed["ok"])
         self.assertEqual(routed["caller"], "codex")
 
+    def test_no_tool_lets_the_model_declare_capacity(self):
+        """The one input a model must not control is not on the wire.
+
+        ``capacity_observe`` used to be here, and with it an assistant could
+        name any route available, from any source, for any length of time,
+        which made "a fresh observation from an authorized source" mean
+        whatever the model typed. Capacity has two writers now and neither is
+        a tool: the gate hook and the operator's policy file.
+        """
+        server = Server("codex", self.service, self.router, interval=0.01)
+        self.assertNotIn("capacity_observe", server.tools)
+        for name, tool in server.tools.items():
+            self.assertNotIn(
+                "fresh_until", json.dumps(tool["inputSchema"]),
+                f"{name} accepts a capacity window from the caller")
+
     def test_capacity_register_claim_status_and_complete(self):
         server = Server("codex", self.service, self.router, interval=0.01)
-        observed = self.request(server, "capacity_observe", {
-            "route": "local", "observed_at": 100.0, "fresh_until": 200.0,
-            "available": True, "source": "synthetic-test-feed",
-        })
-        self.assertTrue(observed["ok"])
+        # Written directly, as the gate hook and the policy replay do. There
+        # is deliberately no tool for this.
+        self.router.observe_capacity(CapacityObservation(
+            route="local", observed_at=100.0, fresh_until=200.0, available=True,
+            source="synthetic-test-feed"), trusted=True)
         registered = self.request(server, "stage_register", {
             "item_id": "item-1", "stage": "extract",
             "allowed_routes": ["local", "codex"], "preferred_routes": ["local", "codex"],

@@ -1,10 +1,20 @@
-"""MCP tool definitions for durable routing and local work intake."""
+"""MCP tool definitions for durable routing and local work intake.
+
+There is deliberately no tool here for recording capacity.  There used to be
+``capacity_observe``, and an adversarial review was right about it: the
+assistant chose the route, the availability, the source string and the
+freshness window, so "a fresh observation from an authorized source" meant
+whatever the model typed.  Capacity now has exactly two writers, neither of
+them model-facing: the gate hook, which records that the client calling it is
+running, and the operator's ``routing-policy.json``, which is a file only the
+operator edits.  See :mod:`agent_bridge.orchestration.autodecide`.
+"""
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..capacity_router import CapacityObservation, RoutingError, StageRouter
+from ..capacity_router import RoutingError, StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
 from . import autodecide, gate
@@ -73,19 +83,10 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "expected_revision": {"type": "integer", "minimum": 0},
     }, ["item_id", "stage", "owner_id", "expected_revision"])
     status = _schema(identity, ["item_id", "stage"])
-    observe = _schema({
-        "route": {"type": "string", "enum": ["claude", "codex", "local"]},
-        "observed_at": {"type": "number"}, "fresh_until": {"type": "number"},
-        "available": {"type": "boolean"}, "source": {"type": "string"},
-    }, ["route", "observed_at", "fresh_until", "available", "source"])
     empty = _schema({}, [])
 
     def route_local(args: dict[str, Any]) -> dict[str, Any]:
         return call(intake.route, {"params": None, "risk_flags": [], **args, "caller": caller})
-
-    def observe_capacity(args: dict[str, Any]) -> dict[str, Any]:
-        observation = CapacityObservation(**args)
-        return call(router.observe_capacity, {"observation": observation})
 
     tools = {
         "work_route_local": {
@@ -103,10 +104,6 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "work_feedback": {
             "description": "Record one immutable usefulness outcome for completed production work.",
             "inputSchema": feedback, "handler": lambda args: call(queue.feedback, args),
-        },
-        "capacity_observe": {
-            "description": "Record a time-bounded capacity observation from a supported source. It grants no new authority or data route.",
-            "inputSchema": observe, "handler": observe_capacity,
         },
         "stage_register": {
             "description": "Register one durable stage and its permitted routes before claiming it.",

@@ -492,11 +492,13 @@ Then do three things, in this order:
 2. **Start Codex once and accept the new hook** in its `/hooks` view. Until
    then Codex shows "New hook - review required", the hook does not run, and
    every Codex call is un-gated. `gate report` shows the trust state.
-3. **Record capacity for a route** before work will be dispatched to it. A
-   route with no fresh observation is not eligible, and a stale observation
-   never makes one eligible, so a machine nobody has reported capacity for
-   retains everything. Use the `capacity_observe` tool from an authorized
-   source.
+3. **List the routes installed on this machine** under `declared_available`
+   in that same file. A route with no fresh capacity is not eligible, so a
+   machine nobody has declared anything for retains everything. There are
+   two ways a route gets there and no third: you declare it in the policy
+   file, or it has itself run the gate hook in the last fifteen minutes. No
+   assistant can declare itself or its peer available; the tool that used to
+   allow that is gone.
 
 Check what it did:
 

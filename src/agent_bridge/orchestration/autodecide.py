@@ -21,12 +21,26 @@ route and the reason. Nothing the agent says reaches it. The hook's own
 
 Two honest limits, stated here because they belong next to the mechanism:
 
-* **Capacity for this client is first-hand; capacity for a peer is not.**
-  When the decision retains the work, this module records one capacity
-  observation for the asking client's own route, because a client that just
-  made a tool call is demonstrably running. It never records an observation
-  for the peer or the local model: those still need a real observation from
-  an authorized source, and without one the policy retains the work.
+* **Capacity for this client is first-hand; capacity for a peer is a
+  declaration.** This module records one short-lived capacity observation for
+  the asking client's own route, because a client that just made a tool call
+  is demonstrably running. It never observes the peer or the local model:
+  there is no collector for those, and inventing one would be a guess. What
+  it does instead is replay the operator's ``declared_available`` list from
+  ``routing-policy.json`` into the same ledger, as a *declaration* rather
+  than a measurement, with the same short freshness so that removing a route
+  from the file stops routing to it on the next call. The receipt records
+  which routes were eligible, the ledger records that each row came from the
+  policy file, and neither claims the peer was health-checked.
+
+  What is gone is the third way: an MCP tool called ``capacity_observe``,
+  which let the assistant name the route, the availability, the source and a
+  freshness window of any length. An adversarial review pointed out that
+  "a fresh observation from an authorized source" then meant whatever the
+  model typed, including availability for a route it knew nothing about,
+  lasting years. The tool is removed, the ledger has a ``trusted`` column
+  that only these two writers set, and rows an older version accepted are
+  untrusted after the migration and no longer route anything.
 * **A brief is not something a tool call contains.** When the decision routes
   work to a peer or a local model, this module writes a durable dispatch
   intent naming the route, the repository and the stage binding, and the gate
@@ -47,7 +61,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import store
-from ..capacity_router import CapacityObservation, RoutingError, StageRouter
+from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
+                               StageRouter, capacity_fingerprint as _fingerprint)
 from . import autoroute, gate
 
 #: How long an automatically claimed stage is leased for. Long enough that an
@@ -61,8 +76,17 @@ DEFAULT_TTL_SECONDS = 4 * 3600
 #: it is evidence about right now, not a standing claim.
 CLIENT_PRESENCE_SECONDS = 900
 #: The source string recorded for that observation, so an audit can tell it
-#: apart from an operator-supplied one.
-CLIENT_PRESENCE_SOURCE = "gate-hook:client-present"
+#: apart from an operator-declared one. Defined in ``capacity_router`` because
+#: the fingerprint has to recognise the row without importing this module.
+CLIENT_PRESENCE_SOURCE = PRESENCE_SOURCE
+#: The source string recorded for a route the operator declared available.
+#: A different word from "observed" on purpose: nothing health-checked it.
+DECLARED_SOURCE = "policy:operator-declared"
+#: Freshness of a declaration. As short as the presence observation, because
+#: it is re-read from the operator's file on every decision: keeping it short
+#: is what makes deleting a route from the file take effect at once instead
+#: of hours later.
+DECLARED_SECONDS = 900
 
 INTENT_DIR = "intents"
 INTENT_VERSION = 1
@@ -123,12 +147,58 @@ def _observe_client_presence(router: StageRouter, client: str) -> None:
 
     The hook is executing because the client made a tool call, so this is an
     observation rather than an assumption. It is recorded for the client's own
-    route and never for the peer or the local model.
+    route and never for the peer or the local model. Trusted, because the
+    writer is this code path reacting to a host event, not a model asserting
+    something in a tool call.
     """
     now = float(router.clock())
     router.observe_capacity(CapacityObservation(
         route=client, observed_at=now, fresh_until=now + CLIENT_PRESENCE_SECONDS,
-        available=True, source=CLIENT_PRESENCE_SOURCE))
+        available=True, source=CLIENT_PRESENCE_SOURCE), trusted=True)
+
+
+def _observe_declared_routes(router: StageRouter, policy: autoroute.Policy,
+                             *, client: str) -> None:
+    """Replay the operator's standing declaration into the capacity ledger.
+
+    Trusted, because the operator's policy file is the one input in this
+    system a model cannot write: the gate refuses the editing tools on the
+    gate's own state, which includes it.
+
+    The client's own route is skipped, because presence already covers it
+    first-hand and a declaration must not be able to keep a route eligible
+    that the presence observation would not.
+
+    Withdrawal is replayed too, and it has to be. Writing the declaration
+    with a short freshness was not enough on its own: a route the operator
+    deleted from the file kept the row the last replay wrote and stayed
+    eligible until it aged out, so removing a route took up to fifteen
+    minutes. A test caught exactly that. The withdrawal names
+    ``DECLARED_SOURCE``, so it removes what the declaration put there and
+    cannot remove a peer's own first-hand presence.
+    """
+    now = float(router.clock())
+    for route in autoroute.ROUTES:
+        if route == client or route in policy.declared_routes:
+            continue
+        router.retract_capacity(route, source=DECLARED_SOURCE)
+    for route in policy.declared_routes:
+        if route == client:
+            continue
+        router.observe_capacity(CapacityObservation(
+            route=route, observed_at=now, fresh_until=now + DECLARED_SECONDS,
+            available=True, source=DECLARED_SOURCE), trusted=True)
+
+
+def capacity_fingerprint(router: StageRouter, *, client: str) -> str:
+    """The digest of eligible capacity this decision depends on.
+
+    Thin on purpose: the arithmetic lives in ``capacity_router`` so that the
+    gate hook, which reads the same table read-only, computes the identical
+    value from the identical code.
+    """
+    return _fingerprint(router.capacity_rows(), float(router.clock()),
+                        exclude_client=client)
 
 
 def _own_stage(router: StageRouter, *, item_id: str, stage: str, route: str,
@@ -315,7 +385,11 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
         raise AutoDecisionError("clock_invalid")
 
     try:
-        policy = autoroute.load_policy(state_root)
+        # One read for both the rules and the digest stamped in the receipt.
+        # Two reads let an operator's save land between them, producing a
+        # receipt whose fingerprint described a policy the decision had not
+        # used, and which then looked current for hours.
+        policy, policy_digest = autoroute.load_policy_and_fingerprint(state_root)
     except (OSError, ValueError, autoroute.PolicyError) as exc:
         # An unreadable policy is never a permissive one.
         raise AutoDecisionError(f"policy_unreadable:{type(exc).__name__}") from None
@@ -329,16 +403,21 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                               is_review=is_review, author_route=author_route)
     reading = load if load is not None else autoroute.probe_load()
 
-    # The client's own presence is recorded before the decision, because a
-    # retained decision needs its own route to be a fresh eligible one for
-    # the router to assign. Never for the peer: see the module docstring.
+    # Capacity is written before the decision reads it, because a retained
+    # decision needs its own route to be a fresh eligible one for the router
+    # to assign. Two writers and no others: this client's own presence, and
+    # the operator's standing declaration. See the module docstring.
     try:
         _observe_client_presence(router, client)
+        _observe_declared_routes(router, policy, client=client)
     except Exception as exc:  # noqa: BLE001  RoutingError, sqlite and OS alike
-        raise AutoDecisionError(f"capacity_observe_failed:{type(exc).__name__}") from None
+        raise AutoDecisionError(f"capacity_record_failed:{type(exc).__name__}") from None
 
     decision = autoroute.decide(signal, policy, fresh_routes=fresh_routes(router),
                                 load=reading)
+    # Read after the decision, from the same ledger the decision read, so the
+    # receipt records the capacity it was actually made under.
+    capacity_digest = capacity_fingerprint(router, client=client)
     route = client if decision.route == autoroute.RETAIN else decision.route
     item_id = item_id_for(repo_root)
     owner = owner_id_for(client)
@@ -362,8 +441,8 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
             state_root, caller=client, stage_record=record, repo=repo_root,
             reason=reason, ttl_seconds=int(ttl_seconds), clock=clock,
             code=decision.code, considered=dict(decision.considered),
-            automatic=True,
-            policy_fingerprint=autoroute.policy_fingerprint(state_root))
+            automatic=True, policy_fingerprint=policy_digest,
+            capacity_fingerprint=capacity_digest)
     except (RoutingError, OSError, ValueError) as exc:
         raise AutoDecisionError(f"receipt_write_failed:{type(exc).__name__}") from None
 

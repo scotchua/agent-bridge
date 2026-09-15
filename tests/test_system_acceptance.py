@@ -121,7 +121,8 @@ class SystemAcceptanceTests(unittest.TestCase):
         path = os.path.join(self.temp.name, "stage-router.sqlite3")
         router = StageRouter(path, clock=lambda: 1000.0)
         for route in ("codex", "claude"):
-            router.observe_capacity(CapacityObservation(route, 1000.0, 1100.0, True, "fixture"))
+            router.observe_capacity(CapacityObservation(route, 1000.0, 1100.0, True, "fixture"),
+                                    trusted=True)
         router.register("artifact", "build", allowed_routes=["codex", "claude"],
                         preferred_routes=["codex", "claude"])
         owned = router.assign("artifact", "build", owner_id="codex-author",

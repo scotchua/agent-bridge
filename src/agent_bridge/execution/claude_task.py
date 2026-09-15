@@ -444,6 +444,14 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+        # The delivered patch is a file path, and verification ran between
+        # writing it and returning it. Confinement is what stops a verify
+        # command reaching the job directory, and this is the check that does
+        # not depend on confinement being correct: re-read the bytes and
+        # compare them to what was generated. Without it the receipt could
+        # record one digest while the caller applied different bytes.
+        if hashlib.sha256(pp.read_bytes()).digest()!=hashlib.sha256(patch).digest():
+            raise TaskError("delivered patch changed during verification")
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",
                        generated_patch_sha256=hashlib.sha256(patch).hexdigest(),applied_patch_sha256=hashlib.sha256(applied).hexdigest(),
                        patch_sha256=hashlib.sha256(patch).hexdigest(),patch_bytes=len(patch),verification=evidence,
