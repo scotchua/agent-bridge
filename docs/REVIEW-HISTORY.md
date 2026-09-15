@@ -585,9 +585,10 @@ not run, because nothing ran the driver.
 `bin\agent-bridge-windows-setup`, `setup_bridge.py windows-setup` or
 `python -m`. `step` now calls `schedule_resume`, and a rebooting stage with no
 resume command is refused as `resume_command_missing` before the restart rather
-than taken with no way back. The resume task names the launcher script rather
-than `-m`, because a logon task inherits the user's environment and a
-`PYTHONPATH` does not survive a restart. Consents do not survive one either: a
+than taken with no way back. Before scheduling, setup installs an owner-only,
+self-contained `agent-bridge-resume.pyz` below the runtime root. The task runs
+that stable copy directly, so it depends on neither the repository checkout nor
+a `PYTHONPATH` surviving the restart. Consents do not survive one either: a
 resumed stage that needs one stops for a person, because an unattended task
 elevating on a consent given before the reboot is a standing grant nobody
 re-affirmed.

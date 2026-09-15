@@ -271,8 +271,16 @@ def resume_command(runtime_root: str, *, executable: str | None = None,
     """
 
     launcher = script if script is not None else launcher_script()
-    head = ([executable or sys.executable, launcher, "windows-setup"] if launcher
-            else [executable or sys.executable, "-m", MODULE_PATH])
+    if launcher and str(launcher).lower().endswith(".pyz"):
+        # The installed zipapp enters windows_setup.main directly.  The
+        # checkout's setup_bridge.py is a multiplexer and needs the extra
+        # ``windows-setup`` selector; passing that selector to the zipapp
+        # makes it an invalid subcommand and prevents every reboot resume.
+        head = [executable or sys.executable, launcher]
+    elif launcher:
+        head = [executable or sys.executable, launcher, "windows-setup"]
+    else:
+        head = [executable or sys.executable, "-m", MODULE_PATH]
     argv = [*head, "resume", "--runtime-root", runtime_root, *extra]
     wact.build_action(argv)
     return argv

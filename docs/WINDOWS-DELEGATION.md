@@ -652,13 +652,13 @@ The module owns three things and delegates everything else:
   cost of that direction is one avoidable restart prompt, bounded by the stage
   attempt budget, and the cost of the other is enabling the virtual machine
   platform and then trying to start a sandbox that cannot work.
-* **The argv the resume task will run.** The same interpreter, the repository's
-  `setup_bridge.py`, `windows-setup resume`, the same runtime root. It names
-  the launcher script rather than `-m` because a logon task inherits the user's
-  environment and not the shell that started setup, so a `PYTHONPATH` would not
-  survive the restart. It is validated through `windows_activation.build_action`
-  when it is built, so an interpreter that cannot be named in a scheduled task
-  is discovered before a reboot is offered rather than after one is taken.
+* **The argv the resume task will run.** The same interpreter, an owner-only
+  self-contained `agent-bridge-resume.pyz` installed below the runtime root,
+  `resume`, and the same runtime root. The scheduled task does not depend on
+  the repository checkout or on `PYTHONPATH`, so moving or updating the
+  checkout after scheduling cannot break the restart path. The full action is
+  validated through `windows_activation.build_action` before a reboot is
+  offered and is matched exactly again before replacement or deletion.
 
 Consents are four separate flags and there is deliberately no `--yes`. Each
 covers a different surprise: machine-wide features, ending the session,

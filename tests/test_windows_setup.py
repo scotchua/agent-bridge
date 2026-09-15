@@ -79,7 +79,7 @@ class SetupTestCase(DriverTestCase):
                 clock=lambda: "2026-01-01T00:00:00+00:00",
                 resume_command=ws.resume_command(
                     str(self.runtime), executable="C:\\Python\\python.exe",
-                    script="C:\\agent-bridge\\setup_bridge.py"))
+                    script="C:\\agent-bridge\\agent-bridge-resume.pyz"))
             options.update(self.context_overrides)
             return dr.DriverContext(**options)
 
@@ -191,6 +191,13 @@ class ResumeCommandTests(SetupTestCase):
                                  executable="C:\\Python\\python.exe", script="")
         self.assertEqual(argv[1:3], ["-m", ws.MODULE_PATH])
 
+    def test_the_zipapp_enters_resume_without_the_checkout_selector(self):
+        argv = ws.resume_command(
+            "C:\\runtime", executable="C:\\Python\\python.exe",
+            script="C:\\runtime\\bootstrap\\agent-bridge-resume.pyz")
+        self.assertEqual(argv[2], "resume")
+        self.assertNotIn("windows-setup", argv)
+
     def test_it_is_rejected_before_a_reboot_if_it_cannot_be_registered(self):
         for executable in ("python", "..\\python.exe",
                            "\\\\server\\share\\python.exe"):
@@ -229,6 +236,23 @@ class ResumeCommandTests(SetupTestCase):
             context = ws.build_context(args, run=self._run)
         self.assertEqual(context.resume_command[1], stable)
         self.assertNotIn("setup_bridge.py", " ".join(context.resume_command))
+        self.assertEqual(context.resume_command[2], "resume")
+
+    def test_exact_build_context_resume_command_executes_the_zipapp(self):
+        target = ws.install_resume_launcher(str(self.runtime))
+        args = ws.build_parser().parse_args(
+            ["plan", "--runtime-root", str(self.runtime)])
+        with mock.patch.object(ws.wpf, "is_windows", return_value=False), \
+                mock.patch.object(ws, "stable_resume_launcher", return_value=target), \
+                mock.patch.object(ws.wact, "build_action", return_value="validated"):
+            context = ws.build_context(args, run=self._run)
+        result = subprocess.run(context.resume_command,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(result.returncode, ws.EXIT_OK, result.stderr[:400])
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["command"], "resume")
+        self.assertEqual(payload["reason"], "nothing_to_resume")
 
 
 class ContextAssemblyTests(SetupTestCase):
@@ -333,7 +357,7 @@ class RebootAndResumeLifecycleTests(SetupTestCase):
         self._take_the_reboot()
         action = self._schtasks("/Create")[0]
         target = action[action.index("/TR") + 1]
-        self.assertIn("windows-setup", target)
+        self.assertNotIn("windows-setup", target)
         self.assertIn("resume", target)
         self.assertIn(str(self.runtime), target)
 
