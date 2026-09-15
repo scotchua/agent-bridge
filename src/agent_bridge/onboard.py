@@ -683,7 +683,18 @@ def _backup(path: str) -> str | None:
     return backup
 
 
-def _commit_updates(updates: dict[str, bytes], originals: dict[str, bytes | None]) -> list[str]:
+def _commit_updates(updates: dict[str, bytes], originals: dict[str, bytes | None],
+                    *, shared_paths: frozenset[str] = frozenset()) -> list[str]:
+    """Write every update atomically.
+
+    ``shared_paths`` names files this project does not own -- pre-existing
+    config another tool (Claude Code, Codex) created and manages, such as
+    settings.json, CLAUDE.md, AGENTS.md, or config.toml.  Those are written
+    without the owner-only lockdown, so the atomic replace does not strip
+    access (e.g. SYSTEM, Administrators on Windows) that file already had.
+    Every other path keeps the owner-only guarantee this project's own state
+    depends on.
+    """
     # Host apps do not honor our installer lock, so also compare immediately
     # before each replacement. On failure restore only still-owned writes.
     for path in updates:
@@ -695,7 +706,7 @@ def _commit_updates(updates: dict[str, bytes], originals: dict[str, bytes | None
         for path, content in updates.items():
             if _bytes(path) != originals[path]:
                 raise ValueError(f"configuration changed during installation: {path}")
-            store.atomic_write_bytes(path, content)
+            store.atomic_write_bytes(path, content, owner_only=path not in shared_paths)
             written.append(path)
     except (OSError, ValueError):
         for path in reversed(written):
@@ -703,7 +714,7 @@ def _commit_updates(updates: dict[str, bytes], originals: dict[str, bytes | None
                 if originals[path] is None:
                     os.unlink(path)
                 else:
-                    store.atomic_write_bytes(path, originals[path])
+                    store.atomic_write_bytes(path, originals[path], owner_only=path not in shared_paths)
         raise
     return backups
 
@@ -859,6 +870,18 @@ def _paths(home: str, desktop_path: str | None = None, root: str | None = None) 
             "delegation_config": delegation.paths_for(home, root or config.REPO_ROOT)["config"],
             "delegation_receipt": os.path.join(home, ".agent-bridge", "onboarding", "delegation-installation.json"),
             "launch_agent": delegation.launch_agent_path(home)}
+
+
+# Keys of _paths() that name a file this project does not own: Claude Code's
+# or Codex's own pre-existing config, edited in place (a managed block, or a
+# whole-file update like the hooks feature flag). Every other _paths() entry
+# is a file this project itself created under .agent-bridge or LaunchAgents,
+# where the owner-only lockdown _commit_updates applies by default is correct.
+HOST_OWNED_PATH_KEYS = frozenset({"codex_toml", "claude_json", "desktop_json", "agents", "claude_md"})
+
+
+def _host_owned_paths(paths: dict[str, str]) -> frozenset[str]:
+    return frozenset(paths[key] for key in HOST_OWNED_PATH_KEYS if key in paths)
 
 
 def _looks_managed_command(value: Any) -> bool:
@@ -1100,7 +1123,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     active_bytes = (json.dumps(overlay, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if originals[active_path] != active_bytes:
         updates[active_path] = active_bytes
-    backups = _commit_updates(updates, originals)
+    backups = _commit_updates(updates, originals, shared_paths=_host_owned_paths(paths))
     delegation_report = None
     if delegation_choice["enabled"]:
         assert delegation_status is not None
@@ -1373,7 +1396,7 @@ def uninstall(answers: dict[str, Any], root: str, home: str | None = None,
     if apply_changes:
         lock = os.path.join(home, ".agent-bridge", "onboarding", "install.lock")
         with store.file_lock(lock):
-            _commit_updates(updates, originals)
+            _commit_updates(updates, originals, shared_paths=_host_owned_paths(paths))
             if remove_launch_agent and _bytes(paths["launch_agent"]) == plist_original:
                 try:
                     os.unlink(paths["launch_agent"])

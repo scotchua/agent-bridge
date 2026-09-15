@@ -1289,7 +1289,12 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
     report: dict[str, Any] = {"planned_files": sorted(updates), "applied": False,
                               "remove": remove, "clients": list(clients)}
     if apply:
-        report["backups"] = _commit_updates(updates, originals)
+        # claude_settings, codex_hooks and codex_toml are pre-existing files
+        # Claude Code/Codex own and already had inherited access (e.g. SYSTEM,
+        # Administrators on Windows) to; only the gate's own receipt is this
+        # project's file, which keeps the owner-only lockdown.
+        host_owned = frozenset({paths["claude_settings"], paths["codex_hooks"], paths["codex_toml"]})
+        report["backups"] = _commit_updates(updates, originals, shared_paths=host_owned)
         if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
         report["applied"] = True

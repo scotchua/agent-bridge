@@ -90,14 +90,24 @@ def secure_mkdir(path: str) -> str:
     return path
 
 
-def atomic_write_bytes(path: str, data: bytes) -> None:
-    """Write data to path atomically with mode 0600."""
+def atomic_write_bytes(path: str, data: bytes, *, owner_only: bool = True) -> None:
+    """Write data to path atomically.
+
+    With ``owner_only`` (the default) the result is mode 0600 / an owner-only
+    ACL, correct for this project's own state.  ``owner_only=False`` is for a
+    path this project does not own -- a config file another tool created and
+    manages (Claude Code's settings.json, Codex's config.toml/hooks.json) --
+    where the temp file is left with whatever ACL its directory would give any
+    new file, so the replace does not strip inherited access (e.g. SYSTEM,
+    Administrators) that file already had before this project touched it.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     secure_mkdir(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
         try:
-            platform.enforce_owner_only_file(fd)
+            if owner_only:
+                platform.enforce_owner_only_file(fd)
         except BaseException:
             # The descriptor still belongs to this function until fdopen()
             # succeeds.  On Windows it must be closed before unlinking the
