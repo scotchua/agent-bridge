@@ -62,6 +62,7 @@ from typing import Any
 
 from .. import store
 from ..capacity_router import RoutingError
+from . import autoroute
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -178,7 +179,8 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
                     repo: str, reason: str, ttl_seconds: int,
                     clock: Any = time.time, code: str | None = None,
                     considered: dict[str, Any] | None = None,
-                    automatic: bool = False) -> dict[str, Any]:
+                    automatic: bool = False,
+                    policy_fingerprint: str | None = None) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
 
     ``stage_record`` is the router's current view of the stage, already
@@ -239,6 +241,8 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         receipt["code"] = code
     if considered is not None:
         receipt["considered"] = considered
+    if policy_fingerprint is not None:
+        receipt["policy_fingerprint"] = policy_fingerprint
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
@@ -549,22 +553,31 @@ _OVERTAKEN = frozenset({"stage_not_found", "stage_not_owned", "stage_reassigned"
 
 
 def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
-                                capacity_db: str | None, task_type: str) -> bool:
+                                capacity_db: str | None, task_type: str,
+                                policy_fingerprint: str | None = None) -> bool:
     """Whether an automatic receipt should be replaced by a fresh decision.
 
-    Three ways a recorded decision stops describing the call in front of it,
+    Four ways a recorded decision stops describing the call in front of it,
     all of them ordinary rather than exceptional:
 
+    * the operator's routing policy has changed since it was decided, so the
+      decision was made under rules that no longer apply;
     * it was decided for a different kind of work (one receipt per
       repository, but a repository holds work of more than one kind);
     * it has expired;
     * the stage it points at is finished, reassigned or its lease lapsed,
       which is what happens after a normal ``stage_complete``.
 
-    Before this existed, the first completed stage in a repository left every
-    later edit denied with ``stage_not_owned`` and an instruction to claim a
-    stage by hand, which is the opposite of automatic.
+    Before the stage case was handled, the first completed stage in a
+    repository left every later edit denied with ``stage_not_owned`` and an
+    instruction to claim a stage by hand, which is the opposite of automatic.
+    Before the policy case was handled, classifying a repository took effect
+    whenever its receipt happened to expire, up to four hours later, which
+    made the operator's own document look inert.
     """
+    if (policy_fingerprint is not None
+            and receipt.get("policy_fingerprint") != policy_fingerprint):
+        return True
     if str(receipt.get("stage", "")).split("#")[0] != task_type:
         return True
     valid_until = receipt.get("valid_until")
@@ -627,7 +640,8 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
         task_type = infer_task_type(paths)
         if (receipt is not None and decide is not None and receipt.get("automatic")
-                and automatic_receipt_overtaken(receipt, now, capacity_db, task_type)):
+                and automatic_receipt_overtaken(receipt, now, capacity_db, task_type,
+                                                autoroute.policy_fingerprint(state_root))):
             receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and

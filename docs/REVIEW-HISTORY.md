@@ -956,6 +956,30 @@ and each one was found within minutes of driving the real workflow end to end.
     A signal that is cheap to compute is not the same as a signal that means
     something.
 
+44. **Editing the policy looked like it did nothing, and fixing that exposed
+    the real bug.** A receipt decided under one policy stayed authoritative
+    until it expired, so classifying a repository took effect up to four
+    hours later. Recording the policy's fingerprint in each receipt fixed
+    that and immediately surfaced worse: the stage router never reassigns an
+    owned stage, so when the route changed the old stage was still owned on
+    the old route, the receipt was written naming *that* route while the
+    decision said the new one, and the gate allowed the edit. A decision to
+    delegate had silently become a decision to retain.
+
+    Two lessons, both familiar from earlier rounds. Individually correct
+    fixes interact: this one only became visible because another fix started
+    exercising a path that had never run. And the invariant that mattered
+    ("a receipt never names a route its decision did not choose") was true by
+    construction right up until it was not, which is exactly the kind of
+    thing to assert rather than reason about. It is asserted now.
+
+45. **Walking the documentation found what reading the code did not.** Both
+    of the above came from running the commands `INSTALL.md` tells a user to
+    type, in order, against a fresh state, and looking at what actually came
+    back. The unit tests were green throughout. A test suite checks the cases
+    somebody thought of; the documented workflow is the case the user will
+    actually hit.
+
 One near miss worth naming. Two main-suite checks about orphan processes
 failed during this work and were **not** a regression: they are timing-
 sensitive, the machine was loaded by parallel test runs, and `runner.py`,

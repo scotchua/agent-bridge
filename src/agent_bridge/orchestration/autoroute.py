@@ -369,6 +369,36 @@ def policy_path(state_root: str) -> str:
     return os.path.join(str(state_root), "routing", POLICY_FILE)
 
 
+#: Recorded when no policy file exists, which is a real state and not an error.
+NO_POLICY = "absent"
+
+
+def policy_fingerprint(state_root: str) -> str:
+    """A stable digest of the policy a decision was made under. Never raises.
+
+    Recorded in every automatic receipt so that editing the policy takes
+    effect on the next gated call instead of whenever the receipt happens to
+    expire. Without it, classifying a repository left it retained for up to
+    the receipt's four-hour TTL, which makes the operator's own document feel
+    like it did nothing.
+
+    An unreadable file returns a value that cannot match any recorded one, so
+    the receipt is re-decided and the decision path then refuses through
+    ``load_policy``. Failing closed by the longer route, rather than guessing
+    here.
+    """
+    import hashlib
+
+    path = policy_path(state_root)
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:32]
+    except FileNotFoundError:
+        return NO_POLICY
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+
+
 def parse_policy(document: object) -> Policy:
     """Build a Policy from the operator's document, refusing anything odd.
 

@@ -181,8 +181,9 @@ def _own_stage(router: StageRouter, *, item_id: str, stage: str, route: str,
 MAX_STAGE_GENERATIONS = 1000
 
 
-def stage_name(router: StageRouter, item_id: str, task_type: str) -> str:
-    """The stage this decision should use: the first generation not terminal.
+def stage_name(router: StageRouter, item_id: str, task_type: str, *,
+               route: str | None = None, owner_id: str | None = None) -> str:
+    """The stage this decision should use: the first generation it can own.
 
     A stage is a unit of work, and work completes. Reusing one name per
     repository meant that the first ``stage_complete`` left the repository
@@ -190,6 +191,18 @@ def stage_name(router: StageRouter, item_id: str, task_type: str) -> str:
     stage the router had already closed. Generations keep the common case
     (``implementation``) stable while giving the next piece of work its own
     stage, so a completed decision is history rather than a wall.
+
+    ``route`` matters for the same reason, and skipping it was a worse bug.
+    The router never reassigns an owned stage, by design. So when a decision
+    changed route (the operator classified the repository, and work that had
+    been retained now belongs to the peer) the old stage was still owned on
+    the old route, ``_own_stage`` returned that record, and the receipt was
+    written naming the *old* route while the decision said the new one. The
+    gate then allowed the edit. A decision to delegate had silently become a
+    decision to retain, which is the one failure this whole mechanism exists
+    to prevent. A stage owned on a route this decision did not choose is
+    therefore skipped, and one this decider owns itself is completed on the
+    way past so it does not linger holding a lease.
     """
     for generation in range(1, MAX_STAGE_GENERATIONS + 1):
         candidate = task_type if generation == 1 else f"{task_type}#{generation}"
@@ -197,8 +210,21 @@ def stage_name(router: StageRouter, item_id: str, task_type: str) -> str:
             current = router.get(item_id, candidate)
         except RoutingError:
             return candidate          # never registered: free
-        if current.get("state") not in ("complete", "blocked"):
-            return candidate          # pending, owned or reconciling: reusable
+        if current.get("state") in ("complete", "blocked"):
+            continue                  # terminal: history, try the next one
+        if (route is not None and current.get("state") == "owned"
+                and current.get("owner_route") != route):
+            if owner_id is not None and current.get("owner_id") == owner_id:
+                # Our own earlier decision, superseded. We own it, so we may
+                # close it; leaving it owned would hold a lease for hours
+                # against a route the policy no longer chooses.
+                try:
+                    router.complete(item_id, candidate, owner_id=owner_id,
+                                    expected_revision=current["revision"])
+                except RoutingError:
+                    pass              # a race; the next generation is still free
+            continue
+        return candidate              # free, ours, or owned on this very route
     raise AutoDecisionError(f"stage_generations_exhausted:{MAX_STAGE_GENERATIONS}")
 
 
@@ -315,23 +341,29 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                                 load=reading)
     route = client if decision.route == autoroute.RETAIN else decision.route
     item_id = item_id_for(repo_root)
-    stage = stage_name(router, item_id, task_type)
+    owner = owner_id_for(client)
+    stage = stage_name(router, item_id, task_type, route=route, owner_id=owner)
 
     record = _own_stage(router, item_id=item_id, stage=stage, route=route,
-                        owner_id=owner_id_for(client), lease_seconds=lease_seconds)
+                        owner_id=owner, lease_seconds=lease_seconds)
     if record.get("state") != "owned":
         raise AutoDecisionError(f"stage_not_owned_after_claim:{record.get('state')}")
-    # A stage another route already owns is not an error here. The receipt
-    # below records the owner the router actually shows, and the gate reaches
-    # its ``routed_elsewhere`` deny from that, so the decision stays a
-    # description of live ownership rather than an assertion about it.
+    if record.get("owner_route") != route:
+        # The invariant, checked rather than assumed: a receipt must never
+        # name a route the decision did not choose. ``stage_name`` picks a
+        # generation this route can own, so reaching here means another
+        # process took the stage in between. Fail closed; the gate denies and
+        # the next call decides again.
+        raise AutoDecisionError(
+            f"stage_owned_by_another_route:{record.get('owner_route')}")
     reason = decision.reason[:gate.MAX_REASON]
     try:
         receipt = gate.record_decision(
             state_root, caller=client, stage_record=record, repo=repo_root,
             reason=reason, ttl_seconds=int(ttl_seconds), clock=clock,
             code=decision.code, considered=dict(decision.considered),
-            automatic=True)
+            automatic=True,
+            policy_fingerprint=autoroute.policy_fingerprint(state_root))
     except (RoutingError, OSError, ValueError) as exc:
         raise AutoDecisionError(f"receipt_write_failed:{type(exc).__name__}") from None
 

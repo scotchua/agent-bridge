@@ -384,6 +384,111 @@ class AFailedDecisionSaysLittleAndDeniesAnyway(AutoCase):
         self.assertEqual(decision.code, "no_routing_receipt")
 
 
+class TheOperatorsPolicyTakesEffectAtOnce(AutoCase):
+    """Editing the policy must not wait for a receipt to age out.
+
+    Found by walking the documented workflow: classifying a repository
+    changed nothing, because the retained receipt was still valid, still for
+    the same task type, and its stage was still owned. It would have taken
+    effect up to four hours later, which makes the operator's own document
+    look inert. Every automatic receipt now records the fingerprint of the
+    policy it was decided under.
+    """
+
+    def classify(self, **entry):
+        self.write_policy({str(self.repo): entry})
+
+    def consistent(self, receipt):
+        """A routed receipt names another route; a retained one names the caller."""
+        if receipt["code"].startswith("routed_"):
+            return receipt["owner_route"] != receipt["caller"]
+        return receipt["owner_route"] == receipt["caller"]
+
+    def test_a_receipt_records_the_policy_it_was_decided_under(self):
+        self.hook("claude", self.repo)
+        self.assertEqual(self.receipt_for(self.repo)["policy_fingerprint"],
+                         autoroute.NO_POLICY)
+        self.classify(classification="public", allowed_routes=["claude"])
+        self.hook("claude", self.repo)
+        self.assertEqual(self.receipt_for(self.repo)["policy_fingerprint"],
+                         autoroute.policy_fingerprint(str(self.state)))
+
+    def test_classifying_a_repository_is_acted_on_by_the_very_next_call(self):
+        self.observe("codex")
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_repo_unclassified")
+        self.classify(classification="internal_nonclient",
+                      allowed_routes=["claude", "codex"])
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "codex")
+
+    def test_withdrawing_a_route_is_acted_on_by_the_very_next_call(self):
+        self.observe("codex")
+        self.classify(classification="internal_nonclient",
+                      allowed_routes=["claude", "codex"])
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.classify(classification="internal_nonclient", allowed_routes=["claude"])
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+
+    def test_a_receipt_never_names_a_route_its_decision_did_not_choose(self):
+        """The bug the fingerprint exposed, and the worse one.
+
+        The router never reassigns an owned stage. So once the route changed,
+        the old stage was still owned on the old route, the receipt was
+        written naming *that* route while the decision said the new one, and
+        the gate allowed the edit. A decision to delegate had silently become
+        a decision to retain.
+        """
+        self.observe("codex")
+        states = [
+            {"classification": "internal_nonclient", "allowed_routes": ["claude", "codex"]},
+            {"classification": "internal_nonclient", "allowed_routes": ["claude"]},
+            {"classification": "internal_nonclient", "allowed_routes": ["claude", "codex"]},
+            {"classification": "client_derived", "allowed_routes": ["claude", "codex"]},
+        ]
+        seen = []
+        self.hook("claude", self.repo)
+        seen.append(self.receipt_for(self.repo))
+        for entry in states:
+            self.classify(**entry)
+            self.hook("claude", self.repo)
+            seen.append(self.receipt_for(self.repo))
+        for receipt in seen:
+            self.assertTrue(self.consistent(receipt), receipt)
+        # And each change really did produce a new decision, not a reused one.
+        self.assertEqual(len({receipt["stage"] for receipt in seen}), len(seen))
+
+    def test_the_stage_a_superseded_decision_held_is_not_left_leased(self):
+        self.observe("codex")
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        self.classify(classification="internal_nonclient",
+                      allowed_routes=["claude", "codex"])
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        # The claude-owned stage it replaced was completed on the way past.
+        previous = StageRouter(str(self.db)).get(first["item_id"], first["stage"])
+        self.assertEqual(previous["state"], "complete")
+
+    def test_an_unreadable_policy_invalidates_every_automatic_receipt(self):
+        self.classify(classification="public", allowed_routes=["claude"])
+        self.assertAllowed(self.hook("claude", self.repo))
+        Path(autoroute.policy_path(str(self.state))).write_text("{broken",
+                                                                encoding="utf-8")
+        # Not an allow on the strength of the old receipt: the fingerprint no
+        # longer matches, so it re-decides, and the decision refuses.
+        self.assertDenied(self.hook("claude", self.repo),
+                          "gate_auto_decision_failed")
+
+    def test_the_fingerprint_never_raises_on_a_broken_policy(self):
+        Path(autoroute.policy_path(str(self.state))).write_text("{broken",
+                                                                encoding="utf-8")
+        self.assertIsInstance(autoroute.policy_fingerprint(str(self.state)), str)
+        missing = autoroute.policy_fingerprint(str(self.base / "nowhere"))
+        self.assertEqual(missing, autoroute.NO_POLICY)
+
+
 class RestartAndReuse(AutoCase):
     def test_the_decision_survives_into_the_next_hook_process(self):
         """Each tool call is a new process; the decision must be on disk."""

@@ -147,10 +147,13 @@ capacity after one claude hook call:
 codex present: False  local present: False
 ```
 
-### Three defects found while building this
+### Five defects found while building this
 
 Each was a live failure during this work, not a hypothetical, and each has a
-named regression test in `tests/test_automatic_gate.py`.
+named regression test in `tests/test_automatic_gate.py`. The last two were
+found by walking the workflow exactly as `INSTALL.md` documents it, which is
+worth noting on its own: reading the prose back against the running system
+found what reading the code did not.
 
 1. **A completed stage bricked the repository.** After a normal
    `stage_complete`, every later edit denied with `stage_not_owned` and told
@@ -165,6 +168,34 @@ named regression test in `tests/test_automatic_gate.py`.
    `automatic_receipt_overtaken` treats them as a reason to decide again. An
    **unreadable** stage router is deliberately excluded and still fails closed
    with `stage_db_unavailable`: never decide without the router.
+4. **Editing the policy changed nothing until a receipt aged out.**
+   Classifying a repository and then editing it was still allowed, because
+   the retained receipt was valid, for the same task type, and its stage was
+   still owned. The change would have taken effect up to four hours later.
+   Every automatic receipt now records a fingerprint of the policy it was
+   decided under.
+5. **A receipt named a route its decision did not choose, and the gate
+   allowed the edit.** Exposed immediately by fixing defect 4. The stage
+   router never reassigns an owned stage, so when the policy moved work to
+   the peer the old stage was still owned on the old route; `_own_stage`
+   returned that record and the receipt was written naming the old route
+   while the decision said the new one. A decision to delegate had silently
+   become a decision to retain, which is the single failure this whole
+   mechanism exists to prevent. `stage_name` now skips a stage owned on a
+   route the decision did not choose (completing one the decider itself
+   holds), and `ensure_decision` checks the invariant rather than assuming
+   it: a route it cannot establish as live owner is a deny.
+
+   Verified across five consecutive policy changes, each acted on by the
+   very next call, each receipt consistent with its own decision:
+
+   ```text
+   1. unclassified            route=claude code=retained_repo_unclassified
+   2. both providers eligible route=codex  code=routed_peer_implementation
+   3. codex withdrawn         route=claude code=retained_is_the_policy
+   4. codex re-added          route=codex  code=routed_peer_implementation
+   5. client_derived          route=claude code=retained_classification_ineligible
+   ```
 
 ### Two limits, stated rather than dressed up
 

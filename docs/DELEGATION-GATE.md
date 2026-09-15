@@ -170,14 +170,33 @@ authorized source, and without one the policy retains the work.
 ### Decisions are re-made when they are overtaken
 
 An automatic receipt is replaced by a fresh decision, rather than refused,
-when it was decided for a different kind of work, when it has expired, or
-when the stage it points at is finished, reassigned or its lease has lapsed.
-The third case is ordinary: it is what happens after a normal
-`stage_complete`. Before that was handled, the first completed stage in a
-repository left every later edit denied with `stage_not_owned` and an
-instruction to claim a stage by hand, which is the opposite of automatic.
-Stages therefore carry a generation (`implementation`, `implementation#2`),
-so a completed decision is history rather than a wall.
+in four ordinary cases:
+
+* **the policy changed.** Every automatic receipt records a fingerprint of
+  the policy it was decided under, so editing `routing-policy.json` takes
+  effect on the very next gated call. Without this, classifying a repository
+  changed nothing until the receipt happened to expire, up to four hours
+  later, which makes your own document look inert.
+* it was decided for a different kind of work;
+* it has expired;
+* the stage it points at is finished, reassigned or its lease has lapsed,
+  which is what happens after a normal `stage_complete`. Before that was
+  handled, the first completed stage in a repository left every later edit
+  denied with `stage_not_owned` and an instruction to claim a stage by hand.
+
+Stages therefore carry a generation (`implementation`, `implementation#2`), so
+a completed or superseded decision is history rather than a wall, and a stage
+the decider itself still held on a route the policy no longer chooses is
+completed rather than left holding a lease for hours.
+
+**A receipt never names a route its decision did not choose.** That invariant
+is checked, not assumed, and it is checked because it was once violated: the
+stage router never reassigns an owned stage, so when a policy change moved
+work to the peer, the old stage was still owned on the old route, the receipt
+was written naming *that* route, and the gate allowed the edit. A decision to
+delegate had silently become a decision to retain, which is the one failure
+this mechanism exists to prevent. A route the decider cannot establish as the
+live owner is now `gate_auto_decision_failed`, a deny.
 
 An unreadable stage router is **not** treated as overtaken. That stays a deny
 (`stage_db_unavailable`): fail closed, and never decide without the router.
