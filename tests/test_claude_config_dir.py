@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -44,6 +45,18 @@ class ConfigDirTestCase(unittest.TestCase):
             cc.enforce_private(self.canonical)
         self.shared = cc.shared_store_dir(self.home)
         self.shared.mkdir(mode=0o700)
+
+
+class WindowsEnforcementWrapperTests(unittest.TestCase):
+    """The NT half of enforce_private translates every failure it can
+    meet into the fixed operator text this module promises."""
+
+    def test_an_unlistable_store_is_refused_with_the_fixed_text(self):
+        with mock.patch.object(cc, "_store_entries", side_effect=PermissionError("raw os text")):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._enforce_private_nt(Path("C:/nowhere/store"))
+        self.assertEqual(str(caught.exception),
+                         "Claude configuration directory could not be read")
 
 
 class CanonicalDirectoryTests(ConfigDirTestCase):

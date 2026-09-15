@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration.execution_queue import (
-    ExecutionAdmissionError, ExecutionQueue, _atomic_json, _harness_summary,
-    outcome_is_success)
+    UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
+    _harness_summary, outcome_is_success)
 from agent_bridge.orchestration.server import Server
 
 
@@ -139,6 +139,23 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["error"], "ExecutionAdmissionError")
         self.assertEqual(result["error_detail"], "brief_changed_after_admission")
+
+    def test_an_unexpected_exception_records_a_fixed_marker_not_its_text(self):
+        """Only admission and OS errors carry text vetted for a receipt.
+        Anything else is recorded by class and a fixed marker, so a stray
+        message never reaches the durable record."""
+        job = self.submit()
+
+        def explode(request, selected):
+            raise RuntimeError("token=do-not-record")
+
+        queue = ExecutionQueue(self.root / "queue", explode, clock=lambda: 100.0)
+        queue.run_once("worker-1")
+        result = queue.result(job["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "RuntimeError")
+        self.assertEqual(result["error_detail"], UNEXPECTED_FAILURE_DETAIL)
+        self.assertNotIn("do-not-record", json.dumps(result))
 
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")

@@ -111,7 +111,8 @@ both harnesses enforce (`src/agent_bridge/execution/verify_policy.py`): a
 fixed set of programs named without a path (`git`, `pytest`, `python`,
 `python3`, `npm`, `pnpm`, `yarn`, `cargo`, `go`), Python limited to
 `-m pytest` or `-m unittest`, git limited to `diff` and `status`, and no
-control characters. A command outside that policy is refused by
+NUL, carriage return or line feed in any argument (other characters are
+passed through as the harness receives them). A command outside that policy is refused by
 `execution_dispatch` as `verify_argv_rejected: <reason>` before a job exists;
 the same command reaching a harness is refused with the same words. The
 Claude lane requires at least one command (`claude_verification_required`);

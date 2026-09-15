@@ -6,9 +6,9 @@ from . import base
 from .windows_acl import (
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     WINDOWS_OWNER_ONLY_GUARANTEE, DirectoryEntry, SecurityState,
-    accepted_owners, build_owner_only_descriptor, is_exactly_owner_only,
-    judge_security, parse_directory_listing, parse_security_descriptor,
-    parse_sid,
+    accepted_owners, build_owner_only_descriptor, encode_object_name,
+    is_exactly_owner_only, judge_security, parse_directory_listing,
+    parse_security_descriptor, parse_sid,
 )
 
 import contextlib
@@ -249,7 +249,26 @@ READ_CONTROL = 0x00020000
 WRITE_DAC = 0x00040000
 FILE_LIST_DIRECTORY = 0x00000001
 FILE_READ_ATTRIBUTES = 0x00000080
-FILE_SHARE_ALL = 0x00000007
+#: The share mode every security open here uses: readers and writers may
+#: keep working, but the object may not be deleted or renamed while the
+#: handle is held. Without the delete share bit (0x4) in our mode, an open
+#: that asks for DELETE (which a rename or a delete does) fails with a
+#: sharing violation for as long as we hold the object. The kernel applies
+#: sharing only between opens that ask for data access, and a directory
+#: open here asks for FILE_LIST_DIRECTORY, so the root and every directory
+#: under it keep their names and existence for the whole tree pass: a
+#: directory cannot be swapped for another under the same name between
+#: its open and the judgment of what its handle lists (Codex review of
+#: ccb85ef..2e9ed0f, B1; shown live by NativeTreeTests). A file open asks
+#: for no data access, so a file is not pinned: pinning one would need
+#: FILE_READ_DATA, which the pass neither has nor needs, and which would
+#: make a file we own but cannot read unrepairable. Whatever happens to a
+#: name after a pass ends is outside what that pass proved; the read-only
+#: pass that follows enforcement enumerates afresh, and its result is
+#: what the lane relies on. Conversely, our own open fails if another
+#: handle already holds a directory with DELETE access; that refusal is
+#: fail-closed and reported.
+FILE_SHARE_KEEP_NAME = 0x00000003
 OPEN_EXISTING = 3
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -904,7 +923,7 @@ class WindowsPlatform:
         access = READ_CONTROL | (WRITE_DAC if write else 0)
         access |= FILE_LIST_DIRECTORY if listing else 0
         handle = kernel32.CreateFileW(
-            path, access, FILE_SHARE_ALL, None, OPEN_EXISTING,
+            path, access, FILE_SHARE_KEEP_NAME, None, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
         if handle in (None, 0, INVALID_HANDLE_VALUE):
             return None, False, {"open_error": ctypes.get_last_error()}
@@ -925,8 +944,15 @@ class WindowsPlatform:
             return None, False, {"refused": "not a single path component"}
         access = READ_CONTROL | FILE_READ_ATTRIBUTES | (WRITE_DAC if write else 0)
         access |= FILE_LIST_DIRECTORY if listing else 0
-        buffer = ctypes.create_unicode_buffer(name)
-        text = _UNICODE_STRING(len(name) * 2, len(name) * 2,
+        # Length is the UTF-16 byte count, which len(name) * 2 understates
+        # for a supplementary character; the understated length would open
+        # a shorter name. MaximumLength is the buffer's real capacity.
+        try:
+            encoded = encode_object_name(name)
+        except ValueError:
+            return None, False, {"refused": "name is not a valid object name"}
+        buffer = ctypes.create_string_buffer(encoded, len(encoded) + 2)
+        text = _UNICODE_STRING(len(encoded), ctypes.sizeof(buffer),
                                ctypes.cast(buffer, wintypes.LPWSTR))
         attributes = _OBJECT_ATTRIBUTES(
             ctypes.sizeof(_OBJECT_ATTRIBUTES), parent, ctypes.pointer(text),
@@ -935,7 +961,7 @@ class WindowsPlatform:
         status_block = _IO_STATUS_BLOCK()
         status = ntdll.NtCreateFile(
             ctypes.byref(handle), access, ctypes.byref(attributes),
-            ctypes.byref(status_block), None, 0, FILE_SHARE_ALL, FILE_OPEN,
+            ctypes.byref(status_block), None, 0, FILE_SHARE_KEEP_NAME, FILE_OPEN,
             FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT, None, 0)
         if status != 0 or not handle.value:
             return None, False, {"open_status": f"0x{status:08X}"}
@@ -956,7 +982,7 @@ class WindowsPlatform:
         except OSError as exc:
             return None, False, {"descriptor_error": str(exc)}
         access = READ_CONTROL | (WRITE_DAC if write else 0)
-        handle = kernel32.ReOpenFile(original, access, FILE_SHARE_ALL,
+        handle = kernel32.ReOpenFile(original, access, FILE_SHARE_KEEP_NAME,
                                      FILE_FLAG_OPEN_REPARSE_POINT)
         if handle in (None, 0, INVALID_HANDLE_VALUE):
             return None, False, {"reopen_error": ctypes.get_last_error()}
@@ -1192,7 +1218,7 @@ class WindowsPlatform:
                 return objects, {**error, "path": prefix or "."}
             for entry in sorted(entries, key=lambda item: item.name):
                 label = f"{prefix}\\{entry.name}" if prefix else entry.name
-                if len(objects) > max_objects:
+                if len(objects) >= max_objects:
                     return objects, {"error": "tree holds more objects than the lane creates",
                                      "path": label}
                 handle, is_directory, error = self._open_child(
@@ -1269,9 +1295,12 @@ class WindowsPlatform:
 
         The whole tree is opened and every object's ownership is read
         before anything is written. If any object is owned by another
-        account, or the walk could not complete, nothing is written and
-        the pass fails: that object is that account's, and this lane must
-        not use a store holding one. Otherwise the root is judged strictly
+        account, or any object's descriptor could not be read, or the walk
+        could not complete, nothing is written and the pass fails: an
+        object whose owner is unknown may be another account's, and this
+        lane must not use a store holding one. Every handle is held
+        without delete sharing until the pass ends, so no object judged
+        here can be renamed away or replaced meanwhile. Otherwise the root is judged strictly
         and each descendant with inherited entries allowed; an object that
         passes is left alone, and one that fails has its DACL replaced, in
         a single write to that object only, with the exact owner-only DACL
@@ -1303,10 +1332,8 @@ class WindowsPlatform:
                     failed.append(label)
                 elif state.owner_sid not in owners:
                     foreign_owned.append(label)
-            if not foreign_owned and not walk_error:
+            if not foreign_owned and not walk_error and not failed:
                 for (label, handle, is_directory, depth), state in zip(objects, states):
-                    if state is None:
-                        continue
                     if judge_security(state, caller, allow_inherited=depth > 0,
                                       default_owner_sid=default_owner):
                         verified, _evidence = self._protect_handle(handle, is_directory)

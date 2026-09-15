@@ -241,7 +241,11 @@ def _enforce_private_nt(directory: Path) -> Path:
 
     from agent_bridge.platform import platform as host
 
-    _store_entries(directory)
+    try:
+        _store_entries(directory)
+    except OSError:
+        raise ConfigDirError(
+            "Claude configuration directory could not be read") from None
     try:
         protected, evidence = host.enforce_owner_only_tree(
             str(directory), max_objects=MAX_STORE_OBJECTS)

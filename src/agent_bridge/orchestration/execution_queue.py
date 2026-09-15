@@ -263,6 +263,8 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
 
 #: Longest diagnostic text copied from a harness line into a receipt.
 DIAGNOSTIC_LIMIT = 512
+#: Recorded in place of an unexpected exception's own text.
+UNEXPECTED_FAILURE_DETAIL = "unexpected failure of a kind the worker does not record"
 
 
 def _clean_diagnostic(value: object) -> str | None:
@@ -518,9 +520,14 @@ class ExecutionQueue:
         except Exception as exc:
             # The class name alone is not diagnostic evidence. Admission and OS
             # errors carry fixed reason codes or the OS's own text; both are
-            # safe to record and both are what an operator needs first.
+            # safe to record and both are what an operator needs first. Any
+            # other exception's text is unvetted and is replaced by a fixed
+            # marker, so a stray message can never reach the receipt.
             receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())
-            detail = _clean_diagnostic(str(exc))
+            if isinstance(exc, (ExecutionAdmissionError, OSError)):
+                detail = _clean_diagnostic(str(exc))
+            else:
+                detail = UNEXPECTED_FAILURE_DETAIL
             if detail is not None:
                 receipt["error_detail"] = detail
         _atomic_json(selected / "receipt.json", receipt)

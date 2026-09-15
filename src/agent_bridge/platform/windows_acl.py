@@ -82,10 +82,24 @@ SECURITY_DESCRIPTOR_REVISION = 1
 FILE_ALL_ACCESS = 0x001F01FF
 FILE_GENERIC_READ = 0x00120089
 FILE_GENERIC_WRITE = 0x00120116
+FILE_GENERIC_EXECUTE = 0x001200A0
 REQUIRED_OWNER_ACCESS = FILE_GENERIC_READ | FILE_GENERIC_WRITE
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
+GENERIC_EXECUTE = 0x20000000
 GENERIC_ALL = 0x10000000
+#: What each generic right means once mapped onto a file object, the way
+#: the kernel maps it before an access check (GENERIC_MAPPING for files).
+GENERIC_FILE_MAPPING = (
+    (GENERIC_READ, FILE_GENERIC_READ),
+    (GENERIC_WRITE, FILE_GENERIC_WRITE),
+    (GENERIC_EXECUTE, FILE_GENERIC_EXECUTE),
+    (GENERIC_ALL, FILE_ALL_ACCESS),
+)
+
+#: The most bytes a UNICODE_STRING can describe: its Length and
+#: MaximumLength are USHORT, and MaximumLength counts the terminator.
+UNICODE_STRING_MAX_BYTES = 0xFFFF - 2
 
 # File attribute bits a directory listing reports.
 FILE_ATTRIBUTE_DIRECTORY = 0x00000010
@@ -406,24 +420,55 @@ def accepted_owners(caller_sid: str, default_owner_sid: str | None = None
                     ) -> frozenset[str]:
     """The SIDs an object may be owned by and still be the caller's own.
 
-    The token user always; the token's default owner as well when it is
-    known, which is the Administrators group for an elevated administrator
-    and the user itself for everyone else. ValueError if either is not a
-    SID.
+    The token user always. The token's default owner (TokenOwner) as
+    well, but only when it is the Administrators group: that is what an
+    elevated administrator's freshly created objects are owned by, and
+    Administrators is already a principal the owner-only DACL admits. Any
+    other default owner is ignored (Codex review of ccb85ef..2e9ed0f, B2):
+    a token whose default owner is some shared group would otherwise make
+    every object that group owns look like the caller's own, and that
+    group's members could read what is inside. ValueError if either is
+    not a SID.
     """
     owners = {canonical_sid(caller_sid)}
     if default_owner_sid:
-        owners.add(canonical_sid(default_owner_sid))
+        default_owner = canonical_sid(default_owner_sid)
+        if default_owner == SID_ADMINISTRATORS:
+            owners.add(default_owner)
     return frozenset(owners)
+
+
+def map_generic_rights(mask: int) -> int:
+    """``mask`` with each generic right replaced by its file-specific rights.
+
+    A DACL entry may carry generic bits, specific bits, or both; the
+    kernel maps the generic ones before it checks access, and so must a
+    judgment that reads the same entry.
+    """
+    mapped = mask
+    for generic, specific in GENERIC_FILE_MAPPING:
+        if mask & generic:
+            mapped = (mapped & ~generic) | specific
+    return mapped
 
 
 def grants_effective_access(mask: int) -> bool:
     """Whether the accumulated rights let the holder read and write the object."""
-    if mask & GENERIC_ALL:
-        return True
-    if mask & GENERIC_READ and mask & GENERIC_WRITE:
-        return True
-    return mask & REQUIRED_OWNER_ACCESS == REQUIRED_OWNER_ACCESS
+    return map_generic_rights(mask) & REQUIRED_OWNER_ACCESS == REQUIRED_OWNER_ACCESS
+
+
+def encode_object_name(name: str) -> bytes:
+    """``name`` as the UTF-16-LE bytes a UNICODE_STRING's Length counts.
+
+    Length is a byte count of UTF-16 code units, not of Python code
+    points: a supplementary character is one code point and four bytes.
+    ValueError for a name longer than a UNICODE_STRING can describe, or
+    one that is not valid text.
+    """
+    encoded = name.encode("utf-16-le")
+    if len(encoded) > UNICODE_STRING_MAX_BYTES:
+        raise ValueError("object name longer than a UNICODE_STRING can describe")
+    return encoded
 
 
 def judge_security(state: SecurityState, caller_sid: str, *,

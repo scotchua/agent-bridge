@@ -33,9 +33,10 @@ from agent_bridge.platform.windows_acl import (
     SE_DACL_PRESENT, SE_DACL_PROTECTED, SE_SELF_RELATIVE, SID_ADMINISTRATORS,
     SID_OWNER_RIGHTS, SID_SYSTEM, WINDOWS_OWNER_ONLY_GUARANTEE, Ace,
     DirectoryEntry, SecurityState, accepted_owners, build_owner_only_acl,
-    build_owner_only_descriptor, encode_sid, grants_effective_access,
-    is_exactly_owner_only, judge_security, owner_only_aces, parse_acl,
-    parse_directory_listing, parse_security_descriptor, parse_sid,
+    build_owner_only_descriptor, encode_object_name, encode_sid,
+    grants_effective_access, is_exactly_owner_only, judge_security,
+    map_generic_rights, owner_only_aces, parse_acl, parse_directory_listing,
+    parse_security_descriptor, parse_sid,
 )
 
 
@@ -227,6 +228,30 @@ class SecurityDescriptorCodecTests(unittest.TestCase):
                 parse_security_descriptor(bad, is_directory=False)
 
 
+class ObjectNameCodecTests(unittest.TestCase):
+    """Codex review of ccb85ef..2e9ed0f, B3: a UNICODE_STRING's Length is
+    a UTF-16 byte count, which ``len(name) * 2`` understates for a
+    supplementary character, and an understated Length opens a shorter
+    name."""
+
+    def test_length_counts_utf16_bytes_not_code_points(self):
+        name = "\U0001f9ea.txt"
+        self.assertEqual(len(name), 5)
+        encoded = encode_object_name(name)
+        self.assertEqual(len(encoded), 12)
+        self.assertEqual(encoded, name.encode("utf-16-le"))
+        self.assertNotEqual(len(encoded), len(name) * 2)
+        self.assertEqual(encode_object_name("a.txt"), "a.txt".encode("utf-16-le"))
+
+    def test_a_name_longer_than_a_unicode_string_holds_is_refused(self):
+        longest = "x" * (acl.UNICODE_STRING_MAX_BYTES // 2)
+        self.assertLessEqual(len(encode_object_name(longest)), acl.UNICODE_STRING_MAX_BYTES)
+        with self.assertRaises(ValueError):
+            encode_object_name(longest + "x")
+        with self.assertRaises(ValueError):
+            encode_object_name("\ud800")
+
+
 class DirectoryListingCodecTests(unittest.TestCase):
     def test_entries_decode_with_their_attributes_and_dot_entries_are_dropped(self):
         raw = directory_records((".", 0x10), ("..", 0x10), ("f.txt", 0x20),
@@ -310,6 +335,24 @@ class OwnerOnlyJudgmentTests(unittest.TestCase):
                                        default_owner_sid=SID_ADMINISTRATORS))
         with self.assertRaises(ValueError):
             accepted_owners(OWNER_SID, "nonsense")
+
+    def test_only_administrators_is_accepted_as_a_default_owner(self):
+        """Codex review of ccb85ef..2e9ed0f, B2: a token whose default
+        owner is some other group (a shared group the caller belongs to,
+        say) must not make that group's objects the caller's own."""
+        for group in (USERS, OTHER_SID, EVERYONE):
+            self.assertEqual(accepted_owners(OWNER_SID, group), frozenset({OWNER_SID}),
+                             group)
+            theirs = state(group, dacl=(allow(OWNER_SID),))
+            self.assertEqual(judge_security(theirs, OWNER_SID, default_owner_sid=group),
+                             [f"owned by {group}, not the caller"])
+            self.assertFalse(is_exactly_owner_only(theirs, OWNER_SID,
+                                                   default_owner_sid=group))
+        # The caller as its own default owner changes nothing.
+        self.assertEqual(accepted_owners(OWNER_SID, OWNER_SID), frozenset({OWNER_SID}))
+        # The elevated administrator's case still passes.
+        self.assertEqual(accepted_owners(OWNER_SID, SID_ADMINISTRATORS),
+                         frozenset({OWNER_SID, SID_ADMINISTRATORS}))
         self.assertEqual(judge_security(state(), OWNER_SID, default_owner_sid="nonsense"),
                          ["caller identity unknown"])
 
@@ -334,6 +377,21 @@ class OwnerOnlyJudgmentTests(unittest.TestCase):
         self.assertTrue(grants_effective_access(GENERIC_READ | GENERIC_WRITE))
         self.assertFalse(grants_effective_access(GENERIC_READ))
         self.assertFalse(grants_effective_access(FILE_GENERIC_WRITE))
+
+    def test_generic_rights_are_mapped_before_they_are_judged(self):
+        """A mask mixing generic and specific bits grants what the kernel
+        maps it to, so GENERIC_READ beside FILE_GENERIC_WRITE is read and
+        write, and GENERIC_ALL alone is everything."""
+        self.assertTrue(grants_effective_access(GENERIC_READ | FILE_GENERIC_WRITE))
+        self.assertTrue(grants_effective_access(FILE_GENERIC_READ | GENERIC_WRITE))
+        self.assertTrue(grants_effective_access(GENERIC_ALL))
+        self.assertFalse(grants_effective_access(GENERIC_READ | acl.GENERIC_EXECUTE))
+        self.assertEqual(map_generic_rights(GENERIC_ALL), FILE_ALL_ACCESS)
+        self.assertEqual(map_generic_rights(GENERIC_READ | 0x1), FILE_GENERIC_READ | 0x1)
+        self.assertEqual(map_generic_rights(FILE_GENERIC_WRITE), FILE_GENERIC_WRITE)
+        self.assertEqual(map_generic_rights(0), 0)
+        mixed = state(dacl=(allow(OWNER_SID, mask=GENERIC_READ | FILE_GENERIC_WRITE),))
+        self.assertEqual(judge_security(mixed, OWNER_SID), [])
 
     def test_other_principals_are_refused_whatever_their_rights(self):
         for stranger in (EVERYONE, USERS, OTHER_SID):
@@ -744,6 +802,41 @@ class TreeEnforcementTests(unittest.TestCase):
         self.assertEqual(platform.protected, [])
         self.assertEqual(sorted(self.closed), sorted(platform.handles))
 
+    def test_the_object_limit_is_exact(self):
+        """A tree of exactly ``max_objects`` objects, the root included,
+        passes; one more is refused before it is opened."""
+        objects = {".": state(directory=True), "a": state(), "b": state(), "c": state()}
+        platform = self.platform(objects, {".": [("a", FILE), ("b", FILE)]})
+        verified, evidence = self.observe(platform, r"C:\store", max_objects=3)
+        self.assertTrue(verified, evidence)
+        self.assertEqual(evidence["objects_seen"], 3)
+        platform = self.platform(objects, {".": [("a", FILE), ("b", FILE), ("c", FILE)]})
+        verified, evidence = self.observe(platform, r"C:\store", max_objects=3)
+        self.assertFalse(verified)
+        self.assertEqual(evidence["path"], "c")
+        self.assertEqual(evidence["objects_seen"], 3)
+        self.assertEqual([name for _p, name, _w, _l in platform.child_opens], ["a", "b"])
+
+    def test_an_unreadable_descriptor_stops_the_pass_before_any_write(self):
+        """Codex review of ccb85ef..2e9ed0f, B4: an object whose owner
+        could not be read may be another account's. Nothing is written
+        while any ownership read failed, even with no owner found foreign
+        and the walk complete."""
+        objects = {
+            ".": state(directory=True),
+            "leaky": state(protected=False, dacl=(
+                allow(OWNER_SID, flags=INHERITED_ACE), allow(EVERYONE, mask=0x1))),
+            "opaque": None,
+        }
+        platform = self.platform(objects, {".": [("leaky", FILE), ("opaque", FILE)]})
+        verified, evidence = self.enforce(platform, r"C:\store")
+        self.assertFalse(verified)
+        self.assertEqual(platform.protected, [])
+        self.assertEqual(evidence["objects_repaired"], 0)
+        self.assertEqual(evidence["objects_failed"], ["opaque"])
+        self.assertEqual(evidence["objects_foreign_owned"], [])
+        self.assertEqual(sorted(self.closed), sorted(platform.handles))
+
     def test_the_root_open_asks_for_write_only_when_enforcing(self):
         objects = {".": state(directory=True)}
         platform = self.platform(objects, {".": []})
@@ -830,7 +923,27 @@ class HandleBoundSourceTests(unittest.TestCase):
         self.assertIn("judge_security", source)
         self.assertLess(source.index("owner_sid not in owners"),
                         source.index("_protect_handle"))
-        self.assertRegex(source, r"if not foreign_owned and \(?not walk_error\)?:")
+        self.assertRegex(
+            source, r"if not foreign_owned and \(?not walk_error\)? and \(?not failed\)?:")
+
+    def test_every_open_denies_delete_sharing(self):
+        """Codex review of ccb85ef..2e9ed0f, B1: a handle held without
+        FILE_SHARE_DELETE pins the object's name, so a directory cannot be
+        renamed away and replaced between its open and the judgment of
+        what it lists. No open here may offer delete sharing."""
+        self.assertNotIn("FILE_SHARE_ALL", WINDOWS_SOURCE)
+        self.assertNotIn("FILE_SHARE_DELETE", WINDOWS_SOURCE)
+        self.assertNotIn("0x00000007", WINDOWS_SOURCE)
+        self.assertIn("FILE_SHARE_KEEP_NAME = 0x00000003", WINDOWS_SOURCE)
+        for name in ("_open_securable", "_open_child", "_reopen_descriptor"):
+            self.assertIn("FILE_SHARE_KEEP_NAME", method_source(name), name)
+
+    def test_child_names_are_measured_in_utf16_bytes(self):
+        child = method_source("_open_child")
+        self.assertIn("encode_object_name(", child)
+        self.assertNotIn("create_unicode_buffer", child)
+        self.assertNotIn("len(name) * 2", child)
+        self.assertIn("ctypes.sizeof(buffer)", child)
 
     def test_the_caller_identity_comes_from_the_token_not_from_a_name(self):
         source = method_source("_token_sid")
@@ -840,6 +953,107 @@ class HandleBoundSourceTests(unittest.TestCase):
         self.assertNotIn("getlogin", source)
         self.assertIn("TOKEN_USER_CLASS", method_source("_caller_sid"))
         self.assertIn("TOKEN_OWNER_CLASS", method_source("_default_owner_sid"))
+
+
+@unittest.skipUnless(sys.platform == "win32", "native Windows ACL behaviour")
+class NativeTreeTests(unittest.TestCase):
+    """Run against the real kernel: what the scripted tests cannot show.
+    The store is created by this account; on an elevated CI runner its
+    objects are owned by Administrators, which the token's default owner
+    admits."""
+
+    def setUp(self) -> None:
+        import platform_support  # noqa: F401  (drops ACL-bypass privileges)
+        from agent_bridge.platform import platform as host
+        self.host = host
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "store"
+        self.root.mkdir()
+        protected, evidence = host.enforce_owner_only_tree(str(self.root))
+        self.assertTrue(protected, evidence)
+
+    def test_a_directory_under_an_open_handle_cannot_be_renamed_or_replaced(self):
+        """Acceptance for B1: while the tree pass holds ``sub``, a rename
+        of ``sub`` (the first half of swapping it for a directory holding
+        an extra permissive file) fails with a sharing violation, so the
+        swap cannot happen and what is judged is what was opened."""
+        from platform_support import make_permissive
+        sub = self.root / "sub"
+        sub.mkdir()
+        (sub / "deep.txt").write_bytes(b"d")
+        protected, evidence = self.host.enforce_owner_only_tree(str(self.root))
+        self.assertTrue(protected, evidence)
+        attempts: list[BaseException | None] = []
+        original = self.host._list_directory
+
+        def list_directory(handle):
+            entries, error = original(handle)
+            if entries is not None and any(e.name == "deep.txt" for e in entries):
+                # We are inside ``sub`` now, with its handle open: attempt the swap.
+                try:
+                    os.rename(sub, self.root / "sub.old")
+                    replacement = self.root / "sub"
+                    replacement.mkdir()
+                    (replacement / "extra.txt").write_bytes(b"x")
+                    make_permissive(replacement / "extra.txt")
+                    attempts.append(None)
+                except OSError as exc:
+                    attempts.append(exc)
+            return entries, error
+
+        with mock.patch.object(self.host, "_list_directory", list_directory):
+            verified, evidence = self.host.observe_owner_only_tree(str(self.root))
+        self.assertEqual(len(attempts), 1, attempts)
+        self.assertIsInstance(attempts[0], PermissionError, attempts)
+        self.assertTrue(verified, evidence)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["sub"])
+        self.assertEqual(evidence["objects_seen"], 3)
+        # The handle is released with the pass: the rename works afterwards.
+        os.rename(sub, self.root / "sub.old")
+        self.assertTrue((self.root / "sub.old" / "deep.txt").exists())
+
+    def test_the_root_itself_cannot_be_renamed_while_a_pass_holds_it(self):
+        attempts: list[BaseException | None] = []
+        original = self.host._read_security
+
+        def read_security(handle, is_directory):
+            if not attempts:
+                try:
+                    os.rename(self.root, self.root.with_name("store.old"))
+                    attempts.append(None)
+                except OSError as exc:
+                    attempts.append(exc)
+            return original(handle, is_directory)
+
+        with mock.patch.object(self.host, "_read_security", read_security):
+            verified, evidence = self.host.observe_owner_only_tree(str(self.root))
+        self.assertTrue(verified, evidence)
+        self.assertIsInstance(attempts[0], PermissionError, attempts)
+        self.assertTrue(self.root.exists())
+
+    def test_a_supplementary_character_name_opens_that_name_and_no_shorter_one(self):
+        """Acceptance for B3: with ``\U0001f9ea.tx`` owner-only beside a
+        permissive ``\U0001f9ea.txt``, a Length short by one code unit would
+        open the former and pass; the pass must judge the latter and fail."""
+        from platform_support import make_permissive
+        short = self.root / "\U0001f9ea.tx"
+        full = self.root / "\U0001f9ea.txt"
+        short.write_bytes(b"s")
+        full.write_bytes(b"f")
+        protected, evidence = self.host.enforce_owner_only_tree(str(self.root))
+        self.assertTrue(protected, evidence)
+        verified, evidence = self.host.observe_owner_only_tree(str(self.root))
+        self.assertTrue(verified, evidence)
+        self.assertEqual(evidence["objects_seen"], 3)
+        make_permissive(full)
+        verified, evidence = self.host.observe_owner_only_tree(str(self.root))
+        self.assertFalse(verified, evidence)
+        self.assertEqual(evidence["objects_failed"], ["\U0001f9ea.txt"])
+        protected, evidence = self.host.enforce_owner_only_tree(str(self.root))
+        self.assertTrue(protected, evidence)
+        self.assertEqual(evidence["objects_repaired"], 1)
+        self.assertTrue(self.host.observe_owner_only_tree(str(self.root))[0])
 
 
 class RejectingWindowsPlatform:
