@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -412,6 +413,8 @@ class DocumentedLimitationTests(unittest.TestCase):
     def test_no_image_is_committed_to_git(self):
         self.assertIn("no rootfs tarball is committed to git",
                       wrf.IMAGE_DISTRIBUTION_LIMITATION)
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed on this test host")
         tracked = subprocess.run(
             ["git", "ls-files", "--", "*.tar"], cwd=ROOT,
             check=True, capture_output=True, text=True).stdout.splitlines()
