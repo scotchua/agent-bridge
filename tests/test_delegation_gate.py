@@ -1205,15 +1205,83 @@ class WindowsSpellingsOfAProtectedWrite(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.verdict(command), "allowed")
 
-    def test_the_msys_translation_is_windows_only(self):
+    # The two assertions below are about behaviour that differs by platform,
+    # so each is stated twice: once for the platform it is true on, and once
+    # for the platform it is false on. Writing only the POSIX half is a
+    # mistake I have now made three times in this project, and it fails on
+    # the Windows runners every time, which is the only reason it gets
+    # caught. The rule I keep relearning: when a function branches on
+    # os.name, so must its test.
+
+    @unittest.skipUnless(os.name == "posix", "POSIX path semantics")
+    def test_a_slash_c_path_is_left_alone_on_posix(self):
         """On POSIX, /c/Users/me really is that path."""
         self.assertEqual(gate._windows_drive_path("/c/Users/me"), "/c/Users/me")
 
-    def test_a_posix_colon_operand_is_still_split(self):
-        """The colon split is right on POSIX and was only wrong on Windows."""
+    @unittest.skipUnless(os.name == "nt", "Windows path semantics")
+    def test_a_slash_c_path_is_translated_on_windows(self):
+        """And on Windows it is Git Bash's spelling of a drive.
+
+        Asserted by the Windows runners rather than through a stand-in, which
+        is what makes it a measurement.
+        """
+        self.assertEqual(gate._windows_drive_path("/c/Users/me"), r"C:\Users\me")
+        self.assertEqual(gate._windows_drive_path("/cygdrive/d/x"), r"D:\x")
+        self.assertEqual(gate._windows_drive_path("/c"), "/c")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX operand semantics")
+    def test_a_colon_operand_is_split_on_posix(self):
+        """``a:b`` can be two operands in a POSIX shell."""
         found = gate._command_paths("cp a:b /tmp/x", "/cwd")
         self.assertIn("/cwd/a", found)
         self.assertIn("/cwd/b", found)
+
+    @unittest.skipUnless(os.name == "nt", "Windows operand semantics")
+    def test_a_colon_operand_is_not_split_on_windows(self):
+        """On Windows a colon is a drive or a stream, never a separator, and
+        splitting on it severed the drive letter out of a nested command."""
+        found = gate._command_paths("copy a:b x", r"C:\cwd")
+        self.assertNotIn(r"C:\cwd\a", found)
+        self.assertIn("a:b", [os.path.basename(entry) for entry in found]
+                      + [entry for entry in found])
+
+
+class EveryOperandOfACommandIsRead(unittest.TestCase):
+    """The operand set itself, which nothing was asserting.
+
+    A fix of mine silently dropped every command's own program name from the
+    parsed operands, and 88 tests in this file plus the 559-check suite all
+    passed. The cause is worth keeping: ``A and B`` returns A itself when A is
+    falsy, A was the empty ``previous`` list, and the very next line appends
+    to that same object, so the name held a list that had since become
+    non-empty and therefore truthy.
+
+    Nothing caught it because every test here asserts a *verdict*, and the
+    program name is nearly always redundant with the working directory that
+    ``classify`` adds alongside it. A test that pins the operands directly is
+    the only kind that would have.
+    """
+
+    def test_the_program_name_and_the_operands_are_all_present(self):
+        self.assertEqual(gate._command_paths("rm -f /tmp/x", "/cwd"),
+                         ["/cwd/rm", "/tmp/x"])
+
+    def test_a_bare_flag_names_nothing_but_its_value_does(self):
+        found = gate._command_paths("git --git-dir=/tmp/g status", "/cwd")
+        self.assertIn("/cwd/git", found)
+        self.assertIn("/tmp/g", found)
+
+    def test_a_redirection_target_is_an_operand(self):
+        self.assertIn("/cwd/out.txt", gate._command_paths("echo hi > out.txt", "/cwd"))
+
+    def test_a_nested_shell_command_contributes_its_own_operands(self):
+        found = gate._command_paths('sh -c "rm -f /tmp/inner"', "/cwd")
+        self.assertIn("/tmp/inner", found)
+
+    def test_the_shells_own_flag_is_not_an_operand(self):
+        """And this is what the dropped-name bug was introduced to do."""
+        found = gate._command_paths('sh -c "rm -f /tmp/inner"', "/cwd")
+        self.assertNotIn("/cwd/-c", found)
 
 
 class TheSqliteUriEscapesEveryReservedCharacter(unittest.TestCase):

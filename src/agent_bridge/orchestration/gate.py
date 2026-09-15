@@ -537,8 +537,15 @@ def _command_paths(command: str, cwd: str) -> list[str]:
         # Windows spelling caused trouble, and it caused plenty: translated as
         # a drive it became ``C:\``, an ancestor of every protected path, so
         # every ``cmd /c`` carrying a tree verb was refused.
-        consumed_flag = (previous and _SHELL_COMMAND_FLAGS.match(word)
-                         and _program_name(previous[-1]).lower() in _SHELLS)
+        # ``bool(...)`` is load-bearing, and leaving it out cost the command
+        # name out of every parsed command. ``A and B`` returns A itself when
+        # A is falsy, A here was the empty ``previous`` list, and the very
+        # next line appends to that same object: so this name *was*
+        # ``previous``, and by the time it was tested it held one word and was
+        # truthy. Every command's own program name was skipped, and 88 gate
+        # tests and the 559-check suite all passed anyway.
+        consumed_flag = bool(previous and _SHELL_COMMAND_FLAGS.match(word)
+                             and _program_name(previous[-1]).lower() in _SHELLS)
         previous.append(raw)
         if nested:
             found.extend(_command_paths(word, cwd))
