@@ -273,7 +273,8 @@ class ContextAssemblyTests(SetupTestCase):
         return args
 
     def test_off_windows_it_collects_nothing_and_spawns_nothing(self):
-        context = ws.build_context(self._args(), run=self._run)
+        with mock.patch.object(ws.wpf, "is_windows", return_value=False):
+            context = ws.build_context(self._args(), run=self._run)
         self.assertIsNone(context.preflight)
         self.assertEqual(dict(context.feature_states), {})
         self.assertFalse(context.reboot_pending)
@@ -568,6 +569,8 @@ class RealLauncherTests(SetupTestCase):
              *argv, "--runtime-root", str(self.runtime)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
+    @unittest.skipIf(sys.platform.startswith("win"),
+                     "this assertion is specifically the off-Windows refusal")
     def test_the_launcher_runs_plan_and_prints_one_object(self):
         result = self._launch("plan")
         self.assertEqual(result.returncode, ws.EXIT_OK, result.stderr[:400])
