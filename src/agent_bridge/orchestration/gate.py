@@ -176,7 +176,9 @@ def route_decision(caller: str, owner_route: str) -> str:
 
 def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any],
                     repo: str, reason: str, ttl_seconds: int,
-                    clock: Any = time.time) -> dict[str, Any]:
+                    clock: Any = time.time, code: str | None = None,
+                    considered: dict[str, Any] | None = None,
+                    automatic: bool = False) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
 
     ``stage_record`` is the router's current view of the stage, already
@@ -226,6 +228,17 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         "decided_at": now,
         "valid_until": valid_until,
     }
+    # A receipt written by the automatic policy carries the code it decided
+    # under and the inputs it saw, so the decision can be re-derived rather
+    # than taken on trust. A receipt written by an agent calling
+    # routing_decide carries neither, and the absent ``automatic`` flag is
+    # how an audit tells the two apart.
+    if automatic:
+        receipt["automatic"] = True
+    if code is not None:
+        receipt["code"] = code
+    if considered is not None:
+        receipt["considered"] = considered
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
@@ -482,6 +495,32 @@ def _edit_paths(client: str, tool_input: Any, cwd: str) -> list[str]:
     return [path if os.path.isabs(path) else os.path.join(cwd, path) for path in paths]
 
 
+def infer_task_type(paths: list[str]) -> str:
+    """What kind of work this call is, from what the call can actually show.
+
+    Always ``"implementation"``. Stated as a function rather than a constant
+    because the decision needs a task type and this is where it would be
+    refined if a host ever gave the hook more than a tool name and a path.
+
+    It is deliberately not ``"mechanical"``, ever. Mechanical work is what the
+    local worker takes, and the local worker processes bounded inline text and
+    returns a draft: it does not read files, run commands or edit anything
+    (``localq.spool``). So routing a file edit to it would produce an intent
+    nothing could satisfy. An earlier version of this function guessed
+    "mechanical" when every target looked like a test file, which read well
+    and was wrong for exactly that reason.
+
+    The consequence, stated plainly rather than hidden: the gate compels a
+    routing decision for implementation work, and automatic *local* routing
+    happens at the local worker's own entry point (``work_route_local``,
+    whose ``AutomaticIntake`` classifies and submits without anyone asking).
+    Mechanical text work an assistant simply does in its own context produces
+    no tool call, so no local mechanism can intercept it. That is a limit of
+    the hook surface, not something an instruction file fixes.
+    """
+    return "implementation"
+
+
 def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[str, list[str]]:
     """``("edit", paths)``, ``("shell", [cwd, *named paths])`` for a writing
     command, ``("shell_read", [])`` for one that does not look like it
@@ -500,13 +539,60 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
     return "other", []
 
 
+#: Stage states that mean an automatic receipt has been overtaken by events
+#: rather than that something is wrong. Under automatic routing each of these
+#: is a reason to decide again; ``stage_db_unavailable`` is deliberately
+#: absent, because a router we cannot read is an infrastructure failure and
+#: must stay a deny rather than triggering a decision made without it.
+_OVERTAKEN = frozenset({"stage_not_found", "stage_not_owned", "stage_reassigned",
+                        "stage_lease_expired"})
+
+
+def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
+                                capacity_db: str | None, task_type: str) -> bool:
+    """Whether an automatic receipt should be replaced by a fresh decision.
+
+    Three ways a recorded decision stops describing the call in front of it,
+    all of them ordinary rather than exceptional:
+
+    * it was decided for a different kind of work (one receipt per
+      repository, but a repository holds work of more than one kind);
+    * it has expired;
+    * the stage it points at is finished, reassigned or its lease lapsed,
+      which is what happens after a normal ``stage_complete``.
+
+    Before this existed, the first completed stage in a repository left every
+    later edit denied with ``stage_not_owned`` and an instruction to claim a
+    stage by hand, which is the opposite of automatic.
+    """
+    if str(receipt.get("stage", "")).split("#")[0] != task_type:
+        return True
+    valid_until = receipt.get("valid_until")
+    if not isinstance(valid_until, (int, float)) or valid_until <= now:
+        return True
+    if capacity_db is None:
+        return False
+    return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
+
+
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
-          capacity_db: str | None = None) -> Decision:
+          capacity_db: str | None = None,
+          decide: Any = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
     with ``capacity_db`` every allow also requires the receipt's stage to be
-    owned right now (:func:`stage_binding`)."""
+    owned right now (:func:`stage_binding`).
+
+    ``decide`` makes the gate automatic. When a repository has no receipt and
+    ``decide`` is supplied, it is called with ``(repo, task_type)`` and must
+    create the decision (see :mod:`autodecide`): compute the route from the
+    operator's policy, establish the ownership it implies, and write the
+    receipt. The call is then judged against that receipt like any other, so
+    work the policy retains proceeds with no friction and work it routes
+    elsewhere is refused here and owed to the route the receipt names.
+    Without ``decide`` the gate behaves as it did: a missing receipt is a
+    deny telling the agent which calls to make."""
     if client not in CLIENTS:
         return Decision("deny", "client_invalid", "gate configured with an unknown client")
     kind, paths = classify(client, tool_name, tool_input, cwd)
@@ -539,6 +625,28 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
             return Decision("deny", "gate_state_unavailable",
                             f"delegation-first gate: routing state could not be read "
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
+        task_type = infer_task_type(paths)
+        if (receipt is not None and decide is not None and receipt.get("automatic")
+                and automatic_receipt_overtaken(receipt, now, capacity_db, task_type)):
+            receipt = None
+        if receipt is None and decide is not None:
+            # No receipt yet: make the decision now rather than refusing and
+            # asking the agent to make it. This is the automatic part.
+            try:
+                decide(repo, task_type)
+            except Exception as exc:  # noqa: BLE001  fail closed, name the class
+                return Decision(
+                    "deny", "gate_auto_decision_failed",
+                    f"delegation-first gate: the routing decision for {repo} could not be "
+                    f"created ({type(exc).__name__}: {exc}); nothing is implemented until "
+                    f"it can be", repos)
+            try:
+                receipt = read_receipt(state_root, repo)
+            except (OSError, ValueError) as exc:
+                return Decision("deny", "gate_state_unavailable",
+                                f"delegation-first gate: routing state could not be read "
+                                f"({type(exc).__name__}); nothing is implemented until it can",
+                                repos)
         if receipt is None:
             return Decision(
                 "deny", "no_routing_receipt",
@@ -553,12 +661,20 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                 f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
                 f"(stage_renew) and call routing_decide again.", repos, receipt)
         if receipt["owner_route"] != client:
+            route = receipt["owner_route"]
+            call = "work_route_local" if route == "local" else "execution_dispatch"
+            automatic = (" The routing decision was made automatically: "
+                         + str(receipt.get("code", "")) + "." if receipt.get("automatic") else "")
             return Decision(
                 "deny", "routed_elsewhere",
                 f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
-                f"in {repo} is owned by route {receipt['owner_route']}; this client does not "
-                f"implement it. Dispatch through execution_dispatch or wait for that stage to "
-                f"complete.", repos, receipt)
+                f"in {repo} is routed to {route}; this client does not implement it."
+                f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
+                f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
+                f"owner_id={receipt.get('owner_id')!r}, "
+                f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
+                f"already claimed, so no stage_register or stage_claim is needed.",
+                repos, receipt)
         if capacity_db is not None:
             stale = stage_binding(capacity_db, receipt, now)
             if stale is not None:
@@ -597,6 +713,20 @@ def record_event(state_root: str, client: str, tool_name: str, decision: Decisio
     store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
 
 
+def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:
+    """The callable :func:`judge` uses to create a decision that does not exist.
+
+    Imported lazily so ``gate`` stays importable without the stage router and
+    so the two modules do not import each other at module scope.
+    """
+    def decide(repo: str, task_type: str) -> Any:
+        from .autodecide import ensure_decision
+
+        return ensure_decision(client=client, repo=repo, state_root=state_root,
+                               capacity_db=capacity_db, task_type=task_type)
+    return decide
+
+
 def state_root_from_config(config_path: str) -> str:
     return gate_paths_from_config(config_path)[0]
 
@@ -613,7 +743,7 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str]:
 
 def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
-             protected: tuple[str, ...] = ()) -> Decision:
+             protected: tuple[str, ...] = (), decide: Any = None) -> Decision:
     tool_name = payload.get("tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     if not isinstance(tool_name, str):
@@ -621,7 +751,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
         decision = Decision("deny", "hook_input_invalid", "delegation-first gate: hook input has no tool_name")
     else:
         decision = judge(client, tool_name, payload.get("tool_input"), cwd,
-                         state_root=state_root, clock=clock, protected=protected, capacity_db=capacity_db)
+                         state_root=state_root, clock=clock, protected=protected,
+                         capacity_db=capacity_db, decide=decide)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -842,6 +973,11 @@ NOT_COVERED = [
     "shell commands that write in a way the text heuristic does not recognise, including one that "
     "reaches the gate's own state or the hook files without naming their paths",
     "installation on Windows: the .cmd launcher is written but has not been run under either host",
+    "mechanical text work an assistant performs in its own context: it produces no tool "
+    "call, so no local mechanism intercepts it. The local worker's automatic intake "
+    "covers work an assistant sends it, not work it never sends",
+    "the brief itself: a PreToolUse payload names a tool and some paths, not the task, so "
+    "automatic routing compels the dispatch but the brief's words are the assistant's",
 ]
 
 
@@ -879,6 +1015,53 @@ def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     return "needs_review"
 
 
+def _automatic_routing_state(paths: dict[str, str]) -> dict[str, Any]:
+    """Whether each installed client decides automatically or refuses instead.
+
+    Read from the installed hook command, because that is what actually runs;
+    a flag recorded anywhere else would describe an intention.
+    """
+    state: dict[str, Any] = {}
+    for client, path in (("claude", paths["claude_settings"]),
+                         ("codex", paths["codex_hooks"])):
+        if not os.path.exists(path):
+            state[client] = "not_installed"
+            continue
+        try:
+            loaded = store.read_json(path)
+            pre = loaded.get("hooks", {}).get("PreToolUse", [])
+        except (OSError, ValueError, AttributeError):
+            state[client] = "unreadable"
+            continue
+        entry = next((item for item in pre if _is_ours(item)), None)
+        if entry is None:
+            state[client] = "not_installed"
+            continue
+        command = " ".join(str(hook.get("command", "")) for hook in entry.get("hooks", [])
+                           if isinstance(hook, dict))
+        state[client] = "off" if "--no-automatic-routing" in command else "on"
+    return state
+
+
+def _policy_state(state_root: str) -> dict[str, Any]:
+    """The operator's routing policy, summarised. Never its repository names."""
+    from .autoroute import load_policy, policy_path
+
+    path = policy_path(state_root)
+    if not os.path.exists(path):
+        return {"path": path, "present": False,
+                "consequence": "every repository is retained; nothing is dispatched"}
+    try:
+        policy = load_policy(state_root)
+    except Exception as exc:  # noqa: BLE001  a report never crashes
+        return {"path": path, "present": True, "readable": False,
+                "error": type(exc).__name__,
+                "consequence": "the gate denies every gated call until it can be read"}
+    return {"path": path, "present": True, "readable": True,
+            "classified_repositories": len(policy.repos),
+            "default_allows_dispatch": bool(policy.default.allowed_routes)}
+
+
 def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.time) -> dict[str, Any]:
     paths = install_paths(home)
     now = float(clock())
@@ -911,6 +1094,8 @@ def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.ti
     return {
         "state_root": state_root,
         "installed": installed,
+        "automatic_routing": _automatic_routing_state(paths),
+        "routing_policy": _policy_state(state_root),
         "codex_trust": codex_trust_state(paths["codex_toml"], paths["codex_hooks"]),
         "receipts": receipts,
         "recent_events": recent,
@@ -928,6 +1113,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--client", choices=CLIENTS)
     parser.add_argument("--config", help="private orchestration config (state_root is read from it)")
     parser.add_argument("--state-root", help="alternative to --config")
+    parser.add_argument("--no-automatic-routing", action="store_true",
+                        help="do not create the routing decision; refuse a call that has no "
+                             "receipt instead. The pre-automatic behaviour, kept for an "
+                             "operator who wants every route claimed explicitly.")
     ins = sub.add_parser("install", help="register the PreToolUse hook in Claude Code and/or Codex")
     ins.add_argument("--home"); ins.add_argument("--root", required=True); ins.add_argument("--config", required=True)
     ins.add_argument("--clients", default="claude,codex"); ins.add_argument("--apply", action="store_true")
@@ -935,11 +1124,16 @@ def main(argv: list[str] | None = None) -> int:
     rep = sub.add_parser("report", help="receipts, recent gate events, installation and trust state")
     rep.add_argument("--home"); rep.add_argument("--config"); rep.add_argument("--state-root")
     rep.add_argument("--events", type=int, default=20)
+    aud = sub.add_parser("audit", help="eligible, routed, retained, bypassed, failed, and why")
+    aud.add_argument("--home"); aud.add_argument("--config"); aud.add_argument("--state-root")
+    aud.add_argument("--since-hours", type=float, default=24.0,
+                     help="window to account for; 0 for everything on record")
+    aud.add_argument("--json", action="store_true", help="the full record rather than the summary")
     words = sys.argv[1:] if argv is None else argv
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        if exc.code in (0, None) or any(word in ("install", "report", "-h", "--help") for word in words):
+        if exc.code in (0, None) or any(word in ("install", "report", "audit", "-h", "--help") for word in words):
             raise
         # Hook mode with unusable arguments: the host must still read a deny.
         sys.stdout.write(json.dumps(hook_output(Decision(
@@ -958,6 +1152,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report(args.home or home, state_root, events=args.events),
                          indent=2, sort_keys=True))
         return 0
+    if args.command == "audit":
+        from .audit import render, report as audit_report
+
+        state_root = args.state_root or state_root_from_config(args.config)
+        document = audit_report(state_root, home=args.home or home,
+                                config_path=args.config,
+                                since_hours=args.since_hours)
+        print(json.dumps(document, indent=2, sort_keys=True) if args.json
+              else render(document), end="" if not args.json else "\n")
+        return 0
     # Hook mode: judge the call described on stdin. Always exit 0; the
     # decision travels in the JSON so the host applies it, and a deny is
     # a deny whatever went wrong on the way to it.
@@ -973,7 +1177,10 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
-        decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db, protected=protected)
+        decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
+                            protected=protected,
+                            decide=None if args.no_automatic_routing else
+                            automatic_decider(args.client, state_root, capacity_db))
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "

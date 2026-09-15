@@ -454,9 +454,12 @@ class HookProcessTests(GateCase):
         return router, owned
 
     def test_a_denied_edit_is_reported_on_stdout_and_logged(self):
+        # --no-automatic-routing is the pre-automatic posture: no receipt is a
+        # deny, full stop. With automatic routing on (the default) this same
+        # call creates a decision first, which the AutomaticGate tests cover.
         completed = self.run_hook("claude", {"hook_event_name": "PreToolUse", "tool_name": "Edit",
                                              "tool_input": {"file_path": str(self.repo / "a.py")},
-                                             "cwd": str(self.repo)})
+                                             "cwd": str(self.repo)}, "--no-automatic-routing")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         out = json.loads(completed.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
@@ -487,7 +490,7 @@ class HookProcessTests(GateCase):
             self.skipTest("the sh launcher is for POSIX hosts; the .cmd launcher is not exercised here")
         self.owned_now()
         config = self.write_config()
-        command = gate.hook_command(str(ROOT), "claude", str(config))
+        command = gate.hook_command(str(ROOT), "claude", str(config)) + " --no-automatic-routing"
         denied = subprocess.run(command, shell=True, input=json.dumps({
             "tool_name": "Write", "tool_input": {"file_path": str(self.other / "b.py")},
             "cwd": str(self.other)}).encode(), capture_output=True, timeout=60)

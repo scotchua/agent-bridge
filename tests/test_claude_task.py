@@ -18,6 +18,7 @@ CLAUDE_TASK = Path(__file__).resolve().parent.parent / "src" / "agent_bridge" / 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task as module
+from agent_bridge.execution import hostenv
 from agent_bridge.execution.claude_task import (
     TaskError, _command, _env, _git, _relevant_paths, _remove, _run,
     _sandboxed, _source_state, main, run_task)
@@ -171,25 +172,69 @@ class ClaudeTaskTests(unittest.TestCase):
         time.sleep(0.8)
         self.assertFalse(marker.exists())
 
-    def test_macos_sandbox_denies_network_and_outside_write(self):
-        tree = self.root / "sandbox-tree"
-        tree.mkdir()
-        scratch = self.root / "sandbox-scratch"
-        outside = self.root / "outside"
-        code = ("import pathlib,socket; "
-                f"pathlib.Path({str(outside)!r}).write_text('escape'); "
-                "socket.socket().connect(('127.0.0.1',9))")
-        result = _sandboxed([sys.executable, "-c", code], tree, scratch, _env(), 5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(outside.exists())
+    # The confinement backend is now selected per host (execution/hostenv.py),
+    # so these assert what the *selected* backend claims rather than what one
+    # operating system happens to provide. A test that asserted macOS
+    # semantics everywhere would have to be skipped off macOS, and a skipped
+    # boundary test is one nobody reads.
 
-    def test_macos_sandbox_denies_outside_read(self):
+    def test_selected_backend_denies_network(self):
+        """Every backend must deny network. None is selected if it cannot."""
+        backend = hostenv.confinement("synthetic")
+        tree = self.root / "net-tree"; tree.mkdir()
+        code = ("import socket,sys\n"
+                "try:\n"
+                "    socket.create_connection(('1.1.1.1', 443), timeout=3)\n"
+                "except OSError:\n"
+                "    sys.exit(0)\n"
+                "sys.exit(9)\n")
+        result = _sandboxed([sys.executable, "-c", code], tree,
+                            self.root / "net-scratch", _env(), 20, backend)
+        self.assertTrue(backend.denies_network)
+        self.assertEqual(result.returncode, 0, result.stderr[:400])
+        self.assertEqual(result.sandbox_backend, backend.name)
+
+    def test_backend_write_confinement_matches_its_claim(self):
+        """A write above the worktree is refused exactly when claimed."""
+        backend = hostenv.confinement("synthetic")
+        tree = self.root / "write-tree"; tree.mkdir()
+        outside = self.root / "outside"
+        result = _sandboxed(
+            [sys.executable, "-c", f"open({str(outside)!r},'w').write('escape')"],
+            tree, self.root / "write-scratch", _env(), 20, backend)
+        if backend.confines_writes:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(outside.exists())
+        else:
+            # Stated, not assumed: this backend is not the write boundary.
+            # run_task's source-integrity snapshot is, and
+            # test_detects_source_checkout_mutation proves it.
+            self.assertTrue(outside.exists())
+
+    def test_backend_read_confinement_matches_its_claim(self):
+        backend = hostenv.confinement("synthetic")
         tree = self.root / "read-tree"; tree.mkdir()
         protected = self.root / "client-secret"; protected.write_text("canary-secret")
         result = _sandboxed([sys.executable, "-c", f"print(open({str(protected)!r}).read())"],
-                            tree, self.root / "read-scratch", _env(), 5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn(b"canary-secret", result.stdout + result.stderr)
+                            tree, self.root / "read-scratch", _env(), 20, backend)
+        if backend.confines_reads:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(b"canary-secret", result.stdout + result.stderr)
+        else:
+            # Why such a backend carries synthetic material only.
+            self.assertIn(b"canary-secret", result.stdout)
+            self.assertEqual(backend.classifications, frozenset({"synthetic"}))
+
+    def test_a_backend_that_confines_no_reads_refuses_real_material(self):
+        backend = hostenv.confinement("synthetic")
+        if backend.confines_reads:
+            self.assertTrue(backend.permits("internal_nonclient"))
+            return
+        for classification in ("internal_nonclient", "public"):
+            with self.assertRaises(hostenv.HostCapabilityError) as caught:
+                hostenv.confinement(classification)
+            self.assertEqual(caught.exception.code,
+                             "verification_confinement_insufficient")
 
     def test_cleanup_timeout_is_bounded_failure(self):
         tree = self.root / "cleanup-tree"; tree.mkdir()

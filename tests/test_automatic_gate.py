@@ -1,0 +1,422 @@
+"""The automatic part of the delegation-first gate.
+
+The gate already refused an edit without a routing receipt. What it could not
+do was create the decision: an agent had to choose to call ``stage_register``,
+``stage_claim`` and ``routing_decide``, and it named its own
+``allowed_routes`` when it did, so the route was requested rather than
+decided. These tests cover the mechanism that closes that gap, including the
+two defects found while building it:
+
+* one receipt per repository answered for work of a different kind, so a
+  single decision governed every later call in that repository;
+* a stage that reached ``complete`` left the repository permanently
+  un-editable, because every later decision tried to claim a closed stage.
+
+They run the hook as a real process wherever the behaviour is the process's
+(exit status, the JSON on stdout, state on disk surviving into the next
+invocation), because a decision that only holds in-process is not the thing
+being claimed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from agent_bridge.capacity_router import CapacityObservation, StageRouter  # noqa: E402
+from agent_bridge.orchestration import autodecide, autoroute, gate  # noqa: E402
+
+
+def git_repo(path: Path) -> Path:
+    """A real git checkout: the gate keys decisions on repository roots."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, timeout=60,
+                   capture_output=True)
+    (path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (path / "tests").mkdir(exist_ok=True)
+    (path / "tests" / "test_app.py").write_text("def test_x():\n    assert True\n",
+                                                encoding="utf-8")
+    return path
+
+
+class AutoCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        (self.state / "routing").mkdir(parents=True)
+        os.chmod(self.state, 0o700)
+        self.db = self.state / "capacity.sqlite3"
+        self.config = self.base / "orchestration.json"
+        self.config.write_text(json.dumps(
+            {"state_root": str(self.state), "capacity_db": str(self.db)}),
+            encoding="utf-8")
+        self.repo = git_repo(self.base / "repo")
+
+    # ---------------------------------------------------------------- helpers
+
+    def write_policy(self, repos: dict, **extra):
+        document = {"version": 1, "repos": repos, **extra}
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def observe(self, route: str, available: bool = True, seconds: float = 3600):
+        router = StageRouter(str(self.db))
+        now = time.time()
+        router.observe_capacity(CapacityObservation(
+            route=route, observed_at=now, fresh_until=now + seconds,
+            available=available, source="test-operator"))
+
+    def hook(self, client: str, repo: Path, relative: str = "app.py",
+             tool: str = "Edit", *args) -> dict:
+        payload = {"hook_event_name": "PreToolUse", "tool_name": tool,
+                   "tool_input": {"file_path": str(repo / relative)},
+                   "cwd": str(repo)}
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", client, "--config", str(self.config), *args],
+            input=json.dumps(payload).encode("utf-8"), capture_output=True,
+            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def assertAllowed(self, result):
+        self.assertEqual(result, {}, result)
+
+    def assertDenied(self, result, code):
+        self.assertIn("hookSpecificOutput", result)
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(reason.endswith(f"[{code}]"), reason)
+        return reason
+
+    def receipt_for(self, repo: Path) -> dict:
+        return gate.read_receipt(str(self.state), str(repo))
+
+
+class DecisionIsCreatedWithoutBeingAsked(AutoCase):
+    def test_an_unclassified_repository_is_retained_and_recorded(self):
+        """The decision exists before the edit, with no agent and no user."""
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        self.assertIsNotNone(receipt)
+        self.assertTrue(receipt["automatic"])
+        self.assertEqual(receipt["code"], "retained_repo_unclassified")
+        self.assertEqual(receipt["owner_route"], "claude")
+        self.assertEqual(receipt["decision"], "self")
+        self.assertTrue(receipt["reason"])
+
+    def test_the_receipt_records_what_the_decision_considered(self):
+        self.hook("claude", self.repo)
+        considered = self.receipt_for(self.repo)["considered"]
+        for key in ("client", "peer", "classification", "allowed_routes",
+                    "fresh_routes", "load_per_core", "task_type"):
+            self.assertIn(key, considered)
+
+    def test_a_classified_repository_routes_to_the_peer_and_refuses_the_edit(self):
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["codex", "claude", "local"])
+        self.observe("codex")
+        reason = self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIn("routed to codex", reason)
+        self.assertIn("execution_dispatch", reason)
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "codex")
+
+    def test_the_route_that_owns_the_stage_may_edit_it(self):
+        """The two-way half: the same repository, the other client."""
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["codex", "claude", "local"])
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertAllowed(self.hook("codex", self.repo))
+
+    def test_no_user_sentence_and_no_agent_call_was_needed(self):
+        """Nothing wrote a receipt but the hook itself.
+
+        The audit ledger is the evidence: the only routing_decided line comes
+        from the automatic path, marked as such.
+        """
+        self.write_policy({str(self.repo): {
+            "classification": "public", "allowed_routes": ["claude", "codex"]}},
+            prefer=["codex", "claude", "local"])
+        self.observe("codex")
+        self.hook("claude", self.repo)
+        lines = [json.loads(line) for line in
+                 (self.state / "routing" / "audit.jsonl").read_text(
+                     encoding="utf-8").splitlines()]
+        decided = [line for line in lines if line.get("event") == "routing_decided"]
+        self.assertEqual(len(decided), 1)
+        self.assertTrue(decided[0]["automatic"])
+
+
+class PrivacyIsCheckedBeforeEverythingElse(AutoCase):
+    def test_client_derived_material_is_never_dispatched(self):
+        self.write_policy({str(self.repo): {
+            "classification": "client_derived",
+            "allowed_routes": ["claude", "codex", "local"], "mechanical_ok": True}})
+        for route in ("codex", "local"):
+            self.observe(route)
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        self.assertEqual(receipt["code"], "retained_classification_ineligible")
+        self.assertEqual(receipt["owner_route"], "claude")
+        self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
+
+    def test_capacity_cannot_override_privacy(self):
+        """Every route fresh and available still does not move the work."""
+        self.write_policy({str(self.repo): {"classification": "client_derived",
+                                            "allowed_routes": ["codex"]}})
+        self.observe("codex", seconds=86400)
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_classification_ineligible")
+
+    def test_an_unreadable_policy_denies_rather_than_permitting(self):
+        Path(autoroute.policy_path(str(self.state))).write_text(
+            "{not json at all", encoding="utf-8")
+        reason = self.assertDenied(self.hook("claude", self.repo),
+                                   "gate_auto_decision_failed")
+        self.assertIn("policy_unreadable", reason)
+
+    def test_a_policy_with_the_wrong_version_is_refused(self):
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.write_text(json.dumps({"version": 99, "repos": {}}), encoding="utf-8")
+        self.assertDenied(self.hook("claude", self.repo), "gate_auto_decision_failed")
+
+
+class CapacityEvidenceIsFirstHandOnly(AutoCase):
+    def test_the_hook_observes_its_own_route_and_never_the_peer(self):
+        self.hook("claude", self.repo)
+        capacity = StageRouter(str(self.db)).report()["capacity"]
+        self.assertIn("claude", capacity)
+        self.assertEqual(capacity["claude"]["source"],
+                         autodecide.CLIENT_PRESENCE_SOURCE)
+        self.assertNotIn("codex", capacity)
+        self.assertNotIn("local", capacity)
+
+    def test_a_peer_without_a_fresh_observation_keeps_the_work_here(self):
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["codex", "claude", "local"])
+        # No observation for codex at all.
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+
+    def test_a_stale_observation_does_not_make_a_route_eligible(self):
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["codex", "claude", "local"])
+        router = StageRouter(str(self.db))
+        now = time.time()
+        router.observe_capacity(CapacityObservation(
+            route="codex", observed_at=now - 7200, fresh_until=now - 3600,
+            available=True, source="test-operator"))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"],
+                         "retained_no_fresh_capacity")
+
+
+class DispatchIntent(AutoCase):
+    def setUp(self):
+        super().setUp()
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["codex", "claude", "local"])
+        self.observe("codex")
+
+    def test_routing_away_writes_a_durable_intent(self):
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        intent = autodecide.read_intent(str(self.state), str(self.repo))
+        self.assertEqual(intent["route"], "codex")
+        self.assertEqual(intent["state"], "awaiting_brief")
+        self.assertEqual(intent["next_call"], "execution_dispatch")
+        self.assertEqual(intent["code"], "routed_peer_implementation")
+
+    def test_the_intent_carries_the_binding_the_dispatch_call_needs(self):
+        """So the assistant makes one call, not three."""
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        intent = autodecide.read_intent(str(self.state), str(self.repo))
+        current = StageRouter(str(self.db)).get(intent["item_id"], intent["stage"])
+        self.assertEqual(current["state"], "owned")
+        self.assertEqual(current["owner_id"], intent["owner_id"])
+        self.assertEqual(current["owner_route"], "codex")
+        self.assertEqual(current["revision"], intent["stage_revision"])
+
+    def test_the_intent_is_retired_once_it_is_met(self):
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertTrue(autodecide.clear_intent(str(self.state), str(self.repo)))
+        self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
+        self.assertFalse(autodecide.clear_intent(str(self.state), str(self.repo)))
+
+    def test_retiring_an_intent_is_recorded(self):
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        autodecide.clear_intent(str(self.state), str(self.repo))
+        events = [json.loads(line) for line in
+                  (self.state / "routing" / "audit.jsonl").read_text(
+                      encoding="utf-8").splitlines()]
+        self.assertTrue(any(e.get("event") == "dispatch_intent_met" for e in events))
+
+
+class DefectsFoundWhileBuildingThis(AutoCase):
+    """Both were live failures, not hypotheticals. See the module docstring."""
+
+    def test_a_completed_stage_does_not_brick_the_repository(self):
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        router = StageRouter(str(self.db))
+        current = router.get(first["item_id"], first["stage"])
+        router.complete(first["item_id"], first["stage"],
+                        owner_id=current["owner_id"],
+                        expected_revision=current["revision"])
+        # Before the fix this denied with stage_terminal for ever after.
+        self.assertAllowed(self.hook("claude", self.repo))
+        second = self.receipt_for(self.repo)
+        self.assertNotEqual(second["stage"], first["stage"])
+        self.assertEqual(second["stage"], "implementation#2")
+
+    def test_generations_are_bounded_rather_than_searched_for_ever(self):
+        self.assertLessEqual(autodecide.MAX_STAGE_GENERATIONS, 10_000)
+        router = StageRouter(str(self.db))
+        item = autodecide.item_id_for(str(self.repo))
+        self.assertEqual(autodecide.stage_name(router, item, "implementation"),
+                         "implementation")
+
+    def test_a_receipt_for_one_kind_of_work_does_not_answer_for_another(self):
+        """The automatic receipt is re-decided when the task type differs."""
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        self.assertEqual(receipt["stage"], "implementation")
+        # Rewrite the stage to a different task type, as a decision for other
+        # work would have. The next call must re-decide rather than reuse it.
+        from agent_bridge import store
+        store.atomic_write_json(gate.receipt_path(str(self.state), str(self.repo)),
+                                {**receipt, "stage": "review"})
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["stage"], "implementation")
+
+    def test_an_expired_automatic_receipt_is_re_decided_not_refused(self):
+        self.assertAllowed(self.hook("claude", self.repo))
+        from agent_bridge import store
+        receipt = self.receipt_for(self.repo)
+        store.atomic_write_json(gate.receipt_path(str(self.state), str(self.repo)),
+                                {**receipt, "valid_until": time.time() - 1})
+        # Under the strict posture this is routing_receipt_expired. Under
+        # automatic routing an expiry is not a question for the agent.
+        self.assertDenied(self.hook("claude", self.repo, "app.py", "Edit",
+                                    "--no-automatic-routing"),
+                          "routing_receipt_expired")
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertGreater(self.receipt_for(self.repo)["valid_until"], time.time())
+
+    def test_an_unreadable_router_stays_a_deny_and_does_not_re_decide(self):
+        """Overtaken is ordinary. An unreadable router is not."""
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        self.assertFalse(gate.automatic_receipt_overtaken(
+            receipt, time.time(), str(self.base / "no-such.sqlite3"),
+            "implementation"))
+        self.assertEqual(gate.stage_binding(str(self.base / "no-such.sqlite3"),
+                                            receipt, time.time()),
+                         "stage_db_unavailable")
+
+    def test_a_file_edit_is_never_routed_to_the_local_worker(self):
+        """The local worker does not edit files, so such an intent is unmeetable."""
+        self.write_policy({str(self.repo): {
+            "classification": "synthetic", "allowed_routes": ["claude", "local"],
+            "mechanical_ok": True}}, prefer=["local", "claude", "codex"])
+        self.observe("local")
+        for relative in ("tests/test_app.py", "app.py"):
+            self.assertAllowed(self.hook("claude", self.repo, relative))
+            self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+        self.assertEqual(gate.infer_task_type(["tests/test_app.py"]), "implementation")
+
+
+class RestartAndReuse(AutoCase):
+    def test_the_decision_survives_into_the_next_hook_process(self):
+        """Each tool call is a new process; the decision must be on disk."""
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        self.assertAllowed(self.hook("claude", self.repo))
+        second = self.receipt_for(self.repo)
+        self.assertEqual(first["item_id"], second["item_id"])
+        self.assertEqual(first["stage"], second["stage"])
+        self.assertEqual(first["owner_id"], second["owner_id"])
+
+    def test_one_decision_per_repository_not_one_per_tool_call(self):
+        for _ in range(4):
+            self.assertAllowed(self.hook("claude", self.repo))
+        lines = [json.loads(line) for line in
+                 (self.state / "routing" / "audit.jsonl").read_text(
+                     encoding="utf-8").splitlines()]
+        stages = {line["stage"] for line in lines
+                  if line.get("event") == "routing_decided"}
+        self.assertEqual(stages, {"implementation"})
+
+    def test_a_second_repository_gets_its_own_decision(self):
+        other = git_repo(self.base / "other")
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertAllowed(self.hook("claude", other))
+        self.assertNotEqual(self.receipt_for(self.repo)["item_id"],
+                            self.receipt_for(other)["item_id"])
+
+
+class TheStrictPostureIsStillAvailable(AutoCase):
+    def test_no_automatic_routing_refuses_instead_of_deciding(self):
+        self.assertDenied(self.hook("claude", self.repo, "app.py", "Edit",
+                                    "--no-automatic-routing"),
+                          "no_routing_receipt")
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_the_protected_state_rule_still_applies_under_automatic_routing(self):
+        """An agent cannot write itself a receipt through a covered tool."""
+        payload_target = self.state / "routing" / "anything.json"
+        result = self.hook("claude", self.repo, str(payload_target))
+        self.assertDenied(result, "gate_state_protected")
+
+
+class PolicyParsing(unittest.TestCase):
+    def test_an_absent_policy_retains_everything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = autoroute.load_policy(temporary)
+            self.assertEqual(policy.repos, {})
+            self.assertEqual(policy.default.allowed_routes, ())
+            self.assertEqual(policy.default.classification, "unclassified")
+
+    def test_a_relative_repository_key_is_refused(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {"relative/path": {}}})
+
+    def test_an_unknown_key_in_an_entry_is_refused(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {
+                "/tmp": {"classification": "public", "allow_everything": True}}})
+
+    def test_an_unknown_classification_is_refused(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {
+                "/tmp": {"classification": "totally_fine"}}})
+
+    def test_a_paid_route_cannot_be_expressed(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {
+                "/tmp": {"allowed_routes": ["anthropic_api"]}}})
+        self.assertEqual(autoroute.ROUTES, ("claude", "codex", "local"))
+
+
+if __name__ == "__main__":
+    unittest.main()

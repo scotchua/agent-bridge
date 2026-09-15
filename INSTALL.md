@@ -464,15 +464,60 @@ register the worker as a per-user logon task in your own Task Scheduler
 namespace, with no administrator rights and no other account, and you can remove
 it yourself; that path has not been exercised on a live Windows host.
 
-## Delegation-first gate (optional, after automatic delegation)
+## Delegation-first gate
 
-With automatic delegation on, a PreToolUse hook can make the routing decision
-mandatory: Claude Code and the Codex CLI refuse to edit a repository until a
-stage for it is claimed and `routing_decide` has written a receipt, and the
-client whose route does not own the stage is told to dispatch instead.
-Install with `./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply`,
-then accept the hook once in Codex's `/hooks`. What it covers and what it
-cannot (desktop and web chats have no hook surface) is in
+`onboard apply` installs this for you when you enable automatic delegation.
+The steps below are the manual path, and what to do next either way.
+
+A PreToolUse hook makes the routing decision mandatory *and* automatic.
+Claude Code and the Codex CLI refuse to edit a repository unless a durable
+receipt names the route that owns the work, and when there is no receipt the
+hook computes one itself from your routing policy, the stage router's fresh
+capacity observations and this host's load. You are never asked to say "send
+this to Codex".
+
+Install by hand with:
+
+```
+./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply
+```
+
+Then do three things, in this order:
+
+1. **Classify the repositories you want delegated**, in
+   `<state_root>/routing/routing-policy.json`. `onboard apply` writes an inert
+   scaffold with the shape and a worked example in it. A repository with no
+   entry is retained and never dispatched, so until you edit this file the
+   gate records decisions and changes nothing about where work runs.
+2. **Start Codex once and accept the new hook** in its `/hooks` view. Until
+   then Codex shows "New hook - review required", the hook does not run, and
+   every Codex call is un-gated. `gate report` shows the trust state.
+3. **Record capacity for a route** before work will be dispatched to it. A
+   route with no fresh observation is not eligible, and a stale observation
+   never makes one eligible, so a machine nobody has reported capacity for
+   retains everything. Use the `capacity_observe` tool from an authorized
+   source.
+
+Check what it did:
+
+```
+./bin/agent-bridge-gate-hook report --config <orchestration.json>
+./bin/agent-bridge-gate-hook audit  --config <orchestration.json>
+```
+
+`report` is the status page: which clients hold the hook, whether each one is
+running with automatic routing on, the policy summary, live receipts and
+recent events. `audit` is the accounting: eligible, routed, retained,
+bypassed, failed, and the reason in each case. Add `--since-hours 0` for
+everything on record and `--json` for the full document.
+
+`--no-automatic-routing` on the hook command reverts to the stricter posture:
+a repository with no receipt is refused outright and a route must be claimed
+explicitly. More friction, no silent allows.
+
+What it covers and what it cannot (desktop and web chats have no hook
+surface; a tool call does not contain the brief; mechanical work an assistant
+does in its own context produces no tool call to intercept) is in
 [docs/DELEGATION-GATE.md](docs/DELEGATION-GATE.md).
 
 ## Day to day

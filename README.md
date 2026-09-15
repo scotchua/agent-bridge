@@ -95,6 +95,7 @@ portable guided commands, see [SETUP-WITH-AN-AGENT.md](docs/SETUP-WITH-AN-AGENT.
 | Privacy choices | Baseline, strict, or custom eligibility rules for each receiving peer. |
 | Optional local worker | Bounded summarization, extraction, classification, checklists and log triage through an existing Ollama model. |
 | Advanced orchestration | Durable stage ownership, time-bounded capacity observations, automatic local routing for eligible mechanical work, and bounded cross-provider implementation jobs. |
+| Delegation-first gate | The routing decision is made automatically before implementation, from your own policy, and no edit happens without a receipt naming the route. Includes an audit of what was eligible, routed, retained and bypassed. |
 | Exchange records | Prompts, replies, job status and available model/version/effort provenance. |
 | Guided installation and removal | Staged settings, verification, backups, conflict checks and an uninstall preview. |
 
@@ -159,9 +160,11 @@ more than consultation. It can:
   fallback;
 - register and claim durable work stages so only one assistant owns a stage;
 - use fresh, time-limited capacity observations when selecting an allowed
-  route; and
+  route;
 - queue a bounded implementation job for the other provider's subscription
-  CLI.
+  CLI; and
+- **make the routing decision automatically, and refuse implementation
+  without one.**
 
 Cross-provider implementation runs in disposable Git worktrees and returns an
 unapplied patch. It never grants permission to apply, commit, push or merge.
@@ -190,6 +193,32 @@ without that evidence. The completion report says exactly
 depending on what was actually proven, never more than that. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md) for the manual
 reference path and current platform boundary.
+
+Saying yes also installs the **delegation-first gate**, which is the part that
+makes delegation automatic rather than available:
+
+- Before any substantial edit, a `PreToolUse` hook computes the route from
+  **your** routing policy, the stage router's fresh capacity observations and
+  this host's load, claims the stage, and writes a durable receipt naming the
+  route and the reason. No sentence from you and no tool call from the
+  assistant is involved.
+- Work your policy retains is then allowed with no friction. Work it routes
+  elsewhere is refused, and the assistant is handed the one dispatch call to
+  make. You never relay anything.
+- `onboard apply` writes an **inert** policy: a repository you have not
+  classified is retained and never dispatched. You choose what becomes
+  eligible.
+- `bin/agent-bridge-gate-hook audit` accounts for what was eligible, routed,
+  retained, bypassed and failed, with the reason in each case.
+
+**Two limits we state rather than dress up.** A tool call names files, not the
+task, so the gate compels the dispatch but the brief's words are the
+assistant's. And a Claude Desktop chat, the Codex desktop app and Codex on the
+web expose no hook surface at all, so they cannot be intercepted by this or
+any other local mechanism; the two CLIs are the strongest enforceable entry
+path and that is where the gate lives. We do not describe an instruction file
+as enforcement. Full list of what is and is not covered:
+[docs/DELEGATION-GATE.md](docs/DELEGATION-GATE.md).
 
 **Honest current limitation:** this checkout ships bounded implementation
 harnesses for both directions (`src/agent_bridge/execution/claude_task.py`
@@ -242,6 +271,20 @@ registration and configuration.
 - **Offline CI is not a live installation test.** It uses stand-in provider
   programs. Your accounts, login, selected models and optional Ollama service
   still need verification on your computer.
+- **The execution lanes now run on Linux, and that is not the same as
+  verified everywhere.** Both harnesses used to hard-code one macOS layout
+  (git at the standalone Command Line Tools path, `/usr/bin/sandbox-exec` as
+  the only verification confinement), so on any other host the first git call
+  spawned a file that does not exist and the lane reported only
+  `TaskError: command spawn failed`. Git is now resolved per host and the
+  verification confinement is a selected backend that names what it cannot
+  do. macOS `sandbox-exec` remains the **only independently verified**
+  backend and the only one that carries `public` or `internal_nonclient`
+  material. The Linux backend denies network access and confines no reads, so
+  it carries **synthetic material only**; on Linux the write boundary is the
+  disposable worktree plus the harness's own source-integrity snapshot, not
+  the kernel. A host with neither backend refuses by name rather than running
+  verification unconfined.
 - **Advanced orchestration is not yet a portable service installer.** Its core
   queue and routing logic is tested offline, while the persistent execution
   worker and subscription-backed implementation lane are currently verified on
@@ -299,11 +342,12 @@ configuration are retained separately.
 | `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
 | `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
 | `docs/orchestration-mcp.md` | Manual advanced orchestration, local routing and external execution-worker setup. |
-| `docs/DELEGATION-GATE.md` | Host-enforced delegation-first gate for Claude Code and the Codex CLI, with its stated limits. |
+| `docs/DELEGATION-GATE.md` | Host-enforced delegation-first gate, automatic routing, the audit report, and their stated limits. |
+| `docs/audits/automatic-delegation-2026-09-15.md` | What the automatic component was live-tested against, and what remains unproven. |
 | `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
 | `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
 | `src/agent_bridge/` | Broker, MCP servers, onboarding and local worker. |
-| `src/agent_bridge/orchestration/` | Durable stage routing and cross-provider execution queue. |
+| `src/agent_bridge/orchestration/` | Durable stage routing, automatic route selection, the gate, the audit, and the cross-provider execution queue. |
 | `config/broker.json` | Machine-neutral defaults. |
 | `tests/` | Offline tests, including onboarding and local-worker coverage. |
 | `canaries/run_canaries.py` | Live checks required before activation. |

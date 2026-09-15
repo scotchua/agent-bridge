@@ -5,11 +5,11 @@ import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tem
 from pathlib import Path
 try:
     from .. import runner
-    from . import claude_config, verify_policy
+    from . import claude_config, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
-    from agent_bridge.execution import claude_config, verify_policy
+    from agent_bridge.execution import claude_config, hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -18,17 +18,42 @@ ALLOWED_SUBSCRIPTIONS={"pro","max","team","enterprise","business"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
-GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
+_GIT_BIN:Path|None=None
+
+def _git_bin()->Path:
+    """The host's git, resolved once and named in the refusal when absent.
+
+    This used to be a constant pointing at the standalone macOS Command Line
+    Tools. On a Mac without them, and on every other host, the first git call
+    spawned a path that does not exist and the lane reported only "command
+    spawn failed".
+    """
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        try: _GIT_BIN=hostenv.resolve_git()
+        except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
+    return _GIT_BIN
 
 def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:bytes|None=None):
     """Use the bridge's measured streaming caps and bounded post-kill drain."""
     r=runner.run(argv,cwd=str(cwd),env=env,stdin_data=(input_bytes or b"").decode("utf-8"),timeout=timeout,
                  grace=2,stdout_cap=MAX_STREAM_BYTES,stderr_cap=MAX_STREAM_BYTES)
-    if r.spawn_failed: raise TaskError("command spawn failed")
+    if r.spawn_failed: raise TaskError(_spawn_detail(argv))
     if r.timed_out: raise TaskError(f"command timed out after {timeout}s")
     if r.cap_exceeded: raise TaskError("command output exceeded bounded capture")
     if r.descendant_held_pipes: raise TaskError("command output stream did not close")
     return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
+
+def _spawn_detail(argv:list[str])->str:
+    """Why a process would not start, named. A receipt saying only "command
+    spawn failed" cannot be told from a failed login or a killed process, so
+    this states the program, its path and what is wrong with it."""
+    program=argv[0] if argv else "(no argv)"
+    if not os.path.exists(program): reason="no such file"
+    elif os.path.isdir(program): reason="is a directory"
+    elif not os.access(program,os.X_OK): reason="not executable by this account"
+    else: reason="the operating system refused to start it"
+    return f"could not start {program!r}: {reason}"
 
 def _env(claude_config_dir:Path|None=None):
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
@@ -53,7 +78,7 @@ def _git(repo:Path,*args:str,timeout:int=30,env=None):
     return r.stdout.decode().strip()
 
 def _git_argv(*args:str):
-    return [GIT_BIN,"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
+    return [str(_git_bin()),"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
             "-c","diff.external=","-c","core.attributesFile=/dev/null",*args]
 
 def _sha(path:Path):
@@ -177,9 +202,18 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
-def _assert_macos():
-    if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise TaskError("Claude execution lane requires supported macOS sandbox-exec")
+def _require_confinement(classification:str)->hostenv.Confinement:
+    """The verification confinement this host will apply, or a named refusal.
+
+    Only the verification step needs confinement: generation runs under the
+    Claude CLI's own tool allowlist and the patch steps are git. The old
+    ``_assert_macos`` refused the entire lane on any non-Darwin host, which
+    is why this direction could not run anywhere else even to be diagnosed.
+    Checked up front rather than after generation, because Claude
+    verification is mandatory, so a host that cannot confine it can never
+    complete a job and should say so before spending a provider turn."""
+    try: return hostenv.confinement(classification)
+    except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
 
 def _atomic_json(path:Path,value:dict):
     fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
@@ -241,11 +275,38 @@ def _remove(repo:Path,tree:Path,env):
     # users' stale-but-recoverable worktree registrations.
     return result.returncode==0 and not tree.exists()
 
-def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int):
+def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+               backend:hostenv.Confinement|None=None):
+    """Run one verification command under this host's confinement backend."""
+    backend=backend or _require_confinement("synthetic")
+    if backend.name==hostenv.LINUX_NETNS_SYNTHETIC:
+        return _netns_confined(command,tree,scratch,env,timeout,backend)
+    return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
+
+def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                    backend:hostenv.Confinement):
+    """Network denied through a private namespace. Reads are not confined.
+
+    The write boundary here is the disposable worktree plus the harness's own
+    post-run content snapshot of the source repository, not the kernel, which
+    is why ``hostenv`` carries this backend for synthetic material only."""
+    scratch.mkdir(mode=0o700)
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
+    if command[0]=="git": command=_git_argv(*command[1:])
+    started=time.monotonic()
+    result=_run(hostenv.netns_argv(command),cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
+    result.sandbox_profile_sha256=None
+    result.duration_seconds=time.monotonic()-started
+    return result
+
+def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                           backend:hostenv.Confinement):
     scratch.mkdir(mode=0o700)
     profile=scratch/"verify.sb"
     def quoted(value:Path): return str(value).replace('\\','\\\\').replace('"','\\"')
-    executable=Path(GIT_BIN if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
+    executable=Path(_git_bin() if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
     runtime_root=executable.parent.parent if str(executable).startswith("/Users/") else executable.parent
     read_roots=[Path("/System"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/Library/Frameworks"),Path("/Library/Developer"),
                 Path("/etc"),Path("/var/db"),Path("/var/select"),Path("/var/run"),Path("/private/etc"),
@@ -277,7 +338,8 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
     sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
-    result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result=_run([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
     result.sandbox_profile_sha256=_sha(profile)
     result.duration_seconds=time.monotonic()-started
     return result
@@ -285,8 +347,8 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
 def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
              classification:str,model:str,effort:str,
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    _assert_macos()
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
+    backend=_require_confinement(classification)
     if any(not p.is_absolute() for p in (brief,repo,task_root,claude_bin)): raise TaskError("all paths must be absolute")
     claude_config_dir=_checked_config_dir(claude_config_dir)
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
@@ -304,7 +366,11 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     receipt={"schema":2,"job_id":job.name,"status":"running","route":"claude-subscription-cli","classification":classification,
              "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,"effort_requested":effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(claude_bin.resolve()),
-             "claude_config_dir":str(claude_config_dir),
+             "claude_config_dir":str(claude_config_dir),"host_platform":platform.system(),
+             "git_executable":str(_git_bin()),"verification_confinement":backend.name,
+             "confinement_denies_network":backend.denies_network,
+             "confinement_confines_reads":backend.confines_reads,
+             "confinement_confines_writes":backend.confines_writes,
              "executable_sha256":_sha(claude_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
              "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
@@ -332,10 +398,10 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout)
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
-            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":"macos-no-network-scratch-home",
+            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",

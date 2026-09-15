@@ -1,0 +1,422 @@
+"""Deterministic route selection, computed rather than requested.
+
+The stage router (``capacity_router.StageRouter``) already decides who may
+*own* a stage, but it decides it from ``allowed_routes`` the calling agent
+supplies and then takes the first fresh preferred route. That is a scheduler
+taking instructions, not a policy: an agent that wants to keep the work asks
+for its own route and gets it.
+
+This module is the policy. It takes what the host can observe and what the
+operator has configured, and returns one route plus one reason code. It is
+pure: no database, no filesystem writes, no subprocess, no clock of its own.
+Everything it needs is passed in, so the same inputs always give the same
+decision and a receipt can be re-derived from the inputs recorded beside it.
+
+Four things decide a route, in this order, and the order is the point:
+
+1. **Privacy and eligibility.** A repository the operator has not classified
+   is retained, always. Capacity never overrides privacy, so this is checked
+   first and nothing later can undo it.
+2. **Task type.** Mechanical text work can go to a local model; implementation
+   cannot.
+3. **Hardware load.** A local model competes with the user's own machine, so a
+   loaded or unknown-load host defers rather than assuming spare capacity.
+4. **Capacity.** A peer route needs a fresh, available observation.
+
+Anything that survives all four is dispatched. Anything that does not is
+retained by the assistant that asked, which is itself a decision with a
+reason, recorded like any other. There is no paid fallback here and no way to
+express one: ``ROUTES`` is the complete set.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Mapping
+
+#: Every route that exists. A paid API route is not absent by configuration,
+#: it is absent from the vocabulary.
+ROUTES = ("claude", "codex", "local")
+#: Not a route: the outcome where the asking assistant keeps the work.
+RETAIN = "retain"
+PEER_FOR_CLIENT = {"claude": "codex", "codex": "claude"}
+
+#: Classifications this project admits at all. ``client_derived`` is listed so
+#: a decision can refuse it by name rather than by falling off the end of a
+#: lookup, and ``unclassified`` is what an operator has not spoken about.
+CLASSIFICATIONS = ("synthetic", "public", "internal_nonclient",
+                   "client_derived", "unclassified")
+#: What the two provider lanes accept, matching ``execution_queue`` exactly.
+PEER_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+#: What the local worker accepts, matching ``localq.spool`` exactly. Narrower
+#: than the peers' set only if the operator says so; identical by default.
+LOCAL_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+
+#: Work shapes the gate can tell apart from a tool call. Deliberately coarse:
+#: a PreToolUse payload names files and commands, not intent, and inventing a
+#: finer reading of it would be a guess dressed as a signal.
+TASK_TYPES = ("implementation", "mechanical", "review", "unknown")
+
+#: Load at or above this fraction of a core is "busy". The local worker's own
+#: queue already applies ``QueueCaps.max_load_per_core`` when it runs a job;
+#: this is the routing-time equivalent, so work is not sent to a lane that
+#: will immediately defer it.
+DEFAULT_MAX_LOCAL_LOAD = 0.75
+
+
+class PolicyError(ValueError):
+    """The operator's routing policy cannot be read or is self-contradictory."""
+
+
+@dataclass(frozen=True)
+class RepoPolicy:
+    """What the operator has said about one repository.
+
+    ``classification`` is the operator's statement about the material in the
+    repository, not the agent's. The gate has no agent-supplied field to
+    trust: it sees a tool call. So this is the only place a classification
+    can come from, and an absent entry means ``unclassified``, which is
+    retained.
+    """
+
+    classification: str = "unclassified"
+    allowed_routes: tuple[str, ...] = ()
+    #: Whether mechanical text work in this repository may go to a local model.
+    mechanical_ok: bool = False
+
+    def __post_init__(self) -> None:
+        if self.classification not in CLASSIFICATIONS:
+            raise PolicyError(f"unknown classification {self.classification!r}")
+        for route in self.allowed_routes:
+            if route not in ROUTES:
+                raise PolicyError(f"unknown route {route!r}")
+
+
+@dataclass(frozen=True)
+class Policy:
+    """The operator's complete routing policy. Never agent-supplied.
+
+    ``default`` applies to a repository with no entry. It is deliberately the
+    empty, unclassified policy: automatic dispatch happens only for
+    repositories somebody has actually classified, and everything else is
+    retained. A default that allowed dispatch would mean installing this
+    feature silently started sending unclassified repositories to providers.
+    """
+
+    repos: Mapping[str, RepoPolicy] = field(default_factory=dict)
+    default: RepoPolicy = RepoPolicy()
+    local_classifications: frozenset[str] = LOCAL_CLASSIFICATIONS
+    peer_classifications: frozenset[str] = PEER_CLASSIFICATIONS
+    max_local_load_ratio: float = DEFAULT_MAX_LOCAL_LOAD
+    #: Tie-break order when more than one route survives every check.
+    prefer: tuple[str, ...] = ROUTES
+
+    def for_repo(self, repo: str) -> RepoPolicy:
+        """The entry for ``repo``, matched on the real path, else the default."""
+        real = os.path.realpath(repo)
+        found = self.repos.get(real)
+        if found is None:
+            found = self.repos.get(repo)
+        return found if found is not None else self.default
+
+
+@dataclass(frozen=True)
+class Load:
+    """A portable hardware-load reading, or an admission that there is none.
+
+    ``ratio`` is one-minute load average per core. ``known`` is False where
+    the host exposes no load average (Windows), and an unknown load defers
+    local work rather than assuming the machine is idle: the existing
+    platform boundary report already promises exactly that.
+    """
+
+    ratio: float = 0.0
+    known: bool = False
+
+    @property
+    def busy_at(self) -> str:
+        return f"{self.ratio:.2f}" if self.known else "unknown"
+
+
+def probe_load(cpu_count: int | None = None) -> Load:
+    """Read this host's load average per core. Never raises.
+
+    ``os.getloadavg`` exists on macOS and Linux and not on Windows, and a
+    missing reading is reported as missing.
+    """
+    try:
+        one_minute = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return Load(known=False)
+    cores = cpu_count if cpu_count is not None else (os.cpu_count() or 0)
+    if cores <= 0:
+        return Load(known=False)
+    return Load(ratio=one_minute / cores, known=True)
+
+
+@dataclass(frozen=True)
+class Signal:
+    """What the caller could observe about the work, and nothing it asserted.
+
+    Assembled by the gate from the PreToolUse payload plus the operator's
+    policy. ``client`` is injected by the hook's own ``--client`` flag, so an
+    agent cannot claim to be the other one.
+    """
+
+    client: str
+    repo: str
+    task_type: str = "implementation"
+    is_review: bool = False
+    #: For a review, the route that produced the work under review. A review
+    #: must not be routed back to its own author.
+    author_route: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.client not in PEER_FOR_CLIENT:
+            raise PolicyError(f"unknown client {self.client!r}")
+        if self.task_type not in TASK_TYPES:
+            raise PolicyError(f"unknown task type {self.task_type!r}")
+        if self.author_route is not None and self.author_route not in ROUTES:
+            raise PolicyError(f"unknown author route {self.author_route!r}")
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One route, one closed reason code, and what was considered.
+
+    ``considered`` is recorded in the receipt beside the route so the decision
+    can be re-derived rather than taken on trust. It holds no task content:
+    a classification name, route names, a load figure.
+    """
+
+    route: str
+    code: str
+    reason: str
+    considered: Mapping[str, object]
+
+    @property
+    def dispatches(self) -> bool:
+        return self.route != RETAIN
+
+
+#: Every code this module can return. Held as a set so a test can assert the
+#: vocabulary is closed and a report can enumerate it.
+CODES = frozenset({
+    "retained_repo_unclassified",
+    "retained_classification_ineligible",
+    "retained_no_eligible_route",
+    "retained_no_fresh_capacity",
+    "retained_local_load_high",
+    "retained_local_load_unknown",
+    "retained_is_the_policy",
+    "routed_local_mechanical",
+    "routed_peer_implementation",
+    "routed_peer_review_independence",
+})
+
+
+def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
+           load: Load) -> Decision:
+    """Select one route for ``signal``. Pure, total, and fail-closed.
+
+    ``fresh_routes`` is the set of routes the stage router currently holds a
+    fresh, available capacity observation for. An empty set is normal on a
+    machine nobody has reported capacity for, and it means peers are not
+    dispatched to: a capacity observation expires closed by design, and this
+    function does not second-guess that.
+    """
+    repo_policy = policy.for_repo(signal.repo)
+    peer = PEER_FOR_CLIENT[signal.client]
+    considered: dict[str, object] = {
+        "client": signal.client,
+        "peer": peer,
+        "task_type": signal.task_type,
+        "classification": repo_policy.classification,
+        "allowed_routes": list(repo_policy.allowed_routes),
+        "mechanical_ok": repo_policy.mechanical_ok,
+        "fresh_routes": sorted(fresh_routes),
+        "load_per_core": load.busy_at,
+        "is_review": signal.is_review,
+        "author_route": signal.author_route,
+    }
+
+    def retain(code: str, reason: str) -> Decision:
+        return Decision(RETAIN, code, reason, considered)
+
+    # 1. Privacy and eligibility. First, and nothing below can undo it.
+    if repo_policy.classification == "unclassified":
+        return retain(
+            "retained_repo_unclassified",
+            f"{signal.repo} has no operator classification, so no route is "
+            f"eligible to receive it and the work stays with {signal.client}")
+    if repo_policy.classification == "client_derived":
+        return retain(
+            "retained_classification_ineligible",
+            "client-derived material is outside this bridge's supported use "
+            "and is never dispatched to a peer or a local model")
+    if not repo_policy.allowed_routes:
+        return retain(
+            "retained_no_eligible_route",
+            f"the policy for {signal.repo} permits no route other than the "
+            f"assistant already holding the work")
+
+    # 2. Task type. Mechanical text work is the only kind a local model takes.
+    local_eligible = (
+        "local" in repo_policy.allowed_routes
+        and repo_policy.mechanical_ok
+        and signal.task_type == "mechanical"
+        and repo_policy.classification in policy.local_classifications
+    )
+
+    # 3. Hardware load, but only where it can change the answer.
+    if local_eligible:
+        if not load.known:
+            return retain(
+                "retained_local_load_unknown",
+                "this host exposes no load average, so local capacity is "
+                "unknown and local work defers rather than assuming the "
+                "machine is idle")
+        if load.ratio >= policy.max_local_load_ratio:
+            return retain(
+                "retained_local_load_high",
+                f"load per core is {load.busy_at}, at or above the "
+                f"{policy.max_local_load_ratio} ceiling, so the local model "
+                f"would compete with the user's own machine")
+        if "local" not in fresh_routes:
+            return retain(
+                "retained_no_fresh_capacity",
+                "no fresh capacity observation for the local route, and a "
+                "stale observation never makes a route eligible")
+        return Decision("local", "routed_local_mechanical",
+                        f"mechanical {repo_policy.classification} text work in a "
+                        f"repository the operator marked eligible for a local model",
+                        considered)
+
+    # 4. Capacity, for the peer route.
+    peer_allowed = (peer in repo_policy.allowed_routes
+                    and repo_policy.classification in policy.peer_classifications)
+    if signal.is_review and signal.author_route == signal.client:
+        # Independence is not a preference. If the only other route is not
+        # available, the work is retained and says so, never reviewed by its
+        # own author.
+        if not peer_allowed:
+            return retain(
+                "retained_no_eligible_route",
+                f"this is a review of {signal.client}'s own work and no other "
+                f"route is eligible, so it is not routed and not self-reviewed")
+        if peer not in fresh_routes:
+            return retain(
+                "retained_no_fresh_capacity",
+                f"this is a review of {signal.client}'s own work and {peer} has "
+                f"no fresh capacity observation")
+        return Decision(peer, "routed_peer_review_independence",
+                        f"a review of {signal.client}'s own work goes to {peer} so the "
+                        f"author does not review itself", considered)
+
+    if peer_allowed and peer in fresh_routes:
+        if signal.client in repo_policy.allowed_routes and \
+                _prefers(policy, signal.client, peer):
+            return retain(
+                "retained_is_the_policy",
+                f"both {signal.client} and {peer} are eligible and the policy "
+                f"prefers {signal.client} for this repository")
+        return Decision(peer, "routed_peer_implementation",
+                        f"{signal.task_type} work in a {repo_policy.classification} "
+                        f"repository, {peer} is allowed and has fresh capacity",
+                        considered)
+
+    if peer_allowed:
+        return retain(
+            "retained_no_fresh_capacity",
+            f"{peer} is allowed for {signal.repo} but has no fresh capacity "
+            f"observation, and a stale one never makes a route eligible")
+
+    return retain(
+        "retained_is_the_policy",
+        f"the policy for {signal.repo} does not permit {peer} for "
+        f"{repo_policy.classification} work, so {signal.client} keeps it")
+
+
+def _prefers(policy: Policy, first: str, second: str) -> bool:
+    """Whether ``first`` outranks ``second`` in the operator's tie-break order.
+
+    A route absent from ``prefer`` ranks last rather than raising: the order
+    is a preference, and a missing entry must not make a decision impossible.
+    """
+    order = {route: index for index, route in enumerate(policy.prefer)}
+    return order.get(first, len(order)) < order.get(second, len(order))
+
+
+# ---------------------------------------------------------------------------
+# Loading the operator's policy
+# ---------------------------------------------------------------------------
+
+POLICY_FILE = "routing-policy.json"
+POLICY_VERSION = 1
+
+
+def policy_path(state_root: str) -> str:
+    return os.path.join(str(state_root), "routing", POLICY_FILE)
+
+
+def parse_policy(document: object) -> Policy:
+    """Build a Policy from the operator's document, refusing anything odd.
+
+    Fail closed on shape: a policy file that cannot be understood must not
+    degrade into a permissive default, because a permissive default here is
+    automatic dispatch of material nobody classified.
+    """
+    if not isinstance(document, dict):
+        raise PolicyError("routing policy must be a JSON object")
+    if document.get("version") != POLICY_VERSION:
+        raise PolicyError(f"routing policy version must be {POLICY_VERSION}")
+    raw_repos = document.get("repos", {})
+    if not isinstance(raw_repos, dict):
+        raise PolicyError("routing policy repos must be an object")
+    repos: dict[str, RepoPolicy] = {}
+    for repo, entry in raw_repos.items():
+        if not isinstance(repo, str) or not os.path.isabs(repo):
+            raise PolicyError(f"routing policy repo key {repo!r} must be an absolute path")
+        if not isinstance(entry, dict):
+            raise PolicyError(f"routing policy entry for {repo!r} must be an object")
+        unknown = set(entry) - {"classification", "allowed_routes", "mechanical_ok"}
+        if unknown:
+            raise PolicyError(f"routing policy entry for {repo!r} has unknown keys: "
+                              + ", ".join(sorted(unknown)))
+        routes = entry.get("allowed_routes", [])
+        if not isinstance(routes, list) or any(not isinstance(r, str) for r in routes):
+            raise PolicyError(f"allowed_routes for {repo!r} must be a list of strings")
+        mechanical = entry.get("mechanical_ok", False)
+        if not isinstance(mechanical, bool):
+            raise PolicyError(f"mechanical_ok for {repo!r} must be true or false")
+        repos[os.path.realpath(repo)] = RepoPolicy(
+            classification=entry.get("classification", "unclassified"),
+            allowed_routes=tuple(dict.fromkeys(routes)),
+            mechanical_ok=mechanical)
+    ceiling = document.get("max_local_load_ratio", DEFAULT_MAX_LOCAL_LOAD)
+    if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 64:
+        raise PolicyError("max_local_load_ratio must be a number above 0 and at most 64")
+    prefer = document.get("prefer", list(ROUTES))
+    if not isinstance(prefer, list) or any(route not in ROUTES for route in prefer):
+        raise PolicyError("prefer must be a list of known routes")
+    return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
+                  peer_classifications=PEER_CLASSIFICATIONS,
+                  max_local_load_ratio=float(ceiling), prefer=tuple(prefer))
+
+
+def load_policy(state_root: str) -> Policy:
+    """The operator's policy, or the retain-everything default when absent.
+
+    An absent file is not an error: it is a machine where nobody has
+    classified anything yet, and the correct behaviour there is to retain
+    every repository, which the default Policy does. An unreadable or
+    malformed file *is* an error, and it propagates: the gate turns it into a
+    deny rather than proceeding under a policy it could not read.
+    """
+    from .. import store
+
+    path = policy_path(state_root)
+    if not os.path.exists(path):
+        return Policy()
+    return parse_policy(store.read_json(path))

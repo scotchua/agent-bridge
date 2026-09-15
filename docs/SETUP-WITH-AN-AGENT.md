@@ -85,8 +85,16 @@ checkout, normally under `~/.agent-bridge/`.
   separately tested adapter; do not quietly treat them as Ollama.
 - **Do you want automatic delegation?** This is a separate, advanced opt-in,
   off by default. Only raise it if the user is asking for more than
-  consultation. See [Optional advanced orchestration](#optional-advanced-orchestration-automatic-delegation)
+  consultation. Saying yes also installs a hook that refuses edits without a
+  routing decision, which changes how their editors behave, so it is their
+  decision and not one to make for them. See
+  [Optional advanced orchestration](#optional-advanced-orchestration-automatic-delegation)
   below before saying yes on the user's behalf.
+- **Which repositories may be delegated, and how is each classified?** Only
+  after automatic delegation is on, and one repository at a time. An
+  unclassified repository is retained and never dispatched, which is the safe
+  default; never classify one on the user's behalf, and never put
+  client-derived material in any classification.
 
 The same baseline does not copy the author's contracts or professional data
 permissions. The user must be comfortable with each provider's own terms.
@@ -262,6 +270,47 @@ If the user says yes:
    sandbox rather than a tool allowlist, and neither harness claims filesystem
    read confinement; say so if asked how it is confined. Do not claim it works
    around any of this.
+
+### The delegation-first gate, which is what makes it automatic
+
+Saying yes also installs a `PreToolUse` hook in Claude Code and the Codex CLI.
+`onboard apply` does it as a sequenced step after the main write set commits,
+with its own receipt and backups, and reports the result under
+`automatic_delegation.gate`. Explain these four things to the user, and do not
+overstate any of them:
+
+1. **What it does.** Before a substantial edit, the hook computes the route
+   from the user's own routing policy, the stage router's fresh capacity
+   observations and the host's load, claims the stage, and writes a receipt
+   naming the route and the reason. Work the policy retains is allowed with
+   no friction. Work it routes elsewhere is refused, and the assistant is
+   handed the single dispatch call to make. The user never relays anything
+   and never has to say "send this to Codex".
+2. **What they must do next.** Three things, and the feature changes nothing
+   about where work runs until the first is done:
+   * classify the repositories they want delegated, in
+     `<state_root>/routing/routing-policy.json`. Apply writes an inert
+     scaffold; a repository with no entry is retained and never dispatched.
+     Ask which repositories, one at a time, and never classify one for them.
+   * start Codex once and accept the hook in `/hooks`, or the Codex half does
+     not run at all.
+   * record capacity for a route before work is dispatched to it.
+3. **What it cannot do, stated plainly.** A tool call names files, not the
+   task, so the gate compels the dispatch but the brief's words are the
+   assistant's. A local model does not edit files, so a file edit is never
+   routed to one; automatic local routing happens at `work_route_local`.
+   Mechanical work an assistant does in its own context produces no tool
+   call, so nothing intercepts it. Claude Desktop chats, the Codex desktop
+   app and Codex on the web expose no hook surface and cannot be intercepted
+   by this or any local mechanism. Never describe an instruction file as
+   enforcement.
+4. **How to show them what happened.**
+   `bin/agent-bridge-gate-hook audit --config <orchestration.json>` accounts
+   for eligible, routed, retained, bypassed and failed work with the reason
+   in each case, and it distinguishes bypasses it observed from the surfaces
+   it cannot see. `report` shows installation, trust and policy state. Offer
+   `--no-automatic-routing` to a user who would rather every route be claimed
+   explicitly.
 
 Uninstall follows the same pattern as ordinary removal: `onboard uninstall --delegation-only`
 removes only the orchestration MCP entries and LaunchAgent file it can still

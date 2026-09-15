@@ -138,6 +138,24 @@ and writing shell commands in a repository with no fresh receipt, or one whose
 `owner_route` is the other provider. Install, coverage, and the plainly stated
 surfaces it cannot intercept are in [DELEGATION-GATE.md](DELEGATION-GATE.md).
 
+**`routing_decide` is the manual path.** By default the hook does not wait to
+be called: with no valid receipt it computes the route itself from the
+operator's `routing-policy.json`, the fresh capacity observations in this
+database, and the host's load average per core, then registers, claims and
+records the decision before the edit is judged. So a decision always exists
+before implementation, it was computed rather than requested, and a receipt
+written that way carries `automatic: true`, its decision `code`, and the
+`considered` inputs so it can be re-derived. `routing_decide` remains
+available for an assistant that wants to record a decision of its own, and
+the audit counts the two separately.
+
+When the automatic decision routes work away from the asking client, the hook
+also writes a dispatch intent
+(`<state_root>/routing/intents/<hash>.json`) carrying the route and the full
+stage binding, and the deny message names the single call that is now owed.
+`execution_dispatch` retires the intent when it accepts the job, which is
+what keeps the audit's "routed but never dispatched" column meaningful.
+
 The Codex harness's confinement is different from the Claude harness's, and
 this is stated plainly rather than glossed over: Claude's lane trusts a tool
 allowlist (`--tools Read,Grep,Glob,Edit,Write`, no shell) because Claude Code

@@ -55,12 +55,12 @@ from pathlib import Path
 try:
     from .. import runner, preflight, store
     from ..errors import BrokerError
-    from . import verify_policy
+    from . import hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store
     from agent_bridge.errors import BrokerError
-    from agent_bridge.execution import verify_policy
+    from agent_bridge.execution import hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -69,17 +69,39 @@ ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
-GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
+_GIT_BIN:Path|None=None
+
+def _git_bin()->Path:
+    """The host's git, resolved once and named in the refusal when absent.
+
+    Same defect as the Claude lane carried: a constant pointing at the
+    standalone macOS Command Line Tools, so the first git call on any other
+    host reported only "command spawn failed".
+    """
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        try: _GIT_BIN=hostenv.resolve_git()
+        except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
+    return _GIT_BIN
 
 def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:bytes|None=None):
     """Use the bridge's measured streaming caps and bounded post-kill drain."""
     r=runner.run(argv,cwd=str(cwd),env=env,stdin_data=(input_bytes or b"").decode("utf-8"),timeout=timeout,
                  grace=2,stdout_cap=MAX_STREAM_BYTES,stderr_cap=MAX_STREAM_BYTES)
-    if r.spawn_failed: raise TaskError("command spawn failed")
+    if r.spawn_failed: raise TaskError(_spawn_detail(argv))
     if r.timed_out: raise TaskError(f"command timed out after {timeout}s")
     if r.cap_exceeded: raise TaskError("command output exceeded bounded capture")
     if r.descendant_held_pipes: raise TaskError("command output stream did not close")
     return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
+
+def _spawn_detail(argv:list[str])->str:
+    """Why a process would not start, named. See the Claude lane's copy."""
+    program=argv[0] if argv else "(no argv)"
+    if not os.path.exists(program): reason="no such file"
+    elif os.path.isdir(program): reason="is a directory"
+    elif not os.access(program,os.X_OK): reason="not executable by this account"
+    else: reason="the operating system refused to start it"
+    return f"could not start {program!r}: {reason}"
 
 def _env():
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
@@ -94,7 +116,7 @@ def _git(repo:Path,*args:str,timeout:int=30,env=None):
     return r.stdout.decode().strip()
 
 def _git_argv(*args:str):
-    return [GIT_BIN,"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
+    return [str(_git_bin()),"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
             "-c","diff.external=","-c","core.attributesFile=/dev/null",*args]
 
 def _sha(path:Path):
@@ -218,9 +240,16 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
-def _assert_macos():
-    if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise TaskError("Codex execution lane requires supported macOS sandbox-exec")
+def _require_confinement(classification:str)->hostenv.Confinement:
+    """The verification confinement this host will apply, or a named refusal.
+
+    Only verification needs it: generation runs inside Codex's own
+    ``workspace-write`` sandbox and the patch steps are git. Unlike the
+    Claude lane, Codex verification commands are optional, so a host with no
+    backend still refuses here rather than running a job whose verification
+    would be silently skipped."""
+    try: return hostenv.confinement(classification)
+    except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
 
 def _atomic_json(path:Path,value:dict):
     fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
@@ -301,11 +330,34 @@ def _remove(repo:Path,tree:Path,env):
     # users' stale-but-recoverable worktree registrations.
     return result.returncode==0 and not tree.exists()
 
-def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int):
+def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+               backend:hostenv.Confinement|None=None):
+    """Run one verification command under this host's confinement backend."""
+    backend=backend or _require_confinement("synthetic")
+    if backend.name==hostenv.LINUX_NETNS_SYNTHETIC:
+        return _netns_confined(command,tree,scratch,env,timeout,backend)
+    return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
+
+def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                    backend:hostenv.Confinement):
+    """Network denied through a private namespace. Reads are not confined."""
+    scratch.mkdir(mode=0o700)
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env.pop("CODEX_HOME",None)
+    if command[0]=="git": command=_git_argv(*command[1:])
+    started=time.monotonic()
+    result=_run(hostenv.netns_argv(command),cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
+    result.sandbox_profile_sha256=None
+    result.duration_seconds=time.monotonic()-started
+    return result
+
+def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                           backend:hostenv.Confinement):
     scratch.mkdir(mode=0o700)
     profile=scratch/"verify.sb"
     def quoted(value:Path): return str(value).replace('\\','\\\\').replace('"','\\"')
-    executable=Path(GIT_BIN if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
+    executable=Path(_git_bin() if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
     runtime_root=executable.parent.parent if str(executable).startswith("/Users/") else executable.parent
     read_roots=[Path("/System"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/Library/Frameworks"),Path("/Library/Developer"),
                 Path("/etc"),Path("/var/db"),Path("/var/select"),Path("/var/run"),Path("/private/etc"),
@@ -337,7 +389,8 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
     sandbox_env.pop("CODEX_HOME",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
-    result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result=_run([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
     result.sandbox_profile_sha256=_sha(profile)
     result.duration_seconds=time.monotonic()-started
     return result
@@ -360,8 +413,8 @@ def _assert_no_ancestor_contamination(job:Path):
 def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Path=DEFAULT_CODEX_HOME,
              classification:str,model:str|None=None,reasoning_effort:str|None=None,
              verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    _assert_macos()
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
+    backend=_require_confinement(classification)
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
@@ -380,7 +433,12 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
              "reasoning_effort_requested":reasoning_effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(codex_bin.resolve()),
              "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
-             "codex_home":str(codex_home),"source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
+             "codex_home":str(codex_home),"host_platform":platform.system(),
+             "git_executable":str(_git_bin()),"verification_confinement":backend.name,
+             "confinement_denies_network":backend.denies_network,
+             "confinement_confines_reads":backend.confines_reads,
+             "confinement_confines_writes":backend.confines_writes,
+             "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
     try:
         _assert_no_ancestor_contamination(job)
@@ -419,10 +477,10 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout)
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
-            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":"macos-no-network-scratch-home",
+            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",

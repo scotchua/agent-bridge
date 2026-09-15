@@ -111,6 +111,12 @@ jobs:
           python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
 
+      - name: Automatic routing, the gate that applies it, and its audit
+        run: |
+          python3 -m unittest discover -s tests -p "test_hostenv.py"
+          python3 -m unittest discover -s tests -p "test_automatic_gate.py"
+          python3 -m unittest discover -s tests -p "test_delegation_audit.py"
+
       - name: Guided automatic-delegation opt-in
         run: |
           python3 -m unittest discover -s tests -p "test_automatic_delegation.py"
@@ -161,12 +167,30 @@ jobs:
           # than being skipped.
           python3 -m unittest discover -s tests -p "test_execution_worker.py"
 
-      - name: macOS execution-lane tests
-        if: runner.os == 'macOS'
+      # These used to be macOS-only, because both harnesses hard-coded the
+      # standalone Command Line Tools git path and refused any non-Darwin host
+      # outright. That is exactly why the portability defect survived: the only
+      # tests that would have caught it never ran anywhere it was broken.
+      # execution/hostenv.py resolves git per host and selects a verification
+      # confinement backend, so they now run on macOS and Linux and assert what
+      # the *selected* backend claims rather than macOS semantics everywhere.
+      - name: Execution-lane harness tests
+        if: runner.os != 'Windows'
         run: |
-          python3 -m unittest discover -s tests -p "test_localq_runtime.py"
           python3 -m unittest discover -s tests -p "test_claude_task.py"
           python3 -m unittest discover -s tests -p "test_codex_task.py"
+
+      # The whole workflow, through the installed hook, the MCP server as a
+      # subprocess, the real queue and both real harnesses, with stand-in
+      # provider executables. Skips itself by name on a host with no
+      # confinement backend rather than passing vacuously.
+      - name: Complete automatic-delegation workflow, end to end
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tests -p "test_automatic_delegation_e2e.py"
+
+      - name: macOS-only runtime probes
+        if: runner.os == 'macOS'
+        run: python3 -m unittest discover -s tests -p "test_localq_runtime.py"
 
       - name: Windows command launcher smoke test
         if: runner.os == 'Windows'

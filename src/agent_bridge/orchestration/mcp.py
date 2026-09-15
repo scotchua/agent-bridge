@@ -7,7 +7,7 @@ from typing import Any, Callable
 from ..capacity_router import CapacityObservation, RoutingError, StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
-from . import gate
+from . import autodecide, gate
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
 
@@ -198,12 +198,26 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                         or current["owner_route"] != args.get("provider")
                         or current["revision"] != args.get("stage_revision")):
                     raise RoutingError("execution_stage_binding_invalid")
-                return call(execution.submit, {
+                result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
                     **args, "caller": caller})
             except (RoutingError, TypeError, ValueError) as exc:
                 return {"ok": False, "error": str(exc) or type(exc).__name__}
+            if result.get("ok") and state_root is not None:
+                # The gate wrote a dispatch intent when it routed this
+                # repository away from its caller. The job now exists, so the
+                # intent is met: retiring it here is what keeps the audit's
+                # "routed but never dispatched" column meaningful instead of
+                # every satisfied intent sitting in it forever.
+                try:
+                    autodecide.clear_intent(state_root, args["repo"], clock=router.clock)
+                except (OSError, ValueError, KeyError):
+                    # A job was accepted. Failing the dispatch because its
+                    # bookkeeping could not be tidied would be the worse
+                    # outcome; the audit reports the stale intent instead.
+                    pass
+            return result
 
         tools.update({
             "execution_dispatch": {

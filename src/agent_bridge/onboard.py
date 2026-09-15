@@ -18,7 +18,8 @@ import tomllib
 from typing import Any, Callable
 
 from . import config, setup_cmd, store
-from .orchestration import (delegation, windows_activation,
+from .orchestration import (autoroute, delegation, gate as delegation_gate,
+                            windows_activation,
                             windows_preflight, windows_wsl,
                             windows_wsl_provision)
 
@@ -1123,10 +1124,104 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
                 "windows_preflight.prerequisites_ready is local evidence only "
                 "and enables nothing; no live Windows validation has been "
                 "performed. Consultation (peer registrations) is unaffected.")
+    if delegation_choice["enabled"] and delegation_report is not None:
+        # Sequenced after the commit above, deliberately. Both this and the
+        # peer registrations write managed blocks into Codex's config.toml;
+        # computing two sets of bytes from the same original would mean the
+        # second silently dropped the first. Installing afterwards means the
+        # gate reads the file the commit just wrote.
+        delegation_report["gate"] = _install_gate(
+            home, root, paths["delegation_config"], delegation_cfg)
     print(json.dumps({"backups": backups, "installed_files": sorted(updates),
                       "restore_note": "Inspect backups before restoring; whole-file restore may erase later edits.",
                       "host_loading_verified": False,
                       "automatic_delegation": delegation_report}, indent=2))
+
+
+#: What a fresh routing policy says: nothing is classified, so nothing is
+#: dispatched. Installing the automatic component must not begin sending
+#: repositories nobody has spoken about to a provider, so the scaffold is
+#: inert and the operator fills it in.
+def _routing_policy_scaffold() -> bytes:
+    document = {
+        "version": autoroute.POLICY_VERSION,
+        "_comment": [
+            "The operator's routing policy. The gate reads it; no assistant "
+            "can change it through a covered tool.",
+            "A repository with no entry here is RETAINED by whichever "
+            "assistant is working, and never dispatched. Add an entry to make "
+            "a repository eligible.",
+            "classification: synthetic | public | internal_nonclient. "
+            "client_derived is refused outright, and material that could "
+            "identify a client does not belong in any of them.",
+            "allowed_routes: any of claude, codex, local. There is no paid "
+            "API route and none can be added here.",
+        ],
+        "prefer": list(autoroute.ROUTES),
+        "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
+        "repos": {},
+        "_example": {
+            "/absolute/path/to/a/repository": {
+                "classification": "internal_nonclient",
+                "allowed_routes": ["claude", "codex"],
+                "mechanical_ok": False,
+            }
+        },
+    }
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _install_gate(home: str, root: str, config_path: str,
+                  delegation_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Register the delegation-first gate and lay down an inert policy.
+
+    This is the automatic component: without it the orchestration tools exist
+    but nothing makes the routing decision happen, so a user has to ask for
+    delegation by hand, which is the gap this closes. Reported rather than
+    asserted: a gate that could not be installed says so, and the rest of the
+    installation still stands.
+    """
+    report: dict[str, Any] = {"policy_path": None, "installed": None}
+    if delegation_cfg is not None:
+        state_root = delegation_cfg.get("state_root")
+        if isinstance(state_root, str):
+            policy_path = autoroute.policy_path(state_root)
+            report["policy_path"] = policy_path
+            try:
+                store.secure_mkdir(os.path.dirname(policy_path))
+                if not os.path.exists(policy_path):
+                    store.atomic_write_bytes(policy_path, _routing_policy_scaffold())
+                    report["policy_created"] = True
+                else:
+                    # Never rewritten: it is the operator's document, and an
+                    # install that reset it would silently un-classify every
+                    # repository they had already decided about.
+                    report["policy_created"] = False
+            except OSError as exc:
+                report["policy_error"] = type(exc).__name__
+    try:
+        report["installed"] = delegation_gate.install(
+            home, root, config_path, ("claude", "codex"), apply=True)
+    except (OSError, ValueError) as exc:
+        report["install_error"] = f"{type(exc).__name__}: {exc}"
+        report["consequence"] = (
+            "the orchestration tools are installed but nothing compels a "
+            "routing decision, so delegation stays something an assistant has "
+            "to be asked for. Install the gate by hand with "
+            "bin/agent-bridge-gate-hook install --apply.")
+        return report
+    report["next_steps"] = [
+        "Classify the repositories you want delegated, in "
+        f"{report['policy_path']}. Until then every repository is retained "
+        "and nothing is dispatched.",
+        "Start Codex once and accept the new hook in its /hooks view. Until "
+        "then the Codex half of the gate does not run.",
+        "Record capacity for a route (capacity_observe) before work will be "
+        "dispatched to it; a stale observation never makes a route eligible.",
+        "Read bin/agent-bridge-gate-hook audit --config "
+        f"{config_path} for what was eligible, routed, retained and bypassed.",
+    ]
+    return report
 
 
 def apply(answers: dict[str, Any], candidate_path: str, results_path: str, root: str,
