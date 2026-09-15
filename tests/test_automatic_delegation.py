@@ -339,6 +339,14 @@ class EvidenceValidationTests(unittest.TestCase):
 
 
 class ApplyIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        # These are orchestration integration tests, not host-support tests.
+        # Keep their result independent of the CI runner's operating system;
+        # delegation_platform_blocker has its own platform-boundary coverage.
+        patcher = mock.patch.object(onboard, "delegation_platform_blocker", return_value="")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _stage(self, tmp, choices):
         home = os.path.join(tmp, "home")
         candidate = os.path.join(tmp, "candidate.json")
@@ -717,6 +725,11 @@ class WindowsPreflightWiringTests(unittest.TestCase):
 
 
 class WindowsPlanReportingTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(onboard, "delegation_platform_blocker", return_value="")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_plan_includes_windows_preflight_and_blocked_execution_note(self):
         ready_report = {"status": windows_preflight.STATUS_PREREQUISITES_READY,
                         "prerequisites_ready": True, "checks": {}, "detail": ""}
@@ -738,6 +751,13 @@ class WindowsPlanReportingTests(unittest.TestCase):
 
 class WindowsApplyRefusalTests(unittest.TestCase):
     """Applying on Windows must still report execution delegation blocked."""
+
+    def setUp(self):
+        # Model a machine that has already satisfied the separate platform
+        # admission gate so this test can exercise the reporting below it.
+        patcher = mock.patch.object(onboard, "delegation_platform_blocker", return_value="")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _stage(self, tmp, choices):
         home = os.path.join(tmp, "home")
@@ -792,6 +812,11 @@ class WindowsApplyRefusalTests(unittest.TestCase):
 
 class WindowsSetupLadderWiringTests(unittest.TestCase):
     """Onboarding must describe guided setup, not assume WSL is present."""
+
+    def setUp(self):
+        patcher = mock.patch.object(onboard, "delegation_platform_blocker", return_value="")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _summary(self, *, ready, choice=None, manifest_ok=True):
         patches = [
