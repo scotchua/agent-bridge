@@ -575,7 +575,14 @@ def _command_paths(command: str, cwd: str) -> list[str]:
             if not part:
                 continue
             expanded = _windows_drive_path(os.path.expanduser(part))
-            found.append(expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded))
+            # A forward slash always, not ``os.path.join``: this module's
+            # documented contract for this function is a POSIX-style path
+            # (see the docstring's own examples), and ``os.path.join`` on
+            # Windows joins with a backslash instead, which any caller
+            # comparing this output directly (rather than through ``_under``,
+            # which normalizes separators itself) would read as a different
+            # path than the one named.
+            found.append(expanded if os.path.isabs(expanded) else f"{cwd.rstrip('/')}/{expanded}")
     return found
 
 
