@@ -25,10 +25,17 @@ jobs:
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     # bash everywhere, on purpose. GitHub's default shell on Windows is pwsh,
-    # which reports only the LAST command's exit status for a multi-line step:
-    # every earlier failing test file in a step was silently passed over, and
+    # and a native command that exits nonzero does not stop a pwsh step: only
+    # the LAST command's exit status is reported for a multi-line step, so
+    # every earlier failing test file in a step was silently passed over and
     # the Windows matrix could go green with failures in it. bash -e stops at
     # the first failure on every runner. Steps that need cmd or python say so.
+    #
+    # Known cost of bash on Windows, measured in run 34936853093: a process
+    # under Git bash inherits SeBackupPrivilege and SeRestorePrivilege ENABLED,
+    # which bypass the DACL for the operations the deny-ACE test fixtures
+    # restrict. The test harness removes both from its own token at import
+    # (tests/platform_support.py) so the tests run as an ordinary account.
     defaults:
       run:
         shell: bash

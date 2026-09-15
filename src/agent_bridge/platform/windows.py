@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from . import base
 from .windows_acl import (
-    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_is_owner_only,
+    WINDOWS_OWNER_ONLY_GUARANTEE, icacls_listing_foreign_principals,
+    icacls_listing_is_owner_only, icacls_tree_foreign_principals,
+    icacls_tree_listing_is_owner_only,
 )
 
 import contextlib
@@ -186,8 +188,8 @@ class WindowsPlatform:
             self.supports_owner_only_permissions = False
             # The evidence travels with the exception. A bare "could not
             # verify" has already cost a CI round trip per failure: the
-            # operator needs the SID that was parsed, what icacls said to the
-            # grant, and the listing that was read back, all in one place.
+            # operator needs the identity that was parsed and the listing as
+            # it stands after the attempt, in one place.
             diagnose = getattr(self, "acl_diagnostics", None)
             evidence = repr(diagnose(path)) if diagnose is not None else ""
             raise PermissionError(
@@ -713,7 +715,8 @@ class WindowsPlatform:
             "observed_stderr": observed.stderr.decode("utf-8", "replace").strip(),
         }
 
-    def observe_owner_only_acl(self, path: str) -> tuple[bool, dict[str, Any]]:
+    def observe_owner_only_acl(self, path: str, *, allow_inherited: bool = False
+                               ) -> tuple[bool, dict[str, Any]]:
         """Read the ACL back and judge it. Changes nothing.
 
         The counterpart to :meth:`verify_owner_only_path`, which applies the
@@ -721,6 +724,11 @@ class WindowsPlatform:
         need the reading without the applying: describing a machine must not
         modify it, and an assertion that first repairs what it asserts proves
         nothing. Same parser, same guarantee, no grant.
+
+        ``allow_inherited`` is for an object inside a tree whose protected
+        root has been proved separately (the Claude lane's store): its
+        entries are copies of the root's. An object proved on its own keeps
+        the default and refuses inherited entries.
         """
         try:
             whoami = _trusted_tool("whoami.exe")
@@ -747,7 +755,8 @@ class WindowsPlatform:
         text = observed.stdout.decode("utf-8", "replace")
         verified = bool(observed.returncode == 0 and user.startswith("S-1-")
                         and icacls_listing_is_owner_only(
-                            text, user, owner_name, expected_path=path))
+                            text, user, owner_name, expected_path=path,
+                            allow_inherited=allow_inherited))
         return verified, {
             "mechanism": "windows acl read-back",
             "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
@@ -760,6 +769,16 @@ class WindowsPlatform:
     def _set_and_verify_owner_acl(self, path: str, *,
                                   inheritable: bool = False) -> bool:
         """Apply the owner-only ACL to one object and read it back.
+
+        Every step either grants the owner or removes someone else. Nothing
+        here ever passes through a broader ACL than the one it found: the
+        owner's grant is written first, inherited entries are cut second,
+        and every remaining explicit entry for anyone but the owner, SYSTEM
+        and Administrators is removed by name third. An interruption after
+        any step leaves the object no more readable than before it. (A
+        ``/reset`` would have been shorter and would have handed the object
+        its parent's inheritable entries, whatever those are, for the length
+        of one process spawn, and for good if the next step failed.)
 
         ``inheritable`` is for directories: the owner's entry is written
         (OI)(CI) so that anything created inside inherits owner-only access.
@@ -787,32 +806,49 @@ class WindowsPlatform:
             return False
         owner_name = identity[0].strip('"') if len(identity) > 1 else ""
         try:
-            # /reset first. "/grant:r" replaces only the named principal's
-            # explicit entries; an explicit entry for anyone else (an
-            # Everyone:(R) somebody added, say) survived it, and the read-back
-            # then failed forever for a path this call was asked to protect.
-            # /reset drops every explicit entry, /inheritance:r drops the
-            # inherited ones, and the grant leaves exactly one. That is what
-            # chmod 0600 means on POSIX and what this call promises here.
-            reset = subprocess.run(
-                [icacls, path, "/reset"],
-                capture_output=True, timeout=15, check=False, shell=False,
-                env=dict(_TOOL_ENV),
-            )
-            if reset.returncode != 0:
-                return False
             # The SID must be written *SID. icacls treats a bare SID as an
             # account name and fails with 1332, "No mapping between account
             # names and security IDs was done", so the grant silently never
             # applied and the capability could never be verified.
             rights = "(OI)(CI)(F)" if inheritable else "(F)"
             applied = subprocess.run(
-                [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:{rights}"],
+                [icacls, path, "/grant:r", f"*{user}:{rights}"],
                 capture_output=True, timeout=15, check=False, shell=False,
                 env=dict(_TOOL_ENV),
             )
             if applied.returncode != 0:
                 return False
+            protected = subprocess.run(
+                [icacls, path, "/inheritance:r"],
+                capture_output=True, timeout=15, check=False, shell=False,
+                env=dict(_TOOL_ENV),
+            )
+            if protected.returncode != 0:
+                return False
+            # "/grant:r" replaces only the named principal's explicit entries;
+            # an explicit entry for anyone else (an Everyone:(R) somebody
+            # added, say) survives it, so each one is removed by the name
+            # icacls printed for it. Removing is the only thing this step can
+            # do, so a listing it misreads cannot widen anything.
+            listed = subprocess.run(
+                [icacls, path], capture_output=True,
+                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
+            )
+            if listed.returncode != 0:
+                return False
+            foreign = icacls_listing_foreign_principals(
+                listed.stdout.decode("utf-8", "replace"), user, owner_name,
+                expected_path=path)
+            if foreign is None:
+                return False
+            for principal in foreign:
+                removed = subprocess.run(
+                    [icacls, path, "/remove:g", principal, "/remove:d", principal],
+                    capture_output=True, timeout=15, check=False, shell=False,
+                    env=dict(_TOOL_ENV),
+                )
+                if removed.returncode != 0:
+                    return False
             observed = subprocess.run(
                 [icacls, path], capture_output=True,
                 timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
@@ -823,3 +859,118 @@ class WindowsPlatform:
         return (observed.returncode == 0
                 and icacls_listing_is_owner_only(
                     text, user, owner_name, expected_path=path))
+
+    def _owner_identity(self) -> tuple[str, str] | None:
+        """(SID, account name) of this process, or None if whoami will not say."""
+        try:
+            whoami = _trusted_tool("whoami.exe")
+            raw = subprocess.run(
+                [whoami, "/user", "/fo", "csv", "/nh"],
+                capture_output=True, timeout=10, check=False, shell=False,
+                env=dict(_TOOL_ENV),
+            ).stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        fields = raw.split(",")
+        user = fields[-1].strip('"')
+        if not user.startswith("S-1-"):
+            return None
+        return user, (fields[0].strip('"') if len(fields) > 1 else "")
+
+    def _tree_listing(self, root: str) -> subprocess.CompletedProcess | None:
+        try:
+            icacls = _trusted_tool("icacls.exe")
+            return subprocess.run(
+                [icacls, root, "/t"], capture_output=True, timeout=120,
+                check=False, shell=False, env=dict(_TOOL_ENV),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def observe_owner_only_tree(self, root: str, expected_paths: list[str]
+                                ) -> tuple[bool, dict[str, Any]]:
+        """Read one recursive listing back and judge every object in it.
+
+        Changes nothing. The root must be strictly owner-only (explicit
+        entries, protected); each descendant must carry only permitted
+        principals with the owner among them, inherited entries allowed,
+        because with the root protected an inherited entry can only be a
+        copy of one on an ancestor this same listing proves. The listing
+        must name exactly ``expected_paths`` plus the root: the caller
+        walked the store and refused links; an object it did not see is
+        not one it has vouched for.
+        """
+        identity = self._owner_identity()
+        if identity is None:
+            return False, {"mechanism": "windows acl tree read-back",
+                           "error": "owner identity unavailable"}
+        user, owner_name = identity
+        listed = self._tree_listing(root)
+        if listed is None or listed.returncode != 0:
+            return False, {"mechanism": "windows acl tree read-back",
+                           "parsed_sid": user,
+                           "observed_rc": None if listed is None else listed.returncode,
+                           "observed_stderr": "" if listed is None else
+                           listed.stderr.decode("utf-8", "replace").strip()}
+        text = listed.stdout.decode("utf-8", "replace")
+        verified, failed = icacls_tree_listing_is_owner_only(
+            text, user, owner_name, root, list(expected_paths))
+        return verified, {
+            "mechanism": "windows acl tree read-back",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+            "parsed_sid": user,
+            "objects_expected": len(expected_paths) + 1,
+            "objects_failed": failed[:32],
+            "observed_rc": listed.returncode,
+        }
+
+    def remove_foreign_grants_tree(self, root: str, expected_paths: list[str]
+                                   ) -> tuple[bool, dict[str, Any]]:
+        """Remove every explicit entry for anyone but the owner, SYSTEM and
+        Administrators from every object under ``root``. Removes only.
+
+        The complement of the per-directory grant: directories under a store
+        are protected one by one with inheritable owner entries, which
+        rewrites the inherited entries of everything beneath them, but an
+        explicit entry somebody put on a nested file survives propagation
+        and is what this pass takes away. Principals are removed by the name
+        icacls printed; a name it cannot resolve fails the pass closed, and
+        so does a listing that names an object the caller did not walk.
+        """
+        identity = self._owner_identity()
+        if identity is None:
+            return False, {"mechanism": "windows acl tree removal",
+                           "error": "owner identity unavailable"}
+        user, owner_name = identity
+        listed = self._tree_listing(root)
+        if listed is None or listed.returncode != 0:
+            return False, {"mechanism": "windows acl tree removal",
+                           "error": "tree listing unavailable"}
+        foreign = icacls_tree_foreign_principals(
+            listed.stdout.decode("utf-8", "replace"), user, owner_name, root,
+            list(expected_paths))
+        if foreign is None:
+            return False, {"mechanism": "windows acl tree removal",
+                           "error": "listing named an object outside the walk"}
+        removed: list[str] = []
+        try:
+            icacls = _trusted_tool("icacls.exe")
+            for principal in foreign:
+                completed = subprocess.run(
+                    [icacls, root, "/t", "/remove:g", principal,
+                     "/remove:d", principal],
+                    capture_output=True, timeout=120, check=False,
+                    shell=False, env=dict(_TOOL_ENV),
+                )
+                if completed.returncode != 0:
+                    return False, {"mechanism": "windows acl tree removal",
+                                   "principal": principal,
+                                   "remove_rc": completed.returncode,
+                                   "remove_stderr": completed.stderr.decode(
+                                       "utf-8", "replace").strip()}
+                removed.append(principal)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, {"mechanism": "windows acl tree removal",
+                           "error": type(exc).__name__}
+        return True, {"mechanism": "windows acl tree removal",
+                      "removed_principals": removed}

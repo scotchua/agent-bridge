@@ -17,7 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge import store
-from agent_bridge.platform.windows_acl import icacls_listing_is_owner_only
+from agent_bridge.platform.windows_acl import (
+    icacls_listing_foreign_principals, icacls_listing_is_owner_only,
+    icacls_tree_foreign_principals, icacls_tree_listing_is_owner_only,
+    split_icacls_tree_listing,
+)
 
 
 OWNER_SID = "S-1-5-21-1-2-3-1001"
@@ -61,6 +65,7 @@ def source_acl_verification_method(subprocess_module: object):
     scope: dict[str, object] = {
         "subprocess": subprocess_module,
         "icacls_listing_is_owner_only": icacls_listing_is_owner_only,
+        "icacls_listing_foreign_principals": icacls_listing_foreign_principals,
         "_trusted_tool": trusted_tool,
         "_TOOL_ENV": TOOL_ENV,
     }
@@ -242,6 +247,7 @@ class AclToolResolutionTests(unittest.TestCase):
         scope: dict[str, object] = {
             "subprocess": subprocess_module,
             "icacls_listing_is_owner_only": icacls_listing_is_owner_only,
+            "icacls_listing_foreign_principals": icacls_listing_foreign_principals,
             "_trusted_tool": refuses,
             "_TOOL_ENV": TOOL_ENV,
         }
@@ -317,3 +323,194 @@ class WindowsAclSecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AclTransitionSafetyTests(unittest.TestCase):
+    """Protecting an object must never pass through a broader ACL than the
+    one it found. Codex review of d9e93ab, finding F1: a ``/reset`` handed
+    the object its parent's inheritable entries for the length of a process
+    spawn, and for good if the next step failed."""
+
+    def test_no_reset_is_ever_issued(self):
+        subprocess_module = FakeSubprocess()
+        verify = source_acl_verification_method(subprocess_module)
+        self.assertTrue(verify(object(), TARGET))
+        for argv in subprocess_module.calls:
+            self.assertNotIn("/reset", [a.lower() for a in argv], argv)
+
+    def test_the_owner_grant_precedes_every_removal(self):
+        subprocess_module = FakeSubprocess()
+        verify = source_acl_verification_method(subprocess_module)
+        self.assertTrue(verify(object(), TARGET))
+        icacls_calls = [argv for argv in subprocess_module.calls
+                        if argv[0].endswith("icacls.exe")]
+        modifying = [argv for argv in icacls_calls if len(argv) > 2]
+        self.assertTrue(modifying)
+        self.assertIn("/grant:r", modifying[0], modifying[0])
+        for argv in modifying[1:]:
+            self.assertTrue(argv[2] in ("/inheritance:r", "/remove:g"), argv)
+
+    def test_a_foreign_explicit_entry_is_removed_by_name_then_reproved(self):
+        class Listings(FakeSubprocess):
+            def __init__(self):
+                super().__init__()
+                self.listings = [
+                    (TARGET + " Everyone:(R)\n"
+                     "        MACHINE\\owner:(F)\n"
+                     "Successfully processed 1 files; Failed processing 0 files\n"),
+                    (TARGET + " MACHINE\\owner:(F)\n"
+                     "Successfully processed 1 files; Failed processing 0 files\n"),
+                ]
+
+            def run(self, args, **kwargs):
+                if args[0].endswith("icacls.exe") and len(args) == 2:
+                    self.calls.append(args)
+                    return types.SimpleNamespace(
+                        stdout=self.listings.pop(0).encode(), returncode=0)
+                return super().run(args, **kwargs)
+
+        subprocess_module = Listings()
+        verify = source_acl_verification_method(subprocess_module)
+        self.assertTrue(verify(object(), TARGET))
+        removals = [argv for argv in subprocess_module.calls
+                    if len(argv) > 2 and argv[2] == "/remove:g"]
+        self.assertEqual(removals, [[trusted_tool("icacls.exe"), TARGET,
+                                     "/remove:g", "EVERYONE",
+                                     "/remove:d", "EVERYONE"]])
+
+    def test_a_foreign_entry_that_survives_removal_fails_closed(self):
+        class Sticky(FakeSubprocess):
+            def run(self, args, **kwargs):
+                if args[0].endswith("icacls.exe") and len(args) == 2:
+                    self.calls.append(args)
+                    listing = (TARGET + " Everyone:(R)\n"
+                               "        MACHINE\\owner:(F)\n")
+                    return types.SimpleNamespace(stdout=listing.encode(),
+                                                 returncode=0)
+                return super().run(args, **kwargs)
+
+        verify = source_acl_verification_method(Sticky())
+        self.assertFalse(verify(object(), TARGET))
+
+
+class ForeignPrincipalListingTests(unittest.TestCase):
+    def test_lists_explicit_strangers_once_and_skips_inherited_and_permitted(self):
+        listing = (TARGET + " Everyone:(R)\n"
+                   "        BUILTIN\\Users:(I)(R)\n"
+                   "        MACHINE\\owner:(F)\n"
+                   "        NT AUTHORITY\\SYSTEM:(F)\n"
+                   "        Everyone:(W)\n")
+        self.assertEqual(
+            icacls_listing_foreign_principals(listing, OWNER_SID, "MACHINE\\owner",
+                                              expected_path=TARGET),
+            ["EVERYONE"])
+
+    def test_a_malformed_listing_yields_none_not_an_empty_list(self):
+        listing = TARGET + " OWNER RIGHTS:(F)\n        garbage here\n"
+        self.assertIsNone(icacls_listing_foreign_principals(
+            listing, OWNER_SID, expected_path=TARGET))
+
+
+ROOT_DIR = r"C:\Users\owner\store"
+
+
+def _tree(*blocks: str) -> str:
+    return "\n".join(blocks) + "\nSuccessfully processed 6 files; Failed processing 0 files\n"
+
+
+class TreeListingTests(unittest.TestCase):
+    """One recursive icacls listing proves every object of a store."""
+
+    owner = "MACHINE\\owner"
+    root_block = (ROOT_DIR + " MACHINE\\owner:(OI)(CI)(F)\n"
+                  "                      NT AUTHORITY\\SYSTEM:(OI)(CI)(F)")
+    children = [ROOT_DIR + r"\a.json", ROOT_DIR + r"\sub dir",
+                ROOT_DIR + r"\sub dir\b.json"]
+
+    def test_splits_blocks_at_column_one_without_relying_on_blank_lines(self):
+        text = _tree(self.root_block, "", ROOT_DIR + r"\a.json ",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(OI)(CI)(F)")
+        blocks = split_icacls_tree_listing(text)
+        self.assertEqual(len(blocks), 3)
+        self.assertTrue(blocks[0].startswith(ROOT_DIR + " "))
+
+    def test_inherited_entries_are_accepted_on_descendants_only(self):
+        text = _tree(self.root_block,
+                     ROOT_DIR + r"\a.json MACHINE\owner:(I)(F)",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+                     ROOT_DIR + r"\sub dir\b.json MACHINE\owner:(I)(F)")
+        self.assertEqual(icacls_tree_listing_is_owner_only(
+            text, OWNER_SID, self.owner, ROOT_DIR, self.children), (True, []))
+        inherited_root = _tree(
+            ROOT_DIR + " MACHINE\\owner:(I)(OI)(CI)(F)",
+            ROOT_DIR + r"\a.json MACHINE\owner:(I)(F)",
+            ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+            ROOT_DIR + r"\sub dir\b.json MACHINE\owner:(I)(F)")
+        verified, failed = icacls_tree_listing_is_owner_only(
+            inherited_root, OWNER_SID, self.owner, ROOT_DIR, self.children)
+        self.assertFalse(verified)
+        self.assertEqual(failed, [ROOT_DIR])
+
+    def test_a_nested_stranger_names_the_object_that_failed(self):
+        text = _tree(self.root_block,
+                     ROOT_DIR + r"\a.json MACHINE\owner:(I)(F)",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+                     ROOT_DIR + r"\sub dir\b.json Everyone:(R)",
+                     "                             MACHINE\\owner:(I)(F)")
+        verified, failed = icacls_tree_listing_is_owner_only(
+            text, OWNER_SID, self.owner, ROOT_DIR, self.children)
+        self.assertFalse(verified)
+        self.assertEqual(failed, [ROOT_DIR + r"\sub dir\b.json"])
+
+    def test_an_empty_acl_is_not_owner_only(self):
+        text = _tree(self.root_block,
+                     ROOT_DIR + r"\a.json ",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+                     ROOT_DIR + r"\sub dir\b.json MACHINE\owner:(I)(F)")
+        verified, failed = icacls_tree_listing_is_owner_only(
+            text, OWNER_SID, self.owner, ROOT_DIR, self.children)
+        self.assertEqual((verified, failed), (False, [ROOT_DIR + r"\a.json"]))
+
+    def test_unexpected_or_missing_objects_fail_the_proof(self):
+        extra = _tree(self.root_block,
+                      ROOT_DIR + r"\a.json MACHINE\owner:(I)(F)",
+                      ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+                      ROOT_DIR + r"\sub dir\b.json MACHINE\owner:(I)(F)",
+                      ROOT_DIR + r"\late.json MACHINE\owner:(I)(F)")
+        self.assertFalse(icacls_tree_listing_is_owner_only(
+            extra, OWNER_SID, self.owner, ROOT_DIR, self.children)[0])
+        missing = _tree(self.root_block,
+                        ROOT_DIR + r"\a.json MACHINE\owner:(I)(F)")
+        verified, failed = icacls_tree_listing_is_owner_only(
+            missing, OWNER_SID, self.owner, ROOT_DIR, self.children)
+        self.assertFalse(verified)
+        self.assertEqual(set(failed), set(self.children[1:]))
+
+    def test_a_space_in_a_path_does_not_confuse_the_longest_match(self):
+        # "sub dir" is a prefix of nothing here, but "sub" + " dir..." would
+        # match ROOT\sub if such an object existed; longest match wins.
+        children = [ROOT_DIR + r"\sub", ROOT_DIR + r"\sub dir"]
+        text = _tree(self.root_block,
+                     ROOT_DIR + r"\sub MACHINE\owner:(I)(OI)(CI)(F)",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)")
+        self.assertEqual(icacls_tree_listing_is_owner_only(
+            text, OWNER_SID, self.owner, ROOT_DIR, children), (True, []))
+
+    def test_foreign_principals_are_collected_across_the_tree_by_object(self):
+        """The first ACE shares its line with the path, so a stranger on a
+        path line is only visible once the block is bound to its object.
+        (Found on the Windows VM: the first version parsed the path as a
+        principal, saw nothing, and left Everyone:(R) in place.)"""
+        text = _tree(self.root_block,
+                     ROOT_DIR + r"\a.json Everyone:(R)",
+                     "                MACHINE\\owner:(I)(F)",
+                     ROOT_DIR + r"\sub dir MACHINE\owner:(I)(OI)(CI)(F)",
+                     ROOT_DIR + r"\sub dir\b.json BUILTIN\Users:(RX)",
+                     "                MACHINE\\owner:(I)(F)")
+        self.assertEqual(
+            icacls_tree_foreign_principals(text, OWNER_SID, self.owner, ROOT_DIR,
+                                           self.children),
+            ["EVERYONE", "BUILTIN\\USERS"])
+        unknown = _tree(self.root_block, ROOT_DIR + r"\stray Everyone:(R)")
+        self.assertIsNone(icacls_tree_foreign_principals(
+            unknown, OWNER_SID, self.owner, ROOT_DIR, self.children))

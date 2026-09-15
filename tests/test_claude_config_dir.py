@@ -132,7 +132,63 @@ class PermissionTests(ConfigDirTestCase):
         secret.write_text("{}", encoding="utf-8")
         platform_support.make_permissive(secret)
         cc.checked_config_dir(self.canonical, home=self.home)
-        platform_support.assert_owner_only(self, secret, 0o600)
+        platform_support.assert_owner_only(self, secret, 0o600,
+                                           inside_protected_store=True)
+
+    def test_a_permissive_nested_file_is_tightened_on_windows(self):
+        """Codex review of d9e93ab, F2: Windows grants every account "bypass
+        traverse checking", so a nested file with its own permissive entry is
+        readable by name whatever its parents allow. Enforcement covers the
+        tree there. (POSIX stops at the top level on purpose: a 0700
+        directory cannot be traversed, so nothing below it is reachable.)"""
+        if os.name != "nt":
+            self.skipTest("POSIX confidentiality rests on the 0700 directory")
+        nested = self.canonical / "projects" / "deep"
+        nested.mkdir(parents=True)
+        secret = nested / "session.jsonl"
+        secret.write_text("{}", encoding="utf-8")
+        platform_support.make_permissive(secret)
+        platform_support.assert_not_owner_only(self, secret)
+        cc.checked_config_dir(self.canonical, home=self.home)
+        platform_support.assert_owner_only(self, secret, 0o600,
+                                           inside_protected_store=True)
+        platform_support.assert_owner_only(self, nested, 0o700)
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+
+    def test_readiness_sees_a_permissive_nested_file_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("POSIX confidentiality rests on the 0700 directory")
+        nested = self.canonical / "todos"
+        nested.mkdir()
+        secret = nested / "todo.json"
+        secret.write_text("{}", encoding="utf-8")
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+        platform_support.make_permissive(secret)
+        self.assertFalse(cc.is_ready(self.canonical, home=self.home))
+        # And describing did not repair it.
+        platform_support.assert_not_owner_only(self, secret)
+
+    def test_files_the_lane_creates_after_enforcement_are_still_ready(self):
+        """Claude itself writes into the store between enforcements. On
+        Windows those objects carry only entries inherited from the
+        protected store; readiness must accept them or the lane would refuse
+        every job after its first."""
+        if os.name != "nt":
+            self.skipTest("inherited ACL entries are a Windows concept")
+        later = self.canonical / "shell-snapshots"
+        later.mkdir()
+        (later / "snap.sh").write_text("#", encoding="utf-8")
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+
+    def test_an_owned_unreadable_directory_is_repaired_on_posix(self):
+        """Codex review of d9e93ab, F3: listing before chmod failed exactly
+        the case enforcement exists to repair."""
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            self.skipTest("mode bits, as a non-root account")
+        os.chmod(self.canonical, 0o000)
+        self.addCleanup(os.chmod, self.canonical, 0o700)
+        cc.enforce_private(self.canonical)
+        platform_support.assert_owner_only(self, self.canonical, 0o700)
 
     def test_a_link_inside_the_store_is_refused(self):
         platform_support.require_symlinks(self)

@@ -151,19 +151,23 @@ def enforce_private(directory: Path) -> Path:
     guarantee is the same on both: no other account can read the store.
     """
 
-    try:
-        entries = _store_entries(directory)
-    except OSError:
-        raise ConfigDirError(
-            "Claude configuration directory could not be read") from None
     if os.name == "nt":
-        return _enforce_private_nt(directory, entries)
+        return _enforce_private_nt(directory)
 
+    # chmod before listing: an owned directory left unreadable (mode 000,
+    # say) is one this call exists to repair, and the repair is what makes
+    # the listing possible. Listing first would fail exactly the case that
+    # was fixable.
     try:
         os.chmod(directory, 0o700)
     except OSError:
         raise ConfigDirError(
             "Claude configuration directory permissions could not be set") from None
+    try:
+        entries = _store_entries(directory)
+    except OSError:
+        raise ConfigDirError(
+            "Claude configuration directory could not be read") from None
     # Only the top level. A subdirectory tightened to 0700 is one no other
     # account can traverse, so what is inside it is already unreachable, and
     # walking an arbitrary tree before authenticating is its own hazard.
@@ -211,14 +215,55 @@ def _refuse_links(info: os.stat_result) -> None:
             "Claude configuration directory contains a link or alias")
 
 
-def _enforce_private_nt(directory: Path, entries: list[str]) -> Path:
+#: Objects (files and directories, at any depth) a lane's store may hold
+#: before enforcement refuses it as something this lane did not create.
+MAX_STORE_OBJECTS = 20000
+
+
+def _walk_store(directory: Path) -> tuple[list[str], list[str]]:
+    """Every directory and file under the store, links refused, bounded.
+
+    Names are built from the store path exactly as given so that they match
+    what ``icacls /t`` prints for the same objects. A link or alias anywhere
+    in the tree refuses the store: the ACL that would be applied through it
+    belongs to whatever it points at.
+    """
+
+    directories: list[str] = []
+    files: list[str] = []
+    pending = [str(directory)]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                _refuse_links(info)
+                if len(directories) + len(files) >= MAX_STORE_OBJECTS:
+                    raise ConfigDirError(
+                        "Claude configuration directory holds more files than "
+                        "this lane created")
+                if stat.S_ISDIR(info.st_mode):
+                    directories.append(entry.path)
+                    pending.append(entry.path)
+                else:
+                    files.append(entry.path)
+    return directories, files
+
+
+def _enforce_private_nt(directory: Path) -> Path:
     """The Windows half of :func:`enforce_private`: ACLs, not mode bits.
 
-    Applies the owner-only ACL to the directory and to each top-level entry
-    through the platform layer, which reads every ACL back as part of
-    applying it, then reads them all back once more here so that "enforced"
-    and "verified" remain two observations rather than one call's return
-    value. Every refusal keeps the fixed operator text this module promises.
+    The POSIX half stops at the top level because a 0700 directory cannot be
+    traversed, so nothing inside it is reachable by name. Windows grants
+    every account "bypass traverse checking" by default: a nested file with
+    its own permissive entry is readable by anyone who knows its path,
+    whatever its parents allow. So the whole tree is enforced. Directories
+    are protected one by one with inheritable owner-only entries, which
+    rewrites the inherited entries of everything beneath them; one pass then
+    removes every explicit foreign entry from every object; and one
+    recursive read-back proves every object, so that "enforced" and
+    "verified" remain two observations. Every refusal keeps the fixed
+    operator text this module promises.
     """
 
     from agent_bridge.orchestration import windows_privacy as wpv
@@ -229,36 +274,39 @@ def _enforce_private_nt(directory: Path, entries: list[str]) -> Path:
     except wpv.PrivacyError:
         raise ConfigDirError(
             "Claude configuration directory permissions could not be set") from None
-    for name in entries:
-        child = directory / name
-        try:
-            info = os.lstat(child)
-            _refuse_links(info)
-            if stat.S_ISDIR(info.st_mode):
-                wpv.require_private_directory(child, root=directory)
-                continue
-            descriptor = os.open(child, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-            try:
-                host.enforce_owner_only_file(descriptor)
-            finally:
-                os.close(descriptor)
-        except ConfigDirError:
-            raise
-        except (OSError, wpv.PrivacyError):
-            raise ConfigDirError(
-                "Claude configuration directory contents could not be "
-                "protected") from None
-
-    verified, _evidence = host.observe_owner_only_acl(str(directory))
-    if not verified:
+    try:
+        directories, files = _walk_store(directory)
+    except ConfigDirError:
+        raise
+    except OSError:
         raise ConfigDirError(
-            "Claude configuration directory is readable by other accounts")
-    for name in entries:
-        verified, _evidence = host.observe_owner_only_acl(str(directory / name))
-        if not verified:
+            "Claude configuration directory could not be read") from None
+    if len([path for path in directories + files
+            if os.path.dirname(path) == str(directory)]) > MAX_STORE_ENTRIES:
+        raise ConfigDirError(
+            "Claude configuration directory holds more files than this lane "
+            "created")
+    try:
+        for child in directories:
+            wpv.require_private_directory(child, root=directory)
+        removed, _evidence = host.remove_foreign_grants_tree(
+            str(directory), directories + files)
+    except (OSError, wpv.PrivacyError):
+        removed = False
+    if not removed:
+        raise ConfigDirError(
+            "Claude configuration directory contents could not be protected")
+
+    verified, evidence = host.observe_owner_only_tree(
+        str(directory), directories + files)
+    if not verified:
+        failed = evidence.get("objects_failed") or []
+        if not failed or str(directory) in failed:
             raise ConfigDirError(
-                "Claude configuration directory contains a file readable by "
-                "other accounts")
+                "Claude configuration directory is readable by other accounts")
+        raise ConfigDirError(
+            "Claude configuration directory contains a file readable by "
+            "other accounts")
     return directory
 
 
@@ -289,9 +337,16 @@ def is_ready(value: object, *, home: Path | str | None = None) -> bool:
     if os.name == "nt":
         # A read-back, never a grant: the platform's applying call would make
         # this report true by making it true, which is the one thing a
-        # readiness check must not do.
+        # readiness check must not do. The whole tree, for the reason given
+        # on _enforce_private_nt: a nested file another account can read is
+        # a store that is not ready, wherever it sits.
         from agent_bridge.platform import platform as host
-        verified, _evidence = host.observe_owner_only_acl(str(directory))
+        try:
+            directories, files = _walk_store(directory)
+        except (ConfigDirError, OSError):
+            return False
+        verified, _evidence = host.observe_owner_only_tree(
+            str(directory), directories + files)
         return bool(verified)
     if info.st_mode & 0o077:
         return False

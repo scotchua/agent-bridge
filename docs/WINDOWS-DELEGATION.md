@@ -219,7 +219,15 @@ canaries run last, so a cheaper structural proof fails first.
   `tests/test_workspace_unpacking.py` asserts both measurements rather than
   leaving the choice as an opinion.
 * **Owner-only ACLs**, verified by reading them back with `icacls` rather than
-  trusting a zero exit code.
+  trusting a zero exit code. Applying one never passes through a broader ACL
+  than the one found: the owner's grant is written first, inherited entries
+  are cut second, and remaining explicit entries for anyone else are removed
+  by name third, so an interruption after any step leaves the object no more
+  readable than before. Read paths only observe; they never repair, so a
+  record another account could read stays visible as exactly that. The Claude
+  lane's store is enforced and observed as a whole tree, because Windows grants
+  every account "bypass traverse checking": a nested file with its own
+  permissive entry is readable by name whatever its parents allow.
 * **Fail-closed cleanup.** Registration is a tri-state (`none`, `created`,
   `unproven`), proven by listing the distro name immediately before and after
   the import. A name is never unregistered unless this run positively created

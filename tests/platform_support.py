@@ -59,13 +59,21 @@ def owner_only_platform():
 
 
 def assert_owner_only(test: unittest.TestCase, path, mode: int,
-                      message: str = "") -> None:
-    """Mode bits on POSIX, the ACL read-back on Windows. Never repairs."""
+                      message: str = "", *, inside_protected_store: bool = False
+                      ) -> None:
+    """Mode bits on POSIX, the ACL read-back on Windows. Never repairs.
+
+    ``inside_protected_store`` is for an object under the Claude lane's
+    store, which Windows enforcement proves as a tree: the object may carry
+    entries inherited from the protected root. Anything the bridge writes
+    on its own is proved strictly, with inherited entries refused.
+    """
 
     if os.name != "nt":
         test.assertEqual(os.stat(path).st_mode & 0o777, mode, message or str(path))
         return
-    verified, evidence = host_platform.observe_owner_only_acl(str(path))
+    verified, evidence = host_platform.observe_owner_only_acl(
+        str(path), allow_inherited=inside_protected_store)
     test.assertTrue(verified, (message, str(path), evidence))
 
 
@@ -115,6 +123,77 @@ def write_private_bytes(path, data: bytes) -> None:
         os.write(descriptor, data)
     finally:
         os.close(descriptor)
+
+
+def drop_acl_bypass_privileges() -> list[str]:
+    """Remove SeBackupPrivilege and SeRestorePrivilege from this process.
+
+    Measured on a hosted GitHub Windows runner (run 34936853093): a step
+    launched through Git bash inherits a token in which both privileges are
+    ENABLED (MSYS2 enables them for its own file handling and children keep
+    them), while pwsh and cmd steps hold them disabled. With them enabled the
+    kernel bypasses the DACL for the very operations these tests restrict
+    (listing a directory, creating inside one), so every deny-based fixture
+    restricts nothing and every "access is denied" assertion is void.
+
+    Removing, not disabling: a removed privilege cannot be re-enabled by the
+    process or anything it spawns, which is what "the tests run as an
+    ordinary account would" has to mean. Returns the names removed, for the
+    record; an empty list off Windows or when the token never held them.
+    """
+
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY = 0x0020, 0x0008
+    SE_PRIVILEGE_REMOVED = 0x00000004
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                    ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                     ctypes.byref(token)):
+        raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+    removed: list[str] = []
+    try:
+        for name in ("SeBackupPrivilege", "SeRestorePrivilege"):
+            luid = LUID()
+            if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+                continue
+            privileges = TOKEN_PRIVILEGES()
+            privileges.PrivilegeCount = 1
+            privileges.Privileges[0].Luid = luid
+            privileges.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED
+            advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(privileges),
+                                           0, None, None)
+            # ERROR_NOT_ALL_ASSIGNED (1300) means the token never held it,
+            # which is the state wanted; anything else is a real failure.
+            error = ctypes.get_last_error()
+            if error not in (0, 1300):
+                raise OSError(error, f"AdjustTokenPrivileges({name}) failed")
+            if error == 0:
+                removed.append(name)
+    finally:
+        kernel32.CloseHandle(token)
+    return removed
+
+
+#: Done once, at import, by every test module that reaches this file and by
+#: tests/harness.py: the tests must run as an ordinary account would.
+ACL_BYPASS_PRIVILEGES_REMOVED = drop_acl_bypass_privileges()
 
 
 _SYMLINK_SUPPORT: bool | None = None

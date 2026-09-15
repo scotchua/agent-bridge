@@ -75,7 +75,26 @@ def restrict_dir(path: str, kind: str):
     def restore():
         subprocess.run(["icacls", path, "/remove:d", f"*{sid}"],
                        capture_output=True, text=True, timeout=30, check=True)
-    return restore
+
+    # Prove the deny bit. A token holding SeBackupPrivilege/SeRestorePrivilege
+    # ENABLED (a process under Git bash, measured on a GitHub runner) walks
+    # straight through both denies, and the tests that use this helper then
+    # report the code under test as broken. That is a fixture failure and is
+    # reported as one, here, with the cause, rather than as a product FAIL.
+    try:
+        if kind == "unlistable":
+            os.listdir(path)
+        else:
+            probe = os.path.join(path, ".restrict-probe")
+            os.mkdir(probe)
+            os.rmdir(probe)
+    except OSError:
+        return restore
+    restore()
+    raise RuntimeError(
+        f"restrict_dir({kind}): the deny ACE was applied but this process still "
+        "has access; its token most likely holds SeBackupPrivilege/"
+        "SeRestorePrivilege enabled (see platform_support.drop_acl_bypass_privileges)")
 
 
 from agent_bridge.platform.windows_acl import (  # noqa: E402
