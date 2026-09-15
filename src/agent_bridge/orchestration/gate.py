@@ -401,7 +401,20 @@ def protected_paths(state_root: str, config_path: str | None, home: str,
 
 
 def _under(path: str, root: str) -> bool:
-    real = os.path.realpath(path)
+    r"""Whether ``path`` is ``root`` or inside it.
+
+    Both sides go through ``os.path.normcase``, which is a no-op on POSIX and
+    on Windows lowercases and turns ``/`` into ``\``. Windows paths are
+    case-insensitive and accept either separator, so without it a protected
+    path named in a different case, or with forward slashes, compared unequal
+    to the same path and the protected-path rule did not fire. The comparison
+    stays exact on POSIX, where ``/etc/Passwd`` really is a different file
+    from ``/etc/passwd``.
+
+    Unverified on a live Windows host, like everything else Windows here.
+    """
+    real = os.path.normcase(os.path.realpath(path))
+    root = os.path.normcase(root)
     return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
 
 
