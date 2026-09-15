@@ -423,6 +423,16 @@ class DocumentedLimitationTests(unittest.TestCase):
     def test_no_live_validation_is_claimed(self):
         self.assertIn("has been imported into WSL2 on a live", wrf.NO_LIVE_VALIDATION)
 
+    def test_release_docs_name_the_buildable_architecture_outputs(self):
+        recipe_path = ROOT / "tools" / "rootfs" / "recipes" / "arm64.json"
+        raw = json.loads(recipe_path.read_text(encoding="utf-8"))
+        raw["apt_packages"] = tuple(raw["apt_packages"])
+        names = wrf.output_names(wrf.RootfsRecipe(**raw))
+        for document in ("WINDOWS-VALIDATION-RUNBOOK.md", "RELEASE-SIGNING.md"):
+            text = (ROOT / "docs" / document).read_text(encoding="utf-8")
+            self.assertIn(names["manifest"], text, document)
+            self.assertIn("--architecture arm64", text, document)
+
 
 
 class RecipeHonestyTests(unittest.TestCase):

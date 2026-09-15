@@ -34,7 +34,7 @@ uses, so the two cannot drift.
 ### 1. Build the image
 
 ```bash
-python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/amd64.json --out-dir build/rootfs
+python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/arm64.json --out-dir build/rootfs
 ```
 
 The output directory is gitignored. The tarball is distributed out of band and
@@ -43,7 +43,7 @@ checked against the manifest hash on the machine that uses it.
 ### 2. Emit the bytes to sign
 
 ```bash
-python3 tools/release_signing.py prepare --manifest build/rootfs/manifest.json --out build/rootfs/manifest.canonical
+python3 tools/release_signing.py prepare --manifest build/rootfs/agent-bridge-manifest-arm64.json --out build/rootfs/manifest.canonical
 ```
 
 It prints the manifest digest and the byte count. It asks for no key and has
@@ -69,8 +69,8 @@ terminal that logs, and do not place either half inside a checkout.
 
 ```bash
 python3 tools/release_signing.py anchor \
-    --manifest build/rootfs/manifest.json \
-    --release 2026.1 --architecture amd64 \
+    --manifest build/rootfs/agent-bridge-manifest-arm64.json \
+    --release 2026.1 --architecture arm64 \
     --signature sig.hex --public-key pub.hex
 ```
 

@@ -56,7 +56,8 @@ _FIRMWARE_VIRT_ARGV = [
     "systeminfo.exe",
 ]
 _NESTED_VIRT_ARGV = [
-    "powershell.exe", "-NoProfile", "-NonInteractive", "-NoLogo", "-Command",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    "-NoProfile", "-NonInteractive", "-NoLogo", "-Command",
     "$c=Get-CimInstance Win32_ComputerSystem;"
     "$p=Get-CimInstance Win32_Processor | Select-Object -First 1;"
     "Write-Output ('Manufacturer=' + [string]$c.Manufacturer);"

@@ -176,10 +176,10 @@ pinned and the manifest does not describe the image.
 Full procedure in [RELEASE-SIGNING.md](RELEASE-SIGNING.md). The short form:
 
 ```bash
-python3 tools/release_signing.py prepare --manifest build/rootfs/manifest.json --out build/rootfs/manifest.canonical
+python3 tools/release_signing.py prepare --manifest build/rootfs/agent-bridge-manifest-arm64.json --out build/rootfs/manifest.canonical
 # sign those exact bytes on the machine holding the release key, with your own tool
-python3 tools/release_signing.py anchor --manifest build/rootfs/manifest.json \
-    --release <name> --architecture amd64 --signature sig.hex --public-key pub.hex
+python3 tools/release_signing.py anchor --manifest build/rootfs/agent-bridge-manifest-arm64.json \
+    --release <name> --architecture arm64 --signature sig.hex --public-key pub.hex
 ```
 
 **Expected:** a `TrustAnchor(...)` literal on stdout. It is printed only if the
@@ -204,7 +204,8 @@ key-shaped reached the tree and must be removed before anything is published.
 
 ```bat
 bin\agent-bridge-windows-setup step --image-consent ^
-    --image C:\path\rootfs.tar --manifest C:\path\manifest.json
+    --image C:\path\agent-bridge-rootfs-arm64.tar ^
+    --manifest C:\path\agent-bridge-manifest-arm64.json
 ```
 
 **Expected:** `ok`, or a refusal whose `reason` names exactly which trust

@@ -182,6 +182,11 @@ class FeatureStateTests(unittest.TestCase):
 
 
 class FirmwareVirtualizationTests(unittest.TestCase):
+    def test_nested_probe_uses_the_absolute_system_powershell(self):
+        self.assertEqual(
+            wp._NESTED_VIRT_ARGV[0],
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+
     def test_active_hypervisor_on_physical_host_is_enabled(self):
         output = (
             "Hyper-V Requirements:          A hypervisor has been detected. "
