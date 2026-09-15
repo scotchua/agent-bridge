@@ -1813,13 +1813,34 @@ API_KEY_ENV_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
 #: as a generic failure leaves the lane shut; nothing in this list can turn a
 #: failure into PROBE_AUTHENTICATED, which is reachable only by producing the
 #: sentinel.
+#:
+#: Every entry is a phrase rather than a bare number. A plain "401" used to be
+#: in this list, substring-matched against the whole of stdout and stderr, and
+#: Claude Code's result envelope carries a random session_id: about one run in
+#: a hundred and forty put those three digits somewhere in the UUID and an
+#: unexplained failure was reported as a refused session. Durations, token
+#: counts, costs and request ids do the same thing on a live machine. Status
+#: codes are matched by :data:`AUTH_REJECTION_PATTERNS` instead, which require
+#: the number to be a status code and not merely three digits.
 AUTH_REJECTION_MARKERS = (
     "invalid api key", "invalid_api_key", "authentication_error",
     "authentication failed", "unauthorized", "not logged in", "please log in",
     "please run /login", "login required", "invalid bearer token",
     "oauth token", "invalid_grant", "token expired", "expired token",
-    "session expired", "invalid token", "403 forbidden", "401",
+    "session expired", "invalid token", "403 forbidden",
     "credit balance", "subscription", "unauthenticated",
+)
+
+#: Status codes, matched only where they are being reported as status codes.
+#: ``\b`` alone is not enough: it rejects a 401 buried inside a hex id, but it
+#: still accepts ``"duration_ms": 401``. So the number must either be followed
+#: by the word that names it, or preceded by one of the few words that
+#: introduce a status code, within a short distance and on the same line. The
+#: gap admits digits because a real status line is ``HTTP/1.1 401``.
+AUTH_REJECTION_PATTERNS = (
+    re.compile(r"\b401\b[\s:,-]*unauthori[sz]ed", re.IGNORECASE),
+    re.compile(r"\b(?:http|https|status|statuscode|status_code|code|error)\b"
+               r"[^\n]{0,10}?\b401\b", re.IGNORECASE),
 )
 
 
@@ -1965,6 +1986,9 @@ def _classify_failure(returncode: int, stdout: bytes, stderr: bytes) -> str:
     haystack = (stdout + b"\n" + stderr).decode("utf-8", "replace").lower()
     for marker in AUTH_REJECTION_MARKERS:
         if marker in haystack:
+            return PROBE_REJECTED
+    for pattern in AUTH_REJECTION_PATTERNS:
+        if pattern.search(haystack):
             return PROBE_REJECTED
     return PROBE_FAILED
 

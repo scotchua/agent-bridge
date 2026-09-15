@@ -482,5 +482,119 @@ class ProbeLifecycleTests(unittest.TestCase):
         self.assertTrue(captured["capsule"].exited)
 
 
+class RejectionMarkerPrecisionTests(unittest.TestCase):
+    """A refused session is a phrase, not three digits that happen to occur.
+
+    The regression is exact. ``AUTH_REJECTION_MARKERS`` carried a bare "401"
+    and ``_classify_failure`` substring-matched it against the whole of stdout
+    and stderr. Claude Code's result envelope carries a random ``session_id``,
+    so roughly one run in a hundred and forty put 4-0-1 somewhere inside that
+    UUID and a generic failure was reported as a refused session. It surfaced
+    as an intermittent failure of the provider-lane fixture below, which is
+    the only reason it was found at all.
+
+    Neither verdict opens the lane, so this was never a trust hole. It is a
+    correctness one: the verdict is the entire result an operator is given,
+    and a spurious "rejected" sends them to re-authenticate a session that was
+    never refused.
+    """
+
+    #: The envelope that actually failed, with the session_id fixed at a value
+    #: carrying the three digits. Everything else is Claude Code's shape as the
+    #: fixture emits it.
+    ENVELOPE = json.dumps({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": False,
+        "result": gr.AUTH_PROBE_SENTINEL,
+        "session_id": "c4014f2a-1b3d-4e5f-8a9b-0c1d2e3f4a5b",
+        "num_turns": 1,
+        "duration_ms": 11,
+        "total_cost_usd": 0.0,
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 12, "output_tokens": 7},
+    }).encode("utf-8")
+
+    def test_the_envelope_that_regressed_is_a_failure_not_a_rejection(self):
+        self.assertEqual(gr._classify_failure(1, self.ENVELOPE, b""),
+                         gr.PROBE_FAILED)
+
+    def test_no_bare_number_is_a_marker(self):
+        for marker in gr.AUTH_REJECTION_MARKERS:
+            self.assertFalse(marker.strip().isdigit(),
+                             f"{marker!r} matches any output containing it")
+
+    def test_digits_in_ordinary_envelope_fields_are_not_a_rejection(self):
+        for field, value in (("session_id", '"aaaa-401b-bbbb"'),
+                             ("duration_ms", "401"),
+                             ("input_tokens", "401"),
+                             ("total_cost_usd", "0.401"),
+                             ("num_turns", "4012")):
+            with self.subTest(field):
+                payload = f'{{"{field}": {value}}}'.encode("utf-8")
+                self.assertEqual(gr._classify_failure(1, payload, b""),
+                                 gr.PROBE_FAILED)
+
+    def test_output_that_merely_mentions_the_digits_is_not_a_rejection(self):
+        """The cases that made the old marker wrong, written out.
+
+        A request id, a stack frame and a duration all carry the digits in
+        output a provider really produces. None of them says anything about
+        the session.
+        """
+
+        for text in (
+                b'{"error": {"type": "overloaded_error"}, '
+                b'"request_id": "req_401abc"}',
+                b'{"code": "ENOENT", "errno": -2, "duration": 401}',
+                b'Traceback (most recent call last):\n'
+                b'  File "x.py", line 401, in <module>',
+                b'{"usage": {"input_tokens": 401, "output_tokens": 4012}}'):
+            with self.subTest(text):
+                self.assertEqual(gr._classify_failure(1, text, b""),
+                                 gr.PROBE_FAILED)
+
+    def test_a_real_status_line_is_still_a_rejection(self):
+        for text in (b"HTTP 401 Unauthorized",
+                     b"401 Unauthorised",
+                     b"status: 401",
+                     b"status_code=401",
+                     b"error code 401",
+                     b'{"code": 401}',
+                     b'{"error":{"code":401}}',
+                     b"HTTP/1.1 401 Unauthorized",
+                     b"HTTP/2 401",
+                     b"HTTP/1.1 401"):
+            with self.subTest(text):
+                self.assertEqual(gr._classify_failure(1, text, b""),
+                                 gr.PROBE_REJECTED)
+
+    def test_the_named_refusals_are_still_rejections(self):
+        for text in (b"Invalid API key", b"authentication_error",
+                     b"Please run /login", b"session expired",
+                     b"403 Forbidden", b"unauthenticated"):
+            with self.subTest(text):
+                self.assertEqual(gr._classify_failure(1, text, b""),
+                                 gr.PROBE_REJECTED)
+
+    def test_ten_thousand_session_ids_never_flip_the_verdict(self):
+        """The property the bare marker broke, checked by exhausting it.
+
+        A fixed envelope proves the one id that failed is handled. This proves
+        the id cannot be what decides, which is the actual invariant: a random
+        identifier in the output must never change a verdict.
+        """
+
+        import uuid
+
+        for _ in range(10000):
+            payload = json.dumps({
+                "type": "result", "subtype": "error_during_execution",
+                "session_id": str(uuid.uuid4()), "duration_ms": 11,
+            }).encode("utf-8")
+            self.assertEqual(gr._classify_failure(1, payload, b""),
+                             gr.PROBE_FAILED)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -828,3 +828,98 @@ semantics, and three of them are skipped off Windows because they need the
 real namespace to say anything. The rest are pure and run on every runner,
 which is the point: a Windows-only test that runs on one runner is a test that
 stops being read.
+
+## The slicing round
+
+Consolidating the change into reviewable commits meant running the whole
+suite at each one. That is not a formality here. It found five places where a
+test landed in an earlier commit than the code it exercises, and one real
+defect that only a rerun could have caught.
+
+### Five commits that could not have passed
+
+The slices were ordered by the module import graph, which is the right
+ordering for reading and the wrong one for a test that spans two modules.
+Every one of these was invisible at the tip, because the tip has everything:
+
+- The guest harness taught `guest_runner` two new canary names while the host
+  side of the agreement, `windows_wsl_runtime.CANARY_ORDER`, learned them six
+  commits later. The conformance test that asserts the two lists are equal
+  failed in between. The 74-line runtime hunk moved back to the harness
+  commit, where it already belonged: it imports `guest_runner` and asserts
+  against that module's transport constants.
+- `QueuePrivacyAtCreationTests` tested the queue's use of the privacy module
+  from the commit that introduced the module, not the commit that wired it in.
+- `tests/test_windows_auth.py` imported `windows_delegation` one commit before
+  it existed. That commit did not fail, it failed to *collect*: the suite
+  reported one error and ran nothing at all, which is the failure mode most
+  likely to be waved through.
+- Two methods of `OutcomeTests` called `execution_queue.validate_outcome` from
+  the runtime commit, a commit before the gate that defines it.
+- Twenty-four onboarding tests asserted an `onboard.py` shape that arrives
+  with the platform-gate commit.
+
+Nothing about the change moved: the tree at the tip is byte-identical before
+and after the reordering. What moved is which commit carries which line, so
+that a reviewer reading one commit sees a set of tests that pass against the
+code in front of them.
+
+### A hundred tests that were not running
+
+Seven test files had grown a class or a function below their
+`if __name__ == "__main__":` block. Under pytest the module is imported whole
+and every class runs, so CI was green and stayed green. Running one of those
+files directly executed `unittest.main()` at the point it was written and
+exited before the later definitions existed: 26 of 45 in `test_auth_probe`,
+10 of 20 in `test_signing`, 28 of 41 in `test_windows_privacy`, 46 of 67 in
+`test_windows_provision_driver`, 45 of 57 in `test_windows_setup`, 127 of 152
+in `test_windows_wsl_runtime`.
+
+`tests/test_suite_hygiene.py` parses every test file and fails if anything is
+defined after the block. It has to be a source check. At runtime the classes
+that would be skipped have either already been collected or the process has
+already gone, so nothing executing can observe the problem.
+
+### A rejection marker that matched three digits
+
+One test failed intermittently across the slice runs and passed on every
+rerun, which is the shape of a problem that gets recorded as "flaky" and
+forgotten. Capturing the failure name rather than the count gave it away:
+
+```
+AssertionError: 'auth_probe_rejected' != 'auth_probe_failed'
+```
+
+`AUTH_REJECTION_MARKERS` carried a bare `"401"`, substring-matched against the
+whole of stdout and stderr. Claude Code's result envelope carries a random
+`session_id`, and a UUID contains those three digits about once in a hundred
+and forty. On a live machine a request id, a duration in milliseconds, a token
+count, a cost or a line number in a traceback does the same thing.
+
+Neither verdict opens the lane, so this was never a trust hole. It is a
+correctness one, and it matters most exactly where the runbook says the
+verdict is the whole result an operator gets: a spurious `auth_probe_rejected`
+sends someone to re-authenticate a session that was never refused, and the
+real fault goes unlooked-for.
+
+Status codes now match through `AUTH_REJECTION_PATTERNS`, which require the
+number to be presented as a status code: followed by the word that names it,
+or introduced by one of `http`, `status`, `code` or `error` within ten
+characters on the same line. The gap admits digits because a real status line
+reads `HTTP/1.1 401`. `403 Forbidden` was always a phrase and is unchanged,
+and a test now asserts that no marker in the list is a bare number.
+
+The regression test is the exact envelope that failed, with the session id
+pinned at a value carrying the digits. Beside it is the property that envelope
+is an instance of: ten thousand random session ids, none of which may change a
+verdict. A fixed envelope proves one id is handled; the property proves the id
+cannot be what decides.
+
+### What is still not true, after this round
+
+Every slice now passes the full suite on this machine, and the tip passes it.
+None of that is evidence about Windows. The five orderings were found by
+running the suite, the hundred skipped tests were found by moving a block, and
+the rejection marker was found by a rerun; all three are the kind of thing
+that is only ever found by running something, which is the argument for the
+runbook rather than a substitute for it.
