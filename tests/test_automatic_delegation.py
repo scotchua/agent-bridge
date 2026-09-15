@@ -343,9 +343,13 @@ class ApplyIntegrationTests(unittest.TestCase):
         # These are orchestration integration tests, not host-support tests.
         # Keep their result independent of the CI runner's operating system;
         # delegation_platform_blocker has its own platform-boundary coverage.
-        patcher = mock.patch.object(onboard, "delegation_platform_blocker", return_value="")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.object(onboard, "delegation_platform_blocker", return_value=""),
+            mock.patch.object(onboard, "_windows_preflight_summary", return_value=None),
+            mock.patch.object(onboard, "_windows_setup_summary", return_value=None),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _stage(self, tmp, choices):
         home = os.path.join(tmp, "home")
