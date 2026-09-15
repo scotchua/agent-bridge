@@ -5,10 +5,12 @@ import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tem
 from pathlib import Path
 try:
     from .. import runner
+    from ..platform import platform as agent_platform
     from . import claude_config, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
+    from agent_bridge.platform import platform as agent_platform
     from agent_bridge.execution import claude_config, hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
@@ -239,7 +241,15 @@ def _require_confinement(classification:str)->hostenv.Confinement:
 def _atomic_json(path:Path,value:dict):
     fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
     try:
-        os.fchmod(fd,0o600)
+        # os.fchmod does not exist on Windows at all (AttributeError, measured
+        # on a live VM), unlike the POSIX mode bits this used to assume every
+        # host has. agent_platform picks the real primitive per host: fchmod
+        # on POSIX, an owner-only ACL on Windows.
+        try: agent_platform.enforce_owner_only_file(fd)
+        except BaseException:
+            try: os.close(fd)
+            except OSError: pass
+            raise
         with os.fdopen(fd,"w") as f: json.dump(value,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
         os.replace(tmp,path)
     finally:

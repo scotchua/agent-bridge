@@ -302,11 +302,24 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
 
 
 def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
-    """The receipt for ``repo`` or None; ValueError for one that is not a receipt."""
+    """The receipt for ``repo`` or None; ValueError for one that is not a receipt.
+
+    Reads through ``store.read_json_atomic`` rather than an ``os.path.exists``
+    check followed by a separate open. ``atomic_write_json`` replaces this
+    file with ``os.replace``, which on Windows is not the clean swap it is on
+    POSIX: a reader can arrive in the instant there is no file, or be refused
+    for a sharing violation while the replace is in flight, and both surface
+    as ``OSError`` rather than "no receipt yet". ``read_json_atomic`` retries
+    across that window and only raises once a receipt is genuinely absent, at
+    which point this function reports that the ordinary way, as ``None``,
+    rather than letting an in-flight replace look like a caller-visible crash.
+    A corrupt document still fails immediately: only ``OSError`` is retried.
+    """
     path = receipt_path(state_root, repo)
-    if not os.path.exists(path):
+    try:
+        loaded = store.read_json_atomic(path)
+    except OSError:
         return None
-    loaded = store.read_json(path)
     valid_until = loaded.get("valid_until") if isinstance(loaded, dict) else None
     if not isinstance(loaded, dict) or loaded.get("version") != RECEIPT_VERSION \
             or not isinstance(valid_until, (int, float)) or isinstance(valid_until, bool) \

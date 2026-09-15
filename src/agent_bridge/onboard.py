@@ -833,8 +833,21 @@ def _shared_instructions(answers: dict[str, Any]) -> str:
     return "\n".join(text) + "\n"
 
 
+def _same_directory(a: str, b: str) -> bool:
+    """True when two spellings name the same directory.
+
+    Plain string equality on ``os.path.abspath`` is not enough on Windows:
+    a short 8.3 form, a different drive-letter case, or a path reached
+    through a junction all compare unequal to the same directory's other
+    spelling. ``normcase`` after ``realpath`` is a no-op on POSIX and is the
+    same treatment ``gate._under`` already gives path comparisons for the
+    same reason.
+    """
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
 def _paths(home: str, desktop_path: str | None = None, root: str | None = None) -> dict[str, str]:
-    own_home = os.path.abspath(home) == os.path.abspath(os.path.expanduser("~"))
+    own_home = _same_directory(home, os.path.expanduser("~"))
     codex_home = os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME", os.path.join(home, ".codex")))) if own_home else os.path.join(home, ".codex")
     desktop = desktop_path or (os.path.join(os.environ.get("APPDATA", home) if own_home else home, "Claude", "claude_desktop_config.json")
                                if os.name == "nt" else os.path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"))
