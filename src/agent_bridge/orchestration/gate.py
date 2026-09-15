@@ -118,6 +118,17 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])(unzip|zip|gunzip|gzip|bunzip2|bzip2|xz|unxz)(\s|$)",
     r"(^|[\s;&|('\"])find\s.*(\s-delete(\s|$)|\s-exec\s+(rm|mv|cp|sed\s+-i|chmod|chown|truncate)(\s|$))",
     r"(^|[\s;&|('\"])(gofmt\s+-w|rustfmt|eslint\s+--fix|ruff\s+format|ruff\s+(check\s+)?--fix)(\s|$)",
+    # Windows. The heuristic listed only POSIX verbs, so a cmd.exe call
+    # writing with a built-in read as a read: `del`, `move` and `ren` are the
+    # everyday ones and none of them was here. Case-insensitive, inline, so
+    # the POSIX alternations above stay case-sensitive, where `RM` is not
+    # `rm`. Found while checking the Windows command quoting.
+    r"(^|[\s;&|('\"])(?i:del|erase|move|copy|xcopy|robocopy|ren|rename|rd|md|"
+    r"mklink|attrib|icacls|takeown|fsutil)(\s|$)",
+    # PowerShell, whose cmdlets are the same verbs spelled differently.
+    r"(^|[\s;&|('\"])(?i:Remove-Item|Set-Content|Add-Content|Clear-Content|New-Item|"
+    r"Copy-Item|Move-Item|Rename-Item|Out-File|Set-ItemProperty|New-ItemProperty|"
+    r"Remove-ItemProperty|Set-Acl|Start-Process)(\s|$)",
 ))
 #: Formatters that write unless asked only to report.
 _FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")

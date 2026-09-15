@@ -66,11 +66,19 @@ Not covered, stated plainly:
   subcommand says whether trust has been recorded.
 * Shell commands that write in a way the text heuristic does not recognise.
   The heuristic (redirection, `tee`, `sed -i`, `rm`/`mv`/`cp`/`touch`/...,
-  writing `git` subcommands including a `git tag` that creates or deletes,
-  package installs, inline interpreters, here-documents, archive creation
-  and extraction, `find -delete`/`-exec rm`, formatters that are not run in
-  their report-only mode) catches the ordinary ways a shell
-  writes and can be evaded by an agent that means to. Reads, `--check` and
+  writing `git` subcommands including `init`, `clone`, `submodule` and a
+  `git tag` that creates or deletes, package installs, inline interpreters,
+  here-documents, archive creation and extraction, `find -delete`/`-exec
+  rm`, formatters that are not run in their report-only mode, and on
+  Windows the `cmd.exe` built-ins `del`/`move`/`ren`/`rd` and their kin plus
+  the PowerShell `Remove-Item`/`Set-Content`/`Out-File` family) catches the
+  ordinary ways a shell writes and can be evaded by an agent that means to.
+
+  The Windows half of that list was missing until a check of the Windows
+  command quoting turned it up, which is worth knowing when judging how much
+  weight this part carries: it is one platform's conventions written into a
+  cross-platform component, and it is the reason we describe this as a
+  heuristic rather than a boundary. Reads, `--check` and
   `--diff` runs, `git tag --list` and `ruff check` pass as reads. The
   editing tools are the deterministic part. The protected-path rule for
   shell commands has the same limit: a write that reaches a protected file

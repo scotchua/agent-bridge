@@ -809,6 +809,43 @@ class TheWindowsHookCommandQuoting(unittest.TestCase):
         self.assertEqual(self.quoted(r"C:\Users\a\x.cmd", "nt"),
                          r"C:\Users\a\x.cmd")
 
+    def test_a_cmd_builtin_write_is_recognised(self):
+        r"""The heuristic listed only POSIX verbs, so `del` read as a read.
+
+        Found while checking the Windows quoting, and the same class of
+        oversight: one platform's conventions written into a cross-platform
+        component. Still a heuristic, and still not a security boundary.
+        """
+        for command in (r"cmd /c del C:\Users\First Last\app.py",
+                        "DEL app.py", "move a b", "ren a b", "rd /s /q build",
+                        "attrib +r app.py"):
+            self.assertTrue(gate.shell_writes(command), command)
+
+    def test_a_powershell_write_cmdlet_is_recognised(self):
+        for command in (r"Remove-Item .\app.py", r"remove-item .\app.py",
+                        "Set-Content app.py 'x'", "Out-File -FilePath app.py"):
+            self.assertTrue(gate.shell_writes(command), command)
+
+    def test_windows_reads_are_still_reads(self):
+        """A deny fails closed, but a heuristic that denies everything is no
+        heuristic, so the ordinary read commands must stay reads."""
+        for command in ("dir", "type app.py", "Get-Content app.py",
+                        "Get-ChildItem", "where python", "findstr x app.py"):
+            self.assertFalse(gate.shell_writes(command), command)
+
+    def test_flattening_an_argv_for_the_heuristic_is_a_different_direction(self):
+        r"""``shlex.join`` elsewhere in this module is not the same defect.
+
+        It flattens a tool call's argv list into text so the write heuristic
+        can read it, rather than building a command for a shell to run, and
+        the quoting it adds only makes the patterns easier to match. Checked
+        with a Windows-shaped argv, including a path with a space.
+        """
+        argv = ["cmd", "/c", r"del C:\Users\First Last\app.py"]
+        self.assertTrue(gate.shell_writes(gate._command_text({"command": argv})))
+        self.assertTrue(gate.shell_writes(gate._command_text(
+            {"command": ["sh", "-c", r"rm -f 'C:\Users\First Last\app.py'"]})))
+
     def test_the_command_builder_uses_it_for_both_paths(self):
         """Neither the launcher nor the config path may be POSIX-quoted."""
         import inspect
