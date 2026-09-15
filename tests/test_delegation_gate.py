@@ -196,10 +196,11 @@ class ClassificationTests(GateCase):
         for command in reads:
             self.assertEqual(gate.classify("claude", "Bash", {"command": command}, "/w"),
                              ("shell_read", []), command)
-        self.assertEqual(gate.classify("codex", "local_shell", {"command": ["git", "commit", "-m", "x"]}, "/w"),
-                         ("shell", ["/w"]))
+        kind, paths = gate.classify("codex", "local_shell", {"command": ["git", "commit", "-m", "x"]}, "/w")
+        self.assertEqual((kind, paths[0]), ("shell", "/w"))
         # Codex names its shell tool Bash in hook input, and its patch text may travel in "command".
-        self.assertEqual(gate.classify("codex", "Bash", {"command": "git commit -m x"}, "/w"), ("shell", ["/w"]))
+        kind, paths = gate.classify("codex", "Bash", {"command": "git commit -m x"}, "/w")
+        self.assertEqual((kind, paths[0]), ("shell", "/w"))
         self.assertIn("Bash", gate.MATCHERS["codex"])
         kind, paths = gate.classify("codex", "apply_patch",
                                     {"command": "*** Begin Patch\n*** Update File: a.py\n*** End Patch"}, "/w")
@@ -251,6 +252,18 @@ class JudgmentTests(GateCase):
             self.assertIn(os.path.realpath(self.other), decision.repos)
         inside = self.judge("claude", "Bash", {"command": f"git -C {self.repo} commit -m x"})
         self.assertEqual(inside.code, "routing_receipt_valid")
+        # A quoted path with spaces is one path, not a nested command to be split.
+        spaced = self.base / "private repo"
+        (spaced / ".git").mkdir(parents=True)
+        for command in (f"git -C '{spaced}' commit -m x", f'cp a.txt "{spaced}/b.txt"',
+                        ["git", "-C", str(spaced), "commit", "-m", "x"]):
+            decision = self.judge("claude", "Bash", {"command": command})
+            self.assertEqual(decision.code, "no_routing_receipt", (command, decision))
+            self.assertIn(os.path.realpath(spaced), decision.repos)
+        # A relative operand resolves against the working directory.
+        relative = self.judge("claude", "Bash", {"command": "git -C other commit -m x"}, cwd=str(self.base))
+        self.assertEqual(relative.code, "no_routing_receipt")
+        self.assertIn(os.path.realpath(self.other), relative.repos)
         codex = gate.judge("codex", "Bash", {"command": f"git -C {self.other} push"}, str(self.repo),
                            state_root=str(self.state), clock=self.clock)
         self.assertEqual(codex.code, "no_routing_receipt")
@@ -289,6 +302,7 @@ class JudgmentTests(GateCase):
                  # The directory above the database, moved or replaced wholesale.
                  ("claude", "Bash", {"command": f"mv {self.base / 'elsewhere'} {self.base / 'gone'}"}),
                  ("claude", "Bash", {"command": f"rm -rf {self.base / 'elsewhere'}"}),
+                 ("claude", "Bash", {"command": f"cd {self.base} && rm -rf elsewhere"}),
                  ("claude", "Bash", {"command": f"cp -r {self.base / 'mine'} {self.base}/"}),
                  ("codex", "local_shell", {"command": ["rsync", "-a", "--delete", "mine/", str(self.base) + "/"]}),
                  ("codex", "apply_patch", {"input": f"*** Begin Patch\n*** Add File: {hooks}\n+x\n*** End Patch"}),
@@ -485,6 +499,13 @@ class HookProcessTests(GateCase):
         usage = subprocess.run([sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "install"],
                                capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
         self.assertEqual(usage.returncode, 2)         # a person at the terminal still sees usage
+
+    def test_input_without_a_tool_name_is_a_logged_deny(self):
+        completed = self.run_hook("claude", {"cwd": str(self.repo)})
+        out = json.loads(completed.stdout)
+        self.assertIn("[hook_input_invalid]", out["hookSpecificOutput"]["permissionDecisionReason"])
+        events = (self.state / "routing" / "gate-events.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(events[-1])["code"], "hook_input_invalid")
 
     def test_an_internal_failure_is_logged_when_the_state_root_is_known(self):
         config = self.write_config()

@@ -101,7 +101,7 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+\S+|--[\w-]+(=\S+)?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+('[^']*'|\"[^\"]*\"|\S+)|--[\w-]+(=\S+)?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
@@ -325,23 +325,39 @@ def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
     return through_ancestors and _under(root, os.path.realpath(path))
 
 
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
+_SHELL_COMMAND_FLAGS = re.compile(r"^-[a-zA-Z]*c[a-zA-Z]*$")
+
+
 def _command_paths(command: str, cwd: str) -> list[str]:
-    """Path-looking words of a shell command, resolved against ``cwd``.
-    Quoting is undone where the shell would; ``>out``, ``--flag=path`` and
-    ``a:b`` forms give up their path part. Words that name no path are
-    dropped, so this is a best-effort reading, used to refuse writes aimed at
-    protected locations (a miss there is an allow the receipt still judges)."""
+    """Every operand of a shell command, resolved against ``cwd``: absolute
+    and relative paths alike (a bare ``build`` is ``cwd/build``), the value
+    of ``--flag=path``, the parts of ``a:b``, and the target of ``>out``.
+    Quoting is undone where the shell would, so a quoted path with spaces
+    stays one path; only the string handed to ``sh -c`` (or another shell's
+    ``-c``) is read as a nested command. Words that are flags or shell
+    operators are dropped. Command names resolve under ``cwd`` too, which
+    changes nothing for the repository they are in. A best-effort reading,
+    used to bind a write to the repositories it names and to refuse writes
+    aimed at protected locations."""
     try:
         words = shlex.split(command, posix=os.name != "nt")
     except ValueError:
         words = command.split()
     found: list[str] = []
+    previous: list[str] = []
     for word in words:
+        raw = word
         word = word.strip("'\"")
-        if any(ch.isspace() for ch in word.strip()):
-            found.extend(_command_paths(word, cwd))       # ``sh -c '...'`` carries a command
+        nested = (len(previous) >= 2 and _SHELL_COMMAND_FLAGS.match(previous[-1])
+                  and os.path.basename(previous[-2]) in _SHELLS)
+        previous.append(raw)
+        if nested:
+            found.extend(_command_paths(word, cwd))
             continue
         word = word.lstrip("<>&|;")
+        if not word or word.startswith("-") or word in ("&&", "||", "|", ";", "&", ">", ">>", "<"):
+            continue
         candidates = [word]
         if "=" in word:
             candidates.append(word.split("=", 1)[1])
@@ -349,7 +365,7 @@ def _command_paths(command: str, cwd: str) -> list[str]:
             candidates.extend(word.split(":"))
         for part in candidates:
             part = part.strip("'\"")
-            if not part or ("/" not in part and "\\" not in part and not part.startswith("~")):
+            if not part:
                 continue
             expanded = os.path.expanduser(part)
             found.append(expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded))
@@ -578,11 +594,13 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
              protected: tuple[str, ...] = ()) -> Decision:
     tool_name = payload.get("tool_name")
-    if not isinstance(tool_name, str):
-        return Decision("deny", "hook_input_invalid", "delegation-first gate: hook input has no tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
-    decision = judge(client, tool_name, payload.get("tool_input"), cwd,
-                     state_root=state_root, clock=clock, protected=protected, capacity_db=capacity_db)
+    if not isinstance(tool_name, str):
+        tool_name = "unknown"
+        decision = Decision("deny", "hook_input_invalid", "delegation-first gate: hook input has no tool_name")
+    else:
+        decision = judge(client, tool_name, payload.get("tool_input"), cwd,
+                         state_root=state_root, clock=clock, protected=protected, capacity_db=capacity_db)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
