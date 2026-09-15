@@ -13,7 +13,9 @@ is what an offline test checks against a fixed, synthetic result document.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,22 @@ def _verification_queue_root() -> Path:
     """
 
     return Path(tempfile.mkdtemp(prefix="agent-bridge-verify-queue-"))
+
+
+def _remove_tree(path: Path, *, ignore_errors: bool = False) -> bool:
+    """Remove one verifier-owned tree, including read-only Git files on Windows."""
+
+    def make_writable_and_retry(function: Any, blocked_path: str,
+                                _error: Any) -> None:
+        os.chmod(blocked_path, stat.S_IWRITE)
+        function(blocked_path)
+
+    try:
+        shutil.rmtree(path, onerror=make_writable_and_retry)
+    except OSError:
+        if not ignore_errors:
+            raise
+    return not path.exists()
 
 
 def select_executor(cfg: Any, *, platform_name: str | None = None) -> tuple[Any, str]:
@@ -154,17 +172,13 @@ def _run_direction(executor: Any, _unused_queue_root: Any,
             queue.run_once(f"delegation-verify-{caller}")
         receipt = queue.result(job_id)
     except ExecutionAdmissionError as exc:
-        shutil.rmtree(repo, ignore_errors=True)
-        shutil.rmtree(queue_root, ignore_errors=True)
+        _remove_tree(repo, ignore_errors=True)
+        _remove_tree(queue_root, ignore_errors=True)
         return _empty_row(str(exc) or type(exc).__name__)
     finally:
         # The receipt is already read; the queue was only ever scaffolding.
-        shutil.rmtree(queue_root, ignore_errors=True)
-    removed = True
-    try:
-        shutil.rmtree(repo)
-    except OSError:
-        removed = False
+        _remove_tree(queue_root, ignore_errors=True)
+    removed = _remove_tree(repo, ignore_errors=True)
     harness = receipt.get("harness") or {}
     return {
         "attempted": True, "reason": None, "state": receipt.get("state"),

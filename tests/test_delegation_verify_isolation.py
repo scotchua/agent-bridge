@@ -113,7 +113,8 @@ class VerificationQueueIsolationTests(unittest.TestCase):
         second = dv._verification_queue_root()
         try:
             self.assertNotEqual(first, second)
-            self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            if os.name != "nt":
+                self.assertEqual(first.stat().st_mode & 0o777, 0o700)
         finally:
             for path in (first, second):
                 path.rmdir()

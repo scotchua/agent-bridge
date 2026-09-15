@@ -932,7 +932,8 @@ class WindowsSetupLadderWiringTests(unittest.TestCase):
 
     def test_the_plan_offers_no_windows_activation_on_a_mac(self):
         with mock.patch.object(onboard, "_windows_preflight_summary", return_value=None), \
-             mock.patch.object(onboard, "_windows_setup_summary", return_value=None):
+             mock.patch.object(onboard, "_windows_setup_summary", return_value=None), \
+             mock.patch.object(sys, "platform", "darwin"):
             choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
             plan_report = onboard.plan(choices, str(ROOT))["automatic_delegation"]
         self.assertIsNone(plan_report["windows_activation"])
