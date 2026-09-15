@@ -277,6 +277,8 @@ class RealRunnerTests(unittest.TestCase):
                          wv.FAIL)
         self.assertEqual(wv.platform_runner(platform_name="Windows")().status,
                          wv.PASS)
+        self.assertEqual(wv.platform_runner(platform_name="win32")().status,
+                         wv.PASS)
 
     def test_a_supported_build_passes_and_reports_the_number(self):
         runner = wv.windows_build_runner(

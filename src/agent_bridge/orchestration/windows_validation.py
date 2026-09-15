@@ -428,7 +428,10 @@ def platform_runner(*, platform_name: str | None = None
     name = platform_name if platform_name is not None else platform_module.system()
 
     def check() -> Observation:
-        if name.lower() != "windows":
+        # ``default_runners`` normally receives ``platform.system()``'s
+        # ``Windows``, while the provisioning context carries
+        # ``sys.platform``'s ``win32``.  Both identify the same native host.
+        if name.lower() not in {"windows", "win32"}:
             return Observation(FAIL, "not_a_windows_host")
         return Observation(PASS, "native_windows")
 
