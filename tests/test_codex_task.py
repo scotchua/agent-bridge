@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 
+CODEX_TASK = Path(__file__).resolve().parent.parent / "src" / "agent_bridge" / "execution" / "codex_task.py"
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import codex_task as module
@@ -158,6 +160,18 @@ class CodexTaskTests(unittest.TestCase):
         for commands in ([["sh", "-c", "touch escaped"]], [["python3", "-c", "print(1)"]]):
             with self.subTest(commands=commands), self.assertRaises(TaskError):
                 self.run_default(verify_argv=commands)
+
+    def test_main_reports_the_refusal_text_not_just_the_class(self):
+        completed = subprocess.run(
+            [sys.executable, str(CODEX_TASK), str(self.brief), "--repo", str(self.repo),
+             "--codex-bin", str(self.fake), "--codex-home", str(self.codex_home),
+             "--classification", "synthetic", "--tasks-dir", str(self.root / "tasks"),
+             "--verify-json", json.dumps(["sh", "-c", "touch escaped"])],
+            capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        failure = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(failure, {"ok": False, "error": "TaskError",
+                                   "error_detail": "verification executable is not allowlisted"})
 
     def test_refuses_api_key_auth(self):
         self._write_fake(login="apikey")

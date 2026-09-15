@@ -55,15 +55,17 @@ from pathlib import Path
 try:
     from .. import runner, preflight, store
     from ..errors import BrokerError
+    from . import verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store
     from agent_bridge.errors import BrokerError
+    from agent_bridge.execution import verify_policy
 
 class TaskError(RuntimeError): pass
 
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
-ALLOWED_VERIFY_PROGRAMS={"git","pytest","python","python3","npm","pnpm","yarn","cargo","go"}
+ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
@@ -232,14 +234,8 @@ def _atomic_json(path:Path,value:dict):
 
 def _verify_argv(commands:list[list[str]]):
     if not commands: return []
-    for c in commands:
-        if not isinstance(c,list) or not c or not all(isinstance(x,str) and x for x in c): raise TaskError("verification must be JSON argv arrays")
-        p=Path(c[0]).name
-        if c[0]!=p or p not in ALLOWED_VERIFY_PROGRAMS: raise TaskError("verification executable is not allowlisted")
-        if p in {"python","python3"} and c[1:3]!=["-m","pytest"]: raise TaskError("Python verification is limited to python -m pytest")
-        if p=="git" and (len(c)<2 or c[1] not in {"diff","status"}): raise TaskError("git verification is read-only")
-        if any(any(x in a for x in ("\0","\n","\r")) for a in c): raise TaskError("control character in verification argv")
-    return [c[:] for c in commands]
+    try: return verify_policy.check_verify_argv(commands)
+    except verify_policy.VerifyPolicyError as exc: raise TaskError(str(exc)) from None
 
 def _auth(codex_bin:Path,codex_home:Path,env):
     e={**env,"CODEX_HOME":str(codex_home)}
@@ -483,7 +479,13 @@ def main(argv=None):
     a=p.parse_args(argv)
     try:
         checks=[json.loads(x) for x in a.verify_json]; del a.verify_json; result=run_task(**vars(a),verify_argv=checks)
-    except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc: print(json.dumps({"ok":False,"error":type(exc).__name__})); return 1
+    except (OSError,ValueError,TaskError,subprocess.SubprocessError) as exc:
+        # Same contract as claude_task: the class name alone told an operator
+        # nothing (queue jobs failed for a day as a bare "TaskError"). TaskError
+        # text is fixed, operator-safe diagnostics defined by this harness.
+        failure={"ok":False,"error":type(exc).__name__}
+        if isinstance(exc,TaskError): failure["error_detail"]=str(exc)
+        print(json.dumps(failure,sort_keys=True)); return 1
     # A completed process is not a successful task. run_task returns normally
     # when the generated patch applied cleanly but the verification commands
     # failed, and reporting ok:true with exit 0 for that told every caller,
