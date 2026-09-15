@@ -98,8 +98,8 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(?<![<>])>{1,2}(?!&)",                 # redirection into a file
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
-    r"(^|[\s;&|('\"])(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
+    r"(^|[\s;&|('\"])(rm|mv|cp|rsync|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+\S+|--[\w-]+(=\S+)?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
@@ -304,6 +304,22 @@ def _under(path: str, root: str) -> bool:
     return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
 
 
+#: Commands that act on a directory as a whole, so naming an ancestor of a
+#: protected path reaches the protected path.
+_TREE_VERBS = re.compile(
+    r"(^|[\s;&|('\"])(rm|mv|cp|rsync|rmdir|shred|ln|chmod|chown|dd|truncate|tar|unzip|zip|"
+    r"git\s+clean|git\s+worktree|find)(\s|$)")
+
+
+def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
+    """Whether a write at ``path`` touches ``root``: the path is the root or
+    below it, or (for commands that act on whole trees) the path is a
+    directory above the root."""
+    if _under(path, root):
+        return True
+    return through_ancestors and _under(root, os.path.realpath(path))
+
+
 def _command_paths(command: str, cwd: str) -> list[str]:
     """Path-looking words of a shell command, resolved against ``cwd``.
     Quoting is undone where the shell would; ``>out``, ``--flag=path`` and
@@ -455,8 +471,11 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     if kind == "edit":
         hit = [path for path in paths if any(_under(path, root) for root in protected)]
     else:
-        named = _command_paths(_command_text(tool_input), cwd)
-        hit = [root for root in protected if any(_under(path, root) for path in named)]
+        command = _command_text(tool_input)
+        named = _command_paths(command, cwd)
+        whole_trees = bool(_TREE_VERBS.search(command))
+        hit = [root for root in protected
+               if any(_reaches(path, root, through_ancestors=whole_trees) for path in named)]
     if hit:
         return Decision("deny", "gate_state_protected",
                         "delegation-first gate: the target is the gate's own state or a hook file; "

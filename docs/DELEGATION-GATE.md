@@ -22,9 +22,11 @@ Covered, with the hook installed and trusted:
   the orchestration config, at the stage router's database (and its
   SQLite `-wal`, `-shm`, `-journal` sidecars), at `~/.claude/settings.json`,
   or at Codex's `hooks.json` or `config.toml` is denied
-  (`gate_state_protected`) in any repository or none. A client cannot
-  write itself a receipt, replace the database the live check trusts, or
-  unhook itself with a covered tool.
+  (`gate_state_protected`) in any repository or none. A command that acts
+  on a whole tree (`rm`, `mv`, `cp`, `rsync`, `tar`, and their kin) is also
+  refused when it names a directory above a protected path. A client
+  cannot write itself a receipt, replace the database the live check
+  trusts, or unhook itself with a covered tool.
 * Live ownership. On every allow the hook re-reads the stage router's
   database read-only and requires the receipt's stage to be owned, now, by
   the receipt's owner on the receipt's route with an unexpired lease

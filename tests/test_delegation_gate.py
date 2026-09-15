@@ -261,6 +261,11 @@ class JudgmentTests(GateCase):
                  ("claude", "Bash", {"command": f"echo '{{}}' > {forged}"}),
                  ("claude", "Bash", {"command": f"cp {self.base / 'mine.sqlite3'} {database}"}),
                  ("claude", "Write", {"file_path": database + "-wal"}),
+                 # The directory above the database, moved or replaced wholesale.
+                 ("claude", "Bash", {"command": f"mv {self.base / 'elsewhere'} {self.base / 'gone'}"}),
+                 ("claude", "Bash", {"command": f"rm -rf {self.base / 'elsewhere'}"}),
+                 ("claude", "Bash", {"command": f"cp -r {self.base / 'mine'} {self.base}/"}),
+                 ("codex", "local_shell", {"command": ["rsync", "-a", "--delete", "mine/", str(self.base) + "/"]}),
                  ("codex", "apply_patch", {"input": f"*** Begin Patch\n*** Add File: {hooks}\n+x\n*** End Patch"}),
                  ("codex", "local_shell", {"command": ["sh", "-c", f"rm -f {hooks}"]})]
         for client, tool, tool_input in cases:
@@ -272,6 +277,10 @@ class JudgmentTests(GateCase):
         reading = gate.judge("claude", "Bash", {"command": f"cat {forged}"}, str(self.repo),
                              state_root=str(self.state), clock=self.clock, protected=protected)
         self.assertTrue(reading.allowed)
+        # A write that only names an ancestor without acting on the tree is judged by receipt, not refused.
+        commit = gate.judge("claude", "Bash", {"command": f"git -C {self.base} commit -m x"}, str(self.repo),
+                            state_root=str(self.state), clock=self.clock, protected=protected)
+        self.assertEqual(commit.code, "routing_receipt_valid")
         normal = gate.judge("claude", "Edit", {"file_path": str(self.repo / "a")}, str(self.repo),
                             state_root=str(self.state), clock=self.clock, protected=protected)
         self.assertEqual(normal.code, "routing_receipt_valid")
