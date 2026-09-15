@@ -278,14 +278,23 @@ def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str 
     return None
 
 
-def protected_paths(state_root: str, config_path: str | None, home: str) -> tuple[str, ...]:
-    """The gate's own state and the files that install or disable the hook.
-    An editing tool aimed under any of these is refused whatever repository
-    they are in, so a client cannot write itself a receipt or unhook itself
-    with a covered tool."""
+#: SQLite keeps its journal beside the database; replacing one is replacing the store.
+_SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def protected_paths(state_root: str, config_path: str | None, home: str,
+                    capacity_db: str | None = None) -> tuple[str, ...]:
+    """The gate's own state, the stage router's database (with its SQLite
+    sidecars), and the files that install or disable the hook. An editing
+    tool aimed under any of these is refused whatever repository they are
+    in, so a client cannot write itself a receipt, replace the database the
+    live check trusts, or unhook itself with a covered tool."""
     paths = [state_root]
     if config_path:
         paths.append(config_path)
+    if capacity_db:
+        paths.append(capacity_db)
+        paths.extend(capacity_db + suffix for suffix in _SQLITE_SIDECARS)
     paths.extend(install_paths(home).values())
     return tuple(sorted({os.path.realpath(path) for path in paths}))
 
@@ -726,6 +735,18 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
     return updates, originals, paths
 
 
+def _entries_remaining(receipt_raw: bytes | None, removed: tuple[str, ...]) -> bool:
+    """Whether the installation receipt still records a client after ``removed`` leave it."""
+    if not receipt_raw:
+        return False
+    try:
+        loaded = json.loads(receipt_raw)
+    except ValueError:
+        return False
+    entries = loaded.get("entries") if isinstance(loaded, dict) else None
+    return isinstance(entries, dict) and any(client not in removed for client in entries)
+
+
 def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
             apply: bool, remove: bool = False) -> dict[str, Any]:
     from ..onboard import _commit_updates
@@ -734,7 +755,7 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
                               "remove": remove, "clients": list(clients)}
     if apply:
         report["backups"] = _commit_updates(updates, originals)
-        if remove and os.path.exists(paths["receipt"]) and paths["receipt"] not in updates:
+        if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
         report["applied"] = True
     report["codex_note"] = (
@@ -879,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
             state_root, capacity_db = args.state_root, os.path.join(args.state_root, "capacity.sqlite3")
         else:
             state_root, capacity_db = gate_paths_from_config(args.config or "")
-        protected = protected_paths(state_root, args.config, home)
+        protected = protected_paths(state_root, args.config, home, capacity_db)
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")

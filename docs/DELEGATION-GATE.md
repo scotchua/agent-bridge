@@ -19,10 +19,12 @@ Covered, with the hook installed and trusted:
   `shell_command`, `exec_command`) whose command looks like it writes.
 * The gate's own state and the hook files. An editing tool, or a shell
   command the heuristic reads as a write, aimed under the state root, at
-  the orchestration config, at `~/.claude/settings.json`, or at Codex's
-  `hooks.json` or `config.toml` is denied (`gate_state_protected`) in any
-  repository or none. A client cannot write itself a receipt or unhook
-  itself with a covered tool.
+  the orchestration config, at the stage router's database (and its
+  SQLite `-wal`, `-shm`, `-journal` sidecars), at `~/.claude/settings.json`,
+  or at Codex's `hooks.json` or `config.toml` is denied
+  (`gate_state_protected`) in any repository or none. A client cannot
+  write itself a receipt, replace the database the live check trusts, or
+  unhook itself with a covered tool.
 * Live ownership. On every allow the hook re-reads the stage router's
   database read-only and requires the receipt's stage to be owned, now, by
   the receipt's owner on the receipt's route with an unexpired lease

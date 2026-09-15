@@ -249,15 +249,18 @@ class JudgmentTests(GateCase):
     def test_the_gates_own_state_and_hook_files_are_protected_from_covered_tools(self):
         self.receipt()
         home = self.base / "home"
-        protected = gate.protected_paths(str(self.state), str(self.base / "cfg.json"), str(home))
+        database = str(self.base / "elsewhere" / "capacity.sqlite3")    # outside the state root
+        protected = gate.protected_paths(str(self.state), str(self.base / "cfg.json"), str(home), database)
         forged = gate.receipt_path(str(self.state), str(self.repo))
         settings = os.path.join(str(home), ".claude", "settings.json")
         hooks = os.path.join(str(home), ".codex", "hooks.json")
-        for root in (str(self.state), str(self.base / "cfg.json"), settings, hooks):
+        for root in (str(self.state), str(self.base / "cfg.json"), settings, hooks, database, database + "-wal"):
             self.assertIn(os.path.realpath(root), protected)
         cases = [("claude", "Write", {"file_path": forged}),
                  ("claude", "Edit", {"file_path": settings}),
                  ("claude", "Bash", {"command": f"echo '{{}}' > {forged}"}),
+                 ("claude", "Bash", {"command": f"cp {self.base / 'mine.sqlite3'} {database}"}),
+                 ("claude", "Write", {"file_path": database + "-wal"}),
                  ("codex", "apply_patch", {"input": f"*** Begin Patch\n*** Add File: {hooks}\n+x\n*** End Patch"}),
                  ("codex", "local_shell", {"command": ["sh", "-c", f"rm -f {hooks}"]})]
         for client, tool, tool_input in cases:
@@ -598,6 +601,13 @@ class InstallTests(GateCase):
         self.assertEqual(sorted(after), ["codex"])
         self.assertNotIn("hooks", json.loads(self.settings.read_text(encoding="utf-8")))
         self.assertIn(gate.HOOK_NAME, self.hooks.read_text(encoding="utf-8"))
+        # Removing the same client again changes nothing and keeps the other's record.
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            gate.install(str(self.home), str(ROOT), str(self.config), ("claude",), apply=True, remove=True)
+        self.assertEqual(sorted(json.loads(receipt_path.read_text(encoding="utf-8"))["entries"]), ["codex"])
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            gate.install(str(self.home), str(ROOT), str(self.config), ("codex",), apply=True, remove=True)
+        self.assertFalse(receipt_path.exists())
 
     def test_remove_takes_only_our_entries_and_the_flag_block(self):
         self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [
