@@ -24,6 +24,21 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
+    # bash everywhere, on purpose. GitHub's default shell on Windows is pwsh,
+    # and a native command that exits nonzero does not stop a pwsh step: only
+    # the LAST command's exit status is reported for a multi-line step, so
+    # every earlier failing test file in a step was silently passed over and
+    # the Windows matrix could go green with failures in it. bash -e stops at
+    # the first failure on every runner. Steps that need cmd or python say so.
+    #
+    # Known cost of bash on Windows, measured in run 34936853093: a process
+    # under Git bash inherits SeBackupPrivilege and SeRestorePrivilege ENABLED,
+    # which bypass the DACL for the operations the deny-ACE test fixtures
+    # restrict. The test harness removes both from its own token at import
+    # (tests/platform_support.py) so the tests run as an ordinary account.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -93,6 +108,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_localq_intake.py"
           python3 -m unittest discover -s tests -p "test_localq_server.py"
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
+          python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
 
       - name: Guided automatic-delegation opt-in
@@ -108,6 +124,11 @@ jobs:
       # point: a Windows-only test that only ever runs on one runner is a test
       # that stops being read.
       - name: Windows delegation components (portable)
+        # Host-side components run on every runner. The in-guest runner's
+        # own process behaviour (test_guest_runner's execution classes,
+        # test_capture_diff, test_auth_probe's lifecycle) executes only inside
+        # the Linux guest and skips itself, by name, on a Windows host; the
+        # validators and constants those files also cover still run there.
         run: |
           python3 -m unittest discover -s tests -p "test_windows_wsl.py"
           python3 -m unittest discover -s tests -p "test_windows_preflight.py"

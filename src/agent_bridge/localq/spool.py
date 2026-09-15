@@ -65,6 +65,27 @@ class QueueCaps:
     max_load_per_core: float = 0.75
 
 
+#: Longest failure text the ``error`` column records.
+FAILURE_TEXT_LIMIT = 200
+
+
+def _failure_text(exc: BaseException) -> str:
+    """``ClassName: reason`` for a backend failure, or the class name alone.
+
+    The subprocess backend raises RuntimeError with fixed text ("child
+    exited unsuccessfully", "child did not return a JSON object"); the
+    class name alone told an operator nothing (the same defect the
+    execution queue had). Only RuntimeError text is copied, because that
+    is the backend's own fixed diagnostics; any other exception's text may
+    quote the payload and stays out of the record.
+    """
+    name = type(exc).__name__
+    if not isinstance(exc, RuntimeError):
+        return name
+    detail = "".join(char for char in str(exc) if char.isprintable())[:FAILURE_TEXT_LIMIT]
+    return f"{name}: {detail}" if detail else name
+
+
 class FakeBackend:
     """Deterministic in-process executor for unit tests."""
 
@@ -75,6 +96,27 @@ class FakeBackend:
     def run(self, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
         self.calls.append(payload)
         return self.fn(payload)
+
+
+def _child_failure_suffix(output: str) -> str:
+    """``: <error>: <detail>`` when a failed child left its own fixed
+    diagnostics on stdout (``{"ok": false, "error": ..., "error_detail":
+    ...}``, the shape worker_child prints); empty otherwise. Printable
+    characters only, bounded, so a child cannot put a payload in the record."""
+    try:
+        value = json.loads(output or "")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(value, dict) or value.get("ok") is not False:
+        return ""
+    parts = []
+    for key in ("error", "error_detail"):
+        text = value.get(key)
+        if isinstance(text, str):
+            text = "".join(char for char in text if char.isprintable())[:FAILURE_TEXT_LIMIT]
+            if text:
+                parts.append(text)
+    return ": " + ": ".join(parts) if parts else ""
 
 
 class SubprocessBackend:
@@ -112,7 +154,7 @@ class SubprocessBackend:
             with self._lock:
                 self._processes.pop(job_id, None)
         if proc.returncode != 0:
-            raise RuntimeError("child exited unsuccessfully")
+            raise RuntimeError("child exited unsuccessfully" + _child_failure_suffix(output))
         try:
             value = json.loads(output)
         except (TypeError, ValueError) as exc:
@@ -415,7 +457,7 @@ class LocalQueue:
         except TimeoutError:
             outcome, error = "unknown", "execution_timeout"
         except Exception as exc:  # backend error was observed, so it is not indeterminate
-            outcome, error = "failed", type(exc).__name__
+            outcome, error = "failed", _failure_text(exc)
         now = self.clock()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")

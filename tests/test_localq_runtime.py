@@ -64,6 +64,26 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tool_args["classification"], "public")
             self.assertNotIn("API_KEY", " ".join(run.call_args.kwargs["env"]))
 
+    def test_worker_child_reports_its_own_fixed_reason_when_it_fails(self):
+        """The exit status alone told the queue nothing; the child now prints
+        the fixed diagnostic it raised, and only for the classes it raised."""
+        import subprocess
+        import sys
+        env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "state").mkdir()
+            argv = [sys.executable, "-P", "-m", "agent_bridge.localq.worker_child", "--worker", str(root / "absent.py"),
+                    "--state", str(root / "state"), "--queue-root", str(root)]
+            completed = subprocess.run(argv, input=b"not json", capture_output=True, env=env, timeout=60)
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(json.loads(completed.stdout),
+                             {"ok": False, "error": "ValueError", "error_detail": "payload is not JSON"})
+            completed = subprocess.run(argv, input=json.dumps({"job_id": "a1"}).encode(), capture_output=True, env=env, timeout=60)
+            self.assertEqual(json.loads(completed.stdout),
+                             {"ok": False, "error": "ValueError",
+                              "error_detail": "worker path must be an existing absolute regular file"})
+
     def test_worker_child_forwards_an_explicit_supported_provider(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

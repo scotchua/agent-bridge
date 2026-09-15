@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import windows_delegation as wd
+import platform_support
 
 GIT = shutil.which("git")
 
@@ -54,7 +55,9 @@ class BriefBindingTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.brief = self.root / "brief.txt"
-        self.brief.write_text("Do the thing.\n", encoding="utf-8")
+        # Bytes, not text: write_text would translate the newline on Windows
+        # and the assertion below compares the exact content read back.
+        self.brief.write_bytes(b"Do the thing.\n")
         self.digest = hashlib.sha256(self.brief.read_bytes()).hexdigest()
 
     def test_a_brief_matching_its_admitted_digest_is_read(self):
@@ -98,6 +101,7 @@ class BriefBindingTests(unittest.TestCase):
         self.assertNotIn("read_text(", body)
 
     def test_a_symlinked_brief_is_refused(self):
+        platform_support.require_symlinks(self)
         target = self.root / "outside.txt"
         target.write_text("Do the thing.\n", encoding="utf-8")
         link = self.root / "link.txt"

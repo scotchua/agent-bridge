@@ -72,6 +72,7 @@ class UnpackTestCase(unittest.TestCase):
         return caught.exception.code
 
 
+@unittest.skipIf(os.name == "nt", "in-guest extraction: grants the workspace with geteuid/chown")
 class HappyPathTests(UnpackTestCase):
     def test_an_ordinary_tree_extracts(self):
         self._unpack(_archive([("main.py", b"print('hi')\n"),
@@ -407,6 +408,7 @@ class CrossLayerBoundaryTests(unittest.TestCase):
             gr.MAX_WORKSPACE_BYTES * gr.MAX_WORKSPACE_EXPANSION_RATIO)
 
 
+@unittest.skipIf(os.name == "nt", "in-guest extraction: grants the workspace with geteuid/chown")
 class JustBelowAndAboveTests(UnpackTestCase):
     """Each bound checked from both sides, so none is off by one."""
 

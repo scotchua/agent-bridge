@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import execution_queue as eq
 from agent_bridge.orchestration import windows_privacy as wpv
+import platform_support
 
 
 class _NoAclPlatform:
@@ -91,6 +92,7 @@ class ReparseTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def test_a_link_in_the_path_is_refused(self):
+        platform_support.require_symlinks(self)
         real = self.root / "real"
         real.mkdir(mode=0o700)
         alias = self.root / "alias"
@@ -101,6 +103,7 @@ class ReparseTests(unittest.TestCase):
 
     def test_a_link_above_the_trusted_root_is_not_this_modules_business(self):
         """The operator's own machine layout is not something this polices."""
+        platform_support.require_symlinks(self)
         real = self.root / "real"
         real.mkdir(mode=0o700)
         alias = self.root / "alias"
@@ -151,6 +154,7 @@ class FileTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "file_not_regular")
 
     def test_a_symlink_is_refused_rather_than_followed(self):
+        platform_support.require_symlinks(self)
         real = self.root / "real.json"
         real.write_bytes(b"{}")
         os.chmod(real, 0o600)
@@ -328,8 +332,7 @@ class ReadPrivateFileTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.target = self.root / "record.json"
-        self.target.write_text('{"a": 1}', encoding="utf-8")
-        os.chmod(self.target, 0o600)
+        platform_support.write_private_bytes(self.target, b'{"a": 1}')
 
     def test_the_contents_come_back_with_an_identity(self):
         payload, identity = wpv.read_private_file(self.target, root=self.root)
@@ -369,6 +372,7 @@ class ReadPrivateFileTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "file_not_regular")
 
     def test_a_symlink_is_refused(self):
+        platform_support.require_symlinks(self)
         link = self.root / "alias"
         link.symlink_to(self.target)
         with self.assertRaises(wpv.PrivacyError):

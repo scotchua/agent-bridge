@@ -458,7 +458,25 @@ def _pack_directory(archive: tarfile.TarFile, boundary: _PackRoot,
         if not stat.S_ISREG(info.st_mode):
             counts["skipped"] += 1
             continue
-        _pack_file(archive, boundary, Path(entry.path), info, counts)
+        _pack_file(archive, boundary, Path(entry.path), _identity_of(entry, info),
+                   counts)
+
+
+def _identity_of(entry: os.DirEntry, info: os.stat_result) -> os.stat_result:
+    """The stat result whose (st_dev, st_ino) _pack_file compares against.
+
+    On Windows a scandir entry's stat carries st_ino == st_dev == 0: scandir
+    never opens the file, so it never learns its identity (documented). Since
+    _pack_file compares exactly those two fields against the descriptor it
+    opens, a zero identity never matched and every regular file was refused
+    as "workspace_file_changed". os.lstat opens a handle and reports the real
+    identity. The type and reparse decisions above still come from the entry
+    itself; only the identity is re-read, and only where the entry had none.
+    """
+
+    if (info.st_dev, info.st_ino) != (0, 0):
+        return info
+    return os.lstat(entry.path)
 
 
 def _pack_file(archive: tarfile.TarFile, boundary: _PackRoot, path: Path,
@@ -531,6 +549,20 @@ def read_brief(path: str | os.PathLike[str], *,
     preview, fails loudly at the call site rather than silently here.
     """
 
+    # Examine the name before opening it. O_NOFOLLOW does the refusing on
+    # POSIX; Windows has no O_NOFOLLOW, follows a symlink on open, and reports
+    # an opened directory as PermissionError rather than IsADirectoryError.
+    # So the type check happens on the link itself, by lstat, and the object
+    # the open then produces is required to be that same object.
+    try:
+        examined = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise DelegationRefused("brief_invalid", "not_a_regular_file") from exc
+    except OSError as exc:
+        raise DelegationRefused("brief_unreadable", type(exc).__name__) from exc
+    if not stat.S_ISREG(examined.st_mode) or _reparse_tag(examined):
+        raise DelegationRefused("brief_invalid", "not_a_regular_file")
+
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags)
@@ -547,6 +579,10 @@ def read_brief(path: str | os.PathLike[str], *,
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
+            raise DelegationRefused("brief_invalid", "not_a_regular_file")
+        if (info.st_dev, info.st_ino) != (examined.st_dev, examined.st_ino):
+            # The name was examined as one object and opened as another: a
+            # link that was followed, or a swap between the two calls.
             raise DelegationRefused("brief_invalid", "not_a_regular_file")
         if info.st_size > guest_runner.MAX_BRIEF_BYTES:
             raise DelegationRefused("brief_too_large")
@@ -905,15 +941,58 @@ def write_job_outputs(job_dir: Any, guest: Mapping[str, Any] | None) -> dict[str
         if not payload:
             continue
         target = Path(job_dir) / name
-        target.write_bytes(payload)
-        try:
-            os.chmod(target, 0o600)
-        except OSError:
-            # A platform without POSIX modes still gets the file; the queue
-            # root's own ACL is what protects it there.
-            pass
+        _write_owner_only(target, payload)
         written[name] = str(target)
     return written
+
+
+def _write_owner_only(target: Path, payload: bytes) -> None:
+    """Create the result file owner-only before a byte of the result lands.
+
+    Through the platform layer on every system: fchmod on POSIX, the
+    owner-only ACL applied and read back on Windows. The previous chmod was a
+    no-op there, so a delegated result inherited whatever the job directory
+    granted. Fail closed: a result that cannot be protected is not written,
+    and the refusal names the file rather than the exception class.
+    """
+
+    from ..platform import platform as host_platform
+
+    # A result left by an interrupted earlier attempt is replaced, but only if
+    # it is a plain file: with no O_NOFOLLOW on Windows, a link planted at the
+    # result's name would otherwise be followed and truncated.
+    try:
+        existing = os.lstat(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise DelegationRefused("result_unwritable", type(exc).__name__) from exc
+    else:
+        if not stat.S_ISREG(existing.st_mode) or _reparse_tag(existing):
+            raise DelegationRefused("result_unwritable", "not_a_regular_file")
+        try:
+            os.unlink(target)
+        except OSError as exc:
+            raise DelegationRefused("result_unwritable", type(exc).__name__) from exc
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except OSError as exc:
+        raise DelegationRefused("result_unwritable", type(exc).__name__) from exc
+    try:
+        try:
+            host_platform.enforce_owner_only_file(descriptor)
+        except (OSError, PermissionError) as exc:
+            raise DelegationRefused("result_not_owner_only", target.name) from exc
+        with open(descriptor, "wb", closefd=False) as handle:
+            handle.write(payload)
+    except BaseException:
+        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        raise
+    os.close(descriptor)
 
 
 def build_outcome(result: wr.RuntimeResult,
@@ -1220,7 +1299,15 @@ class WindowsWslExecutor:
                                harness_verdict="guest_response_rejected",
                                base_sha=base_sha)
                 return outcome
-        outcome = build_outcome(result, guest, job_dir=job_dir)
+        try:
+            outcome = build_outcome(result, guest, job_dir=job_dir)
+        except DelegationRefused as exc:
+            # The result could not be stored owner-only. The job is not
+            # complete: an answer nobody may read is not a delivered answer.
+            outcome = build_outcome(result, None)
+            outcome.update(returncode=1, status=wr.STATUS_ABORTED,
+                           reason=exc.reason, detail=exc.detail,
+                           harness_verdict="result_not_stored")
         # The commit the patch is relative to, on the receipt. Without it the
         # patch names files and nothing names the tree they came from.
         outcome["base_sha"] = base_sha

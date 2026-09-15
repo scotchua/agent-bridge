@@ -1,0 +1,11 @@
+#!/bin/sh
+# PreToolUse hook for Claude Code and the Codex CLI: allow an implementation
+# write only while a routing receipt says this client's route owns the stage.
+# Also `install` and `report` subcommands. See docs/DELEGATION-GATE.md.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+PY=${AGENT_BRIDGE_PYTHON:-python3}
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$PY" -P -m agent_bridge.orchestration.gate "$@"

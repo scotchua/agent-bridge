@@ -464,6 +464,17 @@ register the worker as a per-user logon task in your own Task Scheduler
 namespace, with no administrator rights and no other account, and you can remove
 it yourself; that path has not been exercised on a live Windows host.
 
+## Delegation-first gate (optional, after automatic delegation)
+
+With automatic delegation on, a PreToolUse hook can make the routing decision
+mandatory: Claude Code and the Codex CLI refuse to edit a repository until a
+stage for it is claimed and `routing_decide` has written a receipt, and the
+client whose route does not own the stage is told to dispatch instead.
+Install with `./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply`,
+then accept the hook once in Codex's `/hooks`. What it covers and what it
+cannot (desktop and web chats have no hook surface) is in
+[docs/DELEGATION-GATE.md](docs/DELEGATION-GATE.md).
+
 ## Day to day
 
 ```

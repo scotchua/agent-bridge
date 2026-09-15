@@ -22,29 +22,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge.orchestration import guest_runner as gr
 from agent_bridge.orchestration import windows_auth as wa
 from agent_bridge.orchestration import windows_delegation as wd
+import platform_support
 
 TOKEN = "sk-ant-oat01-" + "z" * 40
 CODEX_TOKEN = "codex-access-" + "y" * 40
 
-class _WindowsLike:
-    """A platform layer that enforces owner-only the way the real one claims to.
-
-    Not a permissive stub: ``verify_owner_only_path`` reads the mode actually
-    on the file, so a test that loosens permissions genuinely fails the check
-    rather than passing through a fake that always says yes.
-    """
-
-    name = "nt"
-
-    def enforce_owner_only_file(self, descriptor: int) -> None:
-        os.fchmod(descriptor, 0o600)
-
-    def verify_owner_only_path(self, directory, probe_file):
-        info = os.stat(probe_file)
-        return (info.st_mode & 0o077) == 0, "mode"
-
-
-NT = _WindowsLike()
+#: The real platform on Windows; the mode-bit stand-in on POSIX. Either way
+#: a test that loosens permissions genuinely fails the check.
+NT = platform_support.owner_only_platform()
 
 
 class _Protector:
@@ -119,8 +104,8 @@ class EnrolmentTests(AuthTestCase):
         self._enrol()
         for path in (wa.secret_path(self.root, "claude"),
                      wa.record_path(self.root, "claude")):
-            self.assertEqual(path.stat().st_mode & 0o077, 0, path.name)
-        self.assertEqual(wa.auth_root(self.root).stat().st_mode & 0o077, 0)
+            platform_support.assert_owner_only(self, path, 0o600, path.name)
+        platform_support.assert_owner_only(self, wa.auth_root(self.root), 0o700)
 
     def test_enrolment_without_consent_is_refused(self):
         with self.assertRaises(wa.AuthError) as caught:
@@ -219,14 +204,14 @@ class HandoffTests(AuthTestCase):
 
     def test_a_world_readable_secret_is_refused_rather_than_used(self):
         self._enrol()
-        os.chmod(wa.secret_path(self.root, "claude"), 0o644)
+        platform_support.make_permissive(wa.secret_path(self.root, "claude"))
         with self.assertRaises(wa.AuthError) as caught:
             wa.load_capsule(self.root, "claude", protector=self.box, platform=NT)
         self.assertEqual(caught.exception.reason, "secret_file_not_owner_only")
 
     def test_a_world_readable_record_is_refused(self):
         self._enrol()
-        os.chmod(wa.record_path(self.root, "claude"), 0o644)
+        platform_support.make_permissive(wa.record_path(self.root, "claude"))
         with self.assertRaises(wa.AuthError) as caught:
             wa.load_capsule(self.root, "claude", protector=self.box, platform=NT)
         self.assertEqual(caught.exception.reason, "enrolment_file_not_owner_only")
@@ -244,7 +229,7 @@ class HandoffTests(AuthTestCase):
 
     def test_no_error_message_anywhere_contains_the_token(self):
         self._enrol()
-        os.chmod(wa.secret_path(self.root, "claude"), 0o644)
+        platform_support.make_permissive(wa.secret_path(self.root, "claude"))
         for call in (lambda: wa.load_capsule(self.root, "claude",
                                              protector=self.box, platform=NT),
                      lambda: wa.load_capsule(self.root, "codex",
@@ -690,7 +675,7 @@ class EnrolmentLockingTests(AuthTestCase):
         """A secret that fails the privacy check is not quietly replaced."""
 
         self._enrol()
-        os.chmod(wa.secret_path(self.root, "claude"), 0o644)
+        platform_support.make_permissive(wa.secret_path(self.root, "claude"))
         with self.assertRaises(wa.AuthError) as caught:
             self._enrol(token="sk-ant-oat01-" + "r" * 40)
         self.assertEqual(caught.exception.reason, "enrolment_unreadable")

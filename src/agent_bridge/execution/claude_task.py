@@ -5,17 +5,17 @@ import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tem
 from pathlib import Path
 try:
     from .. import runner
-    from . import claude_config
+    from . import claude_config, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
-    from agent_bridge.execution import claude_config
+    from agent_bridge.execution import claude_config, verify_policy
 
 class TaskError(RuntimeError): pass
 
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_SUBSCRIPTIONS={"pro","max","team","enterprise","business"}
-ALLOWED_VERIFY_PROGRAMS={"git","pytest","python","python3","npm","pnpm","yarn","cargo","go"}
+ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
@@ -199,14 +199,8 @@ def _json(raw:bytes,label:str):
 
 def _verify_argv(commands:list[list[str]]):
     if not commands: raise TaskError("at least one structured verification command is required")
-    for c in commands:
-        if not isinstance(c,list) or not c or not all(isinstance(x,str) and x for x in c): raise TaskError("verification must be JSON argv arrays")
-        p=Path(c[0]).name
-        if c[0]!=p or p not in ALLOWED_VERIFY_PROGRAMS: raise TaskError("verification executable is not allowlisted")
-        if p in {"python","python3"} and c[1:3]!=["-m","pytest"]: raise TaskError("Python verification is limited to python -m pytest")
-        if p=="git" and (len(c)<2 or c[1] not in {"diff","status"}): raise TaskError("git verification is read-only")
-        if any(any(x in a for x in ("\0","\n","\r")) for a in c): raise TaskError("control character in verification argv")
-    return [c[:] for c in commands]
+    try: return verify_policy.check_verify_argv(commands)
+    except verify_policy.VerifyPolicyError as exc: raise TaskError(str(exc)) from None
 
 def _auth(claude:Path,env):
     r=_run([str(claude),"--safe-mode","--setting-sources","","auth","status","--json"],cwd=claude.parent,env=env,timeout=30)

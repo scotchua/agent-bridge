@@ -268,6 +268,7 @@ class _FakeCapsule:
         self.prepared = True
 
 
+@unittest.skipIf(os.name == "nt", "in-guest probe lifecycle: drops privilege with geteuid")
 class ProbeLifecycleTests(unittest.TestCase):
     """``_execute_auth_probe`` end to end, not its helpers in isolation.
 

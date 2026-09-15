@@ -106,6 +106,38 @@ anything outside this repository. `agent_bridge.orchestration.delegation.harness
 reports the bundled files present; it still cannot and does not report a live
 pass, since that needs this machine's own signed-in CLIs.
 
+Verification commands are checked once, at admission, against the policy
+both harnesses enforce (`src/agent_bridge/execution/verify_policy.py`): a
+fixed set of programs named without a path (`git`, `pytest`, `python`,
+`python3`, `npm`, `pnpm`, `yarn`, `cargo`, `go`), Python limited to
+`-m pytest` or `-m unittest`, git limited to `diff` and `status`, and no
+NUL, carriage return or line feed in any argument (other characters are
+passed through as the harness receives them). A command outside that policy is refused by
+`execution_dispatch` as `verify_argv_rejected: <reason>` before a job exists;
+the same command reaching a harness is refused with the same words. The
+Claude lane requires at least one command (`claude_verification_required`);
+the Codex lane permits none.
+
+Receipts carry the reason for a failure, not only its class. A harness that
+refuses a job prints `{"ok": false, "error": "<class>", "error_detail":
+"<fixed text>"}`, and the queue copies both fields into `receipt.harness`
+(printable characters only, at most 512) with `harness_status: failed` and
+`harness_verdict: read_failure`. A failure before the harness runs (a brief
+that changed after admission, an unavailable executable, a missing Claude
+configuration directory) records `error` and `error_detail` at the top of the
+receipt. A receipt that says only `"error": "TaskError"` is a defect, not a
+diagnosis.
+
+`routing_decide` turns a proven stage binding into a durable routing receipt
+for one repository (`<state_root>/routing/<hash>.json`, mirrored to
+`routing/audit.jsonl`). It requires the same binding proof as
+`execution_dispatch`: the stage is owned, by the named `owner_id`, at the
+named `stage_revision`. The receipt is what the delegation-first gate reads:
+a PreToolUse hook in Claude Code and the Codex CLI that refuses editing tools
+and writing shell commands in a repository with no fresh receipt, or one whose
+`owner_route` is the other provider. Install, coverage, and the plainly stated
+surfaces it cannot intercept are in [DELEGATION-GATE.md](DELEGATION-GATE.md).
+
 The Codex harness's confinement is different from the Claude harness's, and
 this is stated plainly rather than glossed over: Claude's lane trusts a tool
 allowlist (`--tools Read,Grep,Glob,Edit,Write`, no shell) because Claude Code

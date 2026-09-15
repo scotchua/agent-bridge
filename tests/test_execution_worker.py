@@ -9,12 +9,12 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_bridge.platform import platform as host_platform
 from agent_bridge.orchestration import config as orchestration_config
 from agent_bridge.orchestration.execution_queue import (
     ExecutionAdmissionError, SubprocessHarnessExecutor)
 from agent_bridge.orchestration.execution_worker import (
     QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, run, select_executor)
+import platform_support
 
 
 class ExecutionWorkerTests(unittest.TestCase):
@@ -34,12 +34,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         for.
         """
 
-        if os.name != "nt":
-            self.assertEqual(path.stat().st_mode & 0o777, mode)
-            return
-        verified, evidence = host_platform.verify_owner_only_path(str(path),
-                                                                  str(path))
-        self.assertTrue(verified, evidence)
+        platform_support.assert_owner_only(self, path, mode)
 
     def test_queue_lock_is_exclusive_and_secure(self):
         queue = self.root / "queue"
@@ -72,6 +67,10 @@ class ExecutionWorkerTests(unittest.TestCase):
             "codex_task_executable": str(codex),
             "claude_task_executable": str(claude),
             "python_executable": str(executable),
+            # A Windows host selects the WSL executor, which needs its paths
+            # configured even to refuse by name; the paths need not exist
+            # for an empty queue to be drained.
+            **(WINDOWS_PATHS if os.name == "nt" else {}),
         }), encoding="utf-8")
         self.assertEqual(run(str(config), once=True, interval=0.01,
                              worker_id="test-worker"), 0)

@@ -36,6 +36,10 @@ class StreamReadResult(NamedTuple):
 class Platform(Protocol):
     """OS services required by the bridge."""
 
+    #: ``os.name`` of the system this layer drives: "nt" or "posix". The
+    #: Windows lane keys on it to tell a supported host from an unsupported
+    #: one, so a stand-in used in tests carries it as well.
+    name: str
     supports_owner_only_permissions: bool
 
     def set_owner_only_umask(self) -> None: ...

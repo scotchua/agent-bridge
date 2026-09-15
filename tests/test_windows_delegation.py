@@ -27,6 +27,7 @@ from agent_bridge.orchestration import windows_rootfs as wrf
 from agent_bridge.orchestration import windows_wsl as ww
 from agent_bridge.orchestration import windows_wsl_provision as wp
 from agent_bridge.orchestration import windows_wsl_runtime as wr
+import platform_support
 
 ROOTFS_BYTES = b"pinned-rootfs" * 32
 ROOTFS_SHA256 = hashlib.sha256(ROOTFS_BYTES).hexdigest()
@@ -70,19 +71,9 @@ def _check(**overrides):
 
 
 def _write_private(path, text):
-    """Fixtures write records the way production does: owner-only.
+    """Write a fixture record the way production writes one: owner-only."""
 
-    The evidence loader refuses anything else, on purpose: a record other
-    accounts could have written is not evidence about this machine.
-    """
-    descriptor = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        os.write(descriptor, text.encode("utf-8"))
-    finally:
-        os.close(descriptor)
-    if os.name != "nt":
-        os.chmod(str(path), 0o600)
-
+    platform_support.write_private_bytes(path, text.encode("utf-8"))
 
 def _open_lane(*providers):
     """A lane a live record would have opened. Never the default."""
@@ -156,7 +147,7 @@ def setUpModule():
     repo = base / "repo"
     repo.mkdir()
     (repo / "main.py").write_text("print('hello')\n", encoding="utf-8")
-    (base / "brief.txt").write_text("Do the synthetic thing.\n", encoding="utf-8")
+    (base / "brief.txt").write_bytes(b"Do the synthetic thing.\n")
     _BASE_SHA = _init_repo(repo)
 
 
@@ -606,8 +597,8 @@ class OutcomeTests(unittest.TestCase):
         payload = _guest_response(stdout_b64=_b64(b"answer"))
         with tempfile.TemporaryDirectory() as tmp:
             self._dispatch(_result(stdout=payload), job_dir=Path(tmp))
-            mode = (Path(tmp) / "guest.stdout").stat().st_mode & 0o777
-        self.assertEqual(mode, 0o600)
+            platform_support.assert_owner_only(
+                self, Path(tmp) / "guest.stdout", 0o600)
 
     def test_an_empty_stream_writes_no_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -725,6 +716,7 @@ class WorkspacePackingTests(unittest.TestCase):
         self.assertEqual(names, ["keep.txt"])
 
     def test_a_symlink_is_never_followed_out_of_the_repository(self):
+        platform_support.require_symlinks(self)
         import os as _os
         outside = Path(self.directory.name).parent / "outside-secret.txt"
         outside.write_text("secret\n", encoding="utf-8")
@@ -779,10 +771,11 @@ class BriefReadingTests(unittest.TestCase):
 
     def test_the_brief_is_read_as_text(self):
         target = self.base / "b.txt"
-        target.write_text("do the thing\n", encoding="utf-8")
+        target.write_bytes(b"do the thing\n")
         self.assertEqual(wd.read_brief(target), "do the thing\n")
 
     def test_a_symlinked_brief_is_refused(self):
+        platform_support.require_symlinks(self)
         import os as _os
         real = self.base / "real.txt"
         real.write_text("x\n", encoding="utf-8")

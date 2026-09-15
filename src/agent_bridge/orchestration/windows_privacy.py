@@ -142,6 +142,59 @@ def require_private_directory(path: str | os.PathLike[str], *,
             os.unlink(probe)
 
 
+def _observe_owner_only(active: Any, directory: str, target: str) -> bool:
+    """Read the protection back without changing it.
+
+    The platform's ``verify_owner_only_path`` applies the owner-only ACL and
+    then reads it back, which is right before a write and wrong on a read: a
+    file another account could reach would be tightened on the way past, and
+    the one observable sign of the problem would vanish. Where the platform
+    offers a pure read-back it is used; a platform without one (the POSIX
+    layer, whose verify already only reads modes) falls back to verify.
+    """
+
+    observe = getattr(active, "observe_owner_only_acl", None)
+    if observe is not None:
+        verified, _evidence = observe(target)
+        return bool(verified)
+    verify = getattr(active, "verify_owner_only_path", None)
+    if verify is None:
+        raise PrivacyError("acl_unenforceable")
+    verified, _evidence = verify(directory, target)
+    return bool(verified)
+
+
+def _examine_before_open(target: Path) -> os.stat_result:
+    """lstat the name and refuse anything that is not a plain regular file.
+
+    On POSIX this duplicates what O_NOFOLLOW and the post-open fstat already
+    guarantee. On Windows it is the guarantee: there is no O_NOFOLLOW, a
+    symlink is followed silently by ``os.open``, and opening a directory
+    fails with PermissionError, which used to surface as the generic
+    ``file_unreadable`` instead of the specific ``file_not_regular``. The
+    caller compares the identity returned here with the descriptor it opens,
+    so a name examined as one object and opened as another is refused.
+    """
+
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError as exc:
+        raise PrivacyError("file_absent") from exc
+    except OSError as exc:
+        raise PrivacyError("file_unreadable") from exc
+    if stat.S_ISLNK(info.st_mode) or _reparse_tag(info):
+        raise PrivacyError("path_traverses_a_link")
+    if not stat.S_ISREG(info.st_mode):
+        raise PrivacyError("file_not_regular")
+    return info
+
+
+def _same_object(descriptor_info: os.stat_result,
+                 examined: os.stat_result) -> bool:
+    return ((descriptor_info.st_dev, descriptor_info.st_ino)
+            == (examined.st_dev, examined.st_ino))
+
+
 def require_private_file(path: str | os.PathLike[str], *,
                          root: str | os.PathLike[str] | None = None,
                          platform: Any = None) -> FileIdentity:
@@ -154,6 +207,7 @@ def require_private_file(path: str | os.PathLike[str], *,
 
     target = Path(path)
     assert_no_reparse_ancestors(target, stop=root)
+    examined = _examine_before_open(target)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(target, flags)
@@ -165,12 +219,11 @@ def require_private_file(path: str | os.PathLike[str], *,
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise PrivacyError("file_not_regular")
+        if not _same_object(info, examined):
+            raise PrivacyError("file_changed_while_reading")
         active = platform if platform is not None else host_platform
-        verify = getattr(active, "verify_owner_only_path", None)
-        if verify is None:
-            raise PrivacyError("acl_unenforceable")
         try:
-            verified, _evidence = verify(str(target.parent), str(target))
+            verified = _observe_owner_only(active, str(target.parent), str(target))
         except (OSError, AttributeError, NotImplementedError) as exc:
             raise PrivacyError("acl_unverified") from exc
         if not verified:
@@ -214,6 +267,7 @@ def read_private_file(path: str | os.PathLike[str], *,
 
     target = Path(path)
     assert_no_reparse_ancestors(target, stop=root)
+    examined = _examine_before_open(target)
     flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     try:
@@ -226,6 +280,8 @@ def read_private_file(path: str | os.PathLike[str], *,
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise PrivacyError("file_not_regular")
+        if not _same_object(info, examined):
+            raise PrivacyError("file_changed_while_reading")
         if info.st_size > max_bytes:
             raise PrivacyError("file_too_large")
         _verify_descriptor_acl(descriptor, target, platform)
@@ -264,12 +320,9 @@ def _verify_descriptor_acl(descriptor: int, target: Path, platform: Any) -> None
         if info.st_mode & 0o077:
             raise PrivacyError("file_not_owner_only")
 
-    verify = getattr(active, "verify_owner_only_path", None)
-    if verify is None:
-        raise PrivacyError("acl_unenforceable")
     checked = _descriptor_path(descriptor, target, active)
     try:
-        verified, _evidence = verify(str(checked.parent), str(checked))
+        verified = _observe_owner_only(active, str(checked.parent), str(checked))
     except (OSError, AttributeError, NotImplementedError) as exc:
         raise PrivacyError("acl_unverified") from exc
     if not verified:

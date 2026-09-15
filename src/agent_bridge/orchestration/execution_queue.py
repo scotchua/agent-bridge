@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping
 
 from agent_bridge.platform import platform as host_platform
 
-from ..execution import claude_config
+from ..execution import claude_config, verify_policy
 from . import windows_privacy as wpv
 
 
@@ -106,12 +106,19 @@ class SubprocessHarnessExecutor:
         self.harnesses = harnesses
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
+        provider = request["provider"]
+        if provider == "claude" and not claude_config.is_ready(
+                self.harnesses.claude_config_dir):
+            # Checked before the platform check, on every platform. A missing
+            # or wrong store is the operator's setup problem and is reported
+            # as such wherever the dispatcher runs; the platform refusal below
+            # is about this executor, not about the request.
+            raise ExecutionAdmissionError("claude_config_dir_unavailable")
         if os.name != "posix":
             raise ExecutionAdmissionError("execution_worker_platform_unsupported")
         # Imported only at execution time so the queue/status MCP remains
         # importable on Windows, where the persistent worker is not supported.
         import pwd
-        provider = request["provider"]
         harness = getattr(self.harnesses, provider)
         argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
                 "--repo", request["repo"], "--base", request["base"],
@@ -237,13 +244,50 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
         if not isinstance(parsed, dict):
             return _unreadable("receipt_not_an_object")
         status = parsed.get("status")
+        diagnostics = _harness_diagnostics(parsed)
         if status not in HARNESS_STATUSES:
+            if parsed.get("ok") is False and "error" in diagnostics:
+                # The harness refused before it had a job to give a status:
+                # its failure line names the error class and, for its own
+                # fixed diagnostics, the text. That is a failed job with a
+                # reason, not an unreadable one.
+                return {"harness_ok": False, "harness_status": HARNESS_FAILED,
+                        "harness_verdict": "read_failure", **diagnostics}
             # A status outside the vocabulary is output nobody agreed on. It
             # is not a completion, and it is not silently renamed to one.
             return _unreadable("receipt_status_unknown")
         return {"harness_ok": parsed.get("ok") is True and status == HARNESS_COMPLETE,
-                "harness_status": status, "harness_verdict": "read"}
+                "harness_status": status, "harness_verdict": "read", **diagnostics}
     return _unreadable("receipt_absent")
+
+
+#: Longest diagnostic text copied from a harness line into a receipt.
+DIAGNOSTIC_LIMIT = 512
+#: Recorded in place of an unexpected exception's own text.
+UNEXPECTED_FAILURE_DETAIL = "unexpected failure of a kind the worker does not record"
+
+
+def _clean_diagnostic(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = "".join(char for char in value if char.isprintable())
+    return text[:DIAGNOSTIC_LIMIT] or None
+
+
+def _harness_diagnostics(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    """The harness's own ``error`` and ``error_detail``, bounded and printable.
+
+    Both harnesses print fixed, operator-safe text in ``error_detail`` for
+    their TaskError refusals. Copying it into the receipt is what lets an
+    operator tell a refused verification command from a failed login without
+    opening the job directory.
+    """
+    diagnostics: dict[str, Any] = {}
+    for key in ("error", "error_detail"):
+        text = _clean_diagnostic(parsed.get(key))
+        if text is not None:
+            diagnostics[key] = text
+    return diagnostics
 
 
 def _unreadable(verdict: str) -> dict[str, Any]:
@@ -372,9 +416,16 @@ class ExecutionQueue:
         checks = verify_argv or []
         if provider == "claude" and not checks:
             raise ExecutionAdmissionError("claude_verification_required")
-        if (not isinstance(checks, list) or any(not isinstance(row, list) or not row
-                or any(not isinstance(cell, str) or not cell for cell in row) for row in checks)):
-            raise ExecutionAdmissionError("verify_argv_invalid")
+        try:
+            # The harness's own policy, applied at admission. A command the
+            # harness would refuse is refused here, now, with the harness's
+            # words, instead of after a claim, a worker slot and a receipt
+            # that said only "TaskError".
+            checks = verify_policy.check_verify_argv(checks)
+        except verify_policy.VerifyPolicyError as exc:
+            if str(exc) == verify_policy.MESSAGE_SHAPE:
+                raise ExecutionAdmissionError("verify_argv_invalid") from None
+            raise ExecutionAdmissionError(f"verify_argv_rejected: {exc}") from None
         key = self._clean_text(idempotency_key, "idempotency_key") if idempotency_key else None
         identity = {"caller": caller, "provider": provider, "repo": str(repo_path),
                     "brief": str(brief_path), "brief_sha256": hashlib.sha256(brief_bytes).hexdigest(),
@@ -467,7 +518,18 @@ class ExecutionQueue:
                 state="complete" if outcome_is_success(outcome) else "failed",
                 harness=outcome, finished_at=self.clock())
         except Exception as exc:
+            # The class name alone is not diagnostic evidence. Admission and OS
+            # errors carry fixed reason codes or the OS's own text; both are
+            # safe to record and both are what an operator needs first. Any
+            # other exception's text is unvetted and is replaced by a fixed
+            # marker, so a stray message can never reach the receipt.
             receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())
+            if isinstance(exc, (ExecutionAdmissionError, OSError)):
+                detail = _clean_diagnostic(str(exc))
+            else:
+                detail = UNEXPECTED_FAILURE_DETAIL
+            if detail is not None:
+                receipt["error_detail"] = detail
         _atomic_json(selected / "receipt.json", receipt)
         return self.status(selected.name)
 

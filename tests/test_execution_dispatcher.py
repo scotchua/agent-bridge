@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration.execution_queue import (
-    ExecutionAdmissionError, ExecutionQueue, _atomic_json, _harness_summary,
-    outcome_is_success)
+    UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
+    _harness_summary, outcome_is_success)
 from agent_bridge.orchestration.server import Server
 
 
@@ -111,6 +111,51 @@ class ExecutionDispatcherTests(unittest.TestCase):
             self.submit(brief="brief.md")
         with self.assertRaisesRegex(ExecutionAdmissionError, "claude_verification_required"):
             self.submit(verify_argv=[])
+
+    def test_a_command_the_harness_would_refuse_is_refused_at_admission(self):
+        # Live jobs d8e5763d, 7a79ae7f and 19869b0e were admitted with commands
+        # the harness refuses, ran, and failed as a bare "TaskError".
+        with self.assertRaisesRegex(
+                ExecutionAdmissionError,
+                "verify_argv_rejected: Python verification is limited to "
+                "python -m pytest or python -m unittest"):
+            self.submit(verify_argv=[["python3", "-c", "print(1)"]])
+        with self.assertRaisesRegex(ExecutionAdmissionError,
+                                    "verify_argv_rejected: verification executable"):
+            self.submit(verify_argv=[["/usr/bin/test", "-e", "x"]])
+        with self.assertRaisesRegex(ExecutionAdmissionError, "verify_argv_invalid"):
+            self.submit(verify_argv=[["pytest", ""]])
+        self.assertEqual(self.queue.state_report(), {})
+        unittest_run = [["python3", "-m", "unittest", "discover", "-s", "tests"]]
+        job = self.submit(verify_argv=unittest_run)
+        request = json.loads((self.root / "queue" / job["job_id"] / "request.json").read_text())
+        self.assertEqual(request["verify_argv"], unittest_run)
+
+    def test_a_failed_run_records_the_reason_not_only_the_class(self):
+        job = self.submit()
+        self.brief.write_text("changed", encoding="utf-8")
+        self.queue.run_once("worker-1")
+        result = self.queue.result(job["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "ExecutionAdmissionError")
+        self.assertEqual(result["error_detail"], "brief_changed_after_admission")
+
+    def test_an_unexpected_exception_records_a_fixed_marker_not_its_text(self):
+        """Only admission and OS errors carry text vetted for a receipt.
+        Anything else is recorded by class and a fixed marker, so a stray
+        message never reaches the durable record."""
+        job = self.submit()
+
+        def explode(request, selected):
+            raise RuntimeError("token=do-not-record")
+
+        queue = ExecutionQueue(self.root / "queue", explode, clock=lambda: 100.0)
+        queue.run_once("worker-1")
+        result = queue.result(job["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "RuntimeError")
+        self.assertEqual(result["error_detail"], UNEXPECTED_FAILURE_DETAIL)
+        self.assertNotIn("do-not-record", json.dumps(result))
 
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")
@@ -257,6 +302,41 @@ class HarnessVerdictTests(unittest.TestCase):
     def test_a_json_array_is_refused_rather_than_indexed(self):
         self.assertEqual(_harness_summary(b'["complete"]')["harness_verdict"],
                          "receipt_not_an_object")
+
+    def test_a_harness_refusal_line_is_a_failure_with_its_reason(self):
+        # Exactly what the live harness printed for job d8e5763d, plus the
+        # detail the harness now adds.
+        summary = _harness_summary(
+            b'{"error": "TaskError", "error_detail": "Python verification is limited '
+            b'to python -m pytest or python -m unittest", "ok": false}\n')
+        self.assertEqual(summary["harness_status"], "failed")
+        self.assertEqual(summary["harness_verdict"], "read_failure")
+        self.assertEqual(summary["error"], "TaskError")
+        self.assertTrue(summary["error_detail"].startswith("Python verification"))
+        self.assertFalse(outcome_is_success({"returncode": 1, **summary}))
+        self.assertFalse(outcome_is_success({"returncode": 0, **summary}))
+
+    def test_a_failure_line_without_an_error_is_still_unknown(self):
+        self.assertEqual(_harness_summary(b'{"ok": false}')["harness_verdict"],
+                         "receipt_status_unknown")
+        self.assertEqual(_harness_summary(b'{"ok": true}')["harness_verdict"],
+                         "receipt_status_unknown")
+
+    def test_diagnostics_are_bounded_and_printable(self):
+        line = json.dumps({"ok": False, "error": "TaskError",
+                           "error_detail": "x\x1b[31m" + "y" * 2000}).encode()
+        summary = _harness_summary(line)
+        self.assertEqual(len(summary["error_detail"]), 512)
+        self.assertNotIn("\x1b", summary["error_detail"])
+        self.assertEqual(_harness_summary(b'{"ok": false, "error": 7}')["harness_verdict"],
+                         "receipt_status_unknown")
+
+    def test_a_status_line_keeps_its_diagnostics(self):
+        summary = _harness_summary(
+            b'{"ok": false, "status": "failed", "error": "OSError", '
+            b'"error_detail": "codex login status: not logged in"}')
+        self.assertEqual(summary["harness_verdict"], "read")
+        self.assertEqual(summary["error_detail"], "codex login status: not logged in")
 
 
 

@@ -87,12 +87,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args(argv)
     try:
-        payload = json.load(sys.stdin)
+        try:
+            payload = json.load(sys.stdin)
+        except ValueError:
+            raise ValueError("payload is not JSON") from None
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         print(json.dumps(invoke(payload, worker=args.worker, state=args.state, queue_root=args.queue_root, python=args.python), ensure_ascii=True))
         return 0
-    except Exception:
+    except Exception as exc:  # noqa: BLE001  the parent reads the reason, not a traceback
+        # The exit status alone told the queue nothing ("child exited
+        # unsuccessfully" for a day, the same defect the execution queue
+        # had). ValueError and RuntimeError raised here carry fixed text
+        # this module wrote; any other class is named without its text,
+        # which could quote the payload.
+        failure = {"ok": False, "error": type(exc).__name__}
+        if type(exc) in (ValueError, RuntimeError):
+            failure["error_detail"] = str(exc)
+        print(json.dumps(failure, ensure_ascii=True, sort_keys=True))
         return 1
 
 

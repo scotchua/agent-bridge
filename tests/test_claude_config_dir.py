@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -25,6 +26,7 @@ from agent_bridge.orchestration.execution_queue import (
     Harnesses,
     SubprocessHarnessExecutor,
 )
+import platform_support
 
 
 class ConfigDirTestCase(unittest.TestCase):
@@ -34,8 +36,27 @@ class ConfigDirTestCase(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.canonical = cc.canonical_config_dir(self.home)
         self.canonical.mkdir(mode=0o700, parents=True)
+        if os.name == "nt":
+            # A store the lane created and protected, not one mkdir happened
+            # to leave usable. Python 3.13's mkdir(0o700) writes an explicit
+            # owner-only ACL on Windows; 3.11's leaves only inherited entries,
+            # which the read-back refuses by design. Tighten it the way the
+            # lane does so the fixture means the same thing on both.
+            cc.enforce_private(self.canonical)
         self.shared = cc.shared_store_dir(self.home)
         self.shared.mkdir(mode=0o700)
+
+
+class WindowsEnforcementWrapperTests(unittest.TestCase):
+    """The NT half of enforce_private translates every failure it can
+    meet into the fixed operator text this module promises."""
+
+    def test_an_unlistable_store_is_refused_with_the_fixed_text(self):
+        with mock.patch.object(cc, "_store_entries", side_effect=PermissionError("raw os text")):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._enforce_private_nt(Path("C:/nowhere/store"))
+        self.assertEqual(str(caught.exception),
+                         "Claude configuration directory could not be read")
 
 
 class CanonicalDirectoryTests(ConfigDirTestCase):
@@ -50,6 +71,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
     def test_a_symlink_that_resolves_to_the_shared_store_is_refused(self):
         """String equality would pass this, which is the whole problem."""
+        platform_support.require_symlinks(self)
         alias = self.home / "alias-home"
         alias.symlink_to(self.shared, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -57,6 +79,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
         self.assertIn("~/.claude", str(caught.exception))
 
     def test_the_canonical_name_pointing_at_the_shared_store_is_refused(self):
+        platform_support.require_symlinks(self)
         self.canonical.rmdir()
         self.canonical.symlink_to(self.shared, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -65,6 +88,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
     def test_a_link_to_the_canonical_directory_is_still_refused(self):
         """What a link points at can change between the check and the login."""
+        platform_support.require_symlinks(self)
         alias = self.home / "also-fine"
         alias.symlink_to(self.canonical, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -112,18 +136,79 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
 class PermissionTests(ConfigDirTestCase):
     def test_a_permissive_directory_is_tightened_and_then_verified(self):
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         cc.checked_config_dir(self.canonical, home=self.home)
-        self.assertEqual(self.canonical.stat().st_mode & 0o077, 0)
+        platform_support.assert_owner_only(self, self.canonical, 0o700)
 
     def test_a_permissive_credential_file_is_tightened(self):
         secret = self.canonical / ".credentials.json"
         secret.write_text("{}", encoding="utf-8")
-        os.chmod(secret, 0o644)
+        platform_support.make_permissive(secret)
         cc.checked_config_dir(self.canonical, home=self.home)
-        self.assertEqual(secret.stat().st_mode & 0o077, 0)
+        platform_support.assert_owner_only(self, secret, 0o600,
+                                           inside_protected_store=True)
+
+    def test_a_permissive_nested_file_is_tightened_on_windows(self):
+        """Codex review of d9e93ab, F2: Windows grants every account "bypass
+        traverse checking", so a nested file with its own permissive entry is
+        readable by name whatever its parents allow. Enforcement covers the
+        tree there. (POSIX stops at the top level on purpose: a 0700
+        directory cannot be traversed, so nothing below it is reachable.)"""
+        if os.name != "nt":
+            self.skipTest("POSIX confidentiality rests on the 0700 directory")
+        nested = self.canonical / "projects" / "deep"
+        nested.mkdir(parents=True)
+        secret = nested / "session.jsonl"
+        secret.write_text("{}", encoding="utf-8")
+        platform_support.make_permissive(secret)
+        platform_support.assert_not_owner_only(self, secret)
+        cc.checked_config_dir(self.canonical, home=self.home)
+        platform_support.assert_owner_only(self, secret, 0o600,
+                                           inside_protected_store=True)
+        # The directory carried only entries inherited from the protected
+        # root, which is owner-only already; enforcement leaves such an
+        # object alone rather than rewriting what is already right.
+        platform_support.assert_owner_only(self, nested, 0o700,
+                                           inside_protected_store=True)
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+
+    def test_readiness_sees_a_permissive_nested_file_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("POSIX confidentiality rests on the 0700 directory")
+        nested = self.canonical / "todos"
+        nested.mkdir()
+        secret = nested / "todo.json"
+        secret.write_text("{}", encoding="utf-8")
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+        platform_support.make_permissive(secret)
+        self.assertFalse(cc.is_ready(self.canonical, home=self.home))
+        # And describing did not repair it.
+        platform_support.assert_not_owner_only(self, secret)
+
+    def test_files_the_lane_creates_after_enforcement_are_still_ready(self):
+        """Claude itself writes into the store between enforcements. On
+        Windows those objects carry only entries inherited from the
+        protected store; readiness must accept them or the lane would refuse
+        every job after its first."""
+        if os.name != "nt":
+            self.skipTest("inherited ACL entries are a Windows concept")
+        later = self.canonical / "shell-snapshots"
+        later.mkdir()
+        (later / "snap.sh").write_text("#", encoding="utf-8")
+        self.assertTrue(cc.is_ready(self.canonical, home=self.home))
+
+    def test_an_owned_unreadable_directory_is_repaired_on_posix(self):
+        """Codex review of d9e93ab, F3: listing before chmod failed exactly
+        the case enforcement exists to repair."""
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            self.skipTest("mode bits, as a non-root account")
+        os.chmod(self.canonical, 0o000)
+        self.addCleanup(os.chmod, self.canonical, 0o700)
+        cc.enforce_private(self.canonical)
+        platform_support.assert_owner_only(self, self.canonical, 0o700)
 
     def test_a_link_inside_the_store_is_refused(self):
+        platform_support.require_symlinks(self)
         (self.canonical / "leak").symlink_to(self.shared)
         with self.assertRaises(cc.ConfigDirError) as caught:
             cc.enforce_private(self.canonical)
@@ -131,14 +216,14 @@ class PermissionTests(ConfigDirTestCase):
 
     def test_readiness_reports_a_permissive_directory_as_not_ready(self):
         self.assertTrue(cc.is_ready(self.canonical, home=self.home))
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         self.assertFalse(cc.is_ready(self.canonical, home=self.home))
 
     def test_readiness_never_changes_anything(self):
         """Describing a machine must not modify it."""
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         cc.is_ready(self.canonical, home=self.home)
-        self.assertEqual(self.canonical.stat().st_mode & 0o777, 0o755)
+        platform_support.assert_not_owner_only(self, self.canonical, 0o755)
 
     def test_readiness_is_false_for_the_shared_store(self):
         self.assertFalse(cc.is_ready(self.shared, home=self.home))

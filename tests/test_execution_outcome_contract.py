@@ -113,7 +113,7 @@ class WindowsQueueIntegrationTests(unittest.TestCase):
         # different commit, so an empty repository would exercise nothing.
         self.base_sha = _commit_repo(self.repo)
         self.brief = base / "brief.txt"
-        self.brief.write_text("Do the synthetic thing.\n", encoding="utf-8")
+        self.brief.write_bytes(b"Do the synthetic thing.\n")
 
         rootfs = base / "rootfs.tar"
         rootfs.write_bytes(ROOTFS_BYTES)

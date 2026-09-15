@@ -34,6 +34,7 @@ GIT = shutil.which("git")
 
 
 @unittest.skipIf(GIT is None, "git is not installed on this machine")
+@unittest.skipIf(os.name == "nt", "in-guest git lifecycle: POSIX process groups")
 class CaptureDiffTests(unittest.TestCase):
     """The guest pins git at /usr/bin/git. Here it is wherever it is."""
 

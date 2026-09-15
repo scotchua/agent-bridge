@@ -105,6 +105,38 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertIsNone(self.queue.run_once("runner"))
 
+    def test_a_child_failure_records_the_backend_reason_not_only_the_class(self):
+        import dataclasses
+        caps = dataclasses.replace(self.caps, timeout_seconds=30)
+        for command, reason in (
+                ("import sys; sys.exit(3)", "child exited unsuccessfully"),
+                ("import sys; print('{\"ok\": false, \"error\": \"ValueError\", "
+                 "\"error_detail\": \"queue provenance unavailable\"}'); sys.exit(1)",
+                 "child exited unsuccessfully: ValueError: queue provenance unavailable"),
+                ("import sys; print('{\"ok\": false, \"error\": \"x\\\\u0007y\"}'); sys.exit(1)",
+                 "child exited unsuccessfully: xy"),
+                ("print('not json')", "child did not return a JSON object")):
+            with self.subTest(reason):
+                queue = LocalQueue(self.temp.name, sampler=self.sampler, caps=caps,
+                                   backend=SubprocessBackend([sys.executable, "-c", command]),
+                                   clock=self.clock)
+                job = queue.submit(task_type="summarize", input=reason, params={},
+                                   priority="interactive", classification="synthetic",
+                                   caller="codex", purpose="work")
+                terminal = queue.run_once("runner")
+                self.assertEqual(terminal["job_id"], job["job_id"])
+                self.assertEqual(terminal["status"], "failed")
+                self.assertEqual(terminal["error"], f"RuntimeError: {reason}")
+
+    def test_a_non_backend_exception_records_only_its_class(self):
+        def boom(payload):
+            raise ValueError("payload said: " + payload["input"])
+        self.queue.backend = FakeBackend(boom)
+        self.submit(input="private text")
+        terminal = self.queue.run_once("runner")
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"], "ValueError")
+
     def test_child_process_timeout_is_hard_and_indeterminate(self):
         self.queue.backend = SubprocessBackend([sys.executable, "-c", "import time; time.sleep(1)"])
         job = self.submit()

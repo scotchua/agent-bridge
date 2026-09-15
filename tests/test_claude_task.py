@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 
+CLAUDE_TASK = Path(__file__).resolve().parent.parent / "src" / "agent_bridge" / "execution" / "claude_task.py"
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task as module
@@ -104,6 +106,20 @@ class ClaudeTaskTests(unittest.TestCase):
                          claude_bin=self.fake, claude_config_dir=self.store,
                          classification="synthetic", model="fake",
                          effort="low", verify_argv=commands)
+
+    def test_main_reports_the_refusal_text_not_just_the_class(self):
+        # The queue's receipts once said only {"ok": false, "error": "TaskError"}.
+        completed = subprocess.run(
+            [sys.executable, str(CLAUDE_TASK), str(self.brief), "--repo", str(self.repo),
+             "--claude-bin", str(self.fake), "--claude-config-dir", str(self.store),
+             "--classification", "synthetic", "--task-root", str(self.root / "tasks"),
+             "--verify-json", json.dumps(["python3", "-c", "print(1)"])],
+            capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        failure = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(failure, {"ok": False, "error": "TaskError",
+                                   "error_detail": "Python verification is limited to "
+                                                   "python -m pytest or python -m unittest"})
 
     def test_refuses_api_auth(self):
         self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"api_key\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\n")
