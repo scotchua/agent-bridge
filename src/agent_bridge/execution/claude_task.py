@@ -278,7 +278,7 @@ def _result_detail(stdout:bytes)->str|None:
     stdout is not that shape, in which case the caller falls back to its
     fixed message alone."""
     try: parsed=json.loads(stdout.decode())
-    except (UnicodeDecodeError,json.JSONDecodeError): return None
+    except (UnicodeDecodeError,json.JSONDecodeError,RecursionError): return None
     if not isinstance(parsed,dict) or parsed.get("is_error") is not True: return None
     result=parsed.get("result")
     if not isinstance(result,str) or not result: return None

@@ -654,6 +654,10 @@ class ResultDetailTests(unittest.TestCase):
     def test_none_when_stdout_is_not_utf8(self):
         self.assertIsNone(_result_detail(b"\xff\xfe not utf-8"))
 
+    def test_none_when_stdout_is_too_deeply_nested_to_parse(self):
+        bomb = (b"[" * 100000) + (b"]" * 100000)
+        self.assertIsNone(_result_detail(bomb))
+
     def test_strips_non_printable_characters(self):
         envelope = json.dumps({"is_error": True, "result": "line one\x00\x07line two"}).encode()
         self.assertEqual(_result_detail(envelope), "line oneline two")
