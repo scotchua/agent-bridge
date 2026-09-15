@@ -176,6 +176,35 @@ class CodexTaskTests(unittest.TestCase):
             self.run_default(classification="client_derived")
         self.assertFalse((self.root / "tasks").exists())
 
+    def test_refuses_when_task_root_cannot_be_protected(self):
+        # mkdir(mode=) and chmod are no-ops on Windows; task_root must be
+        # brought under a real ACL through the platform layer, and a host
+        # that cannot do that must refuse before any job directory exists.
+        # The check under test runs after the confinement-backend probe, so
+        # a host with no backend at all (not yet wired for Windows) never
+        # reaches it -- same reason other full-path tests in this file skip.
+        requires_confinement(self)
+        with mock.patch.object(module.wpv, "require_private_directory",
+                              side_effect=module.wpv.PrivacyError("directory_not_owner_only")):
+            with self.assertRaises(TaskError) as caught:
+                self.run_default()
+        self.assertIn("task root could not be protected", str(caught.exception))
+        self.assertEqual(list((self.root / "tasks").iterdir()), [])
+
+    def test_refuses_when_job_directory_cannot_be_protected(self):
+        requires_confinement(self)
+        task_root = self.root / "tasks"
+
+        def fails_only_for_job(path, *, root):
+            if Path(path) != task_root:
+                raise module.wpv.PrivacyError("directory_not_owner_only")
+
+        with mock.patch.object(module.wpv, "require_private_directory",
+                              side_effect=fails_only_for_job):
+            with self.assertRaises(TaskError) as caught:
+                self.run_default()
+        self.assertIn("job directory could not be protected", str(caught.exception))
+
     def test_verify_argv_empty_is_permitted_for_codex(self):
         requires_confinement(self)
         result = self.run_default(verify_argv=[])

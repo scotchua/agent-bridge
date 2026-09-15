@@ -6,11 +6,13 @@ from pathlib import Path
 try:
     from .. import runner
     from ..platform import platform as agent_platform
+    from ..orchestration import windows_privacy as wpv
     from . import claude_config, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
     from agent_bridge.platform import platform as agent_platform
+    from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.execution import claude_config, hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
@@ -460,7 +462,13 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     version=_run([str(claude_bin),"--version"],cwd=claude_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Claude executable")
     task_root.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(task_root,0o700)
+    # mkdir(mode=) and chmod are no-ops on Windows; without this, task_root and
+    # every job directory under it inherit whatever their parent grants there.
+    try: wpv.require_private_directory(task_root,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution task root could not be protected [{exc.reason}]") from exc
     job=task_root/uuid.uuid4().hex; job.mkdir(mode=0o700); gen=job/"generation-worktree"; fresh=job/"verification-worktree"
+    try: wpv.require_private_directory(job,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution job directory could not be protected [{exc.reason}]") from exc
     receipt={"schema":2,"job_id":job.name,"status":"running","route":"claude-subscription-cli","classification":classification,
              "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,"effort_requested":effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(claude_bin.resolve()),
