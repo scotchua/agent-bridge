@@ -861,6 +861,22 @@ whole working tree and runs in CI.
     message that printed pids and nothing else. The diagnostic was the fix
     that mattered.
 
+57. **The Windows hook command could not have run on most Windows accounts.**
+    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
+    quoting. It wraps a value containing a space in *single* quotes, and
+    `cmd.exe` does not treat single quotes as quoting at all: it would look
+    for a program literally named `'C:\Users\First`. So on any Windows
+    account whose home contains a space, which is the ordinary shape of a
+    Windows home, the installed command was malformed, the hook never ran,
+    and nothing said so. A hook that never runs is a gate that never gates.
+
+    Found by static reading while working the review's "live-test the Windows
+    launcher and command quoting" item, which I cannot do from here. The
+    quoting is fixed and tested as a function; the launcher still has not
+    been run under either host on Windows, and the installer's `not_covered`
+    list still says exactly that. A cross-platform string built with one
+    platform's quoting rules is worth looking for wherever else it appears.
+
 ### What is still not true, after this round
 
 No step of this has run on Windows. No image has been imported, no canary has
@@ -1011,6 +1027,22 @@ cannot be what decides.
     I have now been wrong about this check three times, each time from a
     message that printed pids and nothing else. The diagnostic was the fix
     that mattered.
+
+57. **The Windows hook command could not have run on most Windows accounts.**
+    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
+    quoting. It wraps a value containing a space in *single* quotes, and
+    `cmd.exe` does not treat single quotes as quoting at all: it would look
+    for a program literally named `'C:\Users\First`. So on any Windows
+    account whose home contains a space, which is the ordinary shape of a
+    Windows home, the installed command was malformed, the hook never ran,
+    and nothing said so. A hook that never runs is a gate that never gates.
+
+    Found by static reading while working the review's "live-test the Windows
+    launcher and command quoting" item, which I cannot do from here. The
+    quoting is fixed and tested as a function; the launcher still has not
+    been run under either host on Windows, and the installer's `not_covered`
+    list still says exactly that. A cross-platform string built with one
+    platform's quoting rules is worth looking for wherever else it appears.
 
 ### What is still not true, after this round
 
@@ -1248,6 +1280,22 @@ whole round in miniature, so it goes first.
     I have now been wrong about this check three times, each time from a
     message that printed pids and nothing else. The diagnostic was the fix
     that mattered.
+
+57. **The Windows hook command could not have run on most Windows accounts.**
+    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
+    quoting. It wraps a value containing a space in *single* quotes, and
+    `cmd.exe` does not treat single quotes as quoting at all: it would look
+    for a program literally named `'C:\Users\First`. So on any Windows
+    account whose home contains a space, which is the ordinary shape of a
+    Windows home, the installed command was malformed, the hook never ran,
+    and nothing said so. A hook that never runs is a gate that never gates.
+
+    Found by static reading while working the review's "live-test the Windows
+    launcher and command quoting" item, which I cannot do from here. The
+    quoting is fixed and tested as a function; the launcher still has not
+    been run under either host on Windows, and the installer's `not_covered`
+    list still says exactly that. A cross-platform string built with one
+    platform's quoting rules is worth looking for wherever else it appears.
 
 ### What is still not true, after this round
 

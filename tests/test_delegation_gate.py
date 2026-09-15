@@ -773,5 +773,49 @@ class EachClientHasItsOwnEditingTool(unittest.TestCase):
         self.assertIn("Bash", gate.SHELL_TOOLS["codex"])
 
 
+class TheWindowsHookCommandQuoting(unittest.TestCase):
+    r"""A static fix for a defect that would have silenced the Windows gate.
+
+    ``hook_command`` quoted both paths with ``shlex.quote``, which is POSIX
+    quoting: it wraps a value containing a space in single quotes, and
+    ``cmd.exe`` does not treat single quotes as quoting at all. On any Windows
+    account whose home contains a space, which is ``C:\Users\First Last`` and
+    therefore most of them, the installed command was malformed and the hook
+    never ran. A hook that never runs is a gate that never gates, and nothing
+    would have said so.
+
+    These tests exercise the quoting function, not a Windows host. The
+    launcher still has not been run under either host on Windows, and the
+    installer's ``not_covered`` list still says so.
+    """
+
+    def quoted(self, value, name):
+        with mock.patch.object(gate.os, "name", name):
+            return gate.quote_for_host_shell(value)
+
+    def test_posix_quoting_is_unchanged(self):
+        self.assertEqual(self.quoted("/home/some one/x", "posix"),
+                         "'/home/some one/x'")
+
+    def test_a_windows_path_with_a_space_gets_double_quotes(self):
+        self.assertEqual(self.quoted(r"C:\Users\First Last\x.cmd", "nt"),
+                         r'"C:\Users\First Last\x.cmd"')
+
+    def test_no_single_quotes_ever_reach_a_windows_command(self):
+        """The specific defect: cmd.exe cannot read them."""
+        self.assertNotIn("'", self.quoted(r"C:\Users\First Last\x.cmd", "nt"))
+
+    def test_a_windows_path_without_metacharacters_is_left_alone(self):
+        self.assertEqual(self.quoted(r"C:\Users\a\x.cmd", "nt"),
+                         r"C:\Users\a\x.cmd")
+
+    def test_the_command_builder_uses_it_for_both_paths(self):
+        """Neither the launcher nor the config path may be POSIX-quoted."""
+        import inspect
+        source = inspect.getsource(gate.hook_command)
+        self.assertEqual(source.count("quote_for_host_shell"), 2)
+        self.assertNotIn("shlex.quote", source)
+
+
 if __name__ == "__main__":
     unittest.main()

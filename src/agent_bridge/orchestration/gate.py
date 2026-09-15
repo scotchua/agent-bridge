@@ -867,11 +867,41 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
 # ------------------------------------------------------------ installation
 
 
+#: Characters that make a Windows command line need quoting. Space is the
+#: one that matters: an ordinary Windows home is ``C:/Users/First Last``,
+#: with backslashes.
+_CMD_NEEDS_QUOTES = ' \t"&|<>^()'
+
+
+def quote_for_host_shell(value: str) -> str:
+    r"""Quote one argument for the shell the host will run this command with.
+
+    ``shlex.quote`` is POSIX quoting and was being used on both platforms.
+    It wraps a value containing a space in **single** quotes, and
+    ``cmd.exe`` does not treat single quotes as quoting at all: it would
+    look for a program literally named ``'C:\Users\First``. So on any
+    Windows account whose home contains a space, which is the ordinary
+    case, the installed hook command was malformed, the hook never ran, and
+    a hook that never runs is a gate that never gates, silently.
+
+    Windows filenames cannot contain ``"``, so wrapping in double quotes is
+    sufficient for the paths this builds. It does not attempt general
+    ``cmd.exe`` escaping, and it is not a substitute for running the
+    launcher on a live Windows host, which has still not happened.
+    """
+    if os.name != "nt":
+        return shlex.quote(value)
+    if value and not any(char in value for char in _CMD_NEEDS_QUOTES):
+        return value
+    return '"' + value.replace('"', "") + '"'
+
+
 def hook_command(root: str, client: str, config_path: str) -> str:
     launcher = os.path.join(os.path.realpath(root), "bin", HOOK_NAME)
     if os.name == "nt":
         launcher += ".cmd"
-    return f"{shlex.quote(launcher)} --client {client} --config {shlex.quote(os.path.realpath(config_path))}"
+    return (f"{quote_for_host_shell(launcher)} --client {client} "
+            f"--config {quote_for_host_shell(os.path.realpath(config_path))}")
 
 
 def hook_entry(root: str, client: str, config_path: str) -> dict[str, Any]:
