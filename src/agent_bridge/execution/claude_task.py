@@ -165,7 +165,13 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
     that grows or is replaced mid-read is a refusal, never a hash of a prefix
     that would compare equal to the one taken before the task.
     """
-    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
+    # O_BINARY matters as much as the other two on Windows: without it,
+    # os.open() defaults to text mode, os.read() then translates "\r\n" to
+    # "\n" in whatever it returns, and the bytes read fall short of fstat's
+    # raw st_size for any file that has one -- indistinguishable from this
+    # function's own "file changed size mid-read" refusal (measured: a
+    # 14-byte CRLF file reads back as 12 bytes without this flag).
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)|getattr(os,"O_BINARY",0)
     try: descriptor=os.open(target,flags)
     except OSError as exc: raise TaskError("source snapshot could not read a changed file") from exc
     try:
@@ -176,7 +182,12 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
             raise TaskError("source snapshot exceeds the per-file byte bound; refusing to run without integrity coverage")
         if opened.st_size>budget:
             raise TaskError("source snapshot exceeds the byte bound; refusing to run without integrity coverage")
-        os.set_blocking(descriptor,True)
+        if hasattr(os,"O_NONBLOCK"):
+            # Only undoing what was only ever set on a platform that has it:
+            # Windows never opened with O_NONBLOCK (the flag above is 0
+            # there), and os.set_blocking() on a Windows file descriptor
+            # raises OSError (WinError 87) rather than being a no-op.
+            os.set_blocking(descriptor,True)
         digest.update(b"file\x00");digest.update(str(opened.st_mode&0o777).encode("ascii"));digest.update(b"\x00")
         read=0
         while True:

@@ -283,8 +283,21 @@ class Fixture:
         # its more complicated quote-stripping rules. Testing a different
         # invocation from the one the host uses would answer a different
         # question.
+        #
+        # Built as one pre-formatted string, not an argv list: ``command`` is
+        # already quoted (it is the exact text ``gate.hook_command`` wrote to
+        # the host's config), and passing a list through ``subprocess.run``
+        # with ``shell=False`` makes Python re-quote every element with its
+        # own ``list2cmdline`` on the way to ``CreateProcess``. That escapes
+        # ``command``'s own embedded quotes with backslashes and wraps the
+        # whole thing in a second, outer quote pair, which is not the command
+        # line a real host ever sends and which ``cmd.exe /s`` cannot run
+        # (measured: exit 1, "is not recognized as an internal or external
+        # command"). A string, by contrast, reaches ``CreateProcess``
+        # unchanged.
         if os.name == "nt":
-            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+            comspec = os.environ.get("COMSPEC", "cmd.exe")
+            argv = f'{comspec} /d /s /c "{command}"'
             return run(argv, stdin=payload, env=self.env(for_launcher=True),
                        cwd=str(cwd or self.repo), where="installed command")
         return run(command, stdin=payload, env=self.env(for_launcher=True),
@@ -307,8 +320,8 @@ def run(argv, *, stdin: str | None = None, env: dict[str, str] | None = None,
             __import__("shlex").quote(part) for part in argv)
     try:
         return subprocess.run(
-            argv, input=stdin, capture_output=True, text=True, timeout=timeout,
-            env=env, cwd=cwd, shell=use_shell, check=False)
+            argv, input=stdin, capture_output=True, text=True, encoding="utf-8",
+            timeout=timeout, env=env, cwd=cwd, shell=use_shell, check=False)
     except OSError as exc:
         raise CheckError(f"{where}: could not start {argv!r} ({type(exc).__name__}: {exc})") from None
 
@@ -649,7 +662,14 @@ def _quoting_round_trip(fx: Fixture) -> dict:
     sys.path.insert(0, str(fx.root / "src"))
     from agent_bridge.orchestration import gate  # noqa: PLC0415
 
-    characters = (" ", "\t", ",", ";", "=", "%", "!", "&", "^", "(", ")", "'")
+    # A single quote belongs only in the POSIX matrix below: it is the shell's
+    # own quoting character there, so it must round-trip, but it is not a
+    # cmd.exe delimiter at all (measured: a bare, unquoted path containing one
+    # runs on a real Windows host without error). Asserting it must be quoted
+    # on Windows would be exactly the mistake the docstring above warns
+    # against, pointed the other way: a property that holds on one platform
+    # asserted as if it held on both.
+    characters = (" ", "\t", ",", ";", "=", "%", "!", "&", "^", "(", ")")
     if os.name == "nt":
         results, bare = {}, []
         for character in characters:
@@ -663,9 +683,11 @@ def _quoting_round_trip(fx: Fixture) -> dict:
                              f"command at the delimiter: {bare}")
         return {"platform": "nt", "quoted": results}
 
-    # POSIX: measure the round trip through the real shell.
+    # POSIX: measure the round trip through the real shell. A single quote is
+    # tested only here: it is ``sh``'s own quoting character, so getting its
+    # escaping wrong is exactly the kind of defect a round trip catches.
     round_trips = {}
-    for character in characters:
+    for character in (*characters, "'"):
         path = "/dev/a" + character + "b/hook"
         quoted = gate.quote_for_host_shell(path)
         completed = run(["sh", "-c", "printf '%s' " + quoted], where="sh round trip")

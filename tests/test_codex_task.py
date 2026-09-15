@@ -503,6 +503,8 @@ class CodexSourceIntegrityTests(unittest.TestCase):
 
     def test_a_socket_is_refused(self):
         import socket
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("no AF_UNIX on this host")
         endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(endpoint.close)
         try:
@@ -524,7 +526,11 @@ class CodexSourceIntegrityTests(unittest.TestCase):
         outside = self.root / "outside.txt"
         outside.write_text("secret\n")
         link = self.repo / "link.txt"
-        link.symlink_to(outside)
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("cannot create a symlink on this host "
+                          "(elevation or Developer Mode required)")
         with self.assertRaises(TaskError) as caught:
             module._hash_regular_file(link, hashlib.sha256(), 4096)
         self.assertIn("could not read", str(caught.exception))

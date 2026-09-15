@@ -60,7 +60,13 @@ def _isolated_store(case, root):
     home = root / "home"
     store = home / ".agent-bridge" / "claude-home"
     store.mkdir(mode=0o700, parents=True)
-    patch = mock.patch.dict(os.environ, {"HOME": str(home)})
+    # Both variables, not just HOME: Path.home() resolves through
+    # os.path.expanduser, and ntpath.expanduser (what that is on Windows)
+    # checks USERPROFILE first and never consults HOME at all. Patching only
+    # HOME left Path.home() pointing at the real developer profile on
+    # Windows, so the lane correctly refused this fixture as "not its own
+    # store" rather than the test ever reaching what it meant to exercise.
+    patch = mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)})
     patch.start()
     case.addCleanup(patch.stop)
     return store
@@ -450,8 +456,25 @@ class ClaudeTaskSourceIntegrityTests(unittest.TestCase):
         self.assertNotEqual(self._snapshot(), before)
 
     def test_changing_the_mode_of_a_dirty_file_changes_the_snapshot(self):
+        if os.name == "nt":
+            # Windows has no POSIX mode-bit granularity: st_mode is
+            # synthesized from a single read-only attribute, so 0o700 and
+            # the file's starting 0o666 both mean "writable" and chmod is a
+            # no-op (measured: os.stat().st_mode & 0o777 is 0o666 before and
+            # after). Asserting this POSIX property on Windows would be
+            # asserting something that cannot be true there, not a gap in
+            # the snapshot itself, which does react correctly to the one
+            # permission distinction Windows actually has (see below).
+            self.skipTest("POSIX mode-bit granularity does not exist on Windows")
         before = self._snapshot()
         os.chmod(self.repo / "untracked.txt", 0o700)
+        self.assertNotEqual(self._snapshot(), before)
+
+    def test_toggling_read_only_on_windows_changes_the_snapshot(self):
+        if os.name != "nt":
+            self.skipTest("read-only-attribute toggling is the Windows case")
+        before = self._snapshot()
+        os.chmod(self.repo / "untracked.txt", stat.S_IREAD)
         self.assertNotEqual(self._snapshot(), before)
 
     def test_an_unchanged_tree_snapshots_identically(self):
@@ -496,6 +519,8 @@ class ClaudeTaskSourceIntegrityTests(unittest.TestCase):
 
     def test_a_socket_is_refused(self):
         import socket
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("no AF_UNIX on this host")
         endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(endpoint.close)
         try:
@@ -517,7 +542,11 @@ class ClaudeTaskSourceIntegrityTests(unittest.TestCase):
         outside = self.root / "outside.txt"
         outside.write_text("secret\n")
         link = self.repo / "link.txt"
-        link.symlink_to(outside)
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("cannot create a symlink on this host "
+                          "(elevation or Developer Mode required)")
         with self.assertRaises(TaskError) as caught:
             module._hash_regular_file(link, hashlib.sha256(), 4096)
         self.assertIn("could not read", str(caught.exception))
