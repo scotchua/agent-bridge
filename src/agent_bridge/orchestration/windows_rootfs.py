@@ -122,6 +122,11 @@ class RootfsRecipe:
     #: the repository beforehand.
     claude_integrity: str = ""
     codex_integrity: str = ""
+    #: The wrappers select architecture-specific optional packages containing
+    #: the executables. Pin those separately; verifying only the wrappers
+    #: would leave the bytes that actually run to package-manager resolution.
+    claude_native_integrity: str = ""
+    codex_native_integrity: str = ""
     apt_packages: tuple[str, ...] = ()
 
 
@@ -170,7 +175,10 @@ def _require_download_integrity(recipe: RootfsRecipe) -> None:
         raise RootfsRecipeError(
             "node_tarball_sha256 must be the 64-hex sha256 of the official "
             "Node tarball for this version and architecture")
-    for name in ("claude_integrity", "codex_integrity"):
+    for name in (
+        "claude_integrity", "codex_integrity",
+        "claude_native_integrity", "codex_native_integrity",
+    ):
         value = getattr(recipe, name)
         if not _INTEGRITY_RE.match(value or ""):
             raise RootfsRecipeError(
@@ -194,9 +202,9 @@ PLACEHOLDER_VERSIONS = {
 #: ``nftables`` provides /usr/sbin/nft, which the network-egress canary
 #: applies and reads back; ``git`` provides /usr/bin/git, which the guest uses
 #: to take a baseline commit and produce the returned diff. An image missing
-#: either would import fine and then fail a canary inside the guest, which is
+#: one would import fine and then fail during build or a guest canary, which is
 #: a much worse place to discover it.
-REQUIRED_APT_PACKAGES = ("nftables", "git", "ca-certificates")
+REQUIRED_APT_PACKAGES = ("nftables", "git", "ca-certificates", "openssl")
 
 
 def _reject_placeholders(recipe: RootfsRecipe) -> None:
@@ -287,8 +295,10 @@ RUN chmod 0755 /tmp/install-pinned-tools \\
       --node-sha256 {recipe.node_tarball_sha256} \\
       --claude {recipe.claude_version} \\
       --claude-integrity {recipe.claude_integrity} \\
+      --claude-native-integrity {recipe.claude_native_integrity} \\
       --codex {recipe.codex_version} \\
       --codex-integrity {recipe.codex_integrity} \\
+      --codex-native-integrity {recipe.codex_native_integrity} \\
       --arch {recipe.architecture} \\
  && rm -f /tmp/install-pinned-tools
 
@@ -470,6 +480,13 @@ def build_sidecar(recipe: RootfsRecipe, *, rootfs_sha256: str,
         "base_image": recipe.base_image,
         "base_digest": recipe.base_digest,
         "apt_packages": list(recipe.apt_packages),
+        "download_integrity": {
+            "node_tarball_sha256": recipe.node_tarball_sha256,
+            "claude_integrity": recipe.claude_integrity,
+            "claude_native_integrity": recipe.claude_native_integrity,
+            "codex_integrity": recipe.codex_integrity,
+            "codex_native_integrity": recipe.codex_native_integrity,
+        },
         "rootfs_sha256": rootfs_sha256,
         "guest_runner_sha256": guest_runner_sha256,
         "wsl_conf_sha256": hashlib.sha256(
@@ -677,7 +694,7 @@ def verify_manifest_trust(manifest: Mapping[str, Any], *, architecture: str,
 ARTIFACT_WORKFLOW_BLOCKER = (
     "the rootfs artifact workflow is unreleasable: no release has published a "
     "signed, release-bound manifest to anchor trust to, and the shipped "
-    "recipes are unfilled stubs rather than observed pins")
+    "architectures do not all have observed recipes and trust anchors")
 
 
 def release_blockers(recipes: Mapping[str, RootfsRecipe] | None = None,

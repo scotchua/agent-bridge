@@ -111,10 +111,13 @@ def test_recipe(architecture: str = "amd64") -> wrf.RootfsRecipe:
         node_tarball_sha256=filler,
         claude_integrity="sha512-" + "A" * 86 + "==",
         codex_integrity="sha512-" + "B" * 86 + "==",
+        claude_native_integrity="sha512-" + "C" * 86 + "==",
+        codex_native_integrity="sha512-" + "D" * 86 + "==",
         apt_packages=("ca-certificates=20230311+deb12u1",
                       "curl=7.88.1-10+deb12u12",
                       "git=1:2.39.5-0+deb12u2",
                       "nftables=1.0.6-2+deb12u2",
+                      "openssl=3.0.0",
                       "python3-minimal=3.11.2-1+b1",
                       "xz-utils=5.4.1-0.2"),
     )

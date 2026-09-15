@@ -146,22 +146,24 @@ needs one waits for you.
 
 On a machine with Docker or Podman. This does not have to be the Windows host.
 
-Neither shipped recipe is buildable: `tools/rootfs/recipes/*.json` carry an
-all-zero base digest and unfilled integrity pins, and `validate_recipe` refuses
-them by name. Fill every value with one you have observed before building.
+The ARM64 recipe is fully pinned and buildable. The AMD64 recipe remains an
+explicit refused stub until its platform-specific pins are observed. Select
+the recipe matching the Windows host architecture.
 
 ```bash
-python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/amd64.json --out-dir build/rootfs
+python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/arm64.json --out-dir build/rootfs
 ```
 
-**Expected:** `build/rootfs/rootfs.tar`, `manifest.json` and `sidecar.json`.
+**Expected:** `build/rootfs/agent-bridge-rootfs-arm64.tar`,
+`agent-bridge-manifest-arm64.json` and
+`agent-bridge-rootfs-arm64.tar.sha256`.
 The manifest's `rootfs_sha256` matches the tarball on disk.
 
 **Check reproducibility before trusting it:**
 
 ```bash
-python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/amd64.json --out-dir build/rootfs-2
-shasum -a 256 build/rootfs/rootfs.tar build/rootfs-2/rootfs.tar
+python3 tools/build_windows_rootfs.py --recipe tools/rootfs/recipes/arm64.json --out-dir build/rootfs-2
+shasum -a 256 build/rootfs/agent-bridge-rootfs-arm64.tar build/rootfs-2/agent-bridge-rootfs-arm64.tar
 ```
 
 **Expected:** identical hashes. If they differ, something in the recipe is not

@@ -40,6 +40,7 @@ GUEST_RUNNER_SOURCE = REPO / "src/agent_bridge/orchestration/guest_runner.py"
 INSTALLER_SOURCE = REPO / "tools/rootfs/install-pinned-tools"
 
 RECIPE_KEYS = {"node_tarball_sha256", "claude_integrity", "codex_integrity",
+               "claude_native_integrity", "codex_native_integrity",
                "architecture", "base_image", "base_digest", "distro_release",
                "node_version", "claude_version", "codex_version", "apt_packages"}
 
@@ -62,6 +63,11 @@ def load_recipe(path: Path) -> wrf.RootfsRecipe:
         node_version=raw["node_version"],
         claude_version=raw["claude_version"],
         codex_version=raw["codex_version"],
+        node_tarball_sha256=raw["node_tarball_sha256"],
+        claude_integrity=raw["claude_integrity"],
+        codex_integrity=raw["codex_integrity"],
+        claude_native_integrity=raw["claude_native_integrity"],
+        codex_native_integrity=raw["codex_native_integrity"],
         apt_packages=tuple(raw["apt_packages"]),
     )
     return wrf.validate_recipe(recipe)

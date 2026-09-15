@@ -14,8 +14,10 @@ NODE_VERSION=""
 NODE_SHA256=""
 CLAUDE_VERSION=""
 CLAUDE_INTEGRITY=""
+CLAUDE_NATIVE_INTEGRITY=""
 CODEX_VERSION=""
 CODEX_INTEGRITY=""
+CODEX_NATIVE_INTEGRITY=""
 ARCH=""
 
 while [ $# -gt 0 ]; do
@@ -24,15 +26,18 @@ while [ $# -gt 0 ]; do
     --node-sha256)       NODE_SHA256="$2"; shift 2 ;;
     --claude)            CLAUDE_VERSION="$2"; shift 2 ;;
     --claude-integrity)  CLAUDE_INTEGRITY="$2"; shift 2 ;;
+    --claude-native-integrity) CLAUDE_NATIVE_INTEGRITY="$2"; shift 2 ;;
     --codex)             CODEX_VERSION="$2"; shift 2 ;;
     --codex-integrity)   CODEX_INTEGRITY="$2"; shift 2 ;;
+    --codex-native-integrity) CODEX_NATIVE_INTEGRITY="$2"; shift 2 ;;
     --arch)              ARCH="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 for value in "$NODE_VERSION" "$NODE_SHA256" "$CLAUDE_VERSION" \
-             "$CLAUDE_INTEGRITY" "$CODEX_VERSION" "$CODEX_INTEGRITY" "$ARCH"; do
+             "$CLAUDE_INTEGRITY" "$CLAUDE_NATIVE_INTEGRITY" \
+             "$CODEX_VERSION" "$CODEX_INTEGRITY" "$CODEX_NATIVE_INTEGRITY" "$ARCH"; do
   [ -n "$value" ] || { echo "every version, integrity pin and the architecture must be supplied" >&2; exit 2; }
 done
 
@@ -58,8 +63,8 @@ verify_integrity() {
 }
 
 case "$ARCH" in
-  amd64) NODE_ARCH="x64" ;;
-  arm64) NODE_ARCH="arm64" ;;
+  amd64) NODE_ARCH="x64"; NATIVE_ARCH="x64" ;;
+  arm64) NODE_ARCH="arm64"; NATIVE_ARCH="arm64" ;;
   *) echo "unsupported architecture: $ARCH" >&2; exit 2 ;;
 esac
 
@@ -76,22 +81,49 @@ tar -xJf "/tmp/${NODE_TARBALL}" -C /usr/local --strip-components=1
 rm -f "/tmp/${NODE_TARBALL}"
 
 # The two provider CLIs. Fetched as their exact published tarballs so the
-# bytes can be checked against a pinned integrity before npm executes any of
-# their install scripts. "npm install <name>@<version>" would resolve, fetch
-# and run in one step with nothing this build had beforehand to compare to.
+# bytes can be checked against a pinned integrity before any archive is
+# extracted or any provider lifecycle script executes.
 CLAUDE_TGZ="/tmp/claude-code-${CLAUDE_VERSION}.tgz"
+CLAUDE_NATIVE_TGZ="/tmp/claude-code-linux-${NATIVE_ARCH}-${CLAUDE_VERSION}.tgz"
 CODEX_TGZ="/tmp/codex-${CODEX_VERSION}.tgz"
+CODEX_NATIVE_TGZ="/tmp/codex-${CODEX_VERSION}-linux-${NATIVE_ARCH}.tgz"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   -o "$CLAUDE_TGZ" \
   "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${CLAUDE_VERSION}.tgz"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  -o "$CLAUDE_NATIVE_TGZ" \
+  "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-${NATIVE_ARCH}/-/claude-code-linux-${NATIVE_ARCH}-${CLAUDE_VERSION}.tgz"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   -o "$CODEX_TGZ" \
   "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}.tgz"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  -o "$CODEX_NATIVE_TGZ" \
+  "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}-linux-${NATIVE_ARCH}.tgz"
 verify_integrity "$CLAUDE_TGZ" "$CLAUDE_INTEGRITY"
+verify_integrity "$CLAUDE_NATIVE_TGZ" "$CLAUDE_NATIVE_INTEGRITY"
 verify_integrity "$CODEX_TGZ" "$CODEX_INTEGRITY"
-npm install --global --no-fund --no-audit "$CLAUDE_TGZ" "$CODEX_TGZ"
-rm -f "$CLAUDE_TGZ" "$CODEX_TGZ"
-npm cache clean --force
+verify_integrity "$CODEX_NATIVE_TGZ" "$CODEX_NATIVE_INTEGRITY"
+
+# Install only the four archives verified above.  Do not ask npm to resolve
+# optional dependencies: those are the native executables, and resolving them
+# here would reintroduce an unpinned network download after verification.
+CLAUDE_DIR="/usr/local/lib/node_modules/@anthropic-ai/claude-code"
+CLAUDE_NATIVE_DIR="$CLAUDE_DIR/node_modules/@anthropic-ai/claude-code-linux-${NATIVE_ARCH}"
+CODEX_DIR="/usr/local/lib/node_modules/@openai/codex"
+CODEX_NATIVE_DIR="$CODEX_DIR/node_modules/@openai/codex-linux-${NATIVE_ARCH}"
+mkdir -p "$CLAUDE_DIR" "$CLAUDE_NATIVE_DIR" "$CODEX_DIR" "$CODEX_NATIVE_DIR"
+tar -xzf "$CLAUDE_TGZ" -C "$CLAUDE_DIR" --strip-components=1
+tar -xzf "$CLAUDE_NATIVE_TGZ" -C "$CLAUDE_NATIVE_DIR" --strip-components=1
+tar -xzf "$CODEX_TGZ" -C "$CODEX_DIR" --strip-components=1
+tar -xzf "$CODEX_NATIVE_TGZ" -C "$CODEX_NATIVE_DIR" --strip-components=1
+rm -f "$CLAUDE_TGZ" "$CLAUDE_NATIVE_TGZ" "$CODEX_TGZ" "$CODEX_NATIVE_TGZ"
+
+# Claude's published postinstall selects the already-present native package
+# and copies/links its binary. It performs no dependency resolution.
+(cd "$CLAUDE_DIR" && node install.cjs)
+chmod 0755 "$CODEX_DIR/bin/codex.js"
+ln -s ../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude
+ln -s ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 
 mkdir -p /etc/agent-bridge
 

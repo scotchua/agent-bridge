@@ -1,21 +1,23 @@
 {
-  "_stub": "THIS RECIPE IS NOT BUILDABLE. base_digest is an all-zero placeholder, claude_version/codex_version are stand-ins rather than observed releases, and node_tarball_sha256/claude_integrity/codex_integrity are unfilled. validate_recipe refuses it by name and windows_rootfs.release_blockers() lists it as unreleasable. Replace every value with one you have actually observed, including a real pinned version for every apt package and a real integrity pin for every download, before claiming an image can be built from it.",
   "apt_packages": [
-    "ca-certificates=20230311+deb12u1",
-    "curl=7.88.1-10+deb12u12",
-    "git=REPLACE-WITH-OBSERVED-VERSION",
-    "nftables=REPLACE-WITH-OBSERVED-VERSION",
+    "ca-certificates=20250419~deb12u1",
+    "curl=7.88.1-10+deb12u15",
+    "git=1:2.39.5-0+deb12u3",
+    "nftables=1.0.6-2+deb12u2",
+    "openssl=3.0.20-1~deb12u2",
     "python3-minimal=3.11.2-1+b1",
-    "xz-utils=5.4.1-0.2"
+    "xz-utils=5.4.1-1+deb12u1"
   ],
   "architecture": "arm64",
-  "base_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "base_digest": "sha256:c66c66fac809bfb56a8001b12f08181a49b6db832d2c8ddabe22b6374264055f",
   "base_image": "library/debian",
-  "claude_integrity": "REPLACE-WITH-OBSERVED-NPM-INTEGRITY",
-  "claude_version": "1.0.0",
-  "codex_integrity": "REPLACE-WITH-OBSERVED-NPM-INTEGRITY",
-  "codex_version": "0.1.0",
-  "distro_release": "12.9",
-  "node_tarball_sha256": "REPLACE-WITH-OBSERVED-SHA256",
-  "node_version": "20.19.0"
+  "claude_integrity": "sha512-Arqg8BvlOehmC3QdACN2WKshqqWQVMo+5NwG22aiJbw7M6S1LM7E2pA2MjD8BS5P5EwZVkh2eKUmC6k7pVUqSQ==",
+  "claude_native_integrity": "sha512-lOWJjMw3rRNBjQuGrFqErlk6FW4dbR1Nf51jFtUChv2auatQjPaooslxp9dG944XpNAvn++P65ife4hM2iww6w==",
+  "claude_version": "2.1.260",
+  "codex_integrity": "sha512-SwQns+YIXvaXV4a6RUd9twgTPJkkfZpuTNEkTtIkwBnfw6fpT61+d6gU1WHZxK6vWFNqJCBoJEP69FIAsoPduA==",
+  "codex_native_integrity": "sha512-uayZKgz5lk7Pz3JPjL98FGQGFRcrax3sGEQ9CtduyZscbIcnn3iYszRvGcubqVwiHi3B9oAVqy8V2NcWGwImLg==",
+  "codex_version": "0.153.3",
+  "distro_release": "12.12",
+  "node_tarball_sha256": "01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc",
+  "node_version": "24.19.0"
 }

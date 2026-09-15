@@ -8,24 +8,16 @@ No image is committed to this repository. `build/` and `*.tar` are gitignored.
 The tarball is distributed out of band and checked against its manifest hash on
 the machine that imports it.
 
-## The shipped recipes are stubs, and will not build
+## Recipe status
 
-`tools/rootfs/recipes/amd64.json` and `arm64.json` do **not** describe a
-buildable image today, and `validate_recipe` refuses both by name. Nothing in
-this repository has observed:
+`tools/rootfs/recipes/arm64.json` contains observed, exact pins and is
+buildable. `tools/rootfs/recipes/amd64.json` remains an explicit, refused stub
+until its architecture-specific pins are observed. A test holds that
+distinction so neither status can change silently.
 
-* a real base-image digest (the field is an all-zero placeholder)
-* a real released `claude_version` or `codex_version` (both are stand-ins)
-* a real pinned version for `nftables` or `git`, which the guest now needs:
-  `nftables` provides `/usr/sbin/nft` for the `network-egress-policy` canary,
-  and `git` provides `/usr/bin/git` for the baseline commit and the returned
-  diff
-* a real `node_tarball_sha256`, `claude_integrity` or `codex_integrity`
-
-The build script therefore fails on the shipped recipes rather than producing
-an image from guessed pins, and a test asserts that it fails, so "the rootfs is
-buildable" cannot become a quiet assumption. Fill the recipe in with values you
-have actually observed, then replace that test with one asserting the opposite.
+The runtime packages include exact versions for `nftables`, `git`, and
+`openssl`. OpenSSL is explicit because the build uses it to verify SHA-512
+integrity; it is not left as an accidental transitive dependency.
 
 ## Nothing here is learned after the download
 
@@ -35,13 +27,14 @@ before anything was fetched:
 * the Node tarball against `node_tarball_sha256`. The `SHASUMS256.txt` fetch is
   gone: a checksum file served from the same origin over the same connection is
   learned after the download and proves only that the origin agrees with itself
-* each provider CLI against `claude_integrity` / `codex_integrity`, npm's
-  `sha512-<base64>` form, checked against the package tarball fetched directly
-  from the registry. The install is then `npm install --global <file>`, never
-  `npm install <name>@<version>`, because the latter resolves, downloads and
-  runs install scripts in one step with nothing to compare against
+* both provider wrapper tarballs and both architecture-native tarballs against
+  their four npm `sha512-<base64>` integrity pins. All four are verified before
+  any is extracted. They are then unpacked directly into fixed global module
+  paths. No `npm install` or dependency resolution runs in the image build;
+  the only provider lifecycle script is Claude's local postinstall, after its
+  native dependency is already present and verified
 
-`validate_recipe` refuses a recipe missing any of the three, so an unpinned
+`validate_recipe` refuses a recipe missing any of the five pins, so an unpinned
 download cannot reach a build.
 
 ## The artifact workflow is unreleasable, and says so in code

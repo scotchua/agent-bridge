@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -42,8 +43,11 @@ def _recipe(**overrides):
         node_tarball_sha256="d" * 64,
         claude_integrity="sha512-" + "A" * 86 + "==",
         codex_integrity="sha512-" + "B" * 86 + "==",
+        claude_native_integrity="sha512-" + "C" * 86 + "==",
+        codex_native_integrity="sha512-" + "D" * 86 + "==",
         apt_packages=("ca-certificates=20230311+deb12u1",
-                      "nftables=1.0.6-2+deb12u2", "git=1:2.39.5-0+deb12u2"),
+                      "nftables=1.0.6-2+deb12u2", "git=1:2.39.5-0+deb12u2",
+                      "openssl=3.0.0"),
     )
     fields.update(overrides)
     return wrf.RootfsRecipe(**fields)
@@ -204,6 +208,14 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(sidecar["architecture"], "arm64")
         self.assertEqual(sidecar["base_digest"], DIGEST)
         self.assertEqual(sidecar["guest_runner_sha256"], RUNNER_HASH)
+        self.assertEqual(
+            sidecar["download_integrity"]["claude_native_integrity"],
+            _recipe().claude_native_integrity,
+        )
+        self.assertEqual(
+            sidecar["download_integrity"]["codex_native_integrity"],
+            _recipe().codex_native_integrity,
+        )
         json.dumps(sidecar)
 
     def test_the_sidecar_records_the_boundary_file_hash_the_host_will_check(self):
@@ -400,8 +412,10 @@ class DocumentedLimitationTests(unittest.TestCase):
     def test_no_image_is_committed_to_git(self):
         self.assertIn("no rootfs tarball is committed to git",
                       wrf.IMAGE_DISTRIBUTION_LIMITATION)
-        self.assertEqual([path for path in ROOT.rglob("*.tar")
-                          if ".git" not in path.parts], [])
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", "*.tar"], cwd=ROOT,
+            check=True, capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual(tracked, [])
 
     def test_no_live_validation_is_claimed(self):
         self.assertIn("has been imported into WSL2 on a live", wrf.NO_LIVE_VALIDATION)
@@ -445,24 +459,21 @@ class RecipeHonestyTests(unittest.TestCase):
                          (gr.JOB_USER, gr.JOB_UID, gr.JOB_GID))
         self.assertNotEqual(gr.JOB_UID, 0)
 
-    def test_the_shipped_recipes_do_not_yet_validate(self):
-        """The recipes in tools/rootfs/recipes are stubs, and say so.
-
-        Nothing in this repository has observed a real base-image digest or a
-        real pinned provider release, so the shipped recipe files cannot be
-        built. This test exists so that stops being a quiet fact: it fails the
-        day someone fills them in, which is the day the claim "the rootfs is
-        buildable" becomes true and this test should be replaced by one that
-        asserts the opposite.
-        """
+    def test_arm64_is_pinned_and_amd64_remains_an_explicit_stub(self):
+        """Each shipped architecture says truthfully whether it is buildable."""
         import json
         recipes = ROOT / "tools" / "rootfs" / "recipes"
-        for path in sorted(recipes.glob("*.json")):
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertIn("NOT BUILDABLE", raw.pop("_stub", ""), path.name)
-            raw["apt_packages"] = tuple(raw.get("apt_packages", ()))
-            with self.assertRaises(wrf.RootfsRecipeError, msg=path.name):
-                wrf.validate_recipe(wrf.RootfsRecipe(**raw))
+        arm = json.loads((recipes / "arm64.json").read_text(encoding="utf-8"))
+        self.assertNotIn("_stub", arm)
+        arm["apt_packages"] = tuple(arm["apt_packages"])
+        self.assertEqual(wrf.validate_recipe(wrf.RootfsRecipe(**arm)).architecture,
+                         "arm64")
+
+        amd = json.loads((recipes / "amd64.json").read_text(encoding="utf-8"))
+        self.assertIn("NOT BUILDABLE", amd.pop("_stub", ""))
+        amd["apt_packages"] = tuple(amd.get("apt_packages", ()))
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.validate_recipe(wrf.RootfsRecipe(**amd))
 
 
 
@@ -479,7 +490,10 @@ class DownloadIntegrityTests(unittest.TestCase):
                 _recipe(node_tarball_sha256="REPLACE-WITH-OBSERVED-SHA256"))
 
     def test_each_provider_package_needs_an_integrity_pin(self):
-        for field in ("claude_integrity", "codex_integrity"):
+        for field in (
+            "claude_integrity", "codex_integrity",
+            "claude_native_integrity", "codex_native_integrity",
+        ):
             with self.assertRaisesRegex(wrf.RootfsRecipeError, field):
                 wrf.validate_recipe(_recipe(**{field: ""}))
             with self.assertRaisesRegex(wrf.RootfsRecipeError, field):
@@ -490,6 +504,8 @@ class DownloadIntegrityTests(unittest.TestCase):
         self.assertIn("--node-sha256 " + "d" * 64, text)
         self.assertIn("--claude-integrity sha512-" + "A" * 86 + "==", text)
         self.assertIn("--codex-integrity sha512-" + "B" * 86 + "==", text)
+        self.assertIn("--claude-native-integrity sha512-" + "C" * 86 + "==", text)
+        self.assertIn("--codex-native-integrity sha512-" + "D" * 86 + "==", text)
 
     def test_the_installer_never_learns_a_hash_from_the_download_origin(self):
         """A checksum file fetched next to the tarball proves nothing."""
@@ -500,16 +516,23 @@ class DownloadIntegrityTests(unittest.TestCase):
         self.assertIn("--claude-integrity", installer)
         self.assertIn("--codex-integrity", installer)
 
-    def test_the_installer_verifies_provider_tarballs_before_npm_runs_them(self):
+    def test_the_installer_verifies_all_provider_tarballs_before_extracting(self):
         installer = (ROOT / "tools" / "rootfs" / "install-pinned-tools").read_text(
             encoding="utf-8")
-        verify = installer.index("verify_integrity \"$CLAUDE_TGZ\"")
-        install = installer.index("npm install --global --no-fund --no-audit \"$CLAUDE_TGZ\"")
-        self.assertLess(verify, install)
-        # Never "npm install <name>@<version>": that resolves, downloads and
-        # executes install scripts in one step with nothing to compare against.
-        self.assertNotIn("@anthropic-ai/claude-code@", installer)
-        self.assertNotIn("@openai/codex@", installer)
+        first_extract = installer.index("tar -xzf")
+        for archive in (
+            "CLAUDE_TGZ", "CLAUDE_NATIVE_TGZ", "CODEX_TGZ", "CODEX_NATIVE_TGZ",
+        ):
+            self.assertLess(
+                installer.index(f'verify_integrity \"${archive}\"'), first_extract)
+
+    def test_provider_install_has_no_npm_resolution_or_unpinned_network_fetch(self):
+        installer = (ROOT / "tools" / "rootfs" / "install-pinned-tools").read_text(
+            encoding="utf-8")
+        self.assertNotRegex(installer, r"(?m)^\s*npm\s+install\b")
+        self.assertNotIn("npm cache", installer)
+        self.assertEqual(installer.count("registry.npmjs.org"), 4)
+        self.assertIn('(cd "$CLAUDE_DIR" && node install.cjs)', installer)
 
 
 class ReleaseTrustTests(unittest.TestCase):
