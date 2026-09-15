@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
 from agent_bridge.orchestration import (  # noqa: E402
-    delegation, windows_preflight, windows_wsl_provision as wp)
+    autoroute, delegation, gate as delegation_gate, windows_preflight,
+    windows_wsl_provision as wp)
 import platform_support  # noqa: E402
 
 
@@ -333,7 +335,14 @@ class EvidenceValidationTests(unittest.TestCase):
                                          local_worker_required=False)
 
 
-class ApplyIntegrationTests(unittest.TestCase):
+class ApplyHarness(unittest.TestCase):
+    """Staging and patching for an `onboard apply` run. No tests of its own.
+
+    Separated from the test classes so a second one can reuse it: a subclass
+    of a TestCase re-runs every test the parent defines, which is a silent way
+    to double a suite's work and halve the clarity of its output.
+    """
+
     def setUp(self):
         # These are orchestration integration tests, not host-support tests.
         # Keep their result independent of the CI runner's operating system;
@@ -375,6 +384,8 @@ class ApplyIntegrationTests(unittest.TestCase):
             mock.patch.object(config, "local_config_path", return_value=os.path.join(tmp, "local.json")),
         )
 
+
+class ApplyIntegrationTests(ApplyHarness):
     def test_enabled_without_evidence_is_refused_and_preserves_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
@@ -509,6 +520,121 @@ class ApplyIntegrationTests(unittest.TestCase):
                 report = onboard.uninstall(choices, str(ROOT), home=home, apply_changes=True)
             self.assertTrue(any("LaunchAgent" in c for c in report["preserved_conflicts"]))
             self.assertEqual(Path(paths["launch_agent"]).read_bytes(), edited)
+
+
+class GateInstallationWiringTests(ApplyHarness):
+    """Opting in must install the part that makes delegation automatic.
+
+    Without the gate, the orchestration tools exist but nothing makes the
+    routing decision happen, so delegation stays something an assistant has
+    to be asked for. That was the gap; these assert the installer closes it,
+    and that closing it does not start dispatching anything on its own.
+    """
+
+    def _apply_enabled(self, tmp):
+        choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+        home, candidate, results = self._stage(tmp, choices)
+        cfg = delegation.build_config(home, str(ROOT), local_worker_executable=None)
+        delegation_results = os.path.join(tmp, "delegation.json")
+        store.atomic_write_json(delegation_results, evidence(cfg))
+        patches = self._apply_patches(tmp)
+        stdout = io.StringIO()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            with contextlib.redirect_stdout(stdout):
+                onboard.apply(choices, candidate, results, str(ROOT), home=home,
+                             delegation_results=delegation_results)
+        return home, cfg, json.loads(stdout.getvalue())
+
+    def test_apply_installs_the_hook_for_both_clients(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, _, report = self._apply_enabled(tmp)
+            gate_report = report["automatic_delegation"]["gate"]
+            self.assertNotIn("install_error", gate_report)
+            self.assertEqual(gate_report["installed"]["clients"], ["claude", "codex"])
+            self.assertTrue(gate_report["installed"]["applied"])
+            paths = delegation_gate.install_paths(home)
+            for path in (paths["claude_settings"], paths["codex_hooks"]):
+                loaded = store.read_json(path)
+                entries = loaded.get("hooks", {}).get("PreToolUse", [])
+                self.assertTrue(any(delegation_gate._is_ours(item) for item in entries), path)
+
+    def test_the_installed_hook_runs_with_automatic_routing_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, _, _ = self._apply_enabled(tmp)
+            paths = delegation_gate.install_paths(home)
+            loaded = store.read_json(paths["claude_settings"])
+            entry = next(item for item in loaded["hooks"]["PreToolUse"]
+                         if delegation_gate._is_ours(item))
+            command = entry["hooks"][0]["command"]
+            self.assertNotIn("--no-automatic-routing", command)
+
+    def test_both_managed_blocks_survive_in_codex_config(self):
+        """The peer registrations and the hooks flag are written in sequence.
+
+        Computing both from the same original would mean the second silently
+        dropped the first, which is why the gate is installed after the main
+        write set commits rather than folded into it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home, _, _ = self._apply_enabled(tmp)
+            text = pathlib.Path(delegation_gate.install_paths(home)["codex_toml"]).read_text(
+                encoding="utf-8")
+            self.assertIn("hooks = true", text)
+            self.assertIn("agent-bridge-orchestration", text)
+
+    def test_the_policy_scaffold_is_inert_so_nothing_is_dispatched_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg, report = self._apply_enabled(tmp)
+            gate_report = report["automatic_delegation"]["gate"]
+            self.assertTrue(gate_report["policy_created"])
+            policy = autoroute.load_policy(cfg["state_root"])
+            self.assertEqual(policy.repos, {})
+            self.assertEqual(policy.default.allowed_routes, ())
+            self.assertEqual(policy.default.classification, "unclassified")
+            if os.name != "nt":
+                self.assertEqual(
+                    os.stat(gate_report["policy_path"]).st_mode & 0o777, 0o600)
+
+    def test_an_existing_policy_is_never_rewritten(self):
+        """It is the operator's document; resetting it would un-classify everything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg, _ = self._apply_enabled(tmp)
+            path = autoroute.policy_path(cfg["state_root"])
+            mine = {"version": 1, "repos": {"/srv/project": {
+                "classification": "public", "allowed_routes": ["codex"]}}}
+            store.atomic_write_json(path, mine)
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            _, candidate, results = self._stage(tmp, choices)
+            delegation_results = os.path.join(tmp, "delegation2.json")
+            store.atomic_write_json(delegation_results, evidence(cfg))
+            patches = self._apply_patches(tmp)
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    onboard.apply(choices, candidate, results, str(ROOT), home=home,
+                                 delegation_results=delegation_results)
+            self.assertEqual(store.read_json(path), mine)
+
+    def test_the_report_names_what_the_operator_must_still_do(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, report = self._apply_enabled(tmp)
+            steps = " ".join(report["automatic_delegation"]["gate"]["next_steps"]).lower()
+            for expected in ("classify", "/hooks", "capacity", "audit"):
+                self.assertIn(expected, steps)
+
+    def test_opting_out_installs_no_gate_at_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": False}))
+            home, candidate, results = self._stage(tmp, choices)
+            patches = self._apply_patches(tmp)
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    onboard.apply(choices, candidate, results, str(ROOT), home=home)
+            paths = delegation_gate.install_paths(home)
+            for path in (paths["claude_settings"], paths["codex_hooks"]):
+                if not os.path.exists(path):
+                    continue
+                entries = store.read_json(path).get("hooks", {}).get("PreToolUse", [])
+                self.assertFalse(any(delegation_gate._is_ours(item) for item in entries))
 
 
 class LauncherSecurityTests(unittest.TestCase):

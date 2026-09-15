@@ -346,6 +346,44 @@ class DefectsFoundWhileBuildingThis(AutoCase):
         self.assertEqual(gate.infer_task_type(["tests/test_app.py"]), "implementation")
 
 
+class AFailedDecisionSaysLittleAndDeniesAnyway(AutoCase):
+    """``errors.py``'s rule reaches the gate too: no unvetted text escapes."""
+
+    def judge_with(self, decider):
+        return gate.judge("claude", "Edit", {"file_path": str(self.repo / "app.py")},
+                          str(self.repo), state_root=str(self.state),
+                          capacity_db=str(self.db), decide=decider)
+
+    def test_an_unexpected_exception_contributes_its_class_and_nothing_else(self):
+        secret = "SENTINEL_TOKEN_sk_live_do_not_leak"
+
+        class Surprising(RuntimeError):
+            pass
+
+        def decider(repo, task_type):
+            raise Surprising(secret)
+
+        decision = self.judge_with(decider)
+        self.assertEqual(decision.permission, "deny")
+        self.assertEqual(decision.code, "gate_auto_decision_failed")
+        self.assertIn("Surprising", decision.reason)
+        self.assertNotIn(secret, decision.reason)
+
+    def test_our_own_reason_code_is_repeated_because_we_wrote_it(self):
+        def decider(repo, task_type):
+            raise autodecide.AutoDecisionError("policy_unreadable:ValueError")
+
+        decision = self.judge_with(decider)
+        self.assertEqual(decision.code, "gate_auto_decision_failed")
+        self.assertIn("policy_unreadable", decision.reason)
+
+    def test_the_deny_stands_even_when_the_decider_returns_nothing_useful(self):
+        """A decider that writes no receipt must not become an allow."""
+        decision = self.judge_with(lambda repo, task_type: None)
+        self.assertEqual(decision.permission, "deny")
+        self.assertEqual(decision.code, "no_routing_receipt")
+
+
 class RestartAndReuse(AutoCase):
     def test_the_decision_survives_into_the_next_hook_process(self):
         """Each tool call is a new process; the decision must be on disk."""
@@ -387,6 +425,51 @@ class TheStrictPostureIsStillAvailable(AutoCase):
         payload_target = self.state / "routing" / "anything.json"
         result = self.hook("claude", self.repo, str(payload_target))
         self.assertDenied(result, "gate_state_protected")
+
+
+class TheTieBreakIsSymmetricUnlessAskedOtherwise(unittest.TestCase):
+    """With both providers eligible, no preference must not favour one.
+
+    The default used to be ``prefer = ROUTES``, which ranks claude above
+    codex, so a Claude client kept every repository classified for both while
+    a Codex client handed every one of them over. That reads harmlessly in
+    the source and is a bias nobody chose.
+    """
+
+    def decide(self, client, **policy_kwargs):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("public", ("claude", "codex"))},
+            **policy_kwargs)
+        return autoroute.decide(
+            autoroute.Signal(client=client, repo="/r"), policy,
+            fresh_routes=frozenset({"claude", "codex"}),
+            load=autoroute.Load(0.1, True))
+
+    def test_no_preference_routes_both_clients_to_their_peer(self):
+        self.assertEqual(autoroute.Policy().prefer, ())
+        self.assertEqual(self.decide("claude").route, "codex")
+        self.assertEqual(self.decide("codex").route, "claude")
+
+    def test_a_named_preference_is_honoured_in_one_direction_only(self):
+        self.assertEqual(self.decide("claude", prefer=("claude",)).route,
+                         autoroute.RETAIN)
+        self.assertEqual(self.decide("codex", prefer=("claude",)).route, "claude")
+
+    def test_an_absent_prefer_key_parses_as_no_preference(self):
+        policy = autoroute.parse_policy({"version": 1, "repos": {}})
+        self.assertEqual(policy.prefer, ())
+
+    def test_review_independence_overrides_any_preference(self):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("public", ("claude", "codex"))},
+            prefer=("claude",))
+        decision = autoroute.decide(
+            autoroute.Signal(client="claude", repo="/r", task_type="review",
+                             is_review=True, author_route="claude"),
+            policy, fresh_routes=frozenset({"claude", "codex"}),
+            load=autoroute.Load(0.1, True))
+        self.assertEqual(decision.route, "codex")
+        self.assertEqual(decision.code, "routed_peer_review_independence")
 
 
 class PolicyParsing(unittest.TestCase):

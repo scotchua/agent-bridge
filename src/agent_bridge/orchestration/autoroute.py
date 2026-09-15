@@ -110,7 +110,14 @@ class Policy:
     peer_classifications: frozenset[str] = PEER_CLASSIFICATIONS
     max_local_load_ratio: float = DEFAULT_MAX_LOCAL_LOAD
     #: Tie-break order when more than one route survives every check.
-    prefer: tuple[str, ...] = ROUTES
+    #:
+    #: Empty means no preference, and an eligible peer then wins, because
+    #: that is what delegation-first means. The default used to be ``ROUTES``
+    #: itself, which reads harmlessly and is not: it ranks claude above codex,
+    #: so a Claude client kept every repository classified for both while a
+    #: Codex client handed every one of them over. An asymmetry nobody chose
+    #: does not belong in a default.
+    prefer: tuple[str, ...] = ()
 
     def for_repo(self, repo: str) -> RepoPolicy:
         """The entry for ``repo``, matched on the real path, else the default."""
@@ -343,6 +350,8 @@ def _prefers(policy: Policy, first: str, second: str) -> bool:
 
     A route absent from ``prefer`` ranks last rather than raising: the order
     is a preference, and a missing entry must not make a decision impossible.
+    With no order at all, neither outranks the other, so the caller routes to
+    the peer.
     """
     order = {route: index for index, route in enumerate(policy.prefer)}
     return order.get(first, len(order)) < order.get(second, len(order))
@@ -397,7 +406,9 @@ def parse_policy(document: object) -> Policy:
     ceiling = document.get("max_local_load_ratio", DEFAULT_MAX_LOCAL_LOAD)
     if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 64:
         raise PolicyError("max_local_load_ratio must be a number above 0 and at most 64")
-    prefer = document.get("prefer", list(ROUTES))
+    # Absent means no preference, which routes to an eligible peer. See
+    # Policy.prefer for why this is not ``list(ROUTES)``.
+    prefer = document.get("prefer", [])
     if not isinstance(prefer, list) or any(route not in ROUTES for route in prefer):
         raise PolicyError("prefer must be a list of known routes")
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,

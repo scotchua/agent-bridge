@@ -635,11 +635,16 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
             try:
                 decide(repo, task_type)
             except Exception as exc:  # noqa: BLE001  fail closed, name the class
+                # AutoDecisionError carries a fixed reason code this codebase
+                # wrote, so it is safe to repeat. Any other class's text is
+                # unvetted and is left out, the same rule ``errors.py`` applies
+                # to every caller-visible field.
+                named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
+                detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
                 return Decision(
                     "deny", "gate_auto_decision_failed",
                     f"delegation-first gate: the routing decision for {repo} could not be "
-                    f"created ({type(exc).__name__}: {exc}); nothing is implemented until "
-                    f"it can be", repos)
+                    f"created ({detail}); nothing is implemented until it can be", repos)
             try:
                 receipt = read_receipt(state_root, repo)
             except (OSError, ValueError) as exc:
@@ -663,8 +668,9 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
         if receipt["owner_route"] != client:
             route = receipt["owner_route"]
             call = "work_route_local" if route == "local" else "execution_dispatch"
-            automatic = (" The routing decision was made automatically: "
-                         + str(receipt.get("code", "")) + "." if receipt.get("automatic") else "")
+            automatic = ((" The routing decision was made automatically: "
+                          + str(receipt.get("code", "")) + ".")
+                         if receipt.get("automatic") else "")
             return Decision(
                 "deny", "routed_elsewhere",
                 f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "

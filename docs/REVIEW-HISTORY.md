@@ -924,3 +924,42 @@ running the suite, the hundred skipped tests were found by moving a block, and
 the rejection marker was found by a rerun; all three are the kind of thing
 that is only ever found by running something, which is the argument for the
 runbook rather than a substitute for it.
+
+## Round five: the automatic delegation work, 2026-09-15
+
+Three defects found by running the thing rather than by reading it. Recorded
+here because the pattern transfers: each one passed every test that existed,
+and each one was found within minutes of driving the real workflow end to end.
+
+41. **Both execution lanes could only run on one macOS layout, and the only
+    tests that would have caught it never ran anywhere it was broken.**
+    `GIT_BIN` was the standalone Command Line Tools path and `_assert_macos()`
+    refused every other host, so the first git call spawned a file that does
+    not exist and the lane reported `TaskError: command spawn failed`. CI ran
+    `test_claude_task.py` and `test_codex_task.py` on macOS only, precisely
+    because they could not pass elsewhere. A platform-conditional test step is
+    a place defects go to live. Both modules now run on macOS and Linux and
+    assert what the *selected* confinement backend claims rather than macOS
+    semantics everywhere.
+
+42. **A completed stage bricked its repository.** The automatic decision used
+    one stage name per repository, so the first ordinary `stage_complete` left
+    every later edit denied with `stage_not_owned` and an instruction to claim
+    a stage by hand. The gate was working exactly as written and the result
+    was the opposite of the feature. Stages carry a generation now.
+
+43. **A plausible-sounding signal produced an unsatisfiable instruction.**
+    `infer_task_type` guessed "mechanical" when every target path looked like
+    a test file, and routed such edits to the local model. It read well. But
+    the local worker processes inline text and returns a draft; it does not
+    edit files, so the dispatch intent named a call that could never be made.
+    A signal that is cheap to compute is not the same as a signal that means
+    something.
+
+One near miss worth naming. Two main-suite checks about orphan processes
+failed during this work and were **not** a regression: they are timing-
+sensitive, the machine was loaded by parallel test runs, and `runner.py`,
+`broker.py` and `platform/` were untouched. Two consecutive runs on an idle
+machine returned to the baseline. The temptation to record "4 failures,
+pre-existing" without checking is exactly how a real regression gets filed as
+noise.

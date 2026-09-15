@@ -282,8 +282,10 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
     repo_root = gate.repo_key(repo)
     if repo_root is None:
         raise AutoDecisionError("repo_not_a_repository")
-    now = float(clock())
-    if not math.isfinite(now):
+    # A guard, not a value: every time below comes from the same clock, and a
+    # non-finite one would produce a receipt whose validity window means
+    # nothing. Refuse before anything is written rather than after.
+    if not math.isfinite(float(clock())):
         raise AutoDecisionError("clock_invalid")
 
     try:
@@ -306,7 +308,7 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
     # the router to assign. Never for the peer: see the module docstring.
     try:
         _observe_client_presence(router, client)
-    except (RoutingError, Exception) as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001  RoutingError, sqlite and OS alike
         raise AutoDecisionError(f"capacity_observe_failed:{type(exc).__name__}") from None
 
     decision = autoroute.decide(signal, policy, fresh_routes=fresh_routes(router),
@@ -319,12 +321,10 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                         owner_id=owner_id_for(client), lease_seconds=lease_seconds)
     if record.get("state") != "owned":
         raise AutoDecisionError(f"stage_not_owned_after_claim:{record.get('state')}")
-    if record.get("owner_route") != route:
-        # Another client's automatic decision already owns this repository's
-        # stage. That is the gate's ``routed_elsewhere`` case, reached through
-        # the receipt below rather than asserted here.
-        pass
-
+    # A stage another route already owns is not an error here. The receipt
+    # below records the owner the router actually shows, and the gate reaches
+    # its ``routed_elsewhere`` deny from that, so the decision stays a
+    # description of live ownership rather than an assertion about it.
     reason = decision.reason[:gate.MAX_REASON]
     try:
         receipt = gate.record_decision(

@@ -1,0 +1,249 @@
+
+### host
+Linux 6.18.44-fc-v33 x86_64
+Python 3.11.15 (main, Mar  3 2026, 09:26:23) [GCC 13.3.0]
+git version 2.43.0
+{"classification": "synthetic", "confinement": "linux-netns-synthetic-only", "confines_reads": false, "confines_writes": false, "denies_network": true, "git": "/usr/bin/git", "platform": "Linux"}
+{"classification": "public", "confinement": null, "confinement_detail": "the linux-netns-synthetic-only backend confines no reads, so it carries only synthetic material; 'public' needs a host with full confinement", "confinement_refusal": "verification_confinement_insufficient", "git": "/usr/bin/git", "platform": "Linux"}
+{"classification": "internal_nonclient", "confinement": null, "confinement_detail": "the linux-netns-synthetic-only backend confines no reads, so it carries only synthetic material; 'internal_nonclient' needs a host with full confinement", "confinement_refusal": "verification_confinement_insufficient", "git": "/usr/bin/git", "platform": "Linux"}
+
+### 1. the defect, reproduced before the repair (from git stash of the old constants)
+old GIT_BIN            : /Library/Developer/CommandLineTools/usr/bin/git
+exists on this host    : False
+Traceback (most recent call last):
+  File "<string>", line 8, in <module>
+  File "/usr/lib/python3.11/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.11/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: '/Library/Developer/CommandLineTools/usr/bin/git'
+after the repair, the same failure names itself:
+  claude -> could not start '/Library/Developer/CommandLineTools/usr/bin/git': no such file
+  codex -> could not start '/Library/Developer/CommandLineTools/usr/bin/git': no such file
+
+### 2. the complete workflow, end to end (the real installer, hook, MCP server, queue and harnesses)
+test_a_caller_cannot_dispatch_to_its_own_provider (tests.test_automatic_delegation_e2e.BothDirections.test_a_caller_cannot_dispatch_to_its_own_provider) ... ok
+test_codex_to_claude_and_claude_to_codex_both_produce_verified_patches (tests.test_automatic_delegation_e2e.BothDirections.test_codex_to_claude_and_claude_to_codex_both_produce_verified_patches) ... ok
+test_paid_fallback_is_refused_at_the_queue (tests.test_automatic_delegation_e2e.BothDirections.test_paid_fallback_is_refused_at_the_queue) ... ok
+test_both_assistants_can_reach_the_local_lane (tests.test_automatic_delegation_e2e.LocalLane.test_both_assistants_can_reach_the_local_lane) ... ok
+test_client_derived_material_is_refused_with_no_cloud_fallback (tests.test_automatic_delegation_e2e.LocalLane.test_client_derived_material_is_refused_with_no_cloud_fallback) ... ok
+test_eligible_mechanical_text_is_admitted_and_drafted_automatically (tests.test_automatic_delegation_e2e.LocalLane.test_eligible_mechanical_text_is_admitted_and_drafted_automatically) ... ok
+test_the_routing_receipt_is_immutable (tests.test_automatic_delegation_e2e.LocalLane.test_the_routing_receipt_is_immutable) ... ok
+test_work_needing_judgment_is_refused_rather_than_sent_local (tests.test_automatic_delegation_e2e.LocalLane.test_work_needing_judgment_is_refused_rather_than_sent_local) ... ok
+test_a_claim_without_a_running_receipt_is_also_uncertain (tests.test_automatic_delegation_e2e.RestartRecovery.test_a_claim_without_a_running_receipt_is_also_uncertain)
+The window between taking the claim and publishing running. ... ok
+test_a_failure_is_recorded_with_its_detail_not_just_a_class_name (tests.test_automatic_delegation_e2e.RestartRecovery.test_a_failure_is_recorded_with_its_detail_not_just_a_class_name)
+The spec's rule: a bare TaskError is not diagnostic evidence. ... ok
+test_a_job_interrupted_while_running_is_blocked_for_reconciliation (tests.test_automatic_delegation_e2e.RestartRecovery.test_a_job_interrupted_while_running_is_blocked_for_reconciliation) ... ok
+test_a_queued_job_survives_a_restart_and_still_runs (tests.test_automatic_delegation_e2e.RestartRecovery.test_a_queued_job_survives_a_restart_and_still_runs)
+Recovery must not blanket-block work that was never started. ... ok
+test_the_routing_decision_survives_a_restart (tests.test_automatic_delegation_e2e.RestartRecovery.test_the_routing_decision_survives_a_restart)
+Receipts are files, so a new hook process reads the same decision. ... ok
+test_install_decide_dispatch_verify_and_audit (tests.test_automatic_delegation_e2e.TheUserWorkflow.test_install_decide_dispatch_verify_and_audit)
+One pass through everything, in the order a user meets it. ... ok
+----------------------------------------------------------------------
+Ran 14 tests in 9.820s
+OK
+
+### 3. the two dispatch lanes, run directly, with their receipts
+--- codex -> claude ---
+{
+  "state": "complete",
+  "caller": "codex",
+  "provider": "claude",
+  "classification": "synthetic",
+  "permission_to_apply": false,
+  "permission_to_commit": false,
+  "permission_to_push": false,
+  "permission_to_merge": false
+}
+{
+  "status": "complete",
+  "route": "claude-subscription-cli",
+  "host_platform": "Linux",
+  "git_executable": "/usr/bin/git",
+  "verification_confinement": "linux-netns-synthetic-only",
+  "confinement_denies_network": true,
+  "confinement_confines_reads": false,
+  "source_integrity_match": true,
+  "fresh_worktree_patch_match": true,
+  "permission_to_land": false,
+  "patch_bytes": 157
+}
+verification: [
+  {
+    "argv": [
+      "python",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      ".",
+      "-p",
+      "test_calc.py"
+    ],
+    "duration_seconds": 0.0464598839998871,
+    "returncode": 0,
+    "sandbox": "linux-netns-synthetic-only",
+    "sandbox_profile_sha256": null,
+    "stderr_sha256": "fb184ea57734512b1f088f9181209901b9cd46df3eb7eaa2500ea9e48dde20b5",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]
+patch:
+diff --git a/calc.py b/calc.py
+index 12ee743..4693ad3 100644
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+
+--- claude -> codex ---
+{
+  "state": "complete",
+  "caller": "claude",
+  "provider": "codex",
+  "classification": "synthetic",
+  "permission_to_apply": false,
+  "permission_to_commit": false,
+  "permission_to_push": false,
+  "permission_to_merge": false
+}
+{
+  "status": "complete",
+  "route": "codex-subscription-cli",
+  "host_platform": "Linux",
+  "git_executable": "/usr/bin/git",
+  "verification_confinement": "linux-netns-synthetic-only",
+  "confinement_denies_network": true,
+  "confinement_confines_reads": false,
+  "source_integrity_match": true,
+  "fresh_worktree_patch_match": true,
+  "permission_to_land": false,
+  "patch_bytes": 157
+}
+verification: [
+  {
+    "argv": [
+      "python",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      ".",
+      "-p",
+      "test_calc.py"
+    ],
+    "duration_seconds": 0.055230263999874296,
+    "returncode": 0,
+    "sandbox": "linux-netns-synthetic-only",
+    "sandbox_profile_sha256": null,
+    "stderr_sha256": "fb184ea57734512b1f088f9181209901b9cd46df3eb7eaa2500ea9e48dde20b5",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]
+patch:
+diff --git a/calc.py b/calc.py
+index 12ee743..4693ad3 100644
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+
+source repository after both lanes (must be byte-identical to the seed):
+'def add(a, b):\n    return a - b\n'
+
+### 4. the audit report over that run
+Delegation audit, last 0.0 hours
+
+  classified repositories: 1
+  decisions: 1 (1 automatic, 0 agent-requested)
+  eligible to delegate: 1
+  routed away:          1 {'codex': 1}
+  retained:             0
+
+  bypasses the gate can see:
+    routed but never dispatched: 0
+    clients without the hook:    none
+    writes aimed at the gate:    0
+  a zero above means none this mechanism can see, not none. The not_countable list is what it cannot see.
+
+  gate failures: 0 
+  execution_queue: {'complete': 1}
+  local_queue: {}
+
+  hook (claude): installed
+  hook (codex): installed
+    the hook is installed but Codex has not trusted it, so it does not run and every Codex call is un-gated
+  codex hook trust: needs_review
+
+--- the full record, trimmed to the accounting ---
+{
+  "eligible": {
+    "count": 1,
+    "definition": "decisions whose operator policy permitted a route other than the assistant that asked",
+    "by_code": {
+      "routed_peer_implementation": 1
+    }
+  },
+  "routed": {
+    "count": 1,
+    "by_route": {
+      "codex": 1
+    },
+    "by_code": {
+      "routed_peer_implementation": 1
+    },
+    "reasons": [
+      {
+        "repo": "/tmp/tmpjona9shv/repo",
+        "route": "codex",
+        "code": "routed_peer_implementation",
+        "reason": "implementation work in a synthetic repository, codex is allowed and has fresh capacity"
+      }
+    ]
+  },
+  "retained": {
+    "count": 0,
+    "by_code": {},
+    "reasons": []
+  },
+  "automatic_share": {
+    "decisions": 1,
+    "made_automatically": 1,
+    "made_by_an_agent_calling_routing_decide": 0
+  },
+  "bypasses": {
+    "observed": {
+      "routed_but_never_dispatched": {
+        "count": 0,
+        "meaning": "the gate refused the edit and named the route; no job was submitted for it",
+        "items": []
+      },
+      "clients_without_the_hook": [],
+      "writes_aimed_at_the_gate_itself": {
+        "count": 0,
+        "codes": {}
+      }
+    },
+    "not_countable": [
+      "Claude Desktop chats, the Codex desktop app and Codex on the web: no hook surface exists there",
+      "a person editing files in a terminal or editor",
+      "Claude Code started with --safe-mode or with disableAllHooks set",
+      "Codex started with --dangerously-bypass-hook-trust, or a hook not yet trusted in /hooks",
+      "shell commands that write in a way the text heuristic does not recognise, including one that reaches the gate's own state or the hook files without naming their paths",
+      "installation on Windows: the .cmd launcher is written but has not been run under either host",
+      "mechanical text work an assistant performs in its own context: it produces no tool call, so no local mechanism intercepts it. The local worker's automatic intake covers work an assistant sends it, not work it never sends",
+      "the brief itself: a PreToolUse payload names a tool and some paths, not the task, so automatic routing compels the dispatch but the brief's words are the assistant's"
+    ],
+    "warning": "a zero above means none this mechanism can see, not none. The not_countable list is what it cannot see."
+  }
+}
+=== EVIDENCE DONE ===

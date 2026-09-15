@@ -1156,8 +1156,11 @@ def _routing_policy_scaffold() -> bytes:
             "identify a client does not belong in any of them.",
             "allowed_routes: any of claude, codex, local. There is no paid "
             "API route and none can be added here.",
+            "prefer: empty means no preference, so when both providers are "
+            "eligible the work goes to the peer. Name a route here to keep "
+            "work with it instead.",
         ],
-        "prefer": list(autoroute.ROUTES),
+        "prefer": [],
         "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
         "repos": {},
         "_example": {

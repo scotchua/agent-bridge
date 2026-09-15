@@ -200,6 +200,50 @@ def _hook_coverage(home: str) -> dict[str, Any]:
     return coverage
 
 
+def _local_queue_report(root: str | None) -> dict[str, Any]:
+    """Job states from the local queue's SQLite store, read-only.
+
+    The local queue does not use per-job receipt directories the way the
+    execution queue does, so the directory reader below reported an empty
+    state map for a queue with work in it. Opened read-only and never
+    created: an audit must not bring the thing it measures into existence.
+    """
+    if not root or not os.path.isdir(root):
+        return {"configured": bool(root), "present": False}
+    database = os.path.join(root, "localq.sqlite3")
+    if not os.path.isfile(database):
+        return {"configured": True, "present": True, "states": {},
+                "note": "no local queue database yet"}
+    import sqlite3
+
+    uri = "file:" + os.path.realpath(database).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        return {"configured": True, "present": True,
+                "error": type(exc).__name__}
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status").fetchall()
+        failures = [
+            {"job_id": row["job_id"], "status": row["status"],
+             "task_type": row["task_type"], "caller": row["caller"],
+             # The queue's own recorded reason, which is the point: the worker
+             # child prints a fixed error_detail and the queue stores it.
+             "error": row["error"]}
+            for row in connection.execute(
+                "SELECT job_id, status, task_type, caller, error FROM jobs "
+                "WHERE status IN ('failed','cancelled') ORDER BY updated_at").fetchall()]
+    except sqlite3.Error as exc:
+        return {"configured": True, "present": True, "error": type(exc).__name__}
+    finally:
+        connection.close()
+    return {"configured": True, "present": True,
+            "states": {str(row["status"]): row["n"] for row in rows},
+            "failures": failures}
+
+
 def _queue_report(root: str | None) -> dict[str, Any]:
     """Job states from a durable queue directory, without importing its class.
 
@@ -252,11 +296,16 @@ def report(state_root: str, *, home: str | None = None,
     events = _read_ledger(os.path.join(routing, gate.EVENT_LEDGER), since)
     decisions = _decision_rows(audit_entries)
 
-    routed = [row for row in decisions
-              if str(row.get("code", "")).startswith(ROUTED_PREFIX)
-              or (row.get("decision") in ("peer", "local"))]
-    retained = [row for row in decisions
-                if row not in routed]
+    def moved(row: dict[str, Any]) -> bool:
+        return (str(row.get("code", "")).startswith(ROUTED_PREFIX)
+                or row.get("decision") in ("peer", "local"))
+
+    # Partitioned by predicate, not by ``row not in routed``: two decisions
+    # with identical contents compare equal as dicts, so membership put both
+    # in whichever bucket the first one landed in and the counts stopped
+    # adding up to the total.
+    routed = [row for row in decisions if moved(row)]
+    retained = [row for row in decisions if not moved(row)]
     eligible = [row for row in decisions if _eligible(row)]
 
     denials = [event for event in events if event.get("permission") == "deny"]
@@ -360,7 +409,7 @@ def report(state_root: str, *, home: str | None = None,
                            "repos": event.get("repos")} for event in failures],
             },
             "execution_queue": _queue_report(execution_root),
-            "local_queue": _queue_report(local_root),
+            "local_queue": _local_queue_report(local_root),
         },
 
         "gate_events": {

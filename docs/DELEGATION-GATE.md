@@ -137,6 +137,15 @@ default, and it is deliberate: installing this feature must not begin sending
 repositories nobody has classified to a provider. `onboard apply` writes an
 inert scaffold with no repositories in it and never rewrites one that exists.
 
+**`prefer` is empty by default, and empty means the eligible peer wins.** That
+is what delegation-first means: when a repository permits both providers and
+both have fresh capacity, the work goes to the other one. Name a route in
+`prefer` to keep work with it instead. The default was briefly `["claude",
+"codex", "local"]`, which reads harmlessly and is not: it ranks Claude above
+Codex, so a Claude client kept every repository classified for both while a
+Codex client handed every one of them over. An asymmetry nobody chose does not
+belong in a default, so there is no longer one.
+
 An unreadable or malformed policy is a deny (`gate_auto_decision_failed`
 naming `policy_unreadable`), never a permissive default.
 

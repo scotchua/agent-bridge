@@ -225,6 +225,71 @@ class Failures(AuditCase):
         self.assertFalse(queue["present"])
 
 
+class CountsThatHaveToAddUp(AuditCase):
+    def test_two_identical_decisions_are_both_counted(self):
+        """They compare equal as dicts, which is how the partition broke.
+
+        ``retained = [row for row in decisions if row not in routed]`` put
+        both identical rows in whichever bucket the first one landed in, so
+        routed + retained stopped equalling the total.
+        """
+        for _ in range(2):
+            self.decision(code="routed_peer_implementation", owner_route="codex",
+                          decision="peer")
+        for _ in range(2):
+            self.decision(code="retained_repo_unclassified")
+        document = self.run_audit()
+        self.assertEqual(document["routed"]["count"], 2)
+        self.assertEqual(document["retained"]["count"], 2)
+        self.assertEqual(document["automatic_share"]["decisions"], 4)
+        self.assertEqual(document["routed"]["count"] + document["retained"]["count"],
+                         document["automatic_share"]["decisions"])
+
+    def test_the_local_queue_is_read_from_its_own_store(self):
+        """It keeps state in SQLite, not per-job receipt directories."""
+        import sqlite3
+
+        root = self.base / "local-queue"
+        root.mkdir()
+        connection = sqlite3.connect(root / "localq.sqlite3")
+        try:
+            connection.execute(
+                "CREATE TABLE jobs (job_id TEXT, status TEXT, task_type TEXT, "
+                "caller TEXT, purpose TEXT, error TEXT, updated_at REAL)")
+            connection.executemany(
+                "INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
+                [("j1", "complete", "summarize", "claude", "work", None, 1.0),
+                 ("j2", "complete", "extract", "codex", "work", None, 2.0),
+                 ("j3", "failed", "log_triage", "claude", "work",
+                  "private worker rejected request", 3.0)])
+            connection.commit()
+        finally:
+            connection.close()
+        config = self.base / "orchestration.json"
+        config.write_text(json.dumps({
+            "state_root": str(self.state),
+            "capacity_db": str(self.state / "c.sqlite3"),
+            "local_queue_root": str(root)}), encoding="utf-8")
+        queue = self.run_audit(config_path=str(config))["failures"]["local_queue"]
+        self.assertEqual(queue["states"], {"complete": 2, "failed": 1})
+        self.assertEqual(len(queue["failures"]), 1)
+        self.assertEqual(queue["failures"][0]["error"],
+                         "private worker rejected request")
+
+    def test_a_local_queue_directory_with_no_database_yet_says_so(self):
+        root = self.base / "empty-local"
+        root.mkdir()
+        config = self.base / "orchestration.json"
+        config.write_text(json.dumps({
+            "state_root": str(self.state),
+            "capacity_db": str(self.state / "c.sqlite3"),
+            "local_queue_root": str(root)}), encoding="utf-8")
+        queue = self.run_audit(config_path=str(config))["failures"]["local_queue"]
+        self.assertTrue(queue["present"])
+        self.assertEqual(queue["states"], {})
+        self.assertIn("note", queue)
+
+
 class Hygiene(AuditCase):
     def test_reporting_creates_nothing(self):
         """An audit must not bring the thing it measures into existence."""
