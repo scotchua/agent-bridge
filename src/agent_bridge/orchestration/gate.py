@@ -582,7 +582,18 @@ def _command_paths(command: str, cwd: str) -> list[str]:
             # comparing this output directly (rather than through ``_under``,
             # which normalizes separators itself) would read as a different
             # path than the one named.
-            found.append(expanded if os.path.isabs(expanded) else f"{cwd.rstrip('/')}/{expanded}")
+            #
+            # Already-rooted is judged by a leading separator, not
+            # ``os.path.isabs``: ``ntpath.isabs("/tmp/x")`` is False on
+            # Python 3.11 and True on 3.13 (a stdlib behavior change, not a
+            # host difference), so a Windows CI job on one and not the other
+            # is proof this must not gate on it. A leading ``/`` or ``\\`` is
+            # what every candidate this function ever sees actually looks
+            # like when it is already rooted; drive-letter paths take the
+            # other branch below since ``os.path.isabs`` does agree on those
+            # across versions.
+            rooted = os.path.isabs(expanded) or expanded.startswith(("/", "\\"))
+            found.append(expanded if rooted else f"{cwd.rstrip('/')}/{expanded}")
     return found
 
 
