@@ -262,6 +262,33 @@ def _json(raw:bytes,label:str):
     if not isinstance(v,dict): raise TaskError(f"{label} must be a JSON object")
     return v
 
+#: Longest piece of Claude's own error text folded into a TaskError message.
+RESULT_DETAIL_LIMIT=200
+
+def _result_detail(stdout:bytes)->str|None:
+    """Claude's own explanation for a failed turn (``result`` when
+    ``is_error`` is true), bounded and printable-only.
+
+    A bare exit status or "failed the success contract" told an operator
+    nothing about *why* (job d8e5763d: an expired OAuth session read back as
+    a bare "TaskError"). Claude's JSON envelope already carries the reason in
+    ``result`` when it ran and reported one; this is the only place that
+    reads it back out. Printable characters only and length-bounded, so a
+    provider payload cannot inflate or corrupt the receipt; ``None`` when
+    stdout is not that shape, in which case the caller falls back to its
+    fixed message alone."""
+    try: parsed=json.loads(stdout.decode())
+    except (UnicodeDecodeError,json.JSONDecodeError): return None
+    if not isinstance(parsed,dict) or parsed.get("is_error") is not True: return None
+    result=parsed.get("result")
+    if not isinstance(result,str) or not result: return None
+    cleaned="".join(ch for ch in result if ch.isprintable())[:RESULT_DETAIL_LIMIT]
+    return cleaned or None
+
+def _with_result_detail(message:str,stdout:bytes)->str:
+    detail=_result_detail(stdout)
+    return f"{message}: {detail}" if detail else message
+
 def _verify_argv(commands:list[list[str]]):
     if not commands: raise TaskError("at least one structured verification command is required")
     try: return verify_policy.check_verify_argv(commands)
@@ -452,13 +479,15 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         for n,data in (("claude.stdout",r.stdout),("claude.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
             receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
-        if r.returncode: raise TaskError(f"Claude exited with status {r.returncode}")
+        if r.returncode:
+            raise TaskError(_with_result_detail(f"Claude exited with status {r.returncode}",r.stdout))
         response=_json(r.stdout,"Claude output")
         usage_models=response.get("modelUsage")
         receipt["response_metadata"]={"session_id":response.get("session_id"),"subtype":response.get("subtype"),
                                       "terminal_reason":response.get("terminal_reason"),"stop_reason":response.get("stop_reason"),
                                       "num_turns":response.get("num_turns"),"observed_models":sorted(usage_models) if isinstance(usage_models,dict) else []}
-        if response.get("is_error") is not False or not isinstance(response.get("result"),str): raise TaskError("Claude output failed success contract")
+        if response.get("is_error") is not False or not isinstance(response.get("result"),str):
+            raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
         patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)

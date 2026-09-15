@@ -66,6 +66,22 @@ except ImportError:  # The orchestration worker invokes this file directly.
 
 class TaskError(RuntimeError): pass
 
+#: Longest piece of Codex's own error text folded into a TaskError message.
+ERROR_MESSAGE_DETAIL_LIMIT=200
+
+def _with_error_detail(message:str,error_messages:list[str])->str:
+    """Fold Codex's own first error/turn.failed message into a fixed
+    TaskError message, bounded and printable-only.
+
+    A bare exit status told an operator nothing about *why* (the same defect
+    claude_task carries the identical fix for). ``error_messages`` already
+    comes from ``_parse_events`` reading structured JSON event fields, not
+    raw output, so this only bounds and sanitizes text Codex itself reported
+    as the reason; ``message`` alone is returned when there is none."""
+    if not error_messages: return message
+    cleaned="".join(ch for ch in error_messages[0] if ch.isprintable())[:ERROR_MESSAGE_DETAIL_LIMIT]
+    return f"{message}: {cleaned}" if cleaned else message
+
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
@@ -531,7 +547,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
         receipt["response_metadata"]={"thread_id":thread_id,"event_count":len(events),
                                       "event_types":sorted({str(e.get("type")) for e in events})[:20],
                                       "error_event_count":len(error_messages)}
-        if failed: raise TaskError(f"Codex exited with status {r.returncode}")
+        if failed: raise TaskError(_with_error_detail(f"Codex exited with status {r.returncode}",error_messages))
         if not thread_id: raise TaskError("Codex did not report a thread id")
         last_message=last_message_file.read_bytes() if last_message_file.is_file() else b""
         if not last_message.strip(): raise TaskError("Codex produced no final message")

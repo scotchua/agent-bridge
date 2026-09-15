@@ -44,7 +44,7 @@ def requires_confinement(case):
 
 from agent_bridge.execution.codex_task import (
     TaskError, _env, _git, _relevant_paths, _remove, _run, _sandboxed,
-    _source_state, main, run_task)
+    _source_state, _with_error_detail, main, run_task)
 
 # `_env()` builds a fixed, minimal environment from scratch (see the module
 # under test): it does not forward arbitrary variables from the parent
@@ -227,6 +227,16 @@ class CodexTaskTests(unittest.TestCase):
         self._write_fake(mode="fail")
         with self.assertRaises(TaskError):
             self.run_default()
+
+    def test_turn_failure_carries_codexs_own_reason(self):
+        """A bare exit status told an operator nothing about *why* (the same
+        defect claude_task carries the identical fix for). The fake's
+        ``turn.failed`` event reports "synthetic failure"; that text belongs
+        in the TaskError message, not just the receipt's event count."""
+        self._write_fake(mode="fail")
+        with self.assertRaises(TaskError) as ctx:
+            self.run_default()
+        self.assertEqual(str(ctx.exception), "Codex exited with status 1: synthetic failure")
 
     def test_refuses_empty_patch(self):
         self._write_fake(mode="nochange")
@@ -611,6 +621,34 @@ class CodexSourceIntegrityTests(unittest.TestCase):
         self.assertNotEqual(self._snapshot(), before)
 
 
+class ErrorDetailTests(unittest.TestCase):
+    """``_with_error_detail`` folds Codex's own first reported error message
+    into a fixed TaskError message, bounded and printable-only."""
+
+    def test_appends_the_first_error_message(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["synthetic failure"]),
+                         "Codex exited with status 1: synthetic failure")
+
+    def test_uses_only_the_first_of_several_messages(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["first", "second"]),
+                         "Codex exited with status 1: first")
+
+    def test_falls_back_when_there_are_no_messages(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", []),
+                         "Codex exited with status 1")
+
+    def test_strips_non_printable_characters(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["line one\x00\x07line two"]),
+                         "Codex exited with status 1: line oneline two")
+
+    def test_truncates_to_the_bound(self):
+        long_message = "x" * 500
+        detail = _with_error_detail("Codex exited with status 1", [long_message])
+        self.assertEqual(detail, "Codex exited with status 1: " + "x" * module.ERROR_MESSAGE_DETAIL_LIMIT)
+
+    def test_falls_back_when_the_message_has_no_printable_content(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["\x00\x07"]),
+                         "Codex exited with status 1")
 
 
 

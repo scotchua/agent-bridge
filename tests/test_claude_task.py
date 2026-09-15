@@ -45,7 +45,7 @@ def requires_confinement(case):
 from agent_bridge.execution import claude_task
 from agent_bridge.execution.claude_task import (
     TaskError, _command, _env, _git, _relevant_paths, _remove, _run,
-    _sandboxed, _source_state, main, run_task)
+    _result_detail, _sandboxed, _source_state, _with_result_detail, main, run_task)
 
 
 
@@ -625,6 +625,125 @@ class ClaudeTaskSourceIntegrityTests(unittest.TestCase):
         before = self._snapshot()
         (nested / "inner.txt").write_text("inner two\n")
         self.assertNotEqual(self._snapshot(), before)
+
+
+class ResultDetailTests(unittest.TestCase):
+    """``_result_detail`` reads Claude's own explanation back out of its
+    JSON envelope: bounded, printable-only, ``None`` when there is none."""
+
+    def test_reads_the_result_text_when_is_error_is_true(self):
+        envelope = json.dumps({"is_error": True, "result": "Failed to authenticate: OAuth session expired"}).encode()
+        self.assertEqual(_result_detail(envelope), "Failed to authenticate: OAuth session expired")
+
+    def test_none_when_is_error_is_false(self):
+        envelope = json.dumps({"is_error": False, "result": "done"}).encode()
+        self.assertIsNone(_result_detail(envelope))
+
+    def test_none_when_is_error_is_missing(self):
+        self.assertIsNone(_result_detail(json.dumps({"result": "boom"}).encode()))
+
+    def test_none_when_result_is_not_a_string(self):
+        self.assertIsNone(_result_detail(json.dumps({"is_error": True, "result": 42}).encode()))
+
+    def test_none_when_result_is_empty(self):
+        self.assertIsNone(_result_detail(json.dumps({"is_error": True, "result": ""}).encode()))
+
+    def test_none_when_stdout_is_not_json(self):
+        self.assertIsNone(_result_detail(b"not json at all"))
+
+    def test_none_when_stdout_is_not_utf8(self):
+        self.assertIsNone(_result_detail(b"\xff\xfe not utf-8"))
+
+    def test_strips_non_printable_characters(self):
+        envelope = json.dumps({"is_error": True, "result": "line one\x00\x07line two"}).encode()
+        self.assertEqual(_result_detail(envelope), "line oneline two")
+
+    def test_truncates_to_the_bound(self):
+        long_text = "x" * 500
+        envelope = json.dumps({"is_error": True, "result": long_text}).encode()
+        detail = _result_detail(envelope)
+        self.assertEqual(len(detail), module.RESULT_DETAIL_LIMIT)
+        self.assertEqual(detail, "x" * module.RESULT_DETAIL_LIMIT)
+
+    def test_with_result_detail_appends_when_present(self):
+        envelope = json.dumps({"is_error": True, "result": "boom"}).encode()
+        self.assertEqual(_with_result_detail("Claude exited with status 1", envelope),
+                         "Claude exited with status 1: boom")
+
+    def test_with_result_detail_falls_back_when_absent(self):
+        self.assertEqual(_with_result_detail("Claude exited with status 1", b"not json"),
+                         "Claude exited with status 1")
+
+
+class ClaudeTaskErrorDetailTests(unittest.TestCase):
+    """Both TaskError sites in ``run_task`` fold Claude's own explanation
+    into the message instead of reporting a bare, undiagnosable failure
+    (the defect job d8e5763d demonstrated: an expired OAuth session read
+    back through the queue as nothing but the string "TaskError")."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.repo / "value.txt").write_text("before\n")
+        subprocess.run(["git", "add", "value.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True)
+        self.brief = self.root / "brief.md"
+        self.brief.write_text("Replace the fixture value.\n")
+        self.store = _isolated_store(self, self.root)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _fake(self, body):
+        fake = self.root / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in "
+            "*\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; "
+            "--version) echo fake; exit;; "
+            "esac\n"
+            + body)
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        return fake
+
+    def _run(self, fake):
+        return run_task(brief=self.brief, repo=self.repo,
+                        task_root=self.root / "tasks", claude_bin=fake,
+                        claude_config_dir=self.store,
+                        classification="synthetic", model="fake", effort="low",
+                        verify_argv=[["git", "diff", "--check"]])
+
+    def test_a_nonzero_exit_with_a_reported_reason_carries_it_in_the_message(self):
+        fake = self._fake(
+            "printf '{\"result\":\"Failed to authenticate: OAuth session expired and could not be refreshed\","
+            "\"is_error\":true}\\n'\nexit 1\n")
+        with self.assertRaises(TaskError) as ctx:
+            self._run(fake)
+        self.assertEqual(str(ctx.exception),
+                         "Claude exited with status 1: Failed to authenticate: OAuth session expired "
+                         "and could not be refreshed")
+
+    def test_a_nonzero_exit_with_no_parseable_reason_keeps_the_bare_message(self):
+        fake = self._fake("printf 'not json\\n'\nexit 1\n")
+        with self.assertRaises(TaskError) as ctx:
+            self._run(fake)
+        self.assertEqual(str(ctx.exception), "Claude exited with status 1")
+
+    def test_a_zero_exit_that_fails_the_success_contract_carries_the_reason(self):
+        fake = self._fake(
+            "printf 'after\\n' > value.txt\n"
+            "printf '{\"result\":\"Failed to authenticate: OAuth session expired and could not be refreshed\","
+            "\"is_error\":true}\\n'\n")
+        with self.assertRaises(TaskError) as ctx:
+            self._run(fake)
+        self.assertEqual(str(ctx.exception),
+                         "Claude output failed success contract: Failed to authenticate: OAuth session "
+                         "expired and could not be refreshed")
 
 
 if __name__ == "__main__":
