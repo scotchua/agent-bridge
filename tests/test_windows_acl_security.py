@@ -876,11 +876,27 @@ class WriteBoundaryTests(unittest.TestCase):
     def test_store_never_writes_bytes_through_a_rejected_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             target = os.path.join(temp, "state.json")
-            with mock.patch.object(store, "platform", RejectingFilePlatform()):
+            rejecting = RejectingFilePlatform()
+            with mock.patch.object(store, "platform", rejecting):
                 with self.assertRaises(PermissionError):
                     store.atomic_write_bytes(target, b"secret")
             self.assertFalse(os.path.exists(target))
             self.assertEqual(os.listdir(temp), [])
+            with self.assertRaises(OSError):
+                os.fstat(rejecting.fd)
+
+    def test_a_rejected_write_leaves_an_existing_file_and_no_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "must-not-change")
+            store.atomic_write_bytes(target, b"original")
+            rejecting = RejectingFilePlatform()
+            with mock.patch.object(store, "platform", rejecting):
+                with self.assertRaises(PermissionError):
+                    store.atomic_write_bytes(target, b"blocked")
+            self.assertEqual(Path(target).read_bytes(), b"original")
+            self.assertEqual(os.listdir(directory), ["must-not-change"])
+            with self.assertRaises(OSError):
+                os.fstat(rejecting.fd)
 
 
 if __name__ == "__main__":
