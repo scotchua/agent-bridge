@@ -106,12 +106,19 @@ class SubprocessHarnessExecutor:
         self.harnesses = harnesses
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
+        provider = request["provider"]
+        if provider == "claude" and not claude_config.is_ready(
+                self.harnesses.claude_config_dir):
+            # Checked before the platform check, on every platform. A missing
+            # or wrong store is the operator's setup problem and is reported
+            # as such wherever the dispatcher runs; the platform refusal below
+            # is about this executor, not about the request.
+            raise ExecutionAdmissionError("claude_config_dir_unavailable")
         if os.name != "posix":
             raise ExecutionAdmissionError("execution_worker_platform_unsupported")
         # Imported only at execution time so the queue/status MCP remains
         # importable on Windows, where the persistent worker is not supported.
         import pwd
-        provider = request["provider"]
         harness = getattr(self.harnesses, provider)
         argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
                 "--repo", request["repo"], "--base", request["base"],

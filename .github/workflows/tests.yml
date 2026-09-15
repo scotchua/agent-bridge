@@ -24,6 +24,14 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
+    # bash everywhere, on purpose. GitHub's default shell on Windows is pwsh,
+    # which reports only the LAST command's exit status for a multi-line step:
+    # every earlier failing test file in a step was silently passed over, and
+    # the Windows matrix could go green with failures in it. bash -e stops at
+    # the first failure on every runner. Steps that need cmd or python say so.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -108,6 +116,11 @@ jobs:
       # point: a Windows-only test that only ever runs on one runner is a test
       # that stops being read.
       - name: Windows delegation components (portable)
+        # Host-side components run on every runner. The in-guest runner's
+        # own process behaviour (test_guest_runner's execution classes,
+        # test_capture_diff, test_auth_probe's lifecycle) executes only inside
+        # the Linux guest and skips itself, by name, on a Windows host; the
+        # validators and constants those files also cover still run there.
         run: |
           python3 -m unittest discover -s tests -p "test_windows_wsl.py"
           python3 -m unittest discover -s tests -p "test_windows_preflight.py"

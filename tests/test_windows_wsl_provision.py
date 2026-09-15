@@ -55,6 +55,7 @@ def _state(**overrides):
     )
     fields.update(overrides)
     return wp.ProvisionState(**fields)
+import platform_support
 
 
 class LadderOrderTests(unittest.TestCase):
@@ -657,8 +658,7 @@ class ResumeRecordReadTests(unittest.TestCase):
         self.assertIsNotNone(identity)
 
     def test_a_malformed_record_is_an_error_not_an_absence(self):
-        Path(self.path).write_text("{", encoding="utf-8")
-        os.chmod(self.path, 0o600)
+        platform_support.write_private_bytes(self.path, b"{")
         with self.assertRaises(wp.ResumeError) as caught:
             wp.read_resume_record(self.path)
         self.assertEqual(caught.exception.reason, "resume_malformed")

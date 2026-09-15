@@ -143,22 +143,27 @@ def enforce_private(directory: Path) -> Path:
     Enforce and verify, in that order, and never only one of them. Verifying
     without enforcing leaves a fixable problem as a hard failure; enforcing
     without verifying assumes a ``chmod`` that may have been refused.
+
+    The mechanism is the platform's. On POSIX that is mode bits; on Windows
+    ``st_mode`` carries only a read-only flag, so the same assertions would
+    refuse a correctly protected store forever, and the protection is an
+    owner-only ACL applied and read back through the platform layer. The
+    guarantee is the same on both: no other account can read the store.
     """
+
+    try:
+        entries = _store_entries(directory)
+    except OSError:
+        raise ConfigDirError(
+            "Claude configuration directory could not be read") from None
+    if os.name == "nt":
+        return _enforce_private_nt(directory, entries)
 
     try:
         os.chmod(directory, 0o700)
     except OSError:
         raise ConfigDirError(
             "Claude configuration directory permissions could not be set") from None
-    try:
-        entries = sorted(os.listdir(directory))
-    except OSError:
-        raise ConfigDirError(
-            "Claude configuration directory could not be read") from None
-    if len(entries) > MAX_STORE_ENTRIES:
-        raise ConfigDirError(
-            "Claude configuration directory holds more files than this lane "
-            "created")
     # Only the top level. A subdirectory tightened to 0700 is one no other
     # account can traverse, so what is inside it is already unreachable, and
     # walking an arbitrary tree before authenticating is its own hazard.
@@ -166,9 +171,7 @@ def enforce_private(directory: Path) -> Path:
         child = directory / name
         try:
             info = os.lstat(child)
-            if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
-                raise ConfigDirError(
-                    "Claude configuration directory contains a link or alias")
+            _refuse_links(info)
             if info.st_mode & 0o077:
                 os.chmod(child, 0o700 if stat.S_ISDIR(info.st_mode) else 0o600)
         except ConfigDirError:
@@ -187,6 +190,72 @@ def enforce_private(directory: Path) -> Path:
             "Claude configuration directory is owned by another account")
     for name in entries:
         if os.lstat(directory / name).st_mode & 0o077:
+            raise ConfigDirError(
+                "Claude configuration directory contains a file readable by "
+                "other accounts")
+    return directory
+
+
+def _store_entries(directory: Path) -> list[str]:
+    entries = sorted(os.listdir(directory))
+    if len(entries) > MAX_STORE_ENTRIES:
+        raise ConfigDirError(
+            "Claude configuration directory holds more files than this lane "
+            "created")
+    return entries
+
+
+def _refuse_links(info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+        raise ConfigDirError(
+            "Claude configuration directory contains a link or alias")
+
+
+def _enforce_private_nt(directory: Path, entries: list[str]) -> Path:
+    """The Windows half of :func:`enforce_private`: ACLs, not mode bits.
+
+    Applies the owner-only ACL to the directory and to each top-level entry
+    through the platform layer, which reads every ACL back as part of
+    applying it, then reads them all back once more here so that "enforced"
+    and "verified" remain two observations rather than one call's return
+    value. Every refusal keeps the fixed operator text this module promises.
+    """
+
+    from agent_bridge.orchestration import windows_privacy as wpv
+    from agent_bridge.platform import platform as host
+
+    try:
+        wpv.require_private_directory(directory)
+    except wpv.PrivacyError:
+        raise ConfigDirError(
+            "Claude configuration directory permissions could not be set") from None
+    for name in entries:
+        child = directory / name
+        try:
+            info = os.lstat(child)
+            _refuse_links(info)
+            if stat.S_ISDIR(info.st_mode):
+                wpv.require_private_directory(child, root=directory)
+                continue
+            descriptor = os.open(child, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                host.enforce_owner_only_file(descriptor)
+            finally:
+                os.close(descriptor)
+        except ConfigDirError:
+            raise
+        except (OSError, wpv.PrivacyError):
+            raise ConfigDirError(
+                "Claude configuration directory contents could not be "
+                "protected") from None
+
+    verified, _evidence = host.observe_owner_only_acl(str(directory))
+    if not verified:
+        raise ConfigDirError(
+            "Claude configuration directory is readable by other accounts")
+    for name in entries:
+        verified, _evidence = host.observe_owner_only_acl(str(directory / name))
+        if not verified:
             raise ConfigDirError(
                 "Claude configuration directory contains a file readable by "
                 "other accounts")
@@ -217,6 +286,13 @@ def is_ready(value: object, *, home: Path | str | None = None) -> bool:
         info = os.stat(directory)
     except OSError:
         return False
+    if os.name == "nt":
+        # A read-back, never a grant: the platform's applying call would make
+        # this report true by making it true, which is the one thing a
+        # readiness check must not do.
+        from agent_bridge.platform import platform as host
+        verified, _evidence = host.observe_owner_only_acl(str(directory))
+        return bool(verified)
     if info.st_mode & 0o077:
         return False
     return not (hasattr(os, "getuid") and info.st_uid != os.getuid())

@@ -1,6 +1,9 @@
 """Portable tests for the pinned in-guest runner.
 
-Everything here runs on any platform. The runner's real work is file reads
+Almost everything here runs on any platform. The classes marked as in-guest
+behaviour spawn the runner's own subprocess wrapper or resolve its fixed
+Linux paths, and are skipped on a Windows host: the runner only ever executes
+inside the Linux guest, and hiding that behind a mock would test the mock. The runner's real work is file reads
 and one subprocess, so the decisions are factored into pure functions and the
 subprocess is injected, which means the security properties can be tested
 without a WSL guest. What cannot be tested here is that the installed copy in
@@ -356,6 +359,7 @@ class RequestValidationTests(unittest.TestCase):
                 gr.validate_request(_request(**field))
 
 
+@unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
 class ExecutionTests(unittest.TestCase):
     def _execute(self, request=None, runner=None):
         with mock.patch.object(gr, "read_versions", return_value=VERSIONS["tools"]):
@@ -475,6 +479,7 @@ class EntryPointTests(unittest.TestCase):
     def test_an_empty_request_is_refused(self):
         self.assertEqual(json.loads(self._run(["--run"], b"")[1])["reason"], "request_empty")
 
+    @unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
     def test_a_valid_request_runs_and_reports_on_one_line(self):
         with mock.patch.object(gr, "read_versions", return_value=VERSIONS["tools"]), \
                 mock.patch.object(gr, "_subprocess_runner",
@@ -484,6 +489,7 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual(len(output.splitlines()), 1)
         self.assertEqual(json.loads(output)["status"], "completed")
 
+    @unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
     def test_no_response_field_carries_an_operating_system_message(self):
         """Responses become durable records on the host, so they must not
         quote OS error text, which routinely names the file it failed on."""
@@ -498,6 +504,7 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual(json.loads(output)["reason"], "spawn_failed")
 
 
+@unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
 class LeastPrivilegeTests(unittest.TestCase):
     def test_production_child_wrapper_requests_privilege_drop(self):
         seen = {}
@@ -796,6 +803,7 @@ class EgressPolicyTests(unittest.TestCase):
                          (gr.CANARY_EGRESS, gr.CANARY_EGRESS_PROBE))
 
 
+@unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
 class BoundedStreamingTests(unittest.TestCase):
     """Output is capped while it streams, and nothing can hang the runner."""
 
@@ -1194,6 +1202,7 @@ class ProviderJobExecutionTests(unittest.TestCase):
         self.assertEqual(set(self._execute()), gr.RESPONSE_KEYS)
 
 
+@unittest.skipIf(os.name == "nt", "in-guest runner behaviour: Linux guest only")
 class VerifyProgramResolutionTests(unittest.TestCase):
     def test_only_fixed_directories_are_searched(self):
         self.assertEqual(gr.VERIFY_BIN_DIRS,

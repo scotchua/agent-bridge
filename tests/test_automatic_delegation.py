@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
 from agent_bridge.orchestration import (  # noqa: E402
     delegation, windows_preflight, windows_wsl_provision as wp)
+import platform_support  # noqa: E402
 
 
 def answers(**changes):
@@ -79,16 +80,10 @@ def _write_private(path, text):
     """Fixtures write records the way production does: owner-only.
 
     The evidence loader refuses anything else, on purpose: a record other
-    accounts could have written is not evidence about this machine.
+    accounts could have written is not evidence about this machine. Through
+    the platform layer, so on Windows the record carries an applied ACL.
     """
-    descriptor = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        os.write(descriptor, text.encode("utf-8"))
-    finally:
-        os.close(descriptor)
-    if os.name != "nt":
-        os.chmod(str(path), 0o600)
-
+    platform_support.write_private_bytes(str(path), text.encode("utf-8"))
 
 class AnswersCompatibilityTests(unittest.TestCase):
     def test_old_answers_file_without_the_key_defaults_disabled(self):

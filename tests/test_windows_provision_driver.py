@@ -31,6 +31,7 @@ from agent_bridge.orchestration import windows_provision_driver as dr
 from agent_bridge.orchestration import windows_rootfs as wrf
 from agent_bridge.orchestration import windows_wsl_provision as wp
 from agent_bridge.orchestration import windows_wsl_runtime as wr
+import platform_support
 
 
 class _Check:
@@ -184,10 +185,10 @@ class ImageProvenanceTests(DriverTestCase):
         self.rootfs.unlink()
         provenance = dr.acquire_guest_image(
             str(source), self._config(), consent=True,
-            platform=_WindowsLike(), machine="arm64", anchors=self._anchor(),
+            platform=platform_support.owner_only_platform(), machine="arm64", anchors=self._anchor(),
             verify_signature=lambda *args: True)
         self.assertTrue(provenance.trusted, provenance.reason)
-        self.assertEqual(self.rootfs.stat().st_mode & 0o077, 0)
+        platform_support.assert_owner_only(self, self.rootfs, 0o600)
 
     def test_a_missing_source_file_is_named(self):
         with self.assertRaises(dr.DriverError) as caught:
@@ -196,14 +197,6 @@ class ImageProvenanceTests(DriverTestCase):
         self.assertEqual(caught.exception.reason, "image_source_unreadable")
 
 
-class _WindowsLike:
-    name = "nt"
-
-    def enforce_owner_only_file(self, descriptor):
-        os.fchmod(descriptor, 0o600)
-
-    def verify_owner_only_path(self, directory, probe_file):
-        return (os.stat(probe_file).st_mode & 0o077) == 0, "mode"
 
 
 class BoundaryVerificationTests(DriverTestCase):
@@ -528,25 +521,9 @@ class HonestyTests(unittest.TestCase):
         self.assertIn("provider lane", dr.DRIVER_LIMITATION)
 
 
-class _WindowsLike:
-    """A platform stub that reports the real mode rather than always yes.
-
-    Enrolment refuses a directory it cannot prove is owner-only, so a stub
-    that answered yes unconditionally would make these tests pass for the
-    wrong reason.
-    """
-
-    name = "nt"
-
-    def enforce_owner_only_file(self, descriptor):
-        os.fchmod(descriptor, 0o600)
-
-    def verify_owner_only_path(self, directory, probe_file):
-        info = os.stat(probe_file)
-        return (info.st_mode & 0o077) == 0, {"mechanism": "posix mode bits"}
 
 
-NT = _WindowsLike()
+NT = platform_support.owner_only_platform()
 
 
 class _Enrolled:
@@ -792,8 +769,7 @@ class ResumeMachineTests(DriverTestCase):
 
     def test_a_tampered_record_is_reported_rather_than_ignored(self):
         path = wp.resume_record_path(str(self.runtime))
-        Path(path).write_text("{", encoding="utf-8")
-        os.chmod(path, 0o600)
+        platform_support.write_private_bytes(path, b"{")
         context, _calls = self._context_with()
         state = dr.resume(context)
         self.assertTrue(state.exhausted)

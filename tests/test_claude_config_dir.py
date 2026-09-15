@@ -25,6 +25,7 @@ from agent_bridge.orchestration.execution_queue import (
     Harnesses,
     SubprocessHarnessExecutor,
 )
+import platform_support
 
 
 class ConfigDirTestCase(unittest.TestCase):
@@ -34,6 +35,13 @@ class ConfigDirTestCase(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.canonical = cc.canonical_config_dir(self.home)
         self.canonical.mkdir(mode=0o700, parents=True)
+        if os.name == "nt":
+            # A store the lane created and protected, not one mkdir happened
+            # to leave usable. Python 3.13's mkdir(0o700) writes an explicit
+            # owner-only ACL on Windows; 3.11's leaves only inherited entries,
+            # which the read-back refuses by design. Tighten it the way the
+            # lane does so the fixture means the same thing on both.
+            cc.enforce_private(self.canonical)
         self.shared = cc.shared_store_dir(self.home)
         self.shared.mkdir(mode=0o700)
 
@@ -50,6 +58,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
     def test_a_symlink_that_resolves_to_the_shared_store_is_refused(self):
         """String equality would pass this, which is the whole problem."""
+        platform_support.require_symlinks(self)
         alias = self.home / "alias-home"
         alias.symlink_to(self.shared, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -57,6 +66,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
         self.assertIn("~/.claude", str(caught.exception))
 
     def test_the_canonical_name_pointing_at_the_shared_store_is_refused(self):
+        platform_support.require_symlinks(self)
         self.canonical.rmdir()
         self.canonical.symlink_to(self.shared, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -65,6 +75,7 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
     def test_a_link_to_the_canonical_directory_is_still_refused(self):
         """What a link points at can change between the check and the login."""
+        platform_support.require_symlinks(self)
         alias = self.home / "also-fine"
         alias.symlink_to(self.canonical, target_is_directory=True)
         with self.assertRaises(cc.ConfigDirError) as caught:
@@ -112,18 +123,19 @@ class CanonicalDirectoryTests(ConfigDirTestCase):
 
 class PermissionTests(ConfigDirTestCase):
     def test_a_permissive_directory_is_tightened_and_then_verified(self):
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         cc.checked_config_dir(self.canonical, home=self.home)
-        self.assertEqual(self.canonical.stat().st_mode & 0o077, 0)
+        platform_support.assert_owner_only(self, self.canonical, 0o700)
 
     def test_a_permissive_credential_file_is_tightened(self):
         secret = self.canonical / ".credentials.json"
         secret.write_text("{}", encoding="utf-8")
-        os.chmod(secret, 0o644)
+        platform_support.make_permissive(secret)
         cc.checked_config_dir(self.canonical, home=self.home)
-        self.assertEqual(secret.stat().st_mode & 0o077, 0)
+        platform_support.assert_owner_only(self, secret, 0o600)
 
     def test_a_link_inside_the_store_is_refused(self):
+        platform_support.require_symlinks(self)
         (self.canonical / "leak").symlink_to(self.shared)
         with self.assertRaises(cc.ConfigDirError) as caught:
             cc.enforce_private(self.canonical)
@@ -131,14 +143,14 @@ class PermissionTests(ConfigDirTestCase):
 
     def test_readiness_reports_a_permissive_directory_as_not_ready(self):
         self.assertTrue(cc.is_ready(self.canonical, home=self.home))
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         self.assertFalse(cc.is_ready(self.canonical, home=self.home))
 
     def test_readiness_never_changes_anything(self):
         """Describing a machine must not modify it."""
-        os.chmod(self.canonical, 0o755)
+        platform_support.make_permissive(self.canonical)
         cc.is_ready(self.canonical, home=self.home)
-        self.assertEqual(self.canonical.stat().st_mode & 0o777, 0o755)
+        platform_support.assert_not_owner_only(self, self.canonical, 0o755)
 
     def test_readiness_is_false_for_the_shared_store(self):
         self.assertFalse(cc.is_ready(self.shared, home=self.home))

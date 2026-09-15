@@ -15,6 +15,7 @@ from typing import Any, Iterator
 
 
 class PosixPlatform:
+    name = "posix"
     supports_owner_only_permissions = True
 
     def set_owner_only_umask(self) -> None:

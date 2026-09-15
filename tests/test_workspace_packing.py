@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import windows_delegation as wd
+import platform_support
 
 
 class _TaggedStat:
@@ -109,18 +110,21 @@ class SymlinkTests(PackingTestCase):
     """Real symlinks, on this machine."""
 
     def test_a_symlinked_file_pointing_outside_is_not_packed(self):
+        platform_support.require_symlinks(self)
         (self.repo / "link.txt").symlink_to(self.secret)
         members = self._members()
         self.assertNotIn("link.txt", members)
         self.assertNoOutsideBytes(members)
 
     def test_a_symlinked_directory_pointing_outside_is_not_traversed(self):
+        platform_support.require_symlinks(self)
         (self.repo / "linked").symlink_to(self.outside, target_is_directory=True)
         members = self._members()
         self.assertNoOutsideBytes(members)
         self.assertEqual(set(members), {"inside.txt"})
 
     def test_a_symlinked_repository_root_is_refused(self):
+        platform_support.require_symlinks(self)
         alias = self.base / "alias"
         alias.symlink_to(self.repo, target_is_directory=True)
         with self.assertRaises(wd.DelegationRefused) as caught:
@@ -128,6 +132,7 @@ class SymlinkTests(PackingTestCase):
         self.assertEqual(caught.exception.reason, "workspace_unreadable")
 
     def test_refused_links_are_counted_rather_than_passed_over_silently(self):
+        platform_support.require_symlinks(self)
         (self.repo / "link.txt").symlink_to(self.secret)
         _encoded, counts = wd.pack_workspace(self.repo)
         self.assertEqual(counts["links_refused"], 1)
@@ -218,6 +223,7 @@ class ContainmentTests(PackingTestCase):
     """The explicit proof, on top of the structural one."""
 
     def test_every_packed_path_resolves_inside_the_repository(self):
+        platform_support.require_symlinks(self)
         (self.repo / "nested").mkdir()
         (self.repo / "nested" / "deep.txt").write_text("deep", encoding="utf-8")
         (self.repo / "link.txt").symlink_to(self.secret)

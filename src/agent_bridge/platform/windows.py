@@ -161,6 +161,8 @@ def _trusted_tool(name: str) -> str:
 
 
 class WindowsPlatform:
+    name = "nt"
+
     def __init__(self) -> None:
         # Unknown until something actually verifies it. Deliberately not
         # probed here: an import-time probe costs two subprocesses on every
@@ -182,7 +184,14 @@ class WindowsPlatform:
         path = self._path_from_fd(fd)
         if not self._set_and_verify_owner_acl(path):
             self.supports_owner_only_permissions = False
-            raise PermissionError(f"could not verify owner-only ACL for {path}")
+            # The evidence travels with the exception. A bare "could not
+            # verify" has already cost a CI round trip per failure: the
+            # operator needs the SID that was parsed, what icacls said to the
+            # grant, and the listing that was read back, all in one place.
+            diagnose = getattr(self, "acl_diagnostics", None)
+            evidence = repr(diagnose(path)) if diagnose is not None else ""
+            raise PermissionError(
+                f"could not verify owner-only ACL for {path}: {evidence}")
         self.supports_owner_only_permissions = True
 
     def verify_owner_only_path(self, directory: str,
@@ -197,7 +206,8 @@ class WindowsPlatform:
         results = {
             "mechanism": "windows acl round-trip",
             "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
-            "directory_acl_verified": self._set_and_verify_owner_acl(directory),
+            "directory_acl_verified": self._set_and_verify_owner_acl(
+                directory, inheritable=True),
             "file_acl_verified": self._set_and_verify_owner_acl(probe_file),
         }
         # Whichever target failed carries its own evidence. Reporting only a
@@ -677,7 +687,7 @@ class WindowsPlatform:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
     def acl_diagnostics(self, path: str) -> dict[str, Any]:
-        """Why an ACL attempt succeeded or failed. For operators and CI only."""
+        """What the ACL looks like now. Describes; never re-applies anything."""
         try:
             whoami = _trusted_tool("whoami.exe")
             icacls = _trusted_tool("icacls.exe")
@@ -690,10 +700,6 @@ class WindowsPlatform:
         raw = identity.stdout.decode("utf-8", "replace").strip()
         fields = raw.split(",")
         user = fields[-1].strip('"') if fields else ""
-        applied = subprocess.run(
-            [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
-            capture_output=True, timeout=15, check=False, shell=False,
-            env=dict(_TOOL_ENV))
         observed = subprocess.run(
             [icacls, path], capture_output=True, timeout=15,
             check=False, shell=False, env=dict(_TOOL_ENV))
@@ -702,14 +708,67 @@ class WindowsPlatform:
             "whoami_raw": raw,
             "parsed_sid": user,
             "sid_looks_valid": user.startswith("S-1-"),
-            "grant_rc": applied.returncode,
-            "grant_stdout": applied.stdout.decode("utf-8", "replace").strip(),
-            "grant_stderr": applied.stderr.decode("utf-8", "replace").strip(),
             "observed_rc": observed.returncode,
             "observed": observed.stdout.decode("utf-8", "replace").strip(),
+            "observed_stderr": observed.stderr.decode("utf-8", "replace").strip(),
         }
 
-    def _set_and_verify_owner_acl(self, path: str) -> bool:
+    def observe_owner_only_acl(self, path: str) -> tuple[bool, dict[str, Any]]:
+        """Read the ACL back and judge it. Changes nothing.
+
+        The counterpart to :meth:`verify_owner_only_path`, which applies the
+        ACL before it reads it. A readiness report and a test assertion both
+        need the reading without the applying: describing a machine must not
+        modify it, and an assertion that first repairs what it asserts proves
+        nothing. Same parser, same guarantee, no grant.
+        """
+        try:
+            whoami = _trusted_tool("whoami.exe")
+            icacls = _trusted_tool("icacls.exe")
+        except OSError as exc:
+            return False, {"mechanism": "windows acl read-back",
+                           "system_directory_error": str(exc)}
+        try:
+            identity_raw = subprocess.run(
+                [whoami, "/user", "/fo", "csv", "/nh"],
+                capture_output=True, timeout=10, check=False, shell=False,
+                env=dict(_TOOL_ENV),
+            ).stdout.decode("utf-8", "replace").strip()
+            observed = subprocess.run(
+                [icacls, path], capture_output=True,
+                timeout=15, check=False, shell=False, env=dict(_TOOL_ENV),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, {"mechanism": "windows acl read-back",
+                           "error": type(exc).__name__}
+        fields = identity_raw.split(",")
+        user = fields[-1].strip('"')
+        owner_name = fields[0].strip('"') if len(fields) > 1 else ""
+        text = observed.stdout.decode("utf-8", "replace")
+        verified = bool(observed.returncode == 0 and user.startswith("S-1-")
+                        and icacls_listing_is_owner_only(
+                            text, user, owner_name, expected_path=path))
+        return verified, {
+            "mechanism": "windows acl read-back",
+            "guarantee": WINDOWS_OWNER_ONLY_GUARANTEE,
+            "whoami_raw": identity_raw,
+            "parsed_sid": user,
+            "observed_rc": observed.returncode,
+            "observed": text.strip(),
+        }
+
+    def _set_and_verify_owner_acl(self, path: str, *,
+                                  inheritable: bool = False) -> bool:
+        """Apply the owner-only ACL to one object and read it back.
+
+        ``inheritable`` is for directories: the owner's entry is written
+        (OI)(CI) so that anything created inside inherits owner-only access.
+        Without it, Windows propagates the directory's change to its
+        children, strips their inherited entries, and leaves an object that
+        only ever had inherited entries with an empty ACL nobody can open.
+        The parser still refuses inherited entries on the object it is asked
+        to prove, so a child that matters is protected explicitly as well.
+        """
         try:
             # _trusted_tool may fail closed if the OS will not say where
             # System32 is. That must return False BEFORE any process is
@@ -728,12 +787,27 @@ class WindowsPlatform:
             return False
         owner_name = identity[0].strip('"') if len(identity) > 1 else ""
         try:
+            # /reset first. "/grant:r" replaces only the named principal's
+            # explicit entries; an explicit entry for anyone else (an
+            # Everyone:(R) somebody added, say) survived it, and the read-back
+            # then failed forever for a path this call was asked to protect.
+            # /reset drops every explicit entry, /inheritance:r drops the
+            # inherited ones, and the grant leaves exactly one. That is what
+            # chmod 0600 means on POSIX and what this call promises here.
+            reset = subprocess.run(
+                [icacls, path, "/reset"],
+                capture_output=True, timeout=15, check=False, shell=False,
+                env=dict(_TOOL_ENV),
+            )
+            if reset.returncode != 0:
+                return False
             # The SID must be written *SID. icacls treats a bare SID as an
             # account name and fails with 1332, "No mapping between account
             # names and security IDs was done", so the grant silently never
             # applied and the capability could never be verified.
+            rights = "(OI)(CI)(F)" if inheritable else "(F)"
             applied = subprocess.run(
-                [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:(F)"],
+                [icacls, path, "/inheritance:r", "/grant:r", f"*{user}:{rights}"],
                 capture_output=True, timeout=15, check=False, shell=False,
                 env=dict(_TOOL_ENV),
             )

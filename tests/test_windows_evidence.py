@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.orchestration import windows_evidence as we
 from agent_bridge.orchestration import windows_wsl_provision as wp
+import platform_support
 
 ROOTFS = "a" * 64
 RUNNER = "b" * 64
@@ -24,17 +25,10 @@ CANARIES = ("host-mount-absent", "wsl-interop-absent", "wsl-conf-sha256",
             "guest-runner-sha256", "pinned-versions", "network-egress-policy")
 
 
-def _write_private(path: str, text: str) -> None:
+def _write_private(path, text):
     """Write a fixture record the way production writes one: owner-only."""
 
-    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        os.write(descriptor, text.encode("utf-8"))
-    finally:
-        os.close(descriptor)
-    if os.name != "nt":
-        os.chmod(path, 0o600)
-
+    platform_support.write_private_bytes(path, text.encode("utf-8"))
 
 def _open_lane() -> we.ProviderLane:
     """A lane with both live observations actually made."""
@@ -312,6 +306,7 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(reason, "evidence_root_not_owner_only")
 
     def test_a_record_reached_through_a_link_is_not_evidence(self):
+        platform_support.require_symlinks(self)
         self._write(_evidence())
         alias = Path(self.temp.name).parent / f"alias-{os.getpid()}"
         alias.symlink_to(self.temp.name)
@@ -323,6 +318,7 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(reason, "evidence_path_traverses_a_link")
 
     def test_a_record_that_is_a_symlink_is_not_evidence(self):
+        platform_support.require_symlinks(self)
         real = Path(self.temp.name) / "real.json"
         _write_private(str(real), json.dumps(_evidence().as_dict()))
         Path(self.path).symlink_to(real)
