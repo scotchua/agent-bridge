@@ -385,6 +385,55 @@ def cmd_reporting(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_local_first(cfg: Config, args: argparse.Namespace) -> int:
+    """Consultation accountability (design section 2.8, optional Phase 4).
+
+    Counts, by peer, how a large consultation prompt carried a local_first
+    declaration when the operator configured it as required. This is
+    accountability, not enforcement: the assistant can type
+    needs_judgment for any reason at all, and this report cannot tell a
+    considered bypass from an impatient one. What it does is turn a leak
+    that left no record into one that does.
+    """
+    rows = _reporting_rows(cfg)
+    of_peer = [r for r in rows if r.get("peer") == args.peer]
+    pre = [r for r in of_peer if "local_first" not in r]
+    not_required = [r for r in of_peer if "local_first" in r and r.get("local_first") is None]
+    declared = [r for r in of_peer if "local_first" in r and r.get("local_first") is not None]
+
+    print(f"ledger records                 {len(rows)}")
+    print(f"  peer={args.peer}                    {len(of_peer)}")
+    print(f"  before this phase existed    {len(pre)}   (no local_first key at all)")
+    print(f"  not required for the call    {len(not_required)}")
+    print(f"  carried a declaration        {len(declared)}")
+    if not declared:
+        print("\nNothing declared yet in this window: either local-first "
+              "accountability is not configured, or no prompt to this peer "
+              "has reached the size threshold.")
+        return 0
+
+    by_reason: dict[str, int] = {}
+    malformed = 0
+    for row in declared:
+        field = row.get("local_first")
+        if isinstance(field, dict) and isinstance(field.get("digest_receipt_id"), str):
+            key = "digest_receipt_id"
+        elif isinstance(field, dict) and isinstance(field.get("bypass"), str):
+            key = field["bypass"]
+        else:
+            malformed += 1
+            continue
+        by_reason[key] = by_reason.get(key, 0) + 1
+
+    print(f"\n{'reason':<20} {'n':>6}")
+    for reason, count in sorted(by_reason.items()):
+        print(f"{reason:<20} {count:>6}")
+    if malformed:
+        print(f"{'malformed':<20} {malformed:>6}   (recorded but not one of the "
+              "closed shapes; worth investigating, not counted above)")
+    return 0
+
+
 def cmd_resolve(cfg: Config, args: argparse.Namespace) -> int:
     """Clear an indeterminate conversation after checking the peer side."""
     record = store.read_json_or_none(cfg.conversation_path(args.conversation_id))
@@ -483,6 +532,9 @@ def main(argv: list[str] | None = None) -> int:
     reporting.add_argument("--peer", default="claude", choices=("claude", "codex"))
     reporting.add_argument("--min-sample", type=int, default=30,
                            help="Below this, print counts rather than a rate.")
+    local_first = sub.add_parser(
+        "local-first", help="Consultation accountability: local_first declarations by peer and reason.")
+    local_first.add_argument("--peer", default="claude", choices=("claude", "codex"))
     sub.add_parser("indeterminate", help="List conversations held as indeterminate.")
     resolve = sub.add_parser("resolve", help="Clear an indeterminate conversation.")
     resolve.add_argument("conversation_id")
@@ -495,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config)
         from .health import cmd_health
         return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
-                "reporting": cmd_reporting,
+                "reporting": cmd_reporting, "local-first": cmd_local_first,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
             args.command](cfg, args)
     except BrokerError as exc:

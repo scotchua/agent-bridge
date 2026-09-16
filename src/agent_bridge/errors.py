@@ -20,6 +20,7 @@ class ErrorCategory(str, enum.Enum):
     INPUT_UNKNOWN_FIELD = "input_unknown_field"
     INPUT_TOO_LARGE = "input_too_large"
     SOURCE_CLASSIFICATION_REFUSED = "source_classification_refused"
+    LOCAL_FIRST_REQUIRED = "local_first_required"
     CONVERSATION_NOT_FOUND = "conversation_not_found"
     CONVERSATION_CLOSED = "conversation_closed"
     CONVERSATION_BUSY = "conversation_busy"
@@ -72,6 +73,7 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.INPUT_UNKNOWN_FIELD,
     ErrorCategory.INPUT_TOO_LARGE,
     ErrorCategory.SOURCE_CLASSIFICATION_REFUSED,
+    ErrorCategory.LOCAL_FIRST_REQUIRED,
     ErrorCategory.CONVERSATION_NOT_FOUND,
     ErrorCategory.CONVERSATION_CLOSED,
     ErrorCategory.CONVERSATION_BUSY,
@@ -121,6 +123,15 @@ _HINTS: dict[ErrorCategory, str] = {
     ErrorCategory.SOURCE_CLASSIFICATION_REFUSED: (
         "This source_classification is refused in contract version 1. "
         "Allowed values are internal, synthetic, public."
+    ),
+    ErrorCategory.LOCAL_FIRST_REQUIRED: (
+        "This prompt is at or above the read-gate threshold and local-first "
+        "accountability is configured. Supply local_first: either "
+        "{'digest_receipt_id': '...'} naming a receipt from a prior "
+        "work_digest_file or work_route_local call whose decision actually "
+        "routed this text locally, or {'bypass': one of needs_judgment, "
+        "not_mechanical, local_unavailable}. This is accountability, not "
+        "enforcement: a bypass reason is recorded, never verified for honesty."
     ),
     ErrorCategory.CONVERSATION_NOT_FOUND: "No such conversation_id.",
     ErrorCategory.CONVERSATION_CLOSED: "Conversation is closed to further turns.",

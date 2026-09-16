@@ -279,6 +279,13 @@ def execute(job_dir: str) -> int:
         "peer": peer,
         "source_classification": request["source_classification"],
         "label": request.get("label"),
+        # Consultation accountability (design section 2.8): a digest receipt
+        # id or a typed bypass reason, or null when local-first was not
+        # required for this call. Recorded, never itself verified for
+        # honesty here -- broker._validate_local_first already did the one
+        # check this field can support (a receipt that actually routed
+        # locally) before this job was ever admitted.
+        "local_first": request.get("local_first"),
         "resume": bool(request["resume"]),
         "status": status,
         "error_category": category.value,

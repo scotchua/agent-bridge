@@ -137,6 +137,53 @@ class Config:
     def refused_classifications(self) -> tuple[str, ...]:
         return tuple(self.raw.get("refused_source_classifications") or ())
 
+    def _local_first(self) -> dict[str, Any]:
+        raw = self.raw.get("local_first")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError("local_first must be an object")
+        return raw
+
+    def local_first_enabled(self) -> bool:
+        """Consultation accountability (design section 2.8), off by default.
+
+        A separate, optional switch from the orchestration read gate's own
+        `local_first.enabled` (routing-policy.json): this bridge and the
+        orchestration subsystem are different packages with different
+        config files, and this flag only says whether a large `*_start`/
+        `*_continue` prompt must carry a `local_first` declaration. Turning
+        it on is the operator's decision, same as the read gate's.
+        """
+        value = self._local_first().get("enabled", False)
+        if not isinstance(value, bool):
+            raise ValueError("local_first.enabled must be a boolean")
+        return value
+
+    def local_first_min_bytes(self) -> int:
+        """The prompt-size floor above which local_first is required.
+
+        Defaults to 8,000, the same `read_gate_min_bytes` default the
+        orchestration read gate uses and for the same reason (design
+        section 4): a prompt no larger than the largest possible local
+        draft cannot be shortened by digesting it first.
+        """
+        value = self._local_first().get("read_gate_min_bytes", 8000)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("local_first.read_gate_min_bytes must be a non-negative integer")
+        return value
+
+    def local_first_queue_root(self) -> str:
+        """Where the orchestration subsystem's local queue lives, so a
+        supplied `digest_receipt_id` can be checked against its
+        `routing_receipts` table. Empty when local_first is not configured
+        to point at one; a receipt then never verifies, so the only way to
+        satisfy a live requirement is a typed `bypass` reason."""
+        value = self._local_first().get("local_queue_root", "")
+        if not isinstance(value, str):
+            raise ValueError("local_first.local_queue_root must be a string")
+        return os.path.expanduser(value) if value else ""
+
     def peer(self, name: str) -> dict[str, Any]:
         if name not in PEERS:
             raise ValueError(f"unknown peer {name!r}")

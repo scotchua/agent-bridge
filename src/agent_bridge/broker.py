@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -21,8 +22,11 @@ from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_fro
 CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
-START_FIELDS = {"prompt", "source_classification", "label"}
-CONTINUE_FIELDS = {"conversation_id", "prompt", "source_classification", "label"}
+START_FIELDS = {"prompt", "source_classification", "label", "local_first"}
+CONTINUE_FIELDS = {"conversation_id", "prompt", "source_classification", "label", "local_first"}
+
+#: local_first.bypass's closed vocabulary (design section 2.8).
+LOCAL_FIRST_BYPASS_REASONS = frozenset({"needs_judgment", "not_mechanical", "local_unavailable"})
 
 
 # ------------------------------------------------------------------ responses
@@ -76,6 +80,87 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
             raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
         if len(label) > cfg.limit("label_max_chars"):
             raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+
+    _validate_local_first(cfg, prompt, args.get("local_first"))
+
+
+def _sqlite_uri_path(path: str) -> str:
+    """A filesystem path as the path part of a SQLite ``file:`` URI. Percent
+    must be escaped before ``?``/``#`` or SQLite's own percent-decoding of
+    the path mangles it first; see orchestration.gate's identically-named,
+    independently-discovered function for the failure this order avoids."""
+    return (os.path.realpath(path).replace("%", "%25")
+            .replace("?", "%3F").replace("#", "%23"))
+
+
+def _digest_receipt_routed_locally(local_queue_root: str, receipt_id: str) -> bool:
+    """Whether ``receipt_id`` names a row in the orchestration local queue's
+    ``routing_receipts`` table (``localq/intake.py``) whose own decision was
+    ``"local"`` -- an admission that actually queued the caller's earlier
+    text for local digestion, not merely an attempt that was refused (too
+    small, a prohibited flag, task type needing cloud judgment). Read-only,
+    direct SQLite by path: this module must never construct
+    ``AutomaticIntake``/``LocalQueue`` itself, whose constructors create the
+    queue's directory and tables as a side effect a read must not have
+    (the same reasoning ``orchestration.gate._digest_job_state`` states for
+    its own read-only query against the sibling job database).
+    """
+    if not local_queue_root or not receipt_id:
+        return False
+    database = os.path.join(local_queue_root, "routing.sqlite3")
+    uri = "file:" + _sqlite_uri_path(database) + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return False
+    try:
+        row = db.execute(
+            "SELECT decision FROM routing_receipts WHERE receipt_id=?", (receipt_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        db.close()
+    return row is not None and row[0] == "local"
+
+
+def _validate_local_first(cfg: Config, prompt: str, local_first: Any) -> None:
+    """Consultation accountability (design section 2.8), not enforcement.
+
+    When the operator has configured local-first accountability and this
+    prompt is at or above its byte threshold, the call must carry
+    ``local_first``: a digest receipt that actually routed the earlier text
+    locally, or one of a closed set of typed bypass reasons. Whichever it
+    is, the field is recorded in the consultation ledger and counted by
+    peer and reason (``agent-bridge-admin local-first``); this function
+    never judges whether a bypass reason is honest, only that one was
+    supplied, because the assistant can always type ``needs_judgment`` and
+    that is by design, not a gap to close.
+
+    A supplied field is validated for shape regardless of whether it was
+    required, so a malformed declaration is refused (and never silently
+    dropped) even when the caller volunteered it unprompted.
+    """
+    if local_first is not None:
+        if not isinstance(local_first, dict) or len(local_first) != 1:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        if "digest_receipt_id" in local_first:
+            receipt_id = local_first["digest_receipt_id"]
+            if not isinstance(receipt_id, str) or not receipt_id:
+                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+            if not _digest_receipt_routed_locally(cfg.local_first_queue_root(), receipt_id):
+                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        elif "bypass" in local_first:
+            if local_first["bypass"] not in LOCAL_FIRST_BYPASS_REASONS:
+                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        else:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        return
+    if not cfg.local_first_enabled():
+        return
+    if len(prompt.encode("utf-8")) < cfg.local_first_min_bytes():
+        return
+    raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
 
 
 def _validate_identifier_request(args: Any, field: str) -> str:
@@ -289,6 +374,7 @@ def _prepare_job(
         "prompt": args["prompt"],
         "source_classification": args["source_classification"].strip().lower(),
         "label": args.get("label"),
+        "local_first": args.get("local_first"),
         "resume": resume,
         "config_path": snapshot_path,
         "created_at": store.utc_now(),

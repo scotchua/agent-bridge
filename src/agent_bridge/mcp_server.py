@@ -69,6 +69,38 @@ def _isolation_note(peer: str) -> str:
     )
 
 
+#: Consultation accountability (design section 2.8, optional Phase 4). Not
+#: enforcement: the bridge cannot verify a bypass reason is honest, only
+#: that one was given. See _validate_local_first in broker.py for when this
+#: is actually required (the operator's own config, plus this prompt's size)
+#: and errors.LOCAL_FIRST_REQUIRED for the refusal a caller gets otherwise.
+_LOCAL_FIRST_DESCRIPTION = (
+    "Required only when this installation has local-first accountability "
+    "configured and this prompt is at or above its byte threshold; omit it "
+    "otherwise, and the bridge tells you if that guess was wrong. Exactly "
+    "one of: {'digest_receipt_id': '...'}, naming a receipt from a prior "
+    "work_digest_file or work_route_local call that actually routed this "
+    "text locally, or {'bypass': 'needs_judgment' | 'not_mechanical' | "
+    "'local_unavailable'}. This is accountability, not enforcement: a "
+    "bypass reason is recorded and counted, never checked for honesty."
+)
+
+
+def _local_first_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "description": _LOCAL_FIRST_DESCRIPTION,
+        "properties": {
+            "digest_receipt_id": {"type": "string", "minLength": 1},
+            "bypass": {
+                "type": "string",
+                "enum": ["needs_judgment", "not_mechanical", "local_unavailable"],
+            },
+        },
+    }
+
+
 def _start_schema(peer: str, allowed: tuple[str, ...] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
@@ -98,6 +130,7 @@ def _start_schema(peer: str, allowed: tuple[str, ...] | None = None) -> dict[str
                 "maxLength": 200,
                 "description": "Optional short human-readable label for the audit ledger.",
             },
+            "local_first": _local_first_schema(),
         },
     }
 
