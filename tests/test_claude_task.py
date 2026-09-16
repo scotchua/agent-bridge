@@ -772,6 +772,7 @@ class ClaudeTaskErrorDetailTests(unittest.TestCase):
                         verify_argv=[["git", "diff", "--check"]])
 
     def test_a_nonzero_exit_with_a_reported_reason_carries_it_in_the_message(self):
+        requires_confinement(self)
         fake = self._fake(
             "printf '{\"result\":\"Failed to authenticate: OAuth session expired and could not be refreshed\","
             "\"is_error\":true}\\n'\nexit 1\n")
@@ -782,12 +783,14 @@ class ClaudeTaskErrorDetailTests(unittest.TestCase):
                          "and could not be refreshed")
 
     def test_a_nonzero_exit_with_no_parseable_reason_keeps_the_bare_message(self):
+        requires_confinement(self)
         fake = self._fake("printf 'not json\\n'\nexit 1\n")
         with self.assertRaises(TaskError) as ctx:
             self._run(fake)
         self.assertEqual(str(ctx.exception), "Claude exited with status 1")
 
     def test_a_zero_exit_that_fails_the_success_contract_carries_the_reason(self):
+        requires_confinement(self)
         fake = self._fake(
             "printf 'after\\n' > value.txt\n"
             "printf '{\"result\":\"Failed to authenticate: OAuth session expired and could not be refreshed\","
