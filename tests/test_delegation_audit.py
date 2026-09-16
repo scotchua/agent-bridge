@@ -527,6 +527,31 @@ class InlineMeasurementAccounting(AuditCase):
         self.assertEqual(im["count"], 2)
         self.assertEqual(im["bytes_measured"], 500)
 
+    def test_a_nan_or_infinite_bytes_value_does_not_crash_the_report(self):
+        # Confirmed by adversarial review: isinstance(x, (int, float)) alone
+        # is True for NaN and Infinity too, and int(nan)/int(inf) raise --
+        # reintroducing the exact crash class this guard exists to prevent.
+        self.measurement(bytes=float("nan"))
+        self.measurement(bytes=float("inf"))
+        self.measurement(bytes=500)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 3)
+        self.assertEqual(im["bytes_measured"], 500)
+
+    def test_an_unparseable_ledger_line_is_not_counted(self):
+        # Confirmed by adversarial review: _read_ledger deliberately keeps an
+        # unparseable line as its own {"error": ...} row rather than dropping
+        # it, so this section must filter to its own rows before counting --
+        # otherwise a single corrupt line inflated count by one and added a
+        # spurious "None" bucket to by_runner.
+        path = self.routing / gate.INLINE_LEDGER
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("not json at all\n")
+        self.measurement(bytes=500)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 1)
+        self.assertNotIn("None", im["by_runner"])
+
     def test_codex_is_named_not_countable(self):
         im = self.run_audit()["inline_measurement"]
         self.assertTrue(any("Codex" in item for item in im["not_countable"]))

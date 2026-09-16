@@ -1943,8 +1943,18 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
         touches_post = (remove and client in post_previous) or (not remove and client in post_clients)
         if touches_post:
             post_entry = hook_entry(root, client, config_path, event="PostToolUse")
-            content = hooks_file_update(target, post_entry, post_previous.get(client),
-                                        event="PostToolUse", remove=remove, base=content)
+            # Reassign only when the Post-side call itself found something to
+            # change. A confirmed bug here (adversarial review): unconditionally
+            # overwriting `content` let a real Pre-side change vanish whenever
+            # the Post-side call was itself a no-op (its own current state,
+            # inside `base`, already matched what this run wants) -- `install`
+            # then reported nothing to write while the Pre-side change never
+            # reached disk, and on a `--remove` run the receipt was still
+            # deleted as if the removal had succeeded.
+            post_content = hooks_file_update(target, post_entry, post_previous.get(client),
+                                             event="PostToolUse", remove=remove, base=content)
+            if post_content is not None:
+                content = post_content
         if content is not None:
             updates[target] = content
         if client == "codex":
@@ -2059,6 +2069,12 @@ NOT_COVERED = [
     "runner matched by its own program name is counted, the same narrow by-name matching the "
     "read gate's own whole-file-read heuristic already uses, because a wrapper's name alone "
     "does not say whether this particular call was a test, a build, or something else entirely",
+    "inline output measurement (Phase 5) if a future Claude Code version's PostToolUse "
+    "tool_response for a Bash call ever uses field names other than stdout/stderr: this was "
+    "not traced to its exact call site in the installed CLI's bundle (docs/"
+    "verified-cli-behaviour.md), only strongly corroborated; _response_byte_length degrades "
+    "to 0 for any field it does not find rather than raising, so the practical failure mode "
+    "is undercounting, never a crash or a wrong block",
 ]
 
 
@@ -2267,7 +2283,17 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         if exc.code in (0, None) or any(word in ("install", "report", "audit", "-h", "--help") for word in words):
             raise
-        # Hook mode with unusable arguments: the host must still read a deny.
+        # Hook mode with unusable arguments: the host must still read a
+        # decision -- but argparse itself failed, so there is no parsed
+        # args.event to consult. A PostToolUse call is found the same
+        # positional way the launcher scripts check for it (never a
+        # substring search over the joined words, which a --config path
+        # could spuriously contain): PostToolUse never denies (an
+        # adversarial review found this branch printing a PreToolUse-shaped
+        # deny regardless of --event, which this fixes).
+        if any(a == "--event" and b == "PostToolUse" for a, b in zip(words, words[1:])):
+            sys.stdout.write(json.dumps({}) + "\n")
+            return 0
         sys.stdout.write(json.dumps(hook_output(Decision(
             "deny", "gate_error", "delegation-first gate: the hook was started with arguments it "
             "cannot use; nothing is implemented until the installation is repaired")), sort_keys=True) + "\n")

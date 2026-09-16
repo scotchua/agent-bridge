@@ -1085,6 +1085,30 @@ class TheLauncherNeverFailsOpen(unittest.TestCase):
         self.assertTrue(reason.endswith("[gate_launcher_failed]"), reason)
         self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_an_interpreter_that_cannot_start_answers_empty_for_posttooluse(self):
+        completed = self.run_launcher("--client", "claude", "--state-root",
+                                      "/nonexistent-state-root", "--event", "PostToolUse",
+                                      python="definitely-not-an-interpreter")
+        self.assertEqual(completed.returncode, 0,
+                         f"a launch failure must still exit 0: {completed.stderr[-500:]}")
+        self.assertEqual(completed.stdout.strip(), "{}")
+
+    def test_a_config_path_spelling_the_marker_does_not_spoof_posttooluse(self):
+        # A confirmed adversarial-review finding: an earlier version of this
+        # check searched for the literal text "--event PostToolUse" anywhere
+        # in the flattened argument line, so a --config path that happened to
+        # contain exactly that text (one argument, quoting preserved) would
+        # misclassify this ordinary PreToolUse call (no --event given at all,
+        # so it defaults to PreToolUse) as PostToolUse, at the one moment the
+        # interpreter has already failed to start -- a silent {} instead of
+        # the fail-closed deny this whole branch exists to guarantee.
+        completed = self.run_launcher("--client", "claude", "--config",
+                                      "some --event PostToolUse path.json",
+                                      python="definitely-not-an-interpreter")
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_a_subcommand_keeps_its_own_exit_status(self):
         """The subcommands are operator tools. Turning their failure into a
         fake hook decision would hide it."""
@@ -2424,6 +2448,32 @@ class PostToolUseHookModeTests(GateCase):
         # decision or an unlogged allow), not Phase 5's bare {} reply.
         self.assertIsInstance(out, dict)
 
+    def test_an_argparse_failure_still_answers_empty_for_posttooluse(self):
+        # A confirmed adversarial-review finding: main()'s except SystemExit
+        # handler (reached when argparse itself rejects the arguments, e.g.
+        # an invalid --client, before args.event even exists) used to print
+        # a PreToolUse-shaped deny unconditionally, regardless of --event --
+        # violating "PostToolUse never denies" for a call this malformed.
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "nobody",
+             "--config", str(self.write_config()), "--event", "PostToolUse"],
+            input=b"{}", capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), b"{}")
+
+    def test_an_argparse_failure_without_the_event_flag_still_denies(self):
+        # The companion case: the same malformed call with no --event at all
+        # (or --event PreToolUse) must keep denying exactly as before.
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "nobody",
+             "--config", str(self.write_config())],
+            input=b"{}", capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
 
 class PostToolUseInstallTests(unittest.TestCase):
     """plan_install/install's Phase 5 additions: a second, independently
@@ -2496,6 +2546,31 @@ class PostToolUseInstallTests(unittest.TestCase):
         self.assertTrue(report["applied"])
         settings = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertNotIn("hooks", settings)
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_pre_side_removal_is_not_lost_when_the_post_side_is_already_gone(self):
+        # CRITICAL regression (confirmed by adversarial review): plan_install's
+        # composition used to let a real Pre-side change vanish whenever the
+        # Post-side call was itself a no-op, because that call's return value
+        # unconditionally overwrote the Pre-side call's already-computed
+        # bytes. Reproduced via drift: the receipt still records a Post entry
+        # for claude, but the live settings.json has already lost it (a hand
+        # edit, or an earlier run of this very bug) -- exactly the state
+        # where the Post-side hooks_file_update call, on --remove, finds
+        # nothing left to do and returns None.
+        self.install(apply=True, include_post=True)
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        del settings["hooks"]["PostToolUse"]
+        self.settings.write_text(json.dumps(settings), encoding="utf-8")
+
+        report = self.install(apply=True, remove=True)
+
+        self.assertTrue(report["applied"])
+        after = json.loads(self.settings.read_text(encoding="utf-8"))
+        # The live PreToolUse entry must actually be gone: the bug left it
+        # installed and active while the receipt below claimed removal
+        # had succeeded.
+        self.assertNotIn("PreToolUse", after.get("hooks", {}))
         self.assertFalse(self.receipt_path.exists())
 
     def test_codex_is_never_given_a_post_entry_even_when_asked(self):

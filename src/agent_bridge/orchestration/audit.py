@@ -32,6 +32,7 @@ work it out.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from typing import Any, Iterable
@@ -411,14 +412,29 @@ def _inline_measurement_report(measurements: list[dict[str, Any]]) -> dict[str, 
     carried. Never a decision -- ``gate.record_inline_measurement`` never
     ran anything but a measurement -- so unlike ``local_first`` above there
     is no allowed/denied split to report, only a count and a total.
+
+    ``_read_ledger`` deliberately keeps an unparseable line as its own
+    ``{"error": ...}`` row rather than dropping it, so every consumer must
+    filter to the rows that are actually its own before counting -- the
+    same discipline ``_decision_rows``/``_local_first_report`` already
+    apply to their own ledgers. A row with no ``matched_runner`` string is
+    never one this section wrote, so it is excluded rather than inflating
+    ``count`` by one and adding a spurious ``"None"`` bucket to
+    ``by_runner`` (an adversarial review found both of those happening).
+    ``math.isfinite`` guards the byte sum the same review found: a
+    hand-edited ``"bytes": NaN``/``Infinity`` passes the existing
+    ``isinstance(..., (int, float))`` check (both are ``float`` instances)
+    and then crashes ``int()``, taking the whole audit report down with
+    it -- the exact crash class this style of guard exists to prevent.
     """
-    total_bytes = sum(int(row["bytes"]) for row in measurements
-                      if isinstance(row.get("bytes"), (int, float)))
+    rows = [row for row in measurements if isinstance(row.get("matched_runner"), str)]
+    total_bytes = sum(int(row["bytes"]) for row in rows
+                      if isinstance(row.get("bytes"), (int, float)) and math.isfinite(row["bytes"]))
     return {
-        "count": len(measurements),
+        "count": len(rows),
         "definition": "a Bash call matched by _TEST_BUILD_RUNNERS: a test or build tool "
                       "invoked by its own program name, Claude only (see not_countable)",
-        "by_runner": _histogram(row.get("matched_runner") for row in measurements),
+        "by_runner": _histogram(row.get("matched_runner") for row in rows),
         "bytes_measured": total_bytes,
         "not_countable": ["Codex (Phase 0 could not confirm PostToolUse there)",
                           "a runner invoked through a general-purpose wrapper such as npm, "
