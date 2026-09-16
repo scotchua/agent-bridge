@@ -26,8 +26,10 @@ a deny.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -35,6 +37,11 @@ from typing import Any, Callable
 from .. import store
 from ..localq.spool import QueueCaps
 from . import autoroute, delegation
+
+#: Matches ``gate.AUDIT_LEDGER``. Restated for the same reason as
+#: ``ROUTING_DIR`` below: this module stays import-free of ``gate`` so
+#: ``gate.py`` can import it without a cycle.
+AUDIT_LEDGER = "audit.jsonl"
 
 #: Matches ``gate.RECEIPT_DIR``. See the module docstring for why this is a
 #: restatement rather than an import.
@@ -477,3 +484,304 @@ def write_calibration_record(state_root: str, record: dict[str, Any]) -> None:
 def load_calibration_record(state_root: str) -> "dict[str, Any] | None":
     loaded = store.read_json_or_none(calibration_path(state_root))
     return loaded if isinstance(loaded, dict) else None
+
+
+# --------------------------------------------------------- descriptor-bound read
+
+
+class WindowReadError(ValueError):
+    """A digest window could not be read safely. Refuses by name."""
+
+
+def read_window(path: str, offset: int, length: int) -> tuple[str, int]:
+    """Read exactly ``length`` bytes at ``offset`` through one descriptor,
+    refusing a file that is not what it appeared to be or that changed
+    underneath the read.
+
+    Modelled on ``windows_privacy.read_private_file``'s shape (open once,
+    ``fstat`` before and after, compare device/inode/size/mtime, never
+    reopen the name to get the bytes), without that module's owner-only ACL
+    check: a digest target is an ordinary repository file the operator's
+    policy already made eligible, not a private credential or evidence
+    record, so that check does not apply here. ``O_NOFOLLOW`` refuses a
+    symlink outright rather than silently following one the caller's own
+    ``matches_any``/realpath check already resolved past.
+
+    Returns the decoded text and how many replacement characters the UTF-8
+    decode inserted: a digest is not a patch, so a log carrying a few stray
+    non-UTF-8 bytes is tolerated and the count is carried in the receipt
+    rather than silently discarded or treated as fatal.
+    """
+    if offset < 0 or length <= 0:
+        raise WindowReadError("window_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise WindowReadError(f"path_unreadable:{type(exc).__name__}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise WindowReadError("not_a_regular_file")
+        if offset > before.st_size:
+            raise WindowReadError("offset_beyond_end_of_file")
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 65_536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if identity_before != identity_after:
+            raise WindowReadError("file_changed_while_reading")
+    finally:
+        os.close(descriptor)
+    text = raw.decode("utf-8", errors="replace")
+    return text, text.count("�")
+
+
+# -------------------------------------------------------------------- templates
+
+
+#: The four digest shapes. Deliberately not ``test_draft``: drafting tests is
+#: generation, not digestion, and Codex's ``infer_task_type`` question from
+#: an earlier round of this project (``REVIEW-HISTORY.md`` finding 43) is
+#: the same lesson -- a plausible-looking task type that the local worker
+#: cannot actually satisfy is worse than an obviously absent one.
+DIGEST_TASK_TYPES = ("log_triage", "summarize", "extract", "checklist")
+
+#: Server-side prompt templates. The assistant chooses a task type and,
+#: for ``extract``, field names; it supplies no instruction text of its
+#: own. See design section 6, finding 4 (instruction gaming): a free-text
+#: instruction let an earlier draft ask the local model to do nothing at
+#: all and still collect a receipt.
+_DIGEST_TEMPLATES = {
+    "log_triage": (
+        "List in order: the first failure or error with its line number; "
+        "every distinct error or warning class with a count; the last five "
+        "lines verbatim. Quote lines exactly. Do not infer causes. At most "
+        "{max_chars} characters."),
+    "summarize": (
+        "Summarize in at most {max_chars} characters. Keep every "
+        "identifier, number, path and version string verbatim. No "
+        "recommendations."),
+    "extract": (
+        "Return a JSON object with these keys and their values as found in "
+        "the text, null where absent: {fields}. Nothing else."),
+    "checklist": (
+        "Rewrite as a checklist of discrete, verifiable items, one per "
+        "line, at most {max_chars} characters."),
+}
+
+#: An identifier ``extract`` may name as a field: this is the shape the
+#: template repeats back as a JSON key, not a path or an expression, so it
+#: is bounded the same way any other identifier in this project is.
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+MAX_EXTRACT_FIELDS = 10
+
+
+class TemplateError(ValueError):
+    """The caller's task type or field list cannot be rendered."""
+
+
+def render_instruction(task_type: str, *, max_chars: int,
+                       fields: "tuple[str, ...] | list[str]" = ()) -> str:
+    """The fixed instruction text for one digest task. Never caller-authored."""
+    if task_type not in DIGEST_TASK_TYPES:
+        raise TemplateError("task_type_invalid")
+    if task_type == "extract":
+        if not fields or len(fields) > MAX_EXTRACT_FIELDS:
+            raise TemplateError("fields_invalid")
+        if any(not isinstance(name, str) or not _FIELD_NAME_RE.match(name) for name in fields):
+            raise TemplateError("fields_invalid")
+        return _DIGEST_TEMPLATES["extract"].format(fields=", ".join(fields))
+    if fields:
+        raise TemplateError("fields_only_valid_for_extract")
+    return _DIGEST_TEMPLATES[task_type].format(max_chars=max_chars)
+
+
+# --------------------------------------------------------- digest identity
+
+
+def digest_key(path: str) -> str:
+    """A stable identity for a file: content-independent, keyed on its real
+    path, exactly the same construction ``gate.receipt_name`` uses for a
+    repository. Two spellings of one file (a relative path, a symlink
+    already resolved) share one intent and one receipt."""
+    return hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()[:32]
+
+
+DIGEST_INTENT_DIR = "digest-intents"
+DIGEST_RECEIPT_DIR = "digests"
+
+
+def digest_intent_path(state_root: str, path: str) -> str:
+    return os.path.join(routing_dir(state_root), DIGEST_INTENT_DIR, digest_key(path) + ".json")
+
+
+def digest_receipt_path(state_root: str, path: str) -> str:
+    return os.path.join(routing_dir(state_root), DIGEST_RECEIPT_DIR, digest_key(path) + ".json")
+
+
+def read_digest_intent(state_root: str, path: str) -> "dict[str, Any] | None":
+    loaded = store.read_json_or_none(digest_intent_path(state_root, path))
+    return loaded if isinstance(loaded, dict) else None
+
+
+def read_digest_receipt(state_root: str, path: str) -> "dict[str, Any] | None":
+    loaded = store.read_json_or_none(digest_receipt_path(state_root, path))
+    return loaded if isinstance(loaded, dict) else None
+
+
+# ------------------------------------------------------------- digest intent
+
+
+DIGEST_INTENT_VERSION = 1
+#: The fields a retiring digest receipt must match, every one of them,
+#: mirroring ``autodecide.INTENT_BINDING``'s own reasoning: a cleanup keyed
+#: on a subset of the binding can retire an intent that a *different*
+#: submission for the same file (a different size or mtime) never actually
+#: answered, which is precisely the "routed but never dispatched" gap that
+#: module's own docstring warns about, transposed to a file instead of a
+#: stage.
+DIGEST_INTENT_BINDING = ("path", "size", "mtime_ns")
+
+
+def write_digest_intent(state_root: str, *, path: str, repo: str, size: int, mtime_ns: int,
+                        matched_glob: str, classification: str, client: str,
+                        readiness_info: "dict[str, Any]", digest_grace_seconds: float,
+                        clock: Callable[[], float] = time.time) -> "dict[str, Any]":
+    """The durable record that a gated read is owed a digest. Written by the
+    hook (a later phase) when it denies ``local_digest_required``; the
+    shape lives here so the digest tool that retires it, and any future
+    caller that needs to read one, share one definition."""
+    now = float(clock())
+    real_path = os.path.realpath(path)
+    intent = {
+        "version": DIGEST_INTENT_VERSION,
+        "path": real_path,
+        "repo": os.path.realpath(repo),
+        "size": size,
+        "mtime_ns": mtime_ns,
+        "matched_glob": matched_glob,
+        "classification": classification,
+        "client": client,
+        "readiness": dict(readiness_info),
+        "created_at": now,
+        "expires_at": now + digest_grace_seconds,
+        "state": "awaiting_digest",
+        "next_call": "work_digest_file",
+    }
+    store.append_ledger(os.path.join(routing_dir(state_root), AUDIT_LEDGER),
+                        {"event": "digest_intent", **intent})
+    store.atomic_write_json(digest_intent_path(state_root, real_path), intent)
+    return intent
+
+
+def retire_digest_intent(state_root: str, path: str, *, binding: "dict[str, Any]",
+                         clock: Callable[[], float] = time.time) -> bool:
+    """Retire the intent for ``path`` once *the file it names* has actually
+    been digested. Returns whether a matching intent existed.
+
+    ``binding`` must equal the intent's own ``path``/``size``/``mtime_ns``
+    in every field. A digest of a different size or a file that has since
+    changed answers a different intent than the one on disk, if any, and
+    must not be recorded as having met it: see ``DIGEST_INTENT_BINDING``.
+    """
+    real_path = os.path.realpath(path)
+    intent_file = digest_intent_path(state_root, real_path)
+    if not os.path.exists(intent_file):
+        return False
+    existing = read_digest_intent(state_root, real_path) or {}
+    mismatched = [field_name for field_name in DIGEST_INTENT_BINDING
+                 if existing.get(field_name) != binding.get(field_name)]
+    ledger = os.path.join(routing_dir(state_root), AUDIT_LEDGER)
+    if mismatched:
+        store.append_ledger(ledger, {
+            "event": "digest_intent_unmatched", "path": real_path,
+            "mismatched": mismatched, "at": float(clock())})
+        return False
+    store.append_ledger(ledger, {"event": "digest_intent_met", "path": real_path,
+                                 "at": float(clock())})
+    os.unlink(intent_file)
+    return True
+
+
+# ------------------------------------------------------------ digest receipt
+
+
+DIGEST_RECEIPT_VERSION = 1
+
+
+def write_digest_receipt(state_root: str, *, path: str, repo: str, size: int, mtime_ns: int,
+                         offset: int, window_bytes: int, window_sha256: str,
+                         decode_replacements: int, task_type: str, classification: str,
+                         caller: str, job_id: str, intake_receipt_id: str,
+                         clock: Callable[[], float] = time.time) -> "dict[str, Any]":
+    """The durable record that a file has been digested: shared by both
+    clients, like a routing receipt. Once either has digested a file, both
+    may read it (the read gate consults this, in a later phase)."""
+    real_path = os.path.realpath(path)
+    receipt = {
+        "version": DIGEST_RECEIPT_VERSION,
+        "path": real_path,
+        "repo": os.path.realpath(repo),
+        "size": size,
+        "mtime_ns": mtime_ns,
+        "offset": offset,
+        "window_bytes": window_bytes,
+        "window_sha256": window_sha256,
+        "decode_replacements": decode_replacements,
+        "task_type": task_type,
+        "classification": classification,
+        "caller": caller,
+        "job_id": job_id,
+        "intake_receipt_id": intake_receipt_id,
+        "created_at": float(clock()),
+    }
+    store.append_ledger(os.path.join(routing_dir(state_root), AUDIT_LEDGER),
+                        {"event": "digest_submitted", **receipt})
+    store.atomic_write_json(digest_receipt_path(state_root, real_path), receipt)
+    return receipt
+
+
+# --------------------------------------------------------------- job index
+
+
+#: ``LocalQueue.result`` does not expose a job's own ``params`` (only
+#: ``task_type``/``priority``/``classification``/``caller``/``purpose``), so
+#: nothing about a completed job says on its own whether it was a digest and,
+#: if so, what to truncate its draft to. This is a small, purpose-built index
+#: from job id to that one number, written only for jobs ``work_digest_file``
+#: itself submits; an ordinary ``work_route_local`` job never has an entry
+#: here and ``work_result`` leaves it untouched.
+DIGEST_JOB_INDEX_DIR = "digest-jobs"
+
+
+def digest_job_index_path(state_root: str, job_id: str) -> str:
+    return os.path.join(routing_dir(state_root), DIGEST_JOB_INDEX_DIR, f"{job_id}.json")
+
+
+def record_digest_job(state_root: str, job_id: str, *, max_output_chars: int) -> None:
+    if not job_id:
+        return
+    store.atomic_write_json(digest_job_index_path(state_root, job_id),
+                            {"max_output_chars": max_output_chars})
+
+
+def digest_job_max_output_chars(state_root: str, job_id: str) -> "int | None":
+    if not job_id:
+        return None
+    loaded = store.read_json_or_none(digest_job_index_path(state_root, job_id))
+    if not isinstance(loaded, dict):
+        return None
+    value = loaded.get("max_output_chars")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None

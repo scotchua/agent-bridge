@@ -49,7 +49,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge.capacity_router import CapacityObservation, StageRouter  # noqa: E402
 from agent_bridge.execution import hostenv  # noqa: E402
 from agent_bridge.localq.spool import ResourceSnapshot  # noqa: E402
-from agent_bridge.orchestration import audit, autodecide, autoroute, gate  # noqa: E402
+from agent_bridge.orchestration import audit, autodecide, autoroute, gate, localfirst  # noqa: E402
 from agent_bridge.orchestration.execution_queue import (  # noqa: E402
     ExecutionQueue, Harnesses, SubprocessHarnessExecutor)
 
@@ -656,6 +656,216 @@ class LocalLane(Workflow):
         again = self.route_local("claude", text)
         self.assertEqual(first["receipt_id"], again["receipt_id"])
         self.assertTrue(again["deduplicated"])
+
+
+class DigestLane(Workflow):
+    """work_digest_file: a local digest before a cloud model reads a
+    mechanical artifact whole. See docs/LOCAL-FIRST-DESIGN.md sections 2.1
+    and 2.2. This class exercises the tool itself (Phase 2); the read gate
+    that compels it is a later phase and is not exercised here."""
+
+    def write_digest_policy(self, *, globs=("**/*.log",), enabled=True,
+                            classification="internal_nonclient",
+                            digest_max_output_chars=None):
+        entry = {"classification": classification, "allowed_routes": ["claude", "codex", "local"],
+                "mechanical_ok": True, "mechanical_globs": list(globs)}
+        local_first = {"enabled": enabled}
+        if digest_max_output_chars is not None:
+            local_first["digest_max_output_chars"] = digest_max_output_chars
+        document = {"version": 1, "prefer": [], "declared_available": ["local"],
+                   "local_first": local_first, "repos": {str(self.repo): entry}}
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def write_log(self, name="app.log", *, lines=200):
+        target = self.repo / name
+        target.write_text("\n".join(f"2026-09-16T00:{i:02d}:00 line {i}" for i in range(lines)) + "\n",
+                          encoding="utf-8")
+        return target
+
+    def digest(self, caller, path, task_type="log_triage", **extra):
+        replies = self.mcp(caller, [("work_digest_file", {
+            "path": str(path), "task_type": task_type, **extra})])
+        return self.tool_result(replies, 2)
+
+    def drain_local(self):
+        from agent_bridge.localq.service import Service
+
+        service = Service(str(self.local_root), str(self.bin / "local-worker"),
+                          str(self.worker_state), sampler=PortableSampler())
+        return service.once()
+
+    def test_a_mechanical_file_is_digested_and_the_template_reaches_the_model_verbatim(self):
+        self.write_digest_policy()
+        target = self.write_log()
+        result = self.digest("codex", target)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["classification"], "internal_nonclient")
+        self.assertEqual(result["next_call"], "work_result")
+        self.assertTrue(result["window"]["bytes"] > 0)
+        job_id = result["job_id"]
+        self.assertTrue(job_id)
+
+        self.drain_local()
+        replies = self.mcp("codex", [("work_result", {"job_id": job_id})])
+        work_result = self.tool_result(replies, 2)
+        self.assertTrue(work_result["ok"], work_result)
+        self.assertEqual(work_result["status"], "complete")
+
+        # The server-side template reached the model verbatim; the assistant
+        # supplied no instruction text at all (design section 6, finding 4).
+        self.assertEqual(len(ModelService.requests), 1)
+        _, payload = ModelService.requests[0]
+        self.assertIn("first failure or error", payload["prompt"])
+        self.assertIn("Do not infer causes", payload["prompt"])
+
+    def test_the_classification_is_the_policys_never_the_callers(self):
+        """work_digest_file's schema has no classification field at all; the
+        intake receives whatever the operator's policy says for this
+        repository, which the digest receipt records."""
+        self.write_digest_policy(classification="public")
+        target = self.write_log()
+        result = self.digest("claude", target)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["classification"], "public")
+
+    def test_a_path_not_matching_the_globs_is_refused(self):
+        self.write_digest_policy(globs=("**/*.out",))
+        target = self.write_log()  # app.log, does not match **/*.out
+        result = self.digest("codex", target)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "digest_path_refused:no_glob_match")
+
+    def test_a_path_outside_any_classified_repository_is_refused(self):
+        self.write_digest_policy()
+        outside = self.base / "outside.log"
+        outside.write_text("x" * 1000, encoding="utf-8")
+        result = self.digest("codex", outside)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "digest_path_refused:not_in_a_repository")
+
+    def test_a_path_under_state_root_is_refused(self):
+        self.write_digest_policy()
+        # Named directly rather than matched by glob, and it would not
+        # ordinarily be "in a repository" at all; the state-root check is
+        # the one that must catch a misconfiguration where it is.
+        (self.state / ".git").mkdir(parents=True, exist_ok=True)
+        target = self.state / "routing" / "leak.log"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x" * 1000, encoding="utf-8")
+        result = self.digest("codex", target)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "digest_path_refused:protected_or_state_path")
+
+    def test_an_escaping_symlink_is_refused(self):
+        outside = self.base / "outside-dir"
+        outside.mkdir()
+        secret = outside / "secret.log"
+        secret.write_text("x" * 1000, encoding="utf-8")
+        link = self.repo / "escape.log"
+        try:
+            link.symlink_to(secret)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not creatable on this account")
+        self.write_digest_policy()
+        result = self.digest("codex", link)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "digest_path_refused:symlink")
+
+    def test_a_file_smaller_than_the_intake_floor_is_refused_by_the_intake(self):
+        """work_digest_file adds constraints; it does not relax the
+        intake's own threshold (design section 2.2, step 6)."""
+        self.write_digest_policy()
+        target = self.repo / "tiny.log"
+        target.write_text("short\n", encoding="utf-8")
+        result = self.digest("codex", target)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reason"], "below_local_delegation_threshold")
+
+    def test_local_first_disabled_refuses_even_a_matching_file(self):
+        self.write_digest_policy(enabled=False)
+        target = self.write_log()
+        result = self.digest("codex", target)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "digest_path_refused:local_first_disabled")
+
+    def test_the_tail_default_offset_reads_the_end_of_a_large_file(self):
+        self.write_digest_policy()
+        # Larger than the digest window cap, so the default offset must be
+        # the tail, not the start.
+        target = self.repo / "big.log"
+        target.write_text("A" * 40_000 + "TAIL-MARKER" + "B" * 100, encoding="utf-8")
+        result = self.digest("codex", target)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["window"]["bytes"], localfirst.MAX_WINDOW_BYTES)
+        self.assertGreater(result["window"]["offset"], 0)
+
+    def test_a_caller_chosen_offset_too_close_to_the_end_is_refused(self):
+        self.write_digest_policy()
+        target = self.repo / "big.log"
+        target.write_text("A" * 40_000, encoding="utf-8")
+        result = self.digest("codex", target, offset=39_999)
+        self.assertFalse(result["ok"])
+        self.assertIn("digest_window_refused:window_too_small", result["error"])
+
+    def test_idempotent_across_two_identical_calls(self):
+        self.write_digest_policy()
+        target = self.write_log()
+        first = self.digest("codex", target)
+        second = self.digest("codex", target)
+        self.assertTrue(first["ok"] and second["ok"])
+        self.assertEqual(first["receipt_id"], second["receipt_id"])
+        self.assertTrue(second["deduplicated"])
+        self.assertEqual(first["job_id"], second["job_id"])
+
+    def test_extract_requires_field_names_and_they_reach_the_template(self):
+        self.write_digest_policy()
+        target = self.write_log()
+        result = self.digest("codex", target, task_type="extract", fields=["level", "count"])
+        self.assertTrue(result["ok"], result)
+        self.drain_local()
+        self.mcp("codex", [("work_result", {"job_id": result["job_id"]})])
+        _, payload = ModelService.requests[-1]
+        self.assertIn("level", payload["prompt"])
+        self.assertIn("count", payload["prompt"])
+
+    def test_extract_without_fields_is_refused(self):
+        self.write_digest_policy()
+        target = self.write_log()
+        result = self.digest("codex", target, task_type="extract")
+        self.assertFalse(result["ok"])
+        self.assertIn("digest_task_refused", result["error"])
+
+    def test_work_result_truncates_a_digest_draft_and_marks_it(self):
+        self.write_digest_policy(digest_max_output_chars=20)
+        target = self.write_log()
+        result = self.digest("codex", target)
+        self.assertTrue(result["ok"], result)
+        job_id = result["job_id"]
+        self.drain_local()
+        replies = self.mcp("codex", [("work_result", {"job_id": job_id})])
+        work_result = self.tool_result(replies, 2)
+        output = work_result["result"]["output"]
+        self.assertTrue(output["output_truncated"])
+        self.assertEqual(len(output["text"]), 20)
+        self.assertGreater(output["output_char_count"], 20)
+
+    def test_a_second_digest_of_a_changed_file_is_a_new_job(self):
+        """Changing the file after a digest is not the same request: the
+        digest key does not itself version content, but a changed mtime/size
+        makes the *content* different, so idempotency (keyed on the window's
+        own sha256) does not collide."""
+        self.write_digest_policy()
+        target = self.write_log(lines=200)
+        first = self.digest("codex", target)
+        self.assertTrue(first["ok"], first)
+        target.write_text(target.read_text(encoding="utf-8") + "one more line\n", encoding="utf-8")
+        second = self.digest("codex", target)
+        self.assertTrue(second["ok"], second)
+        self.assertNotEqual(first["receipt_id"], second["receipt_id"])
+        self.assertFalse(second.get("deduplicated", False))
 
 
 class RestartRecovery(Workflow):

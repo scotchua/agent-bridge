@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import threading
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 from ..capacity_router import StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.service import Service
+from . import gate
 from .config import load
 from .execution_queue import ExecutionQueue
 from .mcp import build_tools
@@ -29,7 +31,8 @@ INSTRUCTIONS = (
 class Server:
     def __init__(self, caller: str, service: Service, router: StageRouter, *,
                  execution: ExecutionQueue | None = None, interval: float = 5.0,
-                 state_root: str | None = None):
+                 state_root: str | None = None,
+                 protected: tuple[str, ...] = ()):
         if caller not in {"claude", "codex"}:
             raise ValueError("caller_invalid")
         if interval <= 0:
@@ -38,7 +41,7 @@ class Server:
         self.execution, self.interval = execution, interval
         self.intake = AutomaticIntake(service.queue)
         self.tools = build_tools(caller, router, service.queue, self.intake, execution,
-                                 state_root=state_root)
+                                 state_root=state_root, protected=protected)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -164,8 +167,15 @@ def main(argv: list[str] | None = None) -> int:
         # standalone execution worker consumes the same queue.
         execution = ExecutionQueue(cfg.execution_queue_root, None,
                                    recover_interrupted=False)
+    # The same protected list the delegation-first hook computes, so
+    # work_digest_file refuses a target the hook would also refuse to write:
+    # the gate's own state, the stage router's database, the local queue's
+    # own database and heartbeat, and the hook installation files.
+    protected = gate.protected_paths(str(cfg.state_root), args.config, os.path.expanduser("~"),
+                                     str(cfg.capacity_db), str(cfg.local_queue_root))
     return Server(args.caller, service, router, execution=execution,
-                  interval=cfg.interval_seconds, state_root=str(cfg.state_root)).serve()
+                  interval=cfg.interval_seconds, state_root=str(cfg.state_root),
+                  protected=protected).serve()
 
 
 if __name__ == "__main__":
