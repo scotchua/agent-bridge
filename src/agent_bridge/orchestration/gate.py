@@ -58,7 +58,7 @@ import sqlite3
 import stat
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .. import store
@@ -193,10 +193,10 @@ _GIT_TAG = re.compile(r"(^|[\s;&|('\"])git\s+tag(\s+(?P<rest>[^;&|]*))?")
 _GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at",
                        "--merged", "--no-merged", "--sort", "--format", "--verify", "-v", "--column")
 
-#: Codex whole-file readers (design section 2.1): a shell command naming one
-#: of these reads a file's entire content, the read-gate equivalent of
-#: Claude's ``Read`` tool. ``head``, ``tail``, ``sed -n``, ``grep`` and ``rg``
-#: are deliberately absent -- exact or bounded reads, the "exact tools first"
+#: Codex whole-file readers (design section 2.1): invoking one of these
+#: reads a file's entire content, the read-gate equivalent of Claude's
+#: ``Read`` tool. ``head``, ``tail``, ``sed -n``, ``grep`` and ``rg`` are
+#: deliberately absent -- exact or bounded reads, the "exact tools first"
 #: the instruction file already asks for, and allowed on purpose. Windows'
 #: ``type`` and PowerShell's ``Get-Content`` are the same word other contexts
 #: use for something else (a POSIX shell builtin that reports what a name
@@ -204,19 +204,70 @@ _GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--p
 #: a false match here still only widens what gets a digest offered before a
 #: read, never what gets refused outright, and an operand that turns out not
 #: to be a regular file falls straight through the fast-path allow below.
-_WHOLE_FILE_READERS = re.compile(
-    r"(^|[\s;&|('\"/\\])(?i:cat|less|more|bat|type|Get-Content)(\s|$)")
+#: Matched by resolved program name (``_program_name``, the same
+#: Windows-executable-suffix stripping this file already applies to
+#: recognize a shell by name) rather than a raw substring: a regex bounded
+#: only by whitespace/punctuation never matched an explicitly-suffixed
+#: spelling (``cat.exe``, ``type.exe``, ``more.com``), which Git-for-Windows
+#: and MSYS2 command captures use routinely, and separately matched a reader
+#: name used as a plain argument to an unrelated command (``echo cat``).
+_WHOLE_FILE_READER_NAMES = frozenset({"cat", "less", "more", "bat", "type", "get-content"})
 #: ``Get-Content -TotalCount N`` / ``-Tail N`` is a bounded read, like
 #: ``head``/``tail``; checked over the whole command text rather than scoped
 #: to one invocation, the same simplification ``_formatter_writes`` already
-#: makes for report-only flags in this file.
-_BOUNDED_READ_FLAGS = re.compile(r"(^|\s)(?i:-TotalCount|-Tail)(\s|=|$)")
+#: makes for report-only flags in this file. ``:`` joins the boundary
+#: alongside whitespace and ``=`` because PowerShell also colon-binds a
+#: flag's value (``-Tail:5``); missing it under-recognized the bounded form
+#: rather than over-recognizing it (the read gate still ran, exactly as it
+#: does for the same command spelled with a space), so this widens a
+#: precision gap, not a bypass.
+_BOUNDED_READ_FLAGS = re.compile(r"(^|\s)(?i:-TotalCount|-Tail)(\s|=|:|$)")
+#: Operators that separate one shell command from the next: a fresh
+#: "command name" position follows each of these (and the start of the
+#: whole command), for ``_shell_reader_words``.
+_COMMAND_SEPARATORS = frozenset({";", "&", "&&", "||", "|"})
+_REDIRECT_OPERATORS = frozenset({"<", ">", ">>"})
+#: A leading ``NAME=value`` shell-assignment prefix (``LANG=C cat a.log``)
+#: names no program; recognized so it does not consume the command-name
+#: position ``_shell_reader_words`` is looking for.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_reader_words(command: str) -> list[str]:
+    """Every word, in order, that occupies a command-name position and names
+    a whole-file reader (``_WHOLE_FILE_READER_NAMES``): the first word since
+    the start of the command or the last ``;``/``&``/``&&``/``||``/``|``
+    that is not a flag, an environment-assignment prefix, or a redirection
+    target (``< a.log cat`` names ``a.log`` first, but ``a.log`` is not the
+    command). Shared between ``_shell_whole_file_read`` (does this command
+    read a file whole at all) and ``_shell_read_paths`` (which resolved path
+    is the reader's own name, to exclude it from the files actually read).
+    """
+    words = _shell_words(command)
+    expect_name = True
+    previous = ""
+    found = []
+    for raw in words:
+        word = raw.strip("'\"")
+        if word in _COMMAND_SEPARATORS:
+            expect_name = True
+            previous = word
+            continue
+        is_redirect_target = word[:1] in "<>" or previous in _REDIRECT_OPERATORS
+        previous = word
+        if is_redirect_target or word.startswith("-") or _ENV_ASSIGNMENT.match(word):
+            continue
+        if expect_name:
+            expect_name = False
+            if _program_name(word).lower() in _WHOLE_FILE_READER_NAMES:
+                found.append(word)
+    return found
 
 
 def _shell_whole_file_read(command: str) -> bool:
     """Whether ``command`` reads a named file whole. A heuristic, scoped to
     Codex only (see ``classify``); Claude's Bash tool is not judged by it."""
-    return bool(_WHOLE_FILE_READERS.search(command)) and not _BOUNDED_READ_FLAGS.search(command)
+    return bool(_shell_reader_words(command)) and not _BOUNDED_READ_FLAGS.search(command)
 
 
 @dataclass(frozen=True)
@@ -232,6 +283,16 @@ class Decision:
     #: only where the design calls for them. Routing decisions leave this
     #: empty; their own extra fields come from ``receipt`` instead.
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Other decisions ``record_event`` must also log as their own ledger
+    #: line. A single call can name more than one gated-shape read (two
+    #: files in one Claude Read-tool batch is not possible, but Codex's
+    #: shell heuristic can match several in one command); only one
+    #: ``Decision`` is ever returned as the call's own outcome, and the rest
+    #: would otherwise leave a ``digest_intent`` audit row (written per path,
+    #: unconditionally) with no matching gate event, breaking the audit's
+    #: own adds-up invariant. Populated only by ``judge_read``; every other
+    #: constructor leaves it empty.
+    also_log: tuple["Decision", ...] = ()
 
     @property
     def allowed(self) -> bool:
@@ -889,16 +950,33 @@ def infer_task_type(paths: list[str]) -> str:
 
 
 def _shell_read_paths(command: str, cwd: str) -> list[str]:
-    """The files a whole-file-read command names, excluding the program name
-    itself. ``_command_paths`` includes that word too: harmless for the
-    write gate's own purpose (a bogus "path" that fails the regular-file
-    check downstream and changes nothing), but the read gate's event log and
-    digest intent should name only the files actually read, and the fast
-    path here specifically wants "no operand" (a bare ``cat``, reading
-    stdin) to mean no read target -- which dropping the leading word also
-    gets right, since nothing remains to drop it from."""
+    """The files a whole-file-read command names, excluding the reader
+    program's own name. ``_command_paths`` treats a command's own name as an
+    operand too (see its docstring): harmless for the write gate's own
+    purpose (a bogus "path" that fails the regular-file check downstream and
+    changes nothing), but the read gate's event log and digest intent should
+    name only the files actually read.
+
+    A previous version excluded it by list position (dropping
+    ``_command_paths()[0]``), on the assumption that word is always first.
+    Shell redirection can place it elsewhere: ``< a.log cat`` names
+    ``a.log`` before ``cat``, so dropping the first entry silently kept the
+    program name and discarded the real read target -- a complete, silent
+    read-gate bypass for that ordinary POSIX construction. Chaining
+    (``cat a.log; cat b.log``) has the same root cause: only the first
+    command's name ever fell at position zero, so every later command in
+    the chain left its own name behind as a bogus extra "path". Found by
+    resolved VALUE at the command-name position instead
+    (``_shell_reader_words``, the same scan ``_shell_whole_file_read`` uses),
+    and removed one matching occurrence per name so a file legitimately
+    named after a reader (``cat cat``, reading a file called ``cat``) still
+    comes back."""
     paths = _command_paths(command, cwd)
-    return paths[1:] if paths else paths
+    for word in _shell_reader_words(command):
+        resolved = _command_paths(word, cwd)
+        if resolved and resolved[0] in paths:
+            paths.remove(resolved[0])
+    return paths
 
 
 def _read_tool_paths(tool_input: Any, cwd: str) -> list[str]:
@@ -997,6 +1075,23 @@ def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
 # ------------------------------------------------------------- read judgment
 
 
+def _same_path(a: str, b: str) -> bool:
+    """Whether two already-resolved path strings name the same file, the
+    same ``os.path.normcase`` treatment ``_under`` applies: a no-op on
+    POSIX, and on Windows a case fold plus separator normalization. Without
+    it, a digest receipt written for a path spelled in one case (or with the
+    other slash direction) compared unequal to the identical file read back
+    in another case -- never a bypass (the mismatch reads as "no receipt
+    yet", so the strict-side outcome is only ever an extra, needless
+    digest), but avoidable churn on Windows, the platform this helps.
+    ``normcase`` is keyed on the OS family, not the actual volume, so it
+    stays a no-op on macOS's own default case-insensitive volume too, same
+    as every other POSIX one; closing that residual would need a real
+    filesystem probe this project's other case-insensitivity fixes have not
+    reached for either."""
+    return os.path.normcase(a) == os.path.normcase(b)
+
+
 def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
                      state_root: str, local_queue_root: str,
                      worker_executable: str, protected: tuple[str, ...],
@@ -1047,7 +1142,8 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
             extra={"waiver_reason": readiness.code, "bytes_estimate": size})
 
     receipt = localfirst.read_digest_receipt(state_root, real_path)
-    matches_current = (receipt is not None and receipt.get("path") == real_path
+    matches_current = (receipt is not None and isinstance(receipt.get("path"), str)
+                       and _same_path(receipt["path"], real_path)
                        and receipt.get("size") == size and receipt.get("mtime_ns") == mtime_ns)
     if matches_current:
         job_id = str(receipt.get("job_id") or "")
@@ -1089,8 +1185,10 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
             f"once it completes. Exact tools (grep, rg, tail -n) are allowed now.",
             (repo_root,), logged=True, extra={"job_id": job_id, "bytes_estimate": size})
 
-    if (receipt is not None and receipt.get("path") == real_path
+    if (receipt is not None and isinstance(receipt.get("path"), str)
+            and _same_path(receipt["path"], real_path)
             and isinstance(receipt.get("created_at"), (int, float))
+            and not isinstance(receipt.get("created_at"), bool)
             and now - receipt["created_at"] <= policy.local_first.digest_grace_seconds):
         return Decision(
             "allow", "local_first_waived",
@@ -1132,6 +1230,18 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
     the whole call is fast-path allowed and unlogged, matching the design's
     "no ledger write" rule for the ordinary case.
 
+    When more than one path is judged (not fast-path-allowed), only one
+    ``Decision`` is returned as the call's own outcome, but every one of them
+    is logged: the rest ride along on the returned decision's ``also_log``,
+    which ``record_event`` also writes a ledger line for. Each judged path
+    already left its own ``digest_intent`` audit-ledger row regardless (a
+    per-path side effect inside ``_judge_read_path``, written independent of
+    which Decision this function returns); before ``also_log`` existed, only
+    the first path's outcome ever became a gate event, so a call naming two
+    files that both required a digest wrote two intents but only one event,
+    and the audit's own adds-up invariant broke the moment the second file's
+    intent expired with nothing to count it against.
+
     An unreadable or malformed routing policy is a deny, the same as an
     edit -- but only once at least one path is inside a repository: outside
     every repository a read is unconditionally allowed (step 1), whatever
@@ -1159,53 +1269,24 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
             protected=protected, clock=clock)
         if outcome is not None:
             decisions.append(outcome)
-    for decision in decisions:
-        if not decision.allowed:
-            return decision
-    if decisions:
-        return decisions[0]
-    return Decision("allow", "not_gated_shape",
-                    "no read target matched the mechanical-artifact shape", logged=False)
+    if not decisions:
+        return Decision("allow", "not_gated_shape",
+                        "no read target matched the mechanical-artifact shape", logged=False)
+    primary_index = next((i for i, decision in enumerate(decisions) if not decision.allowed), 0)
+    primary = decisions[primary_index]
+    others = tuple(decisions[:primary_index] + decisions[primary_index + 1:])
+    return replace(primary, also_log=primary.also_log + others) if others else primary
 
 
-def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
-          state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
-          capacity_db: str | None = None,
-          local_queue_root: str = "", worker_executable: str = "",
-          decide: Any = None) -> Decision:
-    """Allow or deny one tool call. Fails closed when the gate's own state
-    cannot be read. ``protected`` paths refuse the editing tools outright;
-    with ``capacity_db`` every allow also requires the receipt's stage to be
-    owned right now (:func:`stage_binding`).
-
-    ``decide`` makes the gate automatic. When a repository has no receipt and
-    ``decide`` is supplied, it is called with ``(repo, task_type)`` and must
-    create the decision (see :mod:`autodecide`): compute the route from the
-    operator's policy, establish the ownership it implies, and write the
-    receipt. The call is then judged against that receipt like any other, so
-    work the policy retains proceeds with no friction and work it routes
-    elsewhere is refused here and owed to the route the receipt names.
-    Without ``decide`` the gate behaves as it did: a missing receipt is a
-    deny telling the agent which calls to make.
-
-    ``local_queue_root``/``worker_executable`` are needed only for a
-    ``kind == "read"`` call (:func:`judge_read`); every other kind ignores
-    them, so a caller that never enables local-first can leave them at their
-    empty-string default.
-    """
-    if client not in CLIENTS:
-        return Decision("deny", "client_invalid", "gate configured with an unknown client")
-    kind, paths = classify(client, tool_name, tool_input, cwd)
-    if kind == "other":
-        return Decision("allow", "not_gated", "tool is not an implementation write", logged=False)
-    if kind == "shell_read":
-        return Decision("allow", "shell_read_only_heuristic",
-                        "command does not look like it writes (heuristic)", logged=False)
-    if kind == "read":
-        return judge_read(client, paths, cwd, state_root=state_root,
-                          local_queue_root=local_queue_root,
-                          worker_executable=worker_executable,
-                          protected=protected, clock=clock)
+def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
+                 state_root: str, clock: Any, protected: tuple[str, ...],
+                 capacity_db: str | None, decide: Any) -> Decision:
+    """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
+    classification: protected paths, then routing receipts. Split out of
+    ``judge`` so a Codex shell command that both writes and reads a file
+    whole (``cat a.log > b.log``) can be judged on both counts -- see
+    ``judge``'s own overlay of ``judge_read`` for a whole-file read hiding
+    behind a write-shaped command."""
     if kind == "edit":
         hit = [path for path in paths if any(_under(path, root) for root in protected)]
     else:
@@ -1307,6 +1388,77 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                     repos, receipt)
 
 
+def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
+          state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
+          capacity_db: str | None = None,
+          local_queue_root: str = "", worker_executable: str = "",
+          decide: Any = None) -> Decision:
+    """Allow or deny one tool call. Fails closed when the gate's own state
+    cannot be read. ``protected`` paths refuse the editing tools outright;
+    with ``capacity_db`` every allow also requires the receipt's stage to be
+    owned right now (:func:`stage_binding`).
+
+    ``decide`` makes the gate automatic. When a repository has no receipt and
+    ``decide`` is supplied, it is called with ``(repo, task_type)`` and must
+    create the decision (see :mod:`autodecide`): compute the route from the
+    operator's policy, establish the ownership it implies, and write the
+    receipt. The call is then judged against that receipt like any other, so
+    work the policy retains proceeds with no friction and work it routes
+    elsewhere is refused here and owed to the route the receipt names.
+    Without ``decide`` the gate behaves as it did: a missing receipt is a
+    deny telling the agent which calls to make.
+
+    ``local_queue_root``/``worker_executable`` are needed only for a
+    ``kind == "read"`` call, or a Codex ``"shell"`` call that also reads a
+    file whole (:func:`judge_read` either way); every other kind ignores
+    them, so a caller that never enables local-first can leave them at their
+    empty-string default.
+    """
+    if client not in CLIENTS:
+        return Decision("deny", "client_invalid", "gate configured with an unknown client")
+    kind, paths = classify(client, tool_name, tool_input, cwd)
+    if kind == "other":
+        return Decision("allow", "not_gated", "tool is not an implementation write", logged=False)
+    if kind == "shell_read":
+        return Decision("allow", "shell_read_only_heuristic",
+                        "command does not look like it writes (heuristic)", logged=False)
+    if kind == "read":
+        return judge_read(client, paths, cwd, state_root=state_root,
+                          local_queue_root=local_queue_root,
+                          worker_executable=worker_executable,
+                          protected=protected, clock=clock)
+    write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
+                                  clock=clock, protected=protected, capacity_db=capacity_db,
+                                  decide=decide)
+    # classify's own contract (tested, unchanged) picks a command's write
+    # shape over its read shape: shell_writes is checked before
+    # _shell_whole_file_read, so a Codex command that both writes and reads
+    # a file whole (``cat a.log > b.log``, ``cat a.log | tee b.log``) never
+    # reached judge_read at all -- the read gate's entire purpose defeated
+    # for any ordinary command whose text happens to also carry a
+    # write-shaped suffix. Checked independently here, only once the write
+    # side would otherwise allow: a command already blocked for a write
+    # reason gains nothing from also being judged as a read, and judge_read
+    # has the side effect of recording a fresh digest intent, which a call
+    # going nowhere should not trigger.
+    if kind == "shell" and client == "codex" and write_decision.allowed:
+        command = _command_text(tool_input)
+        if _shell_whole_file_read(command):
+            read_decision = judge_read(
+                client, _shell_read_paths(command, cwd), cwd, state_root=state_root,
+                local_queue_root=local_queue_root, worker_executable=worker_executable,
+                protected=protected, clock=clock)
+            # A deny always wins over the write-side allow. An allow only
+            # replaces it when there is something worth logging (a
+            # gated-shape outcome): an unlogged fast-path allow (outside any
+            # repository, not gated-shape) has nothing the audit needs, and
+            # returning it here would discard routing_receipt_valid's own
+            # receipt-bearing record for no reason.
+            if not read_decision.allowed or read_decision.logged:
+                return read_decision
+    return write_decision
+
+
 def hook_output(decision: Decision) -> dict[str, Any]:
     """The PreToolUse wire shape both hosts read (``hookSpecificOutput``)."""
     if decision.allowed:
@@ -1318,18 +1470,37 @@ def hook_output(decision: Decision) -> dict[str, Any]:
     }}
 
 
+#: Fields this function sets itself; a ``Decision.extra`` value under one of
+#: these keys is dropped rather than silently overwriting it. Nothing in
+#: this codebase populates a colliding key today (a read decision's own
+#: ``extra`` keys -- ``waiver_reason``, ``bytes_estimate``, ``job_id``,
+#: ``matched_glob`` -- are all distinct from these), but ``extra`` is a
+#: plain dict a future ``Decision`` construction could populate with
+#: anything, and this ledger is the audit's own source of truth.
+_RESERVED_EVENT_FIELDS = frozenset({
+    "at", "client", "tool", "permission", "code", "repos",
+    "item_id", "stage", "owner_route",
+})
+
+
 def record_event(state_root: str, client: str, tool_name: str, decision: Decision,
                  clock: Any = time.time) -> None:
-    record = {"at": float(clock()), "client": client, "tool": tool_name,
-              "permission": decision.permission, "code": decision.code,
-              "repos": list(decision.repos)}
-    if decision.receipt:
-        record["item_id"] = decision.receipt.get("item_id")
-        record["stage"] = decision.receipt.get("stage")
-        record["owner_route"] = decision.receipt.get("owner_route")
-    if decision.extra:
-        record.update(decision.extra)
-    store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
+    """Append one ledger line for ``decision``, then one more for each entry
+    in its ``also_log`` -- every path a single gated-shape read judged, not
+    just the one call site treats as its overall outcome (``judge_read``'s
+    own docstring)."""
+    for entry in (decision, *decision.also_log):
+        record = {"at": float(clock()), "client": client, "tool": tool_name,
+                  "permission": entry.permission, "code": entry.code,
+                  "repos": list(entry.repos)}
+        if entry.receipt:
+            record["item_id"] = entry.receipt.get("item_id")
+            record["stage"] = entry.receipt.get("stage")
+            record["owner_route"] = entry.receipt.get("owner_route")
+        if entry.extra:
+            record.update({key: value for key, value in entry.extra.items()
+                           if key not in _RESERVED_EVENT_FIELDS})
+        store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
 
 
 def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:

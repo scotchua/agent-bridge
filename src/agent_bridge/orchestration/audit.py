@@ -383,12 +383,21 @@ def _local_first_report(state_root: str, *, events: list[dict[str, Any]],
         },
         "adds_up": compelled == digested + pending + waived + declined + outstanding_count,
         "bytes": {
+            # Filtered by isinstance, not ``int(... or 0)``: the adjacent
+            # ``declined`` count above already guards its own ledger field
+            # this way, and bytes_estimate/window_bytes get no less -- a
+            # non-numeric value in either (a hand-edited or otherwise
+            # malformed ledger row) crashed int() and took the whole audit
+            # report down with it, rather than just being counted as 0 like
+            # an absent one already was.
             "estimated_reaching_cloud_context": sum(
-                int(event.get("bytes_estimate") or 0) for event in reads
-                if event.get("code") in ("local_first_waived", "local_digest_present")),
+                int(event["bytes_estimate"]) for event in reads
+                if event.get("code") in ("local_first_waived", "local_digest_present")
+                and isinstance(event.get("bytes_estimate"), (int, float))),
             "digested_locally_exact": sum(
-                int(row.get("window_bytes") or 0) for row in audit_entries
-                if row.get("event") == "digest_submitted"),
+                int(row["window_bytes"]) for row in audit_entries
+                if row.get("event") == "digest_submitted"
+                and isinstance(row.get("window_bytes"), (int, float))),
             "meaning": "the first is an upper bound (design section 2.5): the file's "
                       "on-disk size, or the caller's own range when one was given; the "
                       "second is exact, from the digest receipts",

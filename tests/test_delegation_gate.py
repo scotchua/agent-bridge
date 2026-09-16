@@ -1446,7 +1446,13 @@ class ReadClassificationTests(unittest.TestCase):
     def test_codex_cat_is_classified_as_a_read(self):
         kind, paths = gate.classify("codex", "Bash", {"command": "cat a.log b.log"}, self.cwd)
         self.assertEqual(kind, "read")
-        self.assertEqual(paths, [os.path.join(self.cwd, "a.log"), os.path.join(self.cwd, "b.log")])
+        # _command_paths joins with a forward slash always, never
+        # os.path.join, on every platform (its own documented contract);
+        # matched here the same way this file's other _command_paths tests
+        # already do, rather than a platform-native join that only agrees
+        # with it on POSIX.
+        cwd = self.cwd.rstrip("/")
+        self.assertEqual(paths, [f"{cwd}/a.log", f"{cwd}/b.log"])
 
     def test_codex_windows_whole_file_readers_are_classified_as_reads(self):
         for command in ("type a.log", "Get-Content a.log", "more a.log", "less a.log", "bat a.log"):
@@ -1476,9 +1482,122 @@ class ReadClassificationTests(unittest.TestCase):
         self.assertEqual(kind, "shell_read")
 
     def test_a_write_shaped_command_is_classified_as_a_write_not_a_read(self):
-        """shell_writes wins first: cat piped into a file still writes."""
+        """shell_writes wins first: cat piped into a file still writes.
+
+        This is classify's own contract, unchanged and still tested here on
+        its own terms. It does NOT mean the read gate is skipped for a
+        command like this: judge (not classify) independently checks
+        _shell_whole_file_read for a Codex shell call regardless of which
+        kind classify returned, specifically because shell_writes winning
+        here used to make it look, wrongly, like the read never needed
+        judging at all. See ReadGateWriteShapedOverlayTests for judge's own
+        behavior on this exact command.
+        """
         kind, _ = gate.classify("codex", "Bash", {"command": "cat a.log > b.log"}, self.cwd)
         self.assertEqual(kind, "shell")
+
+    def test_a_redirection_before_the_command_name_is_still_recognized_as_a_read(self):
+        """A previous version excluded the reader's own name by list
+        position (dropping _command_paths()[0]), which assumed the program
+        name always comes first. ``< a.log cat`` is ordinary POSIX syntax
+        that puts the redirect target first instead: the old code kept
+        ``cat`` and silently discarded ``a.log``, the real read target, a
+        complete read-gate bypass for this construction."""
+        kind, paths = gate.classify("codex", "Bash", {"command": "< a.log cat"}, self.cwd)
+        self.assertEqual(kind, "read")
+        cwd = self.cwd.rstrip("/")
+        self.assertEqual(paths, [f"{cwd}/a.log"])
+
+    def test_a_glued_redirection_before_the_command_name_is_still_a_read(self):
+        kind, paths = gate.classify("codex", "Bash", {"command": "<a.log cat"}, self.cwd)
+        self.assertEqual(kind, "read")
+        cwd = self.cwd.rstrip("/")
+        self.assertEqual(paths, [f"{cwd}/a.log"])
+
+    def test_chained_reader_commands_each_lose_only_their_own_name(self):
+        """Excluding _command_paths()[0] only ever removed the first
+        command's name in a chain: cat a.log; cat b.log kept a bogus ``cat``
+        path in the middle for every command after the first."""
+        kind, paths = gate.classify(
+            "codex", "Bash", {"command": "cat a.log ; cat b.log"}, self.cwd)
+        self.assertEqual(kind, "read")
+        cwd = self.cwd.rstrip("/")
+        self.assertEqual(paths, [f"{cwd}/a.log", f"{cwd}/b.log"])
+
+    def test_a_file_literally_named_like_a_reader_is_still_read(self):
+        """Excluding a reader's name by VALUE, not by position, must still
+        remove only the one occurrence that is the program name: ``cat
+        cat`` reads a file that happens to be called ``cat``."""
+        kind, paths = gate.classify("codex", "Bash", {"command": "cat cat"}, self.cwd)
+        self.assertEqual(kind, "read")
+        cwd = self.cwd.rstrip("/")
+        self.assertEqual(paths, [f"{cwd}/cat"])
+
+    def test_an_executable_suffixed_reader_is_recognized(self):
+        """cat.exe/type.exe/more.com are how Git-for-Windows and MSYS2
+        command captures spell these programs; a bare whitespace-bounded
+        regex never matched the suffixed form."""
+        for command in ("cat.exe a.log", "type.exe a.log", "more.com a.log"):
+            with self.subTest(command=command):
+                kind, _ = gate.classify("codex", "Bash", {"command": command}, self.cwd)
+                self.assertEqual(kind, "read")
+
+    def test_get_content_with_a_colon_bound_tail_or_totalcount_is_a_bounded_read(self):
+        """PowerShell also colon-binds a flag's value (-Tail:5); missing it
+        under-recognized the bounded form, gating a command that a
+        space-separated spelling already exempts."""
+        for command in ("Get-Content a.log -Tail:5", "Get-Content a.log -TotalCount:10"):
+            with self.subTest(command=command):
+                kind, _ = gate.classify("codex", "Bash", {"command": command}, self.cwd)
+                self.assertEqual(kind, "shell_read")
+
+    def test_a_reader_name_used_as_a_plain_argument_is_not_a_read(self):
+        """echo cat prints the word "cat"; it does not read a file. A raw
+        substring regex bounded only by whitespace matched this as a whole-
+        file read, over-gating a command that reads nothing at all."""
+        kind, _ = gate.classify("codex", "Bash", {"command": "echo cat"}, self.cwd)
+        self.assertEqual(kind, "shell_read")
+
+    def test_an_env_assignment_prefix_does_not_hide_the_reader_that_follows(self):
+        kind, paths = gate.classify(
+            "codex", "Bash", {"command": "LANG=C cat a.log"}, self.cwd)
+        self.assertEqual(kind, "read")
+        cwd = self.cwd.rstrip("/")
+        self.assertIn(f"{cwd}/a.log", paths)
+        self.assertNotIn(f"{cwd}/cat", paths)
+
+
+class ReceiptPathCaseFoldingTests(unittest.TestCase):
+    """_judge_read_path's two ``receipt.get("path") == real_path`` checks
+    used to be bare string equality, unlike _under's established pattern for
+    the same kind of comparison. Never a bypass -- a false mismatch only
+    means "no receipt yet", so the strict-side outcome is an extra digest --
+    but needless churn on every case-insensitive-but-preserving filesystem,
+    which is Windows (and, though os.path.normcase cannot help there, also
+    macOS's own default volume)."""
+
+    def test_the_receipt_path_comparisons_fold_case_and_separators(self):
+        """Source-inspection, the same style test_the_protected_path_check_
+        resolves_and_folds_both_sides already uses for _under: the actual
+        cross-platform behavior is verified by the platform-gated tests
+        below, run for real by the Windows/POSIX CI runners rather than
+        mocked."""
+        import inspect
+        source = inspect.getsource(gate._judge_read_path)
+        self.assertEqual(source.count("_same_path(receipt["), 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX case semantics")
+    def test_case_is_significant_on_posix(self):
+        self.assertFalse(gate._same_path("/tmp/App.log", "/tmp/app.log"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows case semantics")
+    def test_case_is_not_significant_on_windows(self):
+        """The actual fix, verified by the Windows runners rather than
+        mocked: a digest receipt written for a path spelled in one case must
+        still match the identical file read back in another, or on the
+        other slash direction."""
+        self.assertTrue(gate._same_path(r"C:\repo\App.log", r"C:\repo\app.log"))
+        self.assertTrue(gate._same_path("C:/repo/App.log", r"C:\repo\App.log"))
 
 
 class ReadGateCase(unittest.TestCase):
@@ -1507,6 +1626,20 @@ class ReadGateCase(unittest.TestCase):
         os.chmod(self.worker, 0o755)
         self.now = 2_000_000.0
         self.clock = lambda: self.now
+        # autoroute.probe_load() reads the real host's load average via
+        # os.getloadavg(), which does not exist on Windows -- Load(known=
+        # False) there, always -- and can vary on Linux/macOS too;
+        # readiness() already exists to defer local work on an unknown
+        # reading (load_unknown), so any fixture here that assumes the lane
+        # IS ready must not depend on the real host's own load. Patched to a
+        # known, comfortably-under-ceiling reading by default; the two
+        # tests that specifically exercise a load-based waiver override
+        # this locally for their own assertion (the nested patch wins for
+        # its own duration and this default resumes after it exits).
+        load_patcher = mock.patch("agent_bridge.orchestration.autoroute.probe_load",
+                                  return_value=autoroute.Load(ratio=0.1, known=True))
+        load_patcher.start()
+        self.addCleanup(load_patcher.stop)
 
     # ---------------------------------------------------------------- fixtures
 
@@ -1563,10 +1696,18 @@ class ReadGateCase(unittest.TestCase):
                               classification="internal_nonclient", caller="codex", purpose="work")
         job_id = result["job_id"]
         if status != "queued" or error is not None:
-            with sqlite3.connect(str(self.local_root / "localq.sqlite3")) as db:
+            # sqlite3.Connection's own context manager only commits/rolls
+            # back; it does not close the connection. On Windows a file
+            # cannot be deleted while any handle to it is still open, so an
+            # unclosed connection here made this fixture's own tempdir
+            # cleanup fail with PermissionError on every CI Windows job.
+            db = sqlite3.connect(str(self.local_root / "localq.sqlite3"))
+            try:
                 db.execute("UPDATE jobs SET status=?, error=? WHERE job_id=?",
                           (status, error, job_id))
                 db.commit()
+            finally:
+                db.close()
         return job_id
 
     def write_receipt(self, target, *, job_id="job-1", created_at=None):
@@ -1875,6 +2016,110 @@ class ReadGatePolicyAndMultiPathTests(ReadGateCase):
         self.assertIn(str(large), decision.reason)
 
 
+class ReadGateWriteShapedOverlayTests(ReadGateCase):
+    """judge's overlay of judge_read onto a Codex "shell" classification
+    (design section 2.1 combined with classify's own, unchanged,
+    tested-elsewhere write-precedence contract). Before this overlay
+    existed, a command shaped like both a write and a whole-file read (``cat
+    a.log > b.log``) never reached judge_read at all: classify picks the
+    write shape, judge trusted that kind alone, and the read gate's entire
+    purpose was defeated for any ordinary Codex command whose text happened
+    to also carry a write-shaped suffix -- not an edge case, since a
+    trailing redirect or a piped ``tee`` is ordinary shell usage."""
+
+    def grant_write_access(self, client="codex"):
+        """A valid, unexpired routing receipt naming ``client`` as owner, so
+        the write side of a "shell" classification allows on its own --
+        exactly the condition under which the read gate previously went
+        unchecked entirely."""
+        gate.record_decision(
+            str(self.state), caller=client,
+            stage_record=owned_stage(owner_route=client, lease_until=self.now + 3600),
+            repo=str(self.repo), reason="test fixture",
+            ttl_seconds=3600, clock=self.clock)
+
+    def test_a_write_shaped_command_that_also_reads_a_file_whole_still_requires_a_digest(self):
+        self.write_policy()
+        self.make_ready()
+        self.grant_write_access()
+        target = self.write_log()
+        decision = self.read("codex", None, command=f"cat {target} > {self.repo / 'out.log'}")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_required")
+        self.assertIn(str(target), decision.reason)
+
+    def test_the_write_side_deny_still_wins_when_there_is_no_routing_receipt_at_all(self):
+        """Without grant_write_access, the write side denies first on its
+        own, pre-existing grounds; a command that cannot proceed at all
+        gains nothing from also being judged as a read (and judge_read would
+        otherwise record a fresh digest intent for a call going nowhere)."""
+        self.write_policy()
+        self.make_ready()
+        target = self.write_log()
+        decision = self.read("codex", None, command=f"cat {target} > {self.repo / 'out.log'}")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "no_routing_receipt")
+
+    def test_a_write_shaped_read_is_allowed_once_the_digest_is_present(self):
+        self.write_policy()
+        self.make_ready()
+        self.grant_write_access()
+        target = self.write_log()
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(target, job_id=job_id)
+        decision = self.read("codex", None, command=f"cat {target} > {self.repo / 'out.log'}")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_present")
+
+    def test_claude_bash_is_not_subject_to_the_overlay(self):
+        """The whole-file-read heuristic stays Codex-only (design section
+        2.1): the identical write-shaped, reads-a-big-file command from
+        Claude's Bash tool is judged as a write only, exactly as before this
+        overlay existed."""
+        self.write_policy()
+        self.make_ready()
+        self.grant_write_access(client="claude")
+        target = self.write_log()
+        decision = gate.judge(
+            "claude", "Bash", {"command": f"cat {target} > {self.repo / 'out.log'}"},
+            str(self.repo), state_root=str(self.state), clock=self.clock,
+            local_queue_root=str(self.local_root), worker_executable=str(self.worker))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.code, "routing_receipt_valid")
+
+
+class RecordEventReservedFieldTests(unittest.TestCase):
+    """Decision.extra is a plain dict merged straight into the ledger
+    record. Nothing in this codebase populates a key that collides with one
+    record_event already sets itself (a read decision's own extra keys --
+    waiver_reason, bytes_estimate, job_id, matched_glob -- are all distinct
+    from them), but nothing stopped a future Decision from doing so either;
+    this is the guard, not a reachable-today exploit."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state = Path(self.temp.name) / "state"
+        (self.state / "routing").mkdir(parents=True)
+
+    def _events(self):
+        ledger = os.path.join(gate.receipt_dir(str(self.state)), gate.EVENT_LEDGER)
+        with open(ledger, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_a_colliding_extra_key_does_not_overwrite_the_reserved_field(self):
+        decision = gate.Decision(
+            "deny", "local_digest_required", "test", ("repo",), logged=True,
+            extra={"code": "hijacked", "at": 999, "client": "hijacked-client",
+                  "bytes_estimate": 8_500})
+        gate.record_event(str(self.state), "codex", "Bash", decision, clock=lambda: 12345.0)
+        event = self._events()[0]
+        self.assertEqual(event["code"], "local_digest_required")
+        self.assertEqual(event["client"], "codex")
+        self.assertEqual(event["at"], 12345.0)
+        self.assertEqual(event["bytes_estimate"], 8_500)
+
+
 class RunHookReadEventTests(ReadGateCase):
     """run_hook, not judge: only run_hook writes the event ledger, so this is
     where "that reason in the event" (design section 2.1/2.5) is actually
@@ -1925,6 +2170,80 @@ class RunHookReadEventTests(ReadGateCase):
                       local_queue_root=str(self.local_root), worker_executable=str(self.worker))
         ledger = os.path.join(gate.receipt_dir(str(self.state)), gate.EVENT_LEDGER)
         self.assertFalse(os.path.exists(ledger))
+
+    def test_two_files_both_requiring_a_digest_each_log_their_own_event(self):
+        """judge_read returns only one Decision as the call's overall
+        outcome (the first deny), but a call naming two gated-shape files
+        must not silently drop the second one's own event: its
+        digest_intent audit-ledger row is written regardless (a per-path
+        side effect inside _judge_read_path), and before also_log existed,
+        only the first path's outcome ever became a gate event -- so the
+        audit's own adds-up invariant broke the moment the second file's
+        intent later expired with nothing counting it."""
+        self.write_policy()
+        self.make_ready()
+        small_gated = self.write_log(name="a.log", size=8_500)
+        large_gated = self.write_log(name="b.log", size=9_500)
+        payload = {"tool_name": "Bash",
+                  "tool_input": {"command": f"cat {small_gated} {large_gated}"},
+                  "cwd": str(self.repo)}
+        decision = gate.run_hook("codex", str(self.state), payload, clock=self.clock,
+                                 local_queue_root=str(self.local_root),
+                                 worker_executable=str(self.worker))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_required")
+        events = self._events()
+        required = [event for event in events if event["code"] == "local_digest_required"]
+        self.assertEqual(len(required), 2)
+        self.assertEqual({event["bytes_estimate"] for event in required}, {8_500, 9_500})
+
+    def test_two_files_already_digested_both_log_their_own_event(self):
+        """The all-allow side of the same gap: two gated-shape files that
+        both already have a complete digest used to log only the first
+        (decisions[0]), silently under-counting compelled/digested for the
+        second even though nothing was denied."""
+        self.write_policy()
+        self.make_ready()
+        first = self.write_log(name="a.log", size=8_500)
+        second = self.write_log(name="b.log", size=9_500)
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(first, job_id=job_id)
+        self.write_receipt(second, job_id=job_id)
+        payload = {"tool_name": "Bash", "tool_input": {"command": f"cat {first} {second}"},
+                  "cwd": str(self.repo)}
+        decision = gate.run_hook("codex", str(self.state), payload, clock=self.clock,
+                                 local_queue_root=str(self.local_root),
+                                 worker_executable=str(self.worker))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_present")
+        events = self._events()
+        present = [event for event in events if event["code"] == "local_digest_present"]
+        self.assertEqual(len(present), 2)
+        self.assertEqual({event["bytes_estimate"] for event in present}, {8_500, 9_500})
+
+    def test_the_audit_adds_up_after_a_multi_path_call_requires_two_digests(self):
+        """The acceptance criterion the design's own build plan names,
+        exercised through the real judge_read/record_event code path rather
+        than hand-constructed ledger rows -- the only way the multi-path
+        under-logging gap this class's other two tests target could actually
+        have been caught."""
+        from agent_bridge.orchestration import audit
+
+        self.write_policy()
+        self.make_ready()
+        small_gated = self.write_log(name="a.log", size=8_500)
+        large_gated = self.write_log(name="b.log", size=9_500)
+        payload = {"tool_name": "Bash",
+                  "tool_input": {"command": f"cat {small_gated} {large_gated}"},
+                  "cwd": str(self.repo)}
+        gate.run_hook("codex", str(self.state), payload, clock=self.clock,
+                      local_queue_root=str(self.local_root), worker_executable=str(self.worker))
+        document = audit.report(str(self.state), home=str(self.base),
+                                since_hours=0.0, clock=self.clock)
+        lf = document["local_first"]
+        self.assertEqual(lf["compelled"]["count"], 2)
+        self.assertEqual(lf["outstanding"]["count"], 2)
+        self.assertTrue(lf["adds_up"])
 
 
 if __name__ == "__main__":

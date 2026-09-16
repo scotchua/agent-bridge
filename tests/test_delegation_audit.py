@@ -454,6 +454,19 @@ class LocalFirstAccounting(AuditCase):
         self.assertEqual(lf["bytes"]["estimated_reaching_cloud_context"], 3_000)
         self.assertEqual(lf["bytes"]["digested_locally_exact"], 500)
 
+    def test_a_malformed_bytes_estimate_does_not_crash_the_report(self):
+        """int(event.get("bytes_estimate") or 0) crashed on any non-numeric
+        truthy value (the adjacent declined count already guards its own
+        ledger field with isinstance; this one did not). A hand-edited or
+        otherwise corrupted ledger line should degrade this one number, not
+        take the whole audit report down."""
+        self.event(code="local_digest_present", bytes_estimate="not-a-number")
+        self.event(code="local_first_waived", bytes_estimate=[1, 2], waiver_reason="x")
+        self.submission(window_bytes="also-not-a-number")
+        lf = self.run_audit()["local_first"]
+        self.assertEqual(lf["bytes"]["estimated_reaching_cloud_context"], 0)
+        self.assertEqual(lf["bytes"]["digested_locally_exact"], 0)
+
     def test_read_gate_strength_is_reported(self):
         lf = self.run_audit()["local_first"]
         self.assertEqual(lf["read_gate_strength"], {"claude": "deterministic", "codex": "heuristic"})
