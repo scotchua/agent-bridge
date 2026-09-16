@@ -154,6 +154,17 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         initiative for a file the operator's policy already makes eligible.
         Refuses by name at every step (design section 2.2); no assistant-
         supplied classification or instruction ever reaches the local model.
+
+        The protected-path, repo-membership and glob checks below run
+        against ``real_path`` by name, before ``digest_read`` ever opens a
+        descriptor. A caller that wins the race in that specific gap can
+        still have some file read and receipted -- honestly, as whatever
+        was actually open when ``digest_read`` took its own fstat, never
+        misattributed to the file these name checks approved (that
+        misattribution, the severe part, is what ``digest_read`` closes).
+        Disclosed, not fixed, in design section 7: the same "detected, not
+        prevented" residual ``windows_privacy.read_private_file`` already
+        accepts elsewhere in this codebase.
         """
         if state_root is None:
             return {"ok": False, "error": "local_first_unavailable"}

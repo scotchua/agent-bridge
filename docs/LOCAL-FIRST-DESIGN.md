@@ -1016,6 +1016,25 @@ command is the first thing that will, and only the operator runs it.
 • **Linux and Windows lanes are not ready** and the gate waives there by
 design until a sampler exists for them.
 
+• **`work_digest_file`'s eligibility checks and its read are not one atomic
+operation.** `digest_read` closes the gap an adversarial review found
+between mcp.py's own separate `os.stat` and `read_window`'s separate
+reopen (a caller could get a receipt naming the file it validated while
+the job actually carried a swapped-in replacement's bytes, retiring a
+digest intent the original never satisfied): the window, size and mtime
+in the receipt now all come from the one descriptor `digest_read` opens
+and reads through. What remains is narrower: the protected-path, repo-
+membership and glob checks run against the path by name, before that
+descriptor is opened, so a caller that wins the race in that specific gap
+can still have some file read and honestly receipted as whatever was
+actually there when the descriptor opened, rather than as the file those
+name-based checks approved. This is the same "detected, not prevented"
+residual `windows_privacy.read_private_file`'s own docstring already
+discloses and accepts elsewhere in this codebase, not a new gap; closing
+it fully would mean deriving repo/glob/protected-path membership from the
+same descriptor rather than from the name beforehand, which is a bigger
+structural change than this phase makes.
+
 ## 8. Handoff
 
 Give the builder this file's path and this instruction:
