@@ -102,6 +102,20 @@ MATCHERS = {
     "claude": "Edit|Write|MultiEdit|NotebookEdit|Bash|Read",
     "codex": "apply_patch|Bash|local_shell|shell|shell_command|exec_command",
 }
+#: The matcher each client's *PostToolUse* hook entry carries (Phase 5,
+#: design section 2.9). Claude only: Phase 0 (docs/verified-cli-behaviour.md)
+#: confirmed ``PostToolUse`` fires for the installed Claude Code CLI, firing
+#: after a tool call has already succeeded and unable to undo it, but no
+#: Codex CLI was available in that sandbox to confirm whether Codex exposes
+#: the event at all -- per the design's own stated fallback ("if Codex lacks
+#: the event, build the Claude side and state the Codex column is not
+#: countable"), Codex is deliberately absent here rather than installed on
+#: an unconfirmed capability. ``codex`` is not a key in this dict at all, not
+#: merely an empty one, so a caller that indexes it by client gets a clear
+#: ``KeyError`` instead of a silently-empty matcher.
+POST_MATCHERS = {
+    "claude": "Bash",
+}
 
 _PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$", re.M)
 
@@ -212,6 +226,22 @@ _GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--p
 #: and MSYS2 command captures use routinely, and separately matched a reader
 #: name used as a plain argument to an unrelated command (``echo cat``).
 _WHOLE_FILE_READER_NAMES = frozenset({"cat", "less", "more", "bat", "type", "get-content"})
+#: Test/build runners for Phase 5's inline output measurement (design
+#: section 2.9): matched by resolved program name, the identical
+#: command-name-position scan ``_WHOLE_FILE_READER_NAMES`` already uses
+#: above, not a raw substring search over the whole command text. Only
+#: tools that ARE a test or build runner whenever invoked by their own
+#: name, regardless of arguments, are here. A general-purpose wrapper --
+#: ``npm``, ``yarn``, ``pnpm``, ``make``, ``cargo``, ``go``, ``mvn``,
+#: ``gradle``, ``dotnet`` -- is deliberately absent: each one runs many
+#: subcommands that are not a test or build (``npm install``, ``go vet``,
+#: ``cargo new``, ``make clean``), and a name-only match would mislabel
+#: most of what it actually does as test/build output, misinforming the
+#: audit rather than narrowing it. That gap is named in ``NOT_COVERED``
+#: rather than closed by guessing at subcommands.
+_TEST_BUILD_RUNNERS = frozenset({
+    "pytest", "tox", "nose2", "rspec", "jest", "mocha", "vitest", "phpunit", "ctest", "rake",
+})
 #: ``Get-Content -TotalCount N`` / ``-Tail N`` is a bounded read, like
 #: ``head``/``tail``; checked over the whole command text rather than scoped
 #: to one invocation, the same simplification ``_formatter_writes`` already
@@ -233,15 +263,20 @@ _REDIRECT_OPERATORS = frozenset({"<", ">", ">>"})
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-def _shell_reader_words(command: str) -> list[str]:
+def _shell_reader_words(command: str, names: frozenset[str] = _WHOLE_FILE_READER_NAMES) -> list[str]:
     """Every word, in order, that occupies a command-name position and names
-    a whole-file reader (``_WHOLE_FILE_READER_NAMES``): the first word since
-    the start of the command or the last ``;``/``&``/``&&``/``||``/``|``
+    one of ``names`` (default ``_WHOLE_FILE_READER_NAMES``): the first word
+    since the start of the command or the last ``;``/``&``/``&&``/``||``/``|``
     that is not a flag, an environment-assignment prefix, or a redirection
     target (``< a.log cat`` names ``a.log`` first, but ``a.log`` is not the
     command). Shared between ``_shell_whole_file_read`` (does this command
-    read a file whole at all) and ``_shell_read_paths`` (which resolved path
-    is the reader's own name, to exclude it from the files actually read).
+    read a file whole at all), ``_shell_read_paths`` (which resolved path
+    is the reader's own name, to exclude it from the files actually read),
+    and, with ``names=_TEST_BUILD_RUNNERS``, Phase 5's inline-measurement
+    match over a Claude ``Bash`` command -- the same tokenizing this file
+    already trusts for a Codex shell command, rather than a second,
+    independently-written parser that could drift from it and reintroduce
+    the exact redirection/chaining bugs the first one had already found.
     """
     words = _shell_words(command)
     expect_name = True
@@ -259,7 +294,7 @@ def _shell_reader_words(command: str) -> list[str]:
             continue
         if expect_name:
             expect_name = False
-            if _program_name(word).lower() in _WHOLE_FILE_READER_NAMES:
+            if _program_name(word).lower() in names:
                 found.append(word)
     return found
 
@@ -1517,6 +1552,77 @@ def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:
     return decide
 
 
+#: Phase 5's own ledger (design section 2.9): separate from ``EVENT_LEDGER``
+#: because these rows are not permission decisions -- there is no
+#: ``permission``/``code`` here, only a measurement -- and mixing the two
+#: shapes into one file would make every existing ``EVENT_LEDGER`` reader
+#: (``audit.py``'s bypass and local_first accounting) responsible for
+#: skipping rows it was never written to expect.
+INLINE_LEDGER = "inline-measurement.jsonl"
+
+
+def _response_byte_length(tool_response: Any) -> int:
+    """Bytes of a Bash call's ``stdout``/``stderr`` combined -- both reach the
+    caller's context, so both count toward what "the largest mechanical
+    stream" (design section 2.9) actually put there. Never raises: a
+    response shape this project has not seen (a future host version, a
+    malformed payload) yields 0 rather than crashing a hook that must
+    still print `{}` and exit 0 either way."""
+    if not isinstance(tool_response, dict):
+        return 0
+    total = 0
+    for key in ("stdout", "stderr"):
+        value = tool_response.get(key)
+        if isinstance(value, str):
+            total += len(value.encode("utf-8", "replace"))
+    return total
+
+
+def record_inline_measurement(state_root: str, client: str, tool_name: str, tool_input: Any,
+                              tool_response: Any, clock: Any = time.time) -> None:
+    """Append one :data:`INLINE_LEDGER` line when this call's command looks
+    like a test or build runner (``_TEST_BUILD_RUNNERS``), Phase 5's own
+    measurement: never a decision, and this function has no way to express
+    one -- ``run_post_hook`` calls it after the tool has already run and
+    always answers the host with ``{}`` regardless of what happens here.
+
+    Claude only, matching :data:`POST_MATCHERS`: a Codex call would never
+    reach this (Phase 5 installs no PostToolUse entry for it), but the
+    client check stays explicit here too rather than trusting the
+    installer alone to keep it out.
+    """
+    if client != "claude" or tool_name != "Bash":
+        return
+    command = _command_text(tool_input)
+    matched = _shell_reader_words(command, _TEST_BUILD_RUNNERS)
+    if not matched:
+        return
+    record = {"at": float(clock()), "client": client, "matched_runner": _program_name(matched[0]).lower(),
+              "bytes": _response_byte_length(tool_response)}
+    store.append_ledger(os.path.join(receipt_dir(state_root), INLINE_LEDGER), record)
+
+
+def run_post_hook(client: str, state_root: str, payload: dict[str, Any],
+                  clock: Any = time.time) -> None:
+    """The whole of Phase 5's PostToolUse handling: measure, never decide.
+
+    Never raises. A PostToolUse hook fires after the tool call already
+    succeeded and cannot undo it (docs/verified-cli-behaviour.md); there is
+    nothing for an exception here to protect against, and the only wrong
+    move is to let one reach the host as an unhandled error for a call the
+    host itself already completed. ``main`` always prints ``{}`` after
+    calling this, whether it returns normally or this catches something.
+    """
+    try:
+        tool_name = payload.get("tool_name")
+        if not isinstance(tool_name, str):
+            return
+        record_inline_measurement(state_root, client, tool_name, payload.get("tool_input"),
+                                  payload.get("tool_response"), clock)
+    except Exception:  # noqa: BLE001  measurement only; never surfaces an error
+        pass
+
+
 def state_root_from_config(config_path: str) -> str:
     return gate_paths_from_config(config_path)[0]
 
@@ -1652,17 +1758,18 @@ def quote_for_host_shell(value: str) -> str:
     return '"' + value.replace('"', "") + '"'
 
 
-def hook_command(root: str, client: str, config_path: str) -> str:
+def hook_command(root: str, client: str, config_path: str, *, event: str = "PreToolUse") -> str:
     launcher = os.path.join(os.path.realpath(root), "bin", HOOK_NAME)
     if os.name == "nt":
         launcher += ".cmd"
     return (f"{quote_for_host_shell(launcher)} --client {client} "
-            f"--config {quote_for_host_shell(os.path.realpath(config_path))}")
+            f"--config {quote_for_host_shell(os.path.realpath(config_path))} --event {event}")
 
 
-def hook_entry(root: str, client: str, config_path: str) -> dict[str, Any]:
-    return {"matcher": MATCHERS[client],
-            "hooks": [{"type": "command", "command": hook_command(root, client, config_path),
+def hook_entry(root: str, client: str, config_path: str, *, event: str = "PreToolUse") -> dict[str, Any]:
+    matcher = MATCHERS[client] if event == "PreToolUse" else POST_MATCHERS[client]
+    return {"matcher": matcher,
+            "hooks": [{"type": "command", "command": hook_command(root, client, config_path, event=event),
                        "timeout": 10}]}
 
 
@@ -1673,42 +1780,61 @@ def _is_ours(entry: Any) -> bool:
 
 
 def hooks_file_update(path: str, entry: dict[str, Any], previous: dict[str, Any] | None,
-                      *, remove: bool = False) -> bytes | None:
+                      *, event: str = "PreToolUse", remove: bool = False,
+                      base: bytes | None = None) -> bytes | None:
     """The bytes ``path`` (a Claude ``settings.json`` or Codex ``hooks.json``)
-    should hold with our PreToolUse entry present (or, with ``remove``,
+    should hold with our ``event`` entry present (or, with ``remove``,
     absent). None when nothing changes. Refuses to touch an entry of ours
-    that someone edited, and never touches anyone else's entry."""
-    raw: dict[str, Any] = {}
-    if os.path.exists(path):
+    that someone edited, and never touches anyone else's entry.
+
+    ``event`` generalizes this beyond ``PreToolUse``: Phase 5 (design
+    section 2.9) adds a ``PostToolUse`` entry to the same file, tracked
+    entirely independently of the ``PreToolUse`` one under its own key.
+
+    ``base``, when given, is used as this file's current bytes instead of
+    reading ``path`` from disk. ``plan_install`` passes the first call's
+    returned bytes as the second call's ``base`` when one install pass
+    changes both a Pre and a Post entry in the same file, so the second
+    call builds on the first call's in-memory result; without this, the
+    second call would re-read the untouched file from disk and its
+    returned bytes would silently drop the first call's change when both
+    land in the same ``updates`` dict entry. ``None`` (every existing call
+    site) keeps today's read-from-disk behaviour exactly.
+    """
+    if base is not None:
+        loaded = json.loads(base.decode("utf-8")) if base.strip() else {}
+    elif os.path.exists(path):
         loaded = store.read_json(path)
-        if not isinstance(loaded, dict):
-            raise ValueError(f"{path} must be a JSON object")
-        raw = loaded
+    else:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must be a JSON object")
+    raw = loaded
     hooks = raw.get("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError(f"{path} has a non-object hooks setting")
-    pre = hooks.get("PreToolUse", [])
-    if not isinstance(pre, list):
-        raise ValueError(f"{path} has a non-array hooks.PreToolUse")
-    ours = [item for item in pre if _is_ours(item)]
+    ours_list = hooks.get(event, [])
+    if not isinstance(ours_list, list):
+        raise ValueError(f"{path} has a non-array hooks.{event}")
+    ours = [item for item in ours_list if _is_ours(item)]
     if len(ours) > 1:
-        raise ValueError(f"{path} holds more than one {HOOK_NAME} entry; resolve by hand")
+        raise ValueError(f"{path} holds more than one {HOOK_NAME} {event} entry; resolve by hand")
     current = ours[0] if ours else None
     if remove:
         if current is None:
             return None
         if current != previous and current != entry:
-            raise ValueError(f"{path} {HOOK_NAME} entry was edited; preserve it for review")
-        new_pre = [item for item in pre if not _is_ours(item)]
+            raise ValueError(f"{path} {HOOK_NAME} {event} entry was edited; preserve it for review")
+        new_list = [item for item in ours_list if not _is_ours(item)]
     else:
         if current == entry:
             return None
         if current is not None and current != previous:
-            raise ValueError(f"{path} {HOOK_NAME} entry was edited; preserve it for review")
-        new_pre = [item for item in pre if not _is_ours(item)] + [entry]
-    new_hooks = {**hooks, "PreToolUse": new_pre}
-    if not new_pre:
-        new_hooks.pop("PreToolUse")
+            raise ValueError(f"{path} {HOOK_NAME} {event} entry was edited; preserve it for review")
+        new_list = [item for item in ours_list if not _is_ours(item)] + [entry]
+    new_hooks = {**hooks, event: new_list}
+    if not new_list:
+        new_hooks.pop(event)
     updated = {**raw, "hooks": new_hooks}
     if not new_hooks:
         updated.pop("hooks")
@@ -1785,7 +1911,18 @@ def install_paths(home: str) -> dict[str, str]:
 
 
 def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...],
-                 *, remove: bool = False) -> tuple[dict[str, bytes], dict[str, bytes | None], dict[str, Any]]:
+                 *, remove: bool = False, include_post: bool = False
+                 ) -> tuple[dict[str, bytes], dict[str, bytes | None], dict[str, Any]]:
+    """``include_post`` additionally installs Phase 5's PostToolUse entry
+    (design section 2.9) for every client in ``clients`` that
+    :data:`POST_MATCHERS` covers (``claude`` only today). It is otherwise
+    left alone -- a plain re-install run without ``include_post`` neither
+    adds nor silently removes an already-opted-in Post entry, since that
+    flag means "install/enable", not "this is the complete desired state".
+    ``remove`` removes whatever is actually recorded for each client,
+    Post entry included, regardless of ``include_post``: uninstalling the
+    gate means taking out everything this tool put there.
+    """
     from ..onboard import _bytes
     paths = install_paths(home)
     originals = {path: _bytes(path) for path in paths.values()}
@@ -1794,6 +1931,8 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
     if not isinstance(receipt, dict) or (receipt and receipt.get("version") != 1):
         raise ValueError("unrecognized gate installation receipt; preserve it for review")
     previous = receipt.get("entries", {}) if isinstance(receipt.get("entries"), dict) else {}
+    post_previous = receipt.get("post_entries", {}) if isinstance(receipt.get("post_entries"), dict) else {}
+    post_clients = tuple(client for client in clients if include_post and client in POST_MATCHERS)
     updates: dict[str, bytes] = {}
     for client in clients:
         if client not in CLIENTS:
@@ -1801,6 +1940,11 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
         entry = hook_entry(root, client, config_path)
         target = paths["claude_settings"] if client == "claude" else paths["codex_hooks"]
         content = hooks_file_update(target, entry, previous.get(client), remove=remove)
+        touches_post = (remove and client in post_previous) or (not remove and client in post_clients)
+        if touches_post:
+            post_entry = hook_entry(root, client, config_path, event="PostToolUse")
+            content = hooks_file_update(target, post_entry, post_previous.get(client),
+                                        event="PostToolUse", remove=remove, base=content)
         if content is not None:
             updates[target] = content
         if client == "codex":
@@ -1812,32 +1956,57 @@ def plan_install(home: str, root: str, config_path: str, clients: tuple[str, ...
     entries = {client: value for client, value in previous.items() if client not in clients}
     if not remove:
         entries.update({client: hook_entry(root, client, config_path) for client in clients})
-    if entries:
-        new_receipt = (json.dumps({"version": 1, "entries": entries, "config": os.path.realpath(config_path)},
-                                  indent=2, sort_keys=True) + "\n").encode("utf-8")
+    # post_entries starts from every recorded entry, not just the ones this
+    # run leaves alone: a client this run targets but does not touch Post
+    # for (a plain re-install without include_post) must keep its recorded
+    # Post entry exactly as-is, matching the file on disk, which this run
+    # never changed either.
+    post_entries = dict(post_previous)
+    for client in clients:
+        if not ((remove and client in post_previous) or (not remove and client in post_clients)):
+            continue
+        if remove:
+            post_entries.pop(client, None)
+        else:
+            post_entries[client] = hook_entry(root, client, config_path, event="PostToolUse")
+    if entries or post_entries:
+        receipt_body: dict[str, Any] = {"version": 1, "entries": entries,
+                                        "config": os.path.realpath(config_path)}
+        if post_entries:
+            receipt_body["post_entries"] = post_entries
+        new_receipt = (json.dumps(receipt_body, indent=2, sort_keys=True) + "\n").encode("utf-8")
         if receipt_raw != new_receipt:
             updates[paths["receipt"]] = new_receipt
     return updates, originals, paths
 
 
 def _entries_remaining(receipt_raw: bytes | None, removed: tuple[str, ...]) -> bool:
-    """Whether the installation receipt still records a client after ``removed`` leave it."""
+    """Whether the installation receipt still records a client (a Pre or a
+    Post entry) after ``removed`` leave it."""
     if not receipt_raw:
         return False
     try:
         loaded = json.loads(receipt_raw)
     except ValueError:
         return False
-    entries = loaded.get("entries") if isinstance(loaded, dict) else None
-    return isinstance(entries, dict) and any(client not in removed for client in entries)
+    if not isinstance(loaded, dict):
+        return False
+    for key in ("entries", "post_entries"):
+        entries = loaded.get(key)
+        if isinstance(entries, dict) and any(client not in removed for client in entries):
+            return True
+    return False
 
 
 def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
-            apply: bool, remove: bool = False) -> dict[str, Any]:
+            apply: bool, remove: bool = False, include_post: bool = False) -> dict[str, Any]:
     from ..onboard import _commit_updates
-    updates, originals, paths = plan_install(home, root, config_path, clients, remove=remove)
+    updates, originals, paths = plan_install(home, root, config_path, clients,
+                                             remove=remove, include_post=include_post)
+    post_clients = tuple(client for client in clients if include_post and client in POST_MATCHERS)
     report: dict[str, Any] = {"planned_files": sorted(updates), "applied": False,
-                              "remove": remove, "clients": list(clients)}
+                              "remove": remove, "clients": list(clients),
+                              "post_clients": list(post_clients)}
     if apply:
         # claude_settings, codex_hooks and codex_toml are pre-existing files
         # Claude Code/Codex own and already had inherited access (e.g. SYSTEM,
@@ -1882,6 +2051,14 @@ NOT_COVERED = [
     "on Codex the read gate is a text heuristic over the shell command, the same strength "
     "limit the write gate's own heuristic states; on Claude it is the Read tool, "
     "deterministic (see read_gate in this report)",
+    "inline output measurement (Phase 5) on Codex: Phase 0 found no codex CLI available to "
+    "confirm whether Codex exposes a PostToolUse hook at all, so nothing is installed there "
+    "and the column stays not countable rather than assumed either way",
+    "inline output measurement (Phase 5) for a test or build runner invoked through a "
+    "general-purpose wrapper (npm, yarn, pnpm, make, cargo, go, mvn, gradle, dotnet): only a "
+    "runner matched by its own program name is counted, the same narrow by-name matching the "
+    "read gate's own whole-file-read heuristic already uses, because a wrapper's name alone "
+    "does not say whether this particular call was a test, a build, or something else entirely",
 ]
 
 
@@ -2003,15 +2180,21 @@ def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.ti
             except ValueError:
                 recent.append({"error": "unreadable event"})
     installed = {}
+    installed_post = {}
     for client, path in (("claude", paths["claude_settings"]), ("codex", paths["codex_hooks"])):
         present = False
+        post_present = False
         if os.path.exists(path):
             try:
                 loaded = store.read_json(path)
-                present = any(_is_ours(item) for item in loaded.get("hooks", {}).get("PreToolUse", []))
+                hooks = loaded.get("hooks", {})
+                present = any(_is_ours(item) for item in hooks.get("PreToolUse", []))
+                post_present = any(_is_ours(item) for item in hooks.get("PostToolUse", []))
             except (OSError, ValueError, AttributeError):
                 present = False
+                post_present = False
         installed[client] = present
+        installed_post[client] = post_present
     return {
         "state_root": state_root,
         "installed": installed,
@@ -2029,6 +2212,14 @@ def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.ti
         # fact about the mechanism, not about whether this host has it
         # installed (``installed`` above already answers that).
         "read_gate": {"claude": "deterministic", "codex": "heuristic"},
+        # Phase 5 (design section 2.9), the same static-vs-installed split
+        # as read_gate above: whether this host has the PostToolUse entry
+        # is installed_post, not this. Codex is "not_countable" -- not
+        # "heuristic" -- because Phase 0 could not confirm the event
+        # exists there at all, unlike the read gate's Codex heuristic,
+        # which is a real, if imprecise, mechanism.
+        "inline_measurement": {"claude": "counted", "codex": "not_countable"},
+        "installed_post": installed_post,
         "not_covered": NOT_COVERED,
     }
 
@@ -2046,10 +2237,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="do not create the routing decision; refuse a call that has no "
                              "receipt instead. The pre-automatic behaviour, kept for an "
                              "operator who wants every route claimed explicitly.")
+    parser.add_argument("--event", choices=("PreToolUse", "PostToolUse"), default="PreToolUse",
+                        help="which hook event this invocation answers. PostToolUse (Phase 5, "
+                             "inline output measurement) only measures a matched Bash call's "
+                             "response and never denies; absent, as on every hook installed "
+                             "before Phase 5 existed, this defaults to PreToolUse.")
     ins = sub.add_parser("install", help="register the PreToolUse hook in Claude Code and/or Codex")
     ins.add_argument("--home"); ins.add_argument("--root", required=True); ins.add_argument("--config", required=True)
     ins.add_argument("--clients", default="claude,codex"); ins.add_argument("--apply", action="store_true")
     ins.add_argument("--remove", action="store_true")
+    ins.add_argument("--include-post", action="store_true",
+                     help="also register Phase 5's PostToolUse inline-measurement entry for "
+                          "every listed client that supports it (claude only; see "
+                          "POST_MATCHERS). Off by default, matching this feature's own "
+                          "off-by-default design; a plain re-install without this flag leaves "
+                          "an already-registered Post entry exactly as it is rather than "
+                          "removing it.")
     rep = sub.add_parser("report", help="receipts, recent gate events, installation and trust state")
     rep.add_argument("--home"); rep.add_argument("--config"); rep.add_argument("--state-root")
     rep.add_argument("--events", type=int, default=20)
@@ -2073,7 +2276,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         clients = tuple(part.strip() for part in args.clients.split(",") if part.strip())
         result = install(args.home or home, args.root, args.config, clients,
-                         apply=args.apply, remove=args.remove)
+                         apply=args.apply, remove=args.remove, include_post=args.include_post)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.command == "report":
@@ -2090,6 +2293,27 @@ def main(argv: list[str] | None = None) -> int:
                                 since_hours=args.since_hours)
         print(json.dumps(document, indent=2, sort_keys=True) if args.json
               else render(document), end="" if not args.json else "\n")
+        return 0
+    if args.event == "PostToolUse":
+        # Phase 5 (design section 2.9): measurement only, never a decision.
+        # A wholly separate branch from Pre's hook mode below rather than a
+        # shared path with an early return, because none of Pre's setup
+        # (capacity_db, protected_paths, the automatic decider) is a Post
+        # concern, and Pre's own except clause below builds a
+        # PreToolUse-shaped deny that would be meaningless here. Always
+        # prints {} and exits 0: a PostToolUse hook fires after the tool
+        # call already succeeded and cannot undo it, so there is nothing
+        # an error here should ever turn into for the host to act on.
+        try:
+            if not args.client:
+                raise ValueError("--client is required in hook mode")
+            state_root = args.state_root or state_root_from_config(args.config or "")
+            payload = json.loads(_hook_input() or "{}")
+            if isinstance(payload, dict):
+                run_post_hook(args.client, state_root, payload)
+        except Exception:  # noqa: BLE001  measurement only; never surfaces an error
+            pass
+        sys.stdout.write(json.dumps({}) + "\n")
         return 0
     # Hook mode: judge the call described on stdin. Always exit 0; the
     # decision travels in the JSON so the host applies it, and a deny is

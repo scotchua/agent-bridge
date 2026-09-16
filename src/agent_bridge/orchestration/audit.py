@@ -405,6 +405,27 @@ def _local_first_report(state_root: str, *, events: list[dict[str, Any]],
     }
 
 
+def _inline_measurement_report(measurements: list[dict[str, Any]]) -> dict[str, Any]:
+    """Phase 5 (design section 2.9): every Bash call this window whose
+    command looked like a test or build runner, and the bytes its response
+    carried. Never a decision -- ``gate.record_inline_measurement`` never
+    ran anything but a measurement -- so unlike ``local_first`` above there
+    is no allowed/denied split to report, only a count and a total.
+    """
+    total_bytes = sum(int(row["bytes"]) for row in measurements
+                      if isinstance(row.get("bytes"), (int, float)))
+    return {
+        "count": len(measurements),
+        "definition": "a Bash call matched by _TEST_BUILD_RUNNERS: a test or build tool "
+                      "invoked by its own program name, Claude only (see not_countable)",
+        "by_runner": _histogram(row.get("matched_runner") for row in measurements),
+        "bytes_measured": total_bytes,
+        "not_countable": ["Codex (Phase 0 could not confirm PostToolUse there)",
+                          "a runner invoked through a general-purpose wrapper such as npm, "
+                          "make, cargo, go, mvn, gradle or dotnet"],
+    }
+
+
 def report(state_root: str, *, home: str | None = None,
            config_path: str | None = None, since_hours: float = 24.0,
            clock: Any = time.time) -> dict[str, Any]:
@@ -416,6 +437,7 @@ def report(state_root: str, *, home: str | None = None,
     routing = gate.receipt_dir(state_root)
     audit_entries = _read_ledger(os.path.join(routing, gate.AUDIT_LEDGER), since)
     events = _read_ledger(os.path.join(routing, gate.EVENT_LEDGER), since)
+    measurements = _read_ledger(os.path.join(routing, gate.INLINE_LEDGER), since)
     decisions = _decision_rows(audit_entries)
 
     def moved(row: dict[str, Any]) -> bool:
@@ -474,6 +496,7 @@ def report(state_root: str, *, home: str | None = None,
     local_first_section = _local_first_report(
         state_root, events=events, audit_entries=audit_entries, local_root=local_root,
         worker_executable=worker_executable, policy=policy_obj, now=now)
+    inline_measurement_section = _inline_measurement_report(measurements)
 
     return {
         "generated_at": now,
@@ -549,6 +572,7 @@ def report(state_root: str, *, home: str | None = None,
         "hook_coverage": coverage,
         "stages": stages,
         "local_first": local_first_section,
+        "inline_measurement": inline_measurement_section,
     }
 
 
@@ -625,4 +649,8 @@ def render(document: dict[str, Any]) -> str:
                      f"{'' if lf['adds_up'] else '  MISMATCH'}")
         strength = lf["read_gate_strength"]
         lines.append(f"    read gate: claude {strength['claude']}, codex {strength['codex']}")
+    im = document.get("inline_measurement", {})
+    if im:
+        lines.append(f"  inline output measured: {im['count']} calls, "
+                     f"{im['bytes_measured']} bytes {im['by_runner'] or ''}")
     return "\n".join(lines) + "\n"

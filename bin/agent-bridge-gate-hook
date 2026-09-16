@@ -32,5 +32,16 @@ esac
 # diagnostic reported "launcher exit 0" for a failure that was exit 1.
 "$PY" -P -m agent_bridge.orchestration.gate "$@" && exit 0
 status=$?
+# A PostToolUse invocation (Phase 5, inline output measurement) never
+# denies and the tool call it answers for has already finished, so a
+# PreToolUse-shaped deny hint below would be meaningless here; the same
+# argv-only mode selection the gate module itself uses, since this
+# script runs before any Python is confirmed to work at all.
+case " $* " in
+  *" --event PostToolUse "*)
+    printf '%s\n' "{}"
+    exit 0
+    ;;
+esac
 printf '%s\n' "{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"delegation-first gate: the hook could not start its interpreter (launcher exit ${status}); nothing is implemented until the installation is repaired [gate_launcher_failed]\"}}"
 exit 0

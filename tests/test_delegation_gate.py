@@ -2252,5 +2252,276 @@ class RunHookReadEventTests(ReadGateCase):
         self.assertTrue(lf["adds_up"])
 
 
+class TestBuildRunnerMatchTests(unittest.TestCase):
+    """Phase 5's own matcher (design section 2.9): narrow, by-name, reusing
+    the same tokenizer the read gate's whole-file-read heuristic already
+    trusts rather than a second parser."""
+
+    def matched(self, command):
+        return gate._shell_reader_words(command, gate._TEST_BUILD_RUNNERS)
+
+    def test_a_bare_runner_is_matched(self):
+        self.assertEqual(self.matched("pytest -q"), ["pytest"])
+
+    def test_the_default_names_are_unchanged(self):
+        # Passing no `names` argument at all still matches the whole-file
+        # readers, not the test/build runners: the generalization did not
+        # change any existing caller's behaviour.
+        self.assertEqual(gate._shell_reader_words("cat a.log"), ["cat"])
+        self.assertEqual(gate._shell_reader_words("pytest -q"), [])
+
+    def test_chained_after_a_cd_is_matched(self):
+        self.assertEqual(self.matched("cd /repo && pytest -q"), ["pytest"])
+
+    def test_used_as_a_plain_argument_is_not_matched(self):
+        # The same "echo cat" negative the whole-file-read heuristic already
+        # guards against: a runner name is only a match in command-name
+        # position, not anywhere in the text.
+        self.assertEqual(self.matched("echo pytest"), [])
+
+    def test_a_windows_executable_suffix_does_not_hide_it(self):
+        self.assertEqual(self.matched("rake.bat test"), ["rake.bat"])
+
+    def test_a_general_purpose_wrapper_is_not_matched(self):
+        # The documented, deliberate gap (NOT_COVERED): npm/make/cargo/etc.
+        # run many non-test/build subcommands too, so a name-only match
+        # would mislabel most of what they actually do.
+        for command in ("npm test", "npm install", "make test", "make clean",
+                        "cargo test", "cargo build", "go test ./...", "go vet ./...",
+                        "python -m pytest", "python3 -m unittest discover"):
+            self.assertEqual(self.matched(command), [], command)
+
+
+class ResponseByteLengthTests(unittest.TestCase):
+    def test_stdout_and_stderr_are_summed(self):
+        self.assertEqual(gate._response_byte_length({"stdout": "abc", "stderr": "de"}), 5)
+
+    def test_missing_fields_count_as_nothing(self):
+        self.assertEqual(gate._response_byte_length({}), 0)
+
+    def test_a_non_dict_response_is_zero_not_a_crash(self):
+        self.assertEqual(gate._response_byte_length(None), 0)
+        self.assertEqual(gate._response_byte_length("not a dict"), 0)
+        self.assertEqual(gate._response_byte_length(["stdout"]), 0)
+
+    def test_a_non_string_field_is_ignored_not_a_crash(self):
+        self.assertEqual(gate._response_byte_length({"stdout": 123, "stderr": "ok"}), 2)
+
+    def test_multibyte_text_counts_encoded_bytes_not_characters(self):
+        self.assertEqual(gate._response_byte_length({"stdout": "café", "stderr": ""}),
+                         len("café".encode("utf-8")))
+
+
+class RecordInlineMeasurementTests(GateCase):
+    """gate.record_inline_measurement and run_post_hook (design section 2.9):
+    measurement only, and only for a Claude Bash call matched by
+    _TEST_BUILD_RUNNERS."""
+
+    def ledger_rows(self):
+        path = os.path.join(gate.receipt_dir(str(self.state)), gate.INLINE_LEDGER)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_a_matching_claude_bash_call_is_recorded(self):
+        gate.record_inline_measurement(str(self.state), "claude", "Bash",
+                                       {"command": "pytest -q"},
+                                       {"stdout": "1 passed", "stderr": ""}, clock=self.clock)
+        rows = self.ledger_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["matched_runner"], "pytest")
+        self.assertEqual(rows[0]["bytes"], len(b"1 passed"))
+        self.assertEqual(rows[0]["client"], "claude")
+        self.assertEqual(rows[0]["at"], self.clock())
+
+    def test_a_non_matching_command_is_not_recorded(self):
+        gate.record_inline_measurement(str(self.state), "claude", "Bash",
+                                       {"command": "ls -la"}, {"stdout": "x"}, clock=self.clock)
+        self.assertEqual(self.ledger_rows(), [])
+
+    def test_a_non_bash_tool_is_not_recorded_even_if_the_input_matches(self):
+        gate.record_inline_measurement(str(self.state), "claude", "Read",
+                                       {"command": "pytest -q"}, {"stdout": "x"}, clock=self.clock)
+        self.assertEqual(self.ledger_rows(), [])
+
+    def test_codex_is_never_recorded(self):
+        # Phase 5 installs no PostToolUse entry for Codex at all (Phase 0
+        # could not confirm the event exists there); this function's own
+        # client check is a second, independent line of defense, not
+        # something that relies solely on the installer keeping it out.
+        gate.record_inline_measurement(str(self.state), "codex", "Bash",
+                                       {"command": "pytest -q"}, {"stdout": "x"}, clock=self.clock)
+        self.assertEqual(self.ledger_rows(), [])
+
+    def test_run_post_hook_never_raises_on_a_garbage_payload(self):
+        for payload in ({}, {"tool_name": 123}, {"tool_name": "Bash", "tool_input": None},
+                        {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": None}):
+            gate.run_post_hook("claude", str(self.state), payload, clock=self.clock)
+        # The one payload above with a real match still gets recorded: a
+        # broad except in run_post_hook must not swallow the normal path.
+        self.assertEqual(len(self.ledger_rows()), 1)
+
+    def test_run_post_hook_survives_an_unwritable_state_root(self):
+        gate.run_post_hook("claude", "/nonexistent/does/not/exist", {
+            "tool_name": "Bash", "tool_input": {"command": "pytest -q"},
+            "tool_response": {"stdout": "x"}}, clock=self.clock)   # must not raise
+
+
+class PostToolUseHookModeTests(GateCase):
+    """main()'s --event PostToolUse branch, through the module's own argv
+    entry point (subprocess, not the installed launcher script -- that is
+    exercised separately in test_automatic_delegation_e2e.py)."""
+
+    def write_config(self):
+        config = self.base / "orchestration.json"
+        config.write_text(json.dumps({"state_root": str(self.state),
+                                      "capacity_db": str(self.state / "capacity.sqlite3")}), encoding="utf-8")
+        return config
+
+    def run_post(self, payload):
+        config = self.write_config()
+        return subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "claude",
+             "--config", str(config), "--event", "PostToolUse"],
+            input=json.dumps(payload).encode(), capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+
+    def test_a_matching_call_is_measured_and_the_reply_is_empty(self):
+        completed = self.run_post({"tool_name": "Bash", "tool_input": {"command": "pytest -q"},
+                                   "tool_response": {"stdout": "1 passed", "stderr": ""}})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), b"{}")
+        path = os.path.join(gate.receipt_dir(str(self.state)), gate.INLINE_LEDGER)
+        with open(path, encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["bytes"], len(b"1 passed"))
+
+    def test_garbage_input_still_answers_empty_not_a_crash(self):
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "claude",
+             "--config", str(self.write_config()), "--event", "PostToolUse"],
+            input=b"not json", capture_output=True, timeout=60,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), b"{}")
+        self.assertNotIn(b"Traceback", completed.stdout)
+
+    def test_no_event_flag_still_defaults_to_pretooluse(self):
+        # Backward compatibility: a hook command installed before Phase 5
+        # existed never passes --event at all.
+        config = self.write_config()
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate", "--client", "claude",
+             "--config", str(config)],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "pytest -q"},
+                              "cwd": str(self.repo)}).encode(),
+            capture_output=True, timeout=60, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        out = json.loads(completed.stdout)
+        # A PreToolUse judgment happened (some hookSpecificOutput-shaped
+        # decision or an unlogged allow), not Phase 5's bare {} reply.
+        self.assertIsInstance(out, dict)
+
+
+class PostToolUseInstallTests(unittest.TestCase):
+    """plan_install/install's Phase 5 additions: a second, independently
+    tracked PostToolUse entry, opt-in via include_post."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.home = self.base / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        (self.home / ".codex").mkdir()
+        self.config = self.base / "orchestration.json"
+        self.config.write_text(json.dumps({"state_root": str(self.base / "state"),
+                                           "capacity_db": str(self.base / "state" / "capacity.sqlite3")}),
+                               encoding="utf-8")
+        self.settings = self.home / ".claude" / "settings.json"
+        self.receipt_path = self.home / ".agent-bridge" / "onboarding" / "gate-installation.json"
+
+    def install(self, clients=("claude",), **kwargs):
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            return gate.install(str(self.home), str(ROOT), str(self.config), clients, **kwargs)
+
+    def settings_hooks(self):
+        return json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]
+
+    def test_include_post_adds_a_bash_only_post_entry(self):
+        report = self.install(apply=True, include_post=True)
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["post_clients"], ["claude"])
+        hooks = self.settings_hooks()
+        self.assertIn("PreToolUse", hooks)
+        self.assertIn("PostToolUse", hooks)
+        post = hooks["PostToolUse"]
+        self.assertEqual(len(post), 1)
+        self.assertEqual(post[0]["matcher"], "Bash")
+        self.assertIn("--event PostToolUse", post[0]["hooks"][0]["command"])
+        pre_command = hooks["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertNotIn("--event PostToolUse", pre_command)
+        receipt = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(receipt["post_entries"]), ["claude"])
+
+    def test_without_include_post_no_post_entry_is_added(self):
+        self.install(apply=True, include_post=False)
+        hooks = self.settings_hooks()
+        self.assertIn("PreToolUse", hooks)
+        self.assertNotIn("PostToolUse", hooks)
+        receipt = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertNotIn("post_entries", receipt)
+
+    def test_a_plain_reinstall_does_not_remove_an_existing_post_entry(self):
+        self.install(apply=True, include_post=True)
+        report = self.install(apply=True, include_post=False)
+        # Nothing changed at all: neither the Pre nor the Post entry needed
+        # a rewrite, so a plain re-install is a true no-op.
+        self.assertEqual(report["planned_files"], [])
+        hooks = self.settings_hooks()
+        self.assertIn("PostToolUse", hooks)
+        receipt = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(receipt["post_entries"]), ["claude"])
+
+    def test_include_post_is_idempotent(self):
+        self.install(apply=True, include_post=True)
+        report = self.install(apply=True, include_post=True)
+        self.assertEqual(report["planned_files"], [])
+
+    def test_remove_takes_out_both_entries_together(self):
+        self.install(apply=True, include_post=True)
+        report = self.install(apply=True, remove=True)
+        self.assertTrue(report["applied"])
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertNotIn("hooks", settings)
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_codex_is_never_given_a_post_entry_even_when_asked(self):
+        report = self.install(clients=("claude", "codex"), apply=True, include_post=True)
+        self.assertEqual(report["post_clients"], ["claude"])
+        hooks_json = json.loads((self.home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertNotIn("PostToolUse", hooks_json.get("hooks", {}))
+
+    def test_an_edited_post_entry_is_preserved_not_overwritten(self):
+        self.install(apply=True, include_post=True)
+        settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        settings["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"] = 99
+        self.settings.write_text(json.dumps(settings), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "was edited"):
+            self.install(apply=True, include_post=True)
+
+    def test_report_shows_post_installation_state(self):
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            before = gate.report(str(self.home), str(self.base / "state"))
+        self.assertEqual(before["installed_post"], {"claude": False, "codex": False})
+        self.assertEqual(before["inline_measurement"], {"claude": "counted", "codex": "not_countable"})
+        self.install(apply=True, include_post=True)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            after = gate.report(str(self.home), str(self.base / "state"))
+        self.assertEqual(after["installed_post"], {"claude": True, "codex": False})
+
+
 if __name__ == "__main__":
     unittest.main()

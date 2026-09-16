@@ -267,14 +267,22 @@ class Workflow(unittest.TestCase):
 
     # --------------------------------------------------------------- drivers
 
-    def install_gate(self):
+    def install_gate(self, *, include_post=False):
         """The real installer, into the isolated home."""
         return gate.install(str(self.home), str(ROOT), str(self.config),
-                            ("claude", "codex"), apply=True)
+                            ("claude", "codex"), apply=True, include_post=include_post)
 
     def run_installed_hook(self, client, payload):
         """Through the launcher the installer wrote, as the host would."""
         command = gate.hook_command(str(ROOT), client, str(self.config))
+        completed = subprocess.run(command, shell=True, input=json.dumps(payload).encode(),
+                                   capture_output=True, timeout=180, env=self.env())
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def run_installed_post_hook(self, client, payload):
+        """Through the launcher the installer wrote, PostToolUse (Phase 5)."""
+        command = gate.hook_command(str(ROOT), client, str(self.config), event="PostToolUse")
         completed = subprocess.run(command, shell=True, input=json.dumps(payload).encode(),
                                    capture_output=True, timeout=180, env=self.env())
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -1078,6 +1086,55 @@ class ReadGate(Workflow):
         self.assertTrue(lf["adds_up"], lf)
         self.assertEqual(lf["digested"]["count"], 2)
         self.assertGreaterEqual(lf["compelled"]["count"], 3)
+
+
+class InlineOutputMeasurement(Workflow):
+    """Phase 5 (design section 2.9) through the real installed launcher:
+    the installer's --include-post entry, the PostToolUse subprocess path,
+    and the audit's own count. Claude only -- Phase 0 could not confirm
+    Codex exposes PostToolUse at all, so this feature installs nothing for
+    it (POST_MATCHERS has no "codex" key), unlike the read gate above."""
+
+    def test_the_installed_post_entry_is_bash_only_and_claude_only(self):
+        self.install_gate(include_post=True)
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        post = settings["hooks"]["PostToolUse"]
+        self.assertEqual(len(post), 1)
+        self.assertEqual(post[0]["matcher"], "Bash")
+        hooks_json = json.loads((self.codex_home / "hooks.json").read_text(encoding="utf-8"))
+        self.assertNotIn("PostToolUse", hooks_json.get("hooks", {}))
+
+    def test_a_matching_bash_call_is_measured_through_the_real_launcher(self):
+        self.install_gate(include_post=True)
+        result = self.run_installed_post_hook("claude", {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "tool_response": {"stdout": "5 passed in 0.01s", "stderr": ""},
+            "cwd": str(self.repo)})
+        self.assertEqual(result, {})
+        document = audit.report(str(self.state), home=str(self.home),
+                                config_path=str(self.config), since_hours=0.0)
+        im = document["inline_measurement"]
+        self.assertEqual(im["count"], 1)
+        self.assertEqual(im["bytes_measured"], len(b"5 passed in 0.01s"))
+        self.assertEqual(im["by_runner"], {"pytest": 1})
+
+    def test_a_non_runner_bash_call_is_not_measured(self):
+        self.install_gate(include_post=True)
+        result = self.run_installed_post_hook("claude", {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "ls -la"},
+            "tool_response": {"stdout": "calc.py\n", "stderr": ""},
+            "cwd": str(self.repo)})
+        self.assertEqual(result, {})
+        document = audit.report(str(self.state), home=str(self.home),
+                                config_path=str(self.config), since_hours=0.0)
+        self.assertEqual(document["inline_measurement"]["count"], 0)
+
+    def test_without_include_post_the_launcher_entry_is_never_installed(self):
+        self.install_gate(include_post=False)
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertNotIn("PostToolUse", settings.get("hooks", {}))
 
 
 class RestartRecovery(Workflow):

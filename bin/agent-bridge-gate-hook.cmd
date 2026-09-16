@@ -27,5 +27,14 @@ if /i "%SUB%"=="report" exit /b %RC%
 if /i "%SUB%"=="audit" exit /b %RC%
 if /i "%SUB%"=="-h" exit /b %RC%
 if /i "%SUB%"=="--help" exit /b %RC%
+REM A PostToolUse invocation (Phase 5, inline output measurement) never
+REM denies and the tool call it answers for has already finished, so the
+REM PreToolUse-shaped deny hint below would be meaningless here; the same
+REM argv-only mode selection the gate module itself uses.
+echo %*| findstr /C:"--event PostToolUse" >nul
+if not errorlevel 1 (
+    echo {}
+    exit /b 0
+)
 echo {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "delegation-first gate: the hook could not start its interpreter (launcher exit %RC%); nothing is implemented until the installation is repaired [gate_launcher_failed]"}}
 exit /b 0
