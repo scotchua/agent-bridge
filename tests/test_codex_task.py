@@ -270,6 +270,7 @@ class CodexTaskTests(unittest.TestCase):
         defect claude_task carries the identical fix for). The fake's
         ``turn.failed`` event reports "synthetic failure"; that text belongs
         in the TaskError message, not just the receipt's event count."""
+        requires_confinement(self)
         self._write_fake(mode="fail")
         with self.assertRaises(TaskError) as ctx:
             self.run_default()
