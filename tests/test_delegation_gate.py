@@ -1354,5 +1354,63 @@ class ABomPrefixedCodexTomlIsStillValidToml(unittest.TestCase):
             self.assertEqual(gate.codex_trust_state(str(codex_toml), str(hooks_path)), "needs_review")
 
 
+class TheTrustStateKeyMatchesCodexsOwnCodexHomeResolution(unittest.TestCase):
+    """codex-rs canonicalizes CODEX_HOME (symlinks, Windows on-disk casing) only
+    when the CODEX_HOME environment variable is set (utils/home-dir/src/lib.rs::
+    find_codex_home); the default ``~/.codex`` gets no resolution at all before
+    it is used to build a trust-state key (hooks/src/engine/discovery.rs). This
+    module's own key must track that exact branch, or a real trust decision
+    never shows as recorded because the two sides spell the same file two
+    different ways.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        real_dir = Path(self.temp.name) / "real"
+        real_dir.mkdir()
+        self.link_dir = Path(self.temp.name) / "link"
+        self.link_dir.symlink_to(real_dir)
+        self.hooks_path = self.link_dir / "hooks.json"
+        ours = {"hooks": [{"command": f"...{gate.HOOK_NAME}..."}]}
+        self.hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": [ours]}}))
+        self.codex_toml = self.link_dir / "config.toml"
+
+    def _write_state_for_key(self, key):
+        escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+        self.codex_toml.write_text(f'[hooks.state."{escaped}"]\ntrusted_hash = "abc"\n')
+
+    def test_with_codex_home_unset_the_key_is_not_resolved_through_the_symlink(self):
+        # Codex's default ~/.codex branch applies no canonicalization; the key
+        # it writes names the path as configured, symlink and all.
+        self._write_state_for_key(f"{self.hooks_path}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "recorded")
+
+    def test_with_codex_home_unset_a_realpath_style_key_does_not_match(self):
+        # The bug this guards against: unconditionally resolving through the
+        # symlink would look for a key Codex never writes in this branch.
+        self._write_state_for_key(f"{os.path.realpath(self.hooks_path)}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "needs_review")
+
+    def test_with_codex_home_set_the_key_is_resolved_through_the_symlink(self):
+        # Codex calls std::fs::canonicalize on an explicit CODEX_HOME.
+        self._write_state_for_key(f"{os.path.realpath(self.hooks_path)}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.link_dir)}):
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "recorded")
+
+    def test_with_codex_home_set_the_unresolved_symlink_style_key_does_not_match(self):
+        self._write_state_for_key(f"{self.hooks_path}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.link_dir)}):
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "needs_review")
+
+
 if __name__ == "__main__":
     unittest.main()

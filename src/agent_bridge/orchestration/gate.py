@@ -1327,6 +1327,23 @@ NOT_COVERED = [
 # ------------------------------------------------------------------ report
 
 
+def _codex_hook_key_path(hooks_path: str) -> str:
+    """The path string Codex itself uses in a trust-state key, not ours.
+
+    Traced from codex-rs (utils/home-dir/src/lib.rs::find_codex_home and
+    hooks/src/engine/discovery.rs's key_source): Codex canonicalizes CODEX_HOME
+    (std::fs::canonicalize -- symlinks resolved, Windows on-disk casing) only
+    when the CODEX_HOME environment variable is set; the default `~/.codex`
+    (dirs::home_dir() + ".codex") gets no resolution at all. Applying
+    os.path.realpath() unconditionally, as this function used to, canonicalizes
+    a path Codex itself never canonicalizes in the common no-CODEX_HOME-set
+    case, so the two sides can name the same file with different strings and
+    a real trust decision never shows as recorded."""
+    if os.environ.get("CODEX_HOME"):
+        return os.path.realpath(hooks_path)
+    return os.path.abspath(hooks_path)
+
+
 def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     """``recorded``, ``needs_review`` or ``not_installed`` for our Codex entry.
 
@@ -1351,7 +1368,7 @@ def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     with open(codex_toml, "rb") as handle:
         parsed = tomllib.loads(handle.read().decode("utf-8-sig"))
     state = parsed.get("hooks", {}) if isinstance(parsed.get("hooks"), dict) else {}
-    key = f"{os.path.realpath(hooks_path)}:pre_tool_use:{index}:0"
+    key = f"{_codex_hook_key_path(hooks_path)}:pre_tool_use:{index}:0"
     entry = state.get("state", {}).get(key) if isinstance(state.get("state"), dict) else None
     if isinstance(entry, dict) and entry.get("trusted_hash"):
         return "recorded"
