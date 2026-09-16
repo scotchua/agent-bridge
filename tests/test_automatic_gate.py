@@ -692,6 +692,18 @@ class PolicyParsing(unittest.TestCase):
             self.assertEqual(policy.default.allowed_routes, ())
             self.assertEqual(policy.default.classification, "unclassified")
 
+    def test_a_bom_prefixed_policy_is_not_refused(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to this operator-edited file. An unreadable policy turns
+        # into a deny for every repository, so a BOM must not raise here.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(autoroute.policy_path(temporary))
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+                {"version": 1, "repos": {}}).encode())
+            policy = autoroute.load_policy(temporary)
+            self.assertEqual(policy.repos, {})
+
     def test_a_relative_repository_key_is_refused(self):
         with self.assertRaises(autoroute.PolicyError):
             autoroute.parse_policy({"version": 1, "repos": {"relative/path": {}}})

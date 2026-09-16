@@ -774,6 +774,15 @@ class BriefReadingTests(unittest.TestCase):
         target.write_bytes(b"do the thing\n")
         self.assertEqual(wd.read_brief(target), "do the thing\n")
 
+    def test_a_bom_prefixed_brief_does_not_embed_a_stray_character(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM. Plain "utf-8" decodes this without raising, so the bug
+        # is silent: a literal U+FEFF ends up embedded at the start of the
+        # text sent to the provider.
+        target = self.base / "b.txt"
+        target.write_bytes(b"\xef\xbb\xbf" + b"do the thing\n")
+        self.assertEqual(wd.read_brief(target), "do the thing\n")
+
     def test_a_symlinked_brief_is_refused(self):
         platform_support.require_symlinks(self)
         import os as _os

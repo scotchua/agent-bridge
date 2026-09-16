@@ -517,7 +517,7 @@ def load_policy_and_fingerprint(state_root: str) -> tuple[Policy, str]:
         return Policy(), NO_POLICY
     digest = hashlib.sha256(raw).hexdigest()[:32]
     try:
-        document = json.loads(raw.decode("utf-8"))
+        document = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PolicyError(f"routing policy is not readable JSON: {type(exc).__name__}") from None
     return parse_policy(document), digest

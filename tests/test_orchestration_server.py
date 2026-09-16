@@ -164,6 +164,19 @@ class OrchestrationServerTests(unittest.TestCase):
             json.dump(valid, handle)
         self.assertEqual(load(config_path).interval_seconds, 5.0)
 
+    def test_a_bom_prefixed_config_is_not_refused(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to this hand-edited file.
+        config_path = os.path.join(self.temp.name, "config.json")
+        valid = {"config_version": "1", "state_root": self.temp.name,
+                 "local_queue_root": os.path.join(self.temp.name, "q"),
+                 "capacity_db": os.path.join(self.temp.name, "c.sqlite3"),
+                 "worker_executable": os.path.join(self.temp.name, "worker"),
+                 "worker_state": os.path.join(self.temp.name, "worker-state")}
+        with open(config_path, "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + json.dumps(valid).encode())
+        self.assertEqual(load(config_path).interval_seconds, 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

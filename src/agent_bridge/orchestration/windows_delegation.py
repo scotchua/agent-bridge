@@ -605,7 +605,7 @@ def read_brief(path: str | os.PathLike[str], *,
             # admitted. There is no safe way to continue from here.
             raise DelegationRefused("brief_changed_after_admission")
     try:
-        return payload.decode("utf-8")
+        return payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise DelegationRefused("brief_invalid", "not_utf8") from exc
 
