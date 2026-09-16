@@ -152,7 +152,17 @@ def compile_glob(pattern: str) -> "re.Pattern[str]":
 
 
 def relative_posix_path(path: str, repo_root: str) -> str:
-    """``path`` relative to ``repo_root``, forward slashes on every host."""
+    """``path`` relative to ``repo_root``, forward slashes on every host.
+
+    Raises ``ValueError`` exactly when ``os.path.relpath`` does: on Windows,
+    ``ntpath.relpath`` refuses a pair of paths on different drives (``path
+    is on mount 'D:', start on mount 'C:'``), which a symlink or junction
+    pointing at a second drive makes an ordinary occurrence, not an edge
+    case. This function does not swallow that here, because it is a thin
+    wrapper over ``os.path.relpath`` and callers other than ``matches_any``
+    may want to see it; ``matches_any`` is what promises "never matches" and
+    is where that promise is kept.
+    """
     relative = os.path.relpath(path, repo_root)
     if os.sep != "/":
         relative = relative.replace(os.sep, "/")
@@ -167,11 +177,19 @@ def matches_any(path: str, repo_root: str, globs: "tuple[str, ...] | list[str]")
     A path that resolves outside ``repo_root`` (a symlink target, most
     plausibly) never matches: these globs are the operator's statement about
     *this repository's* artifacts, and a pattern must not reach outside it
-    by following a link the operator never named.
+    by following a link the operator never named. On Windows that includes a
+    link whose target lives on a different drive letter, which
+    ``os.path.relpath`` cannot even express as a relative path and raises
+    ``ValueError`` for rather than returning one starting with ``..``; that
+    is exactly the same fact (the target is outside this repository) by a
+    different signal, and is treated identically.
     """
     if not globs:
         return False
-    relative = relative_posix_path(path, repo_root)
+    try:
+        relative = relative_posix_path(path, repo_root)
+    except ValueError:
+        return False
     if relative == ".." or relative.startswith("../") or relative.startswith("..\\"):
         return False
     return any(compile_glob(glob).match(relative) for glob in globs)

@@ -101,6 +101,30 @@ class GlobMatchingTests(unittest.TestCase):
             resolved = os.path.realpath(link)
             self.assertFalse(localfirst.matches_any(resolved, repo, ("**/*.log",)))
 
+    def test_a_windows_cross_drive_path_never_matches_rather_than_raising(self):
+        """Found by adversarial review: on Windows, ntpath.relpath raises
+        ValueError for two paths on different drives ("path is on mount
+        'D:', start on mount 'C:'") instead of returning a path starting
+        with "..". A symlink or junction onto a second drive makes this an
+        ordinary occurrence, not a hypothetical, and matches_any's own
+        contract ("a path that resolves outside repo_root never matches")
+        must hold for that signal exactly as it does for the ordinary one.
+        Simulated here with the real exception os.path.relpath raises,
+        since this sandbox has no second drive to reproduce it against
+        natively.
+        """
+        from unittest import mock
+        with mock.patch("agent_bridge.orchestration.localfirst.os.path.relpath",
+                        side_effect=ValueError("path is on mount 'D:', start on mount 'C:'")):
+            self.assertFalse(localfirst.matches_any(
+                "D:\\other\\file.log", "C:\\repo", ("**/*.log",)))
+        # relative_posix_path itself still raises: matches_any is the layer
+        # that promises "never matches", not every caller of the helper.
+        with mock.patch("agent_bridge.orchestration.localfirst.os.path.relpath",
+                        side_effect=ValueError("cross-drive")):
+            with self.assertRaises(ValueError):
+                localfirst.relative_posix_path("D:\\other\\file.log", "C:\\repo")
+
     def test_effective_globs_falls_back_to_the_default_only_when_the_repo_names_none(self):
         lf = autoroute.LocalFirstConfig(default_globs=("**/*.default",))
         narrow = autoroute.RepoPolicy(mechanical_globs=("**/*.custom",))
@@ -708,6 +732,26 @@ class ProtectedLauncherTests(unittest.TestCase):
             "python setup_bridge.py onboard apply --answers a.json --candidate c.json"))
         self.assertTrue(gate.shell_writes("python3 setup_bridge.py onboard apply --answers a.json"))
         self.assertFalse(gate.shell_writes("python setup_bridge.py onboard plan --answers a.json"))
+
+    def test_the_launcher_patterns_are_case_insensitive_on_windows_spellings(self):
+        """Found by adversarial review: NTFS is case-insensitive and
+        case-preserving, so a Windows invocation spelled in a different case
+        is the same file and must be recognised as one, the same lesson
+        docs/REVIEW-HISTORY.md finding 57 already drew for the del/move/ren
+        write verbs and the PowerShell cmdlets. The first assertion is the
+        one that matters most: agent-bridge-orchestration-verify is meant to
+        be blocked outright, so a case mismatch there was a total bypass of
+        that block, not merely a narrower one."""
+        self.assertTrue(gate.shell_writes(
+            "./bin/Agent-Bridge-Orchestration-Verify.cmd calibrate --config x"))
+        self.assertTrue(gate.shell_writes(
+            "./bin/AGENT-BRIDGE-GATE-HOOK.CMD Install --root . --config x --apply"))
+        self.assertTrue(gate.shell_writes(
+            "python Setup_Bridge.py Onboard Apply --answers a.json"))
+        self.assertTrue(gate.shell_writes(
+            "./bin/AGENT-BRIDGE-SETUP.CMD onboard apply --answers a.json"))
+        # And the read-only subcommands stay reads regardless of case.
+        self.assertFalse(gate.shell_writes("./bin/Agent-Bridge-Gate-Hook Report --config x"))
 
     def test_reading_a_launcher_that_requires_a_second_word_stays_a_read(self):
         """gate-hook and onboard-apply both require a second word ("install",

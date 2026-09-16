@@ -145,9 +145,17 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # orchestration config, which both require as an argument; only their
     # write-shape is added here; ``gate-hook report``/``audit`` are read-only
     # and stay unmatched.
-    r"(^|[\s;&|('\"/\\])agent-bridge-orchestration-verify(\.cmd)?(\s|$)",
-    r"(^|[\s;&|('\"/\\])agent-bridge-gate-hook(\.cmd)?\b[^;&|]*\binstall\b",
-    r"(^|[\s;&|('\"/\\])(setup_bridge\.py|agent-bridge-setup(\.cmd)?)\b[^;&|]*\bonboard\s+apply\b",
+    #
+    # Case-insensitive on the launcher name and, where present, the second
+    # word, for the same reason the Windows verbs above are: NTFS is
+    # case-insensitive and case-preserving, so ``Agent-Bridge-Orchestration-
+    # Verify.cmd`` is the same file as the lowercase spelling and the two
+    # were not recognised as one until this was checked. Repeating finding
+    # 57's already-fixed mistake for a different set of names is exactly the
+    # kind of thing an adversarial review exists to catch.
+    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-orchestration-verify)(?i:\.cmd)?(\s|$)",
+    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-gate-hook)(?i:\.cmd)?\b[^;&|]*\b(?i:install)\b",
+    r"(^|[\s;&|('\"/\\])(?i:setup_bridge\.py|agent-bridge-setup)(?i:\.cmd)?\b[^;&|]*\b(?i:onboard\s+apply)\b",
 ))
 #: Formatters that write unless asked only to report.
 _FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")
