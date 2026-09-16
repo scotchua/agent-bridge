@@ -820,6 +820,23 @@ class DigestLane(Workflow):
         self.assertTrue(second["deduplicated"])
         self.assertEqual(first["job_id"], second["job_id"])
 
+    def test_two_extract_calls_with_different_fields_are_not_deduplicated(self):
+        """Found by adversarial review: the idempotency key used to be
+        digest:{caller}:{task_type}:{window_sha256} -- task_type is
+        "extract" either way and window_sha256 is the same file's content
+        either way, so a second extract call asking for different fields
+        would silently collide with the first and hand back its job/receipt
+        instead of running the new extraction."""
+        self.write_digest_policy()
+        target = self.write_log()
+        first = self.digest("codex", target, task_type="extract", fields=["level"])
+        second = self.digest("codex", target, task_type="extract", fields=["count"])
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertNotEqual(first["receipt_id"], second["receipt_id"])
+        self.assertFalse(second["deduplicated"])
+
     def test_extract_requires_field_names_and_they_reach_the_template(self):
         self.write_digest_policy()
         target = self.write_log()

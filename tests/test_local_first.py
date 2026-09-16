@@ -20,6 +20,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKES = Path(__file__).resolve().parent / "fakes"
@@ -27,7 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge import store  # noqa: E402
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot  # noqa: E402
-from agent_bridge.orchestration import autoroute, delegation_verify, gate, localfirst  # noqa: E402
+from agent_bridge.orchestration import autoroute, delegation_verify, gate, localfirst, mcp  # noqa: E402
 
 
 class PortableSampler:
@@ -192,6 +193,280 @@ class WindowArithmeticTests(unittest.TestCase):
             localfirst.digest_window(100, offset=101)
         with self.assertRaises(localfirst.WindowError):
             localfirst.digest_window(True)  # bool is not an accepted int here
+
+
+# ------------------------------------------------------------- descriptor read
+
+
+class ReadWindowTests(unittest.TestCase):
+    """Found by adversarial review: read_window's Windows symlink defense
+    was not descriptor-bound. os.O_NOFOLLOW does not exist on Windows (the
+    getattr fallback is 0, contributing nothing there), so a symlink placed
+    at the name between an earlier os.path.islink check and read_window's
+    own os.open was followed silently. The fix mirrors
+    windows_privacy.read_private_file / windows_delegation.read_brief:
+    lstat the name first and refuse a link there, then require the
+    descriptor os.open actually produces to be that same object
+    (st_dev/st_ino) before any byte is read."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def test_reads_the_requested_window(self):
+        path = self.base / "app.log"
+        path.write_text("0123456789ABCDEF", encoding="utf-8")
+        text, replacements = localfirst.read_window(str(path), 2, 5)
+        self.assertEqual(text, "23456")
+        self.assertEqual(replacements, 0)
+
+    def test_a_symlink_is_refused_by_the_pre_open_lstat_check(self):
+        target = self.base / "real.log"
+        target.write_text("x" * 100, encoding="utf-8")
+        link = self.base / "link.log"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not creatable on this account")
+        with self.assertRaises(localfirst.WindowReadError) as ctx:
+            localfirst.read_window(str(link), 0, 10)
+        self.assertEqual(str(ctx.exception), "path_is_a_link")
+
+    def test_an_object_swap_between_lstat_and_open_is_detected(self):
+        """Simulates the TOCTOU window read_window's two-step check exists
+        for: os.lstat reports one object's identity, but the descriptor
+        os.open actually opens is a different one. Detected, not prevented
+        -- the same residual risk windows_privacy.read_private_file and
+        windows_delegation.read_brief carry and state for the identical
+        reason, and the reason this comparison happens before any byte is
+        read rather than only afterward."""
+        path = self.base / "app.log"
+        path.write_text("x" * 100, encoding="utf-8")
+        real_lstat = os.lstat
+        real_result = real_lstat(path)
+
+        class _Spoofed:
+            def __getattr__(self, name):
+                return getattr(real_result, name)
+            st_dev = real_result.st_dev + 1
+            st_ino = real_result.st_ino + 1
+            st_mode = real_result.st_mode
+
+        def fake_lstat(target, *args, **kwargs):
+            if os.fspath(target) == str(path):
+                return _Spoofed()
+            return real_lstat(target, *args, **kwargs)
+
+        with mock.patch("agent_bridge.orchestration.localfirst.os.lstat", side_effect=fake_lstat):
+            with self.assertRaises(localfirst.WindowReadError) as ctx:
+                localfirst.read_window(str(path), 0, 10)
+        self.assertEqual(str(ctx.exception), "path_changed_before_open")
+
+    def test_a_directory_is_refused_not_a_regular_file(self):
+        directory = self.base / "adir"
+        directory.mkdir()
+        with self.assertRaises(localfirst.WindowReadError) as ctx:
+            localfirst.read_window(str(directory), 0, 10)
+        self.assertEqual(str(ctx.exception), "not_a_regular_file")
+
+    def test_an_absent_path_is_refused(self):
+        with self.assertRaises(localfirst.WindowReadError):
+            localfirst.read_window(str(self.base / "nope.log"), 0, 10)
+
+    def test_non_utf8_bytes_are_replaced_and_counted(self):
+        path = self.base / "app.log"
+        path.write_bytes(b"line one\n\xff\xfeline two\n")
+        text, replacements = localfirst.read_window(str(path), 0, path.stat().st_size)
+        self.assertEqual(replacements, 2)
+        self.assertIn("line one", text)
+        self.assertIn("line two", text)
+
+    def test_a_legitimate_replacement_character_in_the_source_is_not_counted_as_an_error(self):
+        """Found by adversarial review: counting occurrences of U+FFFD in
+        the decoded text conflates an actual decode failure with a file
+        that legitimately contains that character as content -- valid
+        UTF-8 encodes U+FFFD like any other code point. The count must
+        come from the decode error handler actually firing, not from
+        scanning the output afterward."""
+        path = self.base / "app.log"
+        path.write_text("line one � line two", encoding="utf-8")
+        text, replacements = localfirst.read_window(str(path), 0, path.stat().st_size)
+        self.assertEqual(replacements, 0)
+        self.assertIn("�", text)
+
+    def test_a_file_that_shrinks_between_stat_and_read_is_a_short_read_not_silent(self):
+        """Found by adversarial review: a length chosen from a size learned
+        earlier (as digest_read's caller does, from its own single fstat)
+        can still legitimately outrun what remains once the read actually
+        happens if something shrinks the file after that fstat but before
+        the read loop finishes. read_window must refuse rather than
+        silently hand back fewer bytes than the caller asked for and asked
+        to be hashed."""
+        path = self.base / "app.log"
+        path.write_bytes(b"0123456789")
+        real_open = os.open
+
+        def truncating_open(target, *args, **kwargs):
+            descriptor = real_open(target, *args, **kwargs)
+            if os.fspath(target) == str(path):
+                os.truncate(str(path), 4)
+            return descriptor
+
+        with mock.patch("agent_bridge.orchestration.localfirst.os.open", side_effect=truncating_open):
+            with self.assertRaises(localfirst.WindowReadError) as ctx:
+                localfirst.read_window(str(path), 0, 10)
+        self.assertEqual(str(ctx.exception), "window_short_read")
+
+
+class DigestReadTests(unittest.TestCase):
+    """``digest_read`` determines the window from the same descriptor it
+    reads through, instead of a separate, earlier ``os.stat`` by name.
+    Found by an adversarial review: the earlier shape (``os.stat`` by name,
+    then ``read_window`` reopening the same name) let a caller swap the
+    file between the two and get a receipt for the file it validated while
+    the job actually carried the replacement's bytes."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def test_reads_the_tail_by_default_and_reports_the_files_own_identity(self):
+        path = self.base / "app.log"
+        path.write_bytes(b"A" * 100)
+        stat_before = path.stat()
+        (text, replacements, size, mtime_ns,
+         offset, window_bytes) = localfirst.digest_read(str(path), None, max_window_bytes=40)
+        self.assertEqual(len(text), 40)
+        self.assertEqual(replacements, 0)
+        self.assertEqual(size, 100)
+        self.assertEqual(mtime_ns, stat_before.st_mtime_ns)
+        self.assertEqual(offset, 60)
+        self.assertEqual(window_bytes, 40)
+
+    def test_a_caller_supplied_offset_is_honoured(self):
+        path = self.base / "app.log"
+        path.write_text("0123456789", encoding="utf-8")
+        text, _, _, _, offset, window_bytes = localfirst.digest_read(str(path), 2, max_window_bytes=5)
+        self.assertEqual(offset, 2)
+        self.assertEqual(window_bytes, 5)
+        self.assertEqual(text, "23456")
+
+    def test_window_computation_errors_are_a_window_error_not_a_window_read_error(self):
+        """mcp.py distinguishes digest_window_refused from digest_read_refused
+        by exception type; digest_read must preserve that distinction
+        rather than wrapping every failure in one type."""
+        path = self.base / "app.log"
+        path.write_text("A" * 10, encoding="utf-8")
+        with self.assertRaises(localfirst.WindowError):
+            localfirst.digest_read(str(path), 9, max_window_bytes=5)
+
+    def test_digest_read_ignores_a_stale_external_stat_taken_before_it_runs(self):
+        """The property the fix guarantees: digest_read never consults any
+        stat taken outside its own call. The earlier shape had mcp.py take
+        its own os.stat by name first, decide the window from that, and
+        only then call read_window, which reopened the same name on its
+        own -- two independent looks at the path, with nothing tying the
+        second to the first. A caller who changed the file in between got
+        a receipt naming the *first* look's identity while the bytes
+        actually read and hashed came from the *second*. Now there is only
+        one look: whatever an earlier, separate stat saw is irrelevant,
+        because digest_read never receives or consults it."""
+        path = self.base / "app.log"
+        path.write_bytes(b"A" * 100)
+        stale_stat = os.stat(str(path))  # what a caller's own earlier stat would have seen
+        path.write_bytes(b"B" * 40)  # the file changes before digest_read is ever called
+        (text, replacements, size, mtime_ns,
+         offset, window_bytes) = localfirst.digest_read(str(path), None, max_window_bytes=100)
+        self.assertEqual(size, 40)
+        self.assertNotEqual(size, stale_stat.st_size)
+        self.assertEqual(window_bytes, 40)
+        self.assertEqual(text, "B" * 40)
+
+    def test_a_change_while_the_read_is_in_flight_is_detected_not_misreported(self):
+        """Once digest_read's own fstat is taken, a change to that same
+        file (in place, through the same name -- not a swap to a
+        different object, which the pre-open lstat/open identity check in
+        _open_verified already covers) while the read loop is still
+        running must still be caught, exactly as read_window already
+        guarantees: the after-read fstat disagreeing with the before-read
+        fstat is refused rather than silently producing a receipt for one
+        moment's identity next to another moment's bytes."""
+        path = self.base / "app.log"
+        path.write_bytes(b"0" * 100)
+        real_read = os.read
+        state = {"changed": False}
+
+        def change_after_first_read(descriptor, count):
+            chunk = real_read(descriptor, count)
+            if not state["changed"]:
+                state["changed"] = True
+                # Grows the file rather than merely rewriting it in place,
+                # so the identity mismatch this test needs (a different
+                # st_size) does not depend on the filesystem's mtime
+                # timestamp resolution being fine enough to tell two quick
+                # writes apart.
+                with open(str(path), "r+b") as handle:
+                    handle.write(b"1" * 150)
+            return chunk
+
+        with mock.patch("agent_bridge.orchestration.localfirst.os.read", side_effect=change_after_first_read):
+            with self.assertRaises(localfirst.WindowReadError) as ctx:
+                localfirst.digest_read(str(path), None, max_window_bytes=10)
+        self.assertEqual(str(ctx.exception), "file_changed_while_reading")
+
+
+# ----------------------------------------------------------------- protection
+
+
+class UnderAnyTests(unittest.TestCase):
+    """Found by adversarial review: mcp._under_any resolved both sides with
+    realpath but dropped os.path.normcase, repeating the exact gap
+    gate._under was already hardened against (REVIEW-HISTORY.md finding
+    59). os.path.realpath alone does not normalise case for a path
+    component that does not yet exist on disk, which several of the
+    protected paths (SQLite -wal/-shm sidecars, most plausibly) usually
+    are not yet."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def test_an_exact_root_and_a_path_inside_it_both_match(self):
+        root = self.base / "state"
+        root.mkdir()
+        target = root / "routing" / "file.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+        self.assertTrue(mcp._under_any(str(root), (str(root),)))
+        self.assertTrue(mcp._under_any(str(target), (str(root),)))
+
+    def test_a_path_outside_every_root_does_not_match(self):
+        root = self.base / "state"
+        root.mkdir()
+        outside = self.base / "elsewhere.json"
+        outside.write_text("{}", encoding="utf-8")
+        self.assertFalse(mcp._under_any(str(outside), (str(root),)))
+
+    def test_a_root_with_different_case_still_matches_when_normcase_folds_it(self):
+        """os.path.normcase is a no-op on POSIX, so this simulates the
+        Windows behaviour it exists for by patching normcase to fold case,
+        the same technique used elsewhere in this suite (mocking
+        os.path.relpath's Windows-only cross-drive ValueError) for a
+        platform difference this sandbox cannot produce natively."""
+        root = self.base / "State"
+        root.mkdir()
+        target = root / "file.json"
+        target.write_text("{}", encoding="utf-8")
+        with mock.patch("agent_bridge.orchestration.mcp.os.path.normcase",
+                        side_effect=lambda value: value.lower()):
+            self.assertTrue(mcp._under_any(str(target).replace("State", "state"),
+                                           (str(root).replace("State", "STATE"),)))
+
+    def test_empty_and_falsy_roots_are_skipped(self):
+        self.assertFalse(mcp._under_any(str(self.base), ("", None)))
 
 
 # -------------------------------------------------------------- policy parsing

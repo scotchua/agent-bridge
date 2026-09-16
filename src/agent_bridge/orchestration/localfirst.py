@@ -26,10 +26,12 @@ a deny.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import os
 import re
 import stat
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -493,27 +495,52 @@ class WindowReadError(ValueError):
     """A digest window could not be read safely. Refuses by name."""
 
 
-def read_window(path: str, offset: int, length: int) -> tuple[str, int]:
-    """Read exactly ``length`` bytes at ``offset`` through one descriptor,
-    refusing a file that is not what it appeared to be or that changed
-    underneath the read.
+def _reparse_tag(info: "os.stat_result") -> int:
+    """Present only on Windows; 0 for an ordinary file or directory there.
 
-    Modelled on ``windows_privacy.read_private_file``'s shape (open once,
-    ``fstat`` before and after, compare device/inode/size/mtime, never
-    reopen the name to get the bytes), without that module's owner-only ACL
-    check: a digest target is an ordinary repository file the operator's
-    policy already made eligible, not a private credential or evidence
-    record, so that check does not apply here. ``O_NOFOLLOW`` refuses a
-    symlink outright rather than silently following one the caller's own
-    ``matches_any``/realpath check already resolved past.
-
-    Returns the decoded text and how many replacement characters the UTF-8
-    decode inserted: a digest is not a patch, so a log carrying a few stray
-    non-UTF-8 bytes is tolerated and the count is carried in the receipt
-    rather than silently discarded or treated as fatal.
+    Restated from ``windows_privacy._reparse_tag`` rather than imported:
+    that module is Windows-delegation-specific infrastructure this feature
+    does not otherwise depend on, and the check is two lines.
     """
-    if offset < 0 or length <= 0:
-        raise WindowReadError("window_invalid")
+    return int(getattr(info, "st_reparse_tag", 0) or 0)
+
+
+def _open_verified(path: str) -> "tuple[int, os.stat_result]":
+    """``lstat`` ``path`` by name, refuse a link or non-regular-file there,
+    then open it and confirm the descriptor produced is that same object.
+
+    Factored out of ``read_window`` so ``digest_read`` can determine a
+    file's live size from the exact descriptor it goes on to read, instead
+    of a separate, earlier ``os.stat`` by name whose result can go stale
+    (see ``digest_read``'s docstring). Returns the open descriptor (the
+    caller must close it) and the ``fstat`` taken immediately after open,
+    which is also this call's authoritative size/mtime.
+
+    ``O_NOFOLLOW`` alone is not the guarantee it looks like: it exists only
+    on POSIX, so ``getattr(os, "O_NOFOLLOW", 0)`` contributes nothing on
+    Windows and ``os.open`` there follows a symlink or reparse point placed
+    at ``path`` silently. Found by an adversarial review: an earlier
+    version of this function relied on ``O_NOFOLLOW`` alone and compared
+    only two ``fstat``s taken *after* the same open, which cannot see a
+    name that was already a link at the moment of that open. The fix is
+    the same two-step ``windows_privacy.read_private_file`` and
+    ``windows_delegation.read_brief`` already use for the identical
+    reason: ``lstat`` the name first and refuse a link there, then require
+    the descriptor ``open`` actually produces to be that same object
+    (``st_dev``/``st_ino``) before anything is read from it. A swap in the
+    narrow window between the ``lstat`` and the ``open`` is detected, not
+    prevented -- the same residual risk those two functions carry and
+    state, and the reason this comparison happens before any byte is read
+    rather than only afterward.
+    """
+    try:
+        examined = os.lstat(path)
+    except OSError as exc:
+        raise WindowReadError(f"path_unreadable:{type(exc).__name__}") from exc
+    if stat.S_ISLNK(examined.st_mode) or _reparse_tag(examined):
+        raise WindowReadError("path_is_a_link")
+    if not stat.S_ISREG(examined.st_mode):
+        raise WindowReadError("not_a_regular_file")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags)
@@ -523,27 +550,143 @@ def read_window(path: str, offset: int, length: int) -> tuple[str, int]:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise WindowReadError("not_a_regular_file")
+        if (before.st_dev, before.st_ino) != (examined.st_dev, examined.st_ino):
+            raise WindowReadError("path_changed_before_open")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, before
+
+
+def _read_exact(descriptor: int, offset: int, length: int) -> bytes:
+    """Read exactly ``length`` bytes at ``offset`` from an already-open,
+    already-verified descriptor, refusing a run that came up short.
+
+    A short read is not necessarily a shrink caught by the before/after
+    identity comparison in ``read_window``/``digest_read``: that comparison
+    only sees the file's size at the two moments it happens to look, so a
+    file that was already smaller than the caller assumed when ``length``
+    was chosen reads fewer bytes than asked without either ``fstat``
+    disagreeing. Silently returning the short result would hand the
+    receipt's ``window.bytes``/``sha256`` a different length than what was
+    actually read and hashed elsewhere never noticing. Found by an
+    adversarial review.
+    """
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining > 0:
+        chunk = os.read(descriptor, min(remaining, 65_536))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) != length:
+        raise WindowReadError("window_short_read")
+    return raw
+
+
+def _verify_unchanged(descriptor: int, before: "os.stat_result") -> None:
+    after = os.fstat(descriptor)
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise WindowReadError("file_changed_while_reading")
+
+
+_decode_error_local = threading.local()
+
+
+def _count_decode_errors(error: UnicodeError) -> "tuple[str, int]":
+    """A ``codecs`` error handler behaving exactly like ``"replace"`` (one
+    U+FFFD per ill-formed subpart, decoding resumes right after it), except
+    it also counts its own calls in a thread-local so the caller learns how
+    many *decode errors* occurred without re-deriving that from the output
+    text. Counting ``"\\ufffd"`` occurrences in the decoded text instead
+    conflates an actual decode failure with a file that legitimately
+    contains that character as content -- valid UTF-8 encodes U+FFFD like
+    any other code point, and such a file would over-report replacements
+    with no decode error having happened at all. Found by an adversarial
+    review.
+    """
+    _decode_error_local.count = getattr(_decode_error_local, "count", 0) + 1
+    return "�", error.end
+
+
+codecs.register_error("agent_bridge_local_first_replace", _count_decode_errors)
+
+
+def _decode_window(raw: bytes) -> tuple[str, int]:
+    _decode_error_local.count = 0
+    text = raw.decode("utf-8", errors="agent_bridge_local_first_replace")
+    return text, _decode_error_local.count
+
+
+def read_window(path: str, offset: int, length: int) -> tuple[str, int]:
+    """Read exactly ``length`` bytes at ``offset`` through one descriptor,
+    refusing a file that is not what it appeared to be or that changed
+    underneath the read.
+
+    Modelled on ``windows_privacy.read_private_file``'s shape (examine the
+    name, open once, ``fstat`` before and after, compare device/inode/
+    size/mtime, never reopen the name to get the bytes), without that
+    module's owner-only ACL check: a digest target is an ordinary
+    repository file the operator's policy already made eligible, not a
+    private credential or evidence record, so that check does not apply
+    here.
+
+    Returns the decoded text and how many replacement characters the UTF-8
+    decode inserted: a digest is not a patch, so a log carrying a few stray
+    non-UTF-8 bytes is tolerated and the count is carried in the receipt
+    rather than silently discarded or treated as fatal.
+    """
+    if offset < 0 or length <= 0:
+        raise WindowReadError("window_invalid")
+    descriptor, before = _open_verified(path)
+    try:
         if offset > before.st_size:
             raise WindowReadError("offset_beyond_end_of_file")
-        os.lseek(descriptor, offset, os.SEEK_SET)
-        chunks: list[bytes] = []
-        remaining = length
-        while remaining > 0:
-            chunk = os.read(descriptor, min(remaining, 65_536))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        after = os.fstat(descriptor)
-        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        if identity_before != identity_after:
-            raise WindowReadError("file_changed_while_reading")
+        raw = _read_exact(descriptor, offset, length)
+        _verify_unchanged(descriptor, before)
     finally:
         os.close(descriptor)
-    text = raw.decode("utf-8", errors="replace")
-    return text, text.count("�")
+    return _decode_window(raw)
+
+
+def digest_read(path: str, offset: "int | None", *,
+                max_window_bytes: int = MAX_WINDOW_BYTES) -> "tuple[str, int, int, int, int, int]":
+    """Determine a digest window from a file's live size and read exactly
+    that window, both through the one descriptor ``_open_verified`` binds,
+    so the size a caller uses to size the window can never be a different
+    file than the one whose bytes end up in the digest.
+
+    An earlier version of ``work_digest_file`` called ``os.stat`` on the
+    path by name to learn ``size``, computed ``(offset, length)`` from that,
+    and only afterward called ``read_window`` -- which independently
+    reopened the same name. Nothing bound those two operations to the same
+    object: a caller who could replace the file in that gap got a job
+    submitted with the *replacement*'s bytes while the receipt recorded the
+    *original*'s ``size``/``mtime_ns``, silently retiring a digest intent
+    the original file never actually satisfied. Found by an adversarial
+    review. This function closes that gap by using the one ``fstat`` also
+    used for the read's own before/after identity check as the size
+    ``digest_window`` computes from, rather than a second, separate stat.
+
+    Returns ``(text, decode_replacements, size, mtime_ns, computed_offset,
+    window_bytes)`` -- ``size``/``mtime_ns`` are this call's own, for a
+    caller that needs them for a receipt without a further stat of its own.
+    """
+    descriptor, before = _open_verified(path)
+    try:
+        computed_offset, window_bytes = digest_window(
+            before.st_size, offset=offset, max_window_bytes=max_window_bytes)
+        raw = _read_exact(descriptor, computed_offset, window_bytes)
+        _verify_unchanged(descriptor, before)
+    finally:
+        os.close(descriptor)
+    text, decode_replacements = _decode_window(raw)
+    return text, decode_replacements, before.st_size, before.st_mtime_ns, computed_offset, window_bytes
 
 
 # -------------------------------------------------------------------- templates

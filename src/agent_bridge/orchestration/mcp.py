@@ -28,6 +28,37 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
             "properties": properties, "required": required}
 
 
+def _under_any(path: str, roots: "tuple[str, ...]") -> bool:
+    """Whether ``path`` is, or is inside, any of ``roots``.
+
+    Module-level (not nested in ``build_tools``) so it can be exercised
+    directly, the same reason ``gate._under`` -- which this mirrors -- is
+    a standalone function rather than inlined at its one call site.
+
+    Both sides go through ``os.path.normcase``, matching ``gate._under``
+    and for the same reason its own docstring gives (finding 59 in
+    ``docs/REVIEW-HISTORY.md``): Windows paths are case-insensitive and
+    accept either separator, and ``os.path.realpath`` alone does not
+    normalise case for a path component that does not yet exist on disk (a
+    SQLite ``-wal``/``-shm`` sidecar in ``protected``, most plausibly, is
+    created on demand and often does not exist when this runs). Without
+    ``normcase`` a protected path named in a different case than the one
+    this call happens to produce would compare unequal and this refusal
+    would silently not fire. A no-op on POSIX. Found by an adversarial
+    review: an earlier version of this function resolved both sides with
+    ``realpath`` but omitted ``normcase``, repeating the exact gap
+    ``gate._under`` was already hardened against.
+    """
+    real = os.path.normcase(os.path.realpath(path))
+    for root in roots:
+        if not root:
+            continue
+        root_real = os.path.normcase(os.path.realpath(root))
+        if real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
 def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 intake: AutomaticIntake,
                 execution: ExecutionQueue | None = None,
@@ -118,16 +149,6 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "idempotency_key": {"type": "string", "maxLength": 256},
     }, ["path", "task_type"])
 
-    def _under_any(path: str, roots: "tuple[str, ...]") -> bool:
-        real = os.path.realpath(path)
-        for root in roots:
-            if not root:
-                continue
-            root_real = os.path.realpath(root)
-            if real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep):
-                return True
-        return False
-
     def digest_file(args: dict[str, Any]) -> dict[str, Any]:
         """Satisfy a digest intent, or run a digest on the assistant's own
         initiative for a file the operator's policy already makes eligible.
@@ -172,25 +193,35 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         if not localfirst.matches_any(real_path, repo_root, globs):
             return {"ok": False, "error": "digest_path_refused:no_glob_match"}
         try:
-            stat_result = os.stat(real_path)
-        except OSError as exc:
-            return {"ok": False, "error": f"digest_path_refused:{type(exc).__name__}"}
-        size, mtime_ns = stat_result.st_size, stat_result.st_mtime_ns
-        try:
-            computed_offset, window_bytes = localfirst.digest_window(size, offset=offset_arg)
-        except localfirst.WindowError as exc:
-            return {"ok": False, "error": f"digest_window_refused:{exc}"}
-        try:
             instruction = localfirst.render_instruction(
                 task_type, max_chars=policy.local_first.digest_max_output_chars, fields=fields)
         except localfirst.TemplateError as exc:
             return {"ok": False, "error": f"digest_task_refused:{exc}"}
+        # A single call determines the window from the file's live size and
+        # reads exactly that window through the one descriptor it opens --
+        # deliberately not a separate os.stat(real_path) followed by
+        # read_window(real_path, ...): that shape stats and reads the name
+        # twice, and a caller who can replace the file in between gets a
+        # receipt for the file it validated while the job actually carries
+        # the replacement's bytes (found by an adversarial review; see
+        # localfirst.digest_read's docstring).
         try:
-            text, decode_replacements = localfirst.read_window(real_path, computed_offset, window_bytes)
+            (text, decode_replacements, size, mtime_ns,
+             computed_offset, window_bytes) = localfirst.digest_read(real_path, offset_arg)
+        except localfirst.WindowError as exc:
+            return {"ok": False, "error": f"digest_window_refused:{exc}"}
         except localfirst.WindowReadError as exc:
             return {"ok": False, "error": f"digest_read_refused:{exc}"}
         window_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        idem = idempotency_key or f"digest:{caller}:{task_type}:{window_sha256}"
+        # instruction, not just task_type, so two extract calls on the same
+        # window with different field lists get different keys: task_type
+        # alone is "extract" either way, and window_sha256 is the same
+        # file content either way, so without this an operator asking for
+        # different fields the second time would silently get back the
+        # first call's job/receipt instead of a new extraction. Found by an
+        # adversarial review.
+        instruction_sha256 = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
+        idem = idempotency_key or f"digest:{caller}:{task_type}:{window_sha256}:{instruction_sha256}"
         try:
             intake_result = intake.route(
                 task_type=task_type, input=text, params={"instruction": instruction},
