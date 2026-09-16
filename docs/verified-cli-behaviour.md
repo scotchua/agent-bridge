@@ -341,3 +341,71 @@ workspace is empty and per-conversation, no user config or `.rules` are loaded,
 the environment is scrubbed of credentials, and the peer is instructed not to
 inspect the filesystem. An instruction is not a control. Treat it as one layer,
 not a boundary.
+
+## Phase 0 for the local-first read gate (docs/LOCAL-FIRST-DESIGN.md)
+
+Measured 2026-09-16 in a sandbox with no `codex` executable and no live
+Claude Code or Codex session available to drive. What follows is what was
+actually checked, and what remains unchecked and is stated as such rather
+than assumed quietly.
+
+**Confirmed from the installed CLI's own bundled types, not a live hook
+invocation.** `claude --version` here reports `2.1.273 (Claude Code)`, at
+`/opt/node22/bin/claude`. Its package ships
+`sdk-tools.d.ts`, a TypeScript declaration file enumerating every built-in
+tool's input shape. `FileReadInput` (the `Read` tool) is:
+
+```typescript
+export interface FileReadInput {
+  file_path: string;
+  offset?: number;   // line number to start reading from
+  limit?: number;    // number of lines
+  pages?: string;    // PDF page range, e.g. "1-5"
+}
+```
+
+This confirms the design's assumption (`file_path`, `offset`, `limit`) and
+adds `pages`, which the read gate records and otherwise ignores, the same
+treatment already given to `offset`/`limit`. It also confirms `Glob`'s and
+`Grep`'s own `path` field is a search root, not a whole file to read, which
+matters because `gate.PATH_FIELDS` already includes `"path"`: the read gate
+must key on the exact tool name `Read`, in its own set disjoint from
+`EDIT_TOOLS`/`SHELL_TOOLS`, never on the presence of a `path`-shaped field,
+or a `Glob` or `Grep` call would be misread as a whole-file read.
+
+**Not confirmed, and not built on:**
+
+* That a `PreToolUse` matcher actually fires for `tool_name: "Read"` inside a
+  live Claude Code session. The hooks guide's own matcher examples
+  (`Bash`, `Edit|Write`, `mcp__.*`) do not show `Read`, and nothing in this
+  sandbox can run a real interactive session to observe one. The existing
+  gate has the identical gap for `Edit`/`Write`/`Bash` today: every test in
+  this repository, including the end-to-end suite, drives the gate module
+  directly with a hand-built `PreToolUse` payload rather than through a live
+  host. The read gate inherits that same limit rather than closing it; see
+  "What was NOT proven" in `docs/audits/automatic-delegation-2026-09-15.md`.
+* Whether Codex exposes `PostToolUse` at all. No `codex` binary is present
+  to check. Phase 5 of the build plan (inline output measurement) is not
+  attempted until this is confirmed on a host that has Codex installed.
+* Whether Claude Desktop's own hook surface differs from the CLI's. Left
+  exactly as documented (`NOT_COVERED`): no evidence was found either way,
+  and the conservative default is to add nothing to that list without one.
+* From the Claude Code hooks guide, gathered by a research pass rather than
+  a live call and repeated here because it is what the design at
+  section 6, finding 23, is built against: `permissionDecision` accepts
+  `allow`, `deny`, `ask` and `defer`; `updatedInput` is documented for
+  `PreToolUse`; `PostToolUse` exists, fires after a tool call has already
+  succeeded, and cannot undo it. None of `ask`, `defer` or `updatedInput`
+  is used by this gate, on either host, so one receipt continues to mean
+  one thing regardless of which host is asking.
+
+**Baseline hook wall time, before any code in this build exists.** `Read` is
+not in any matcher today, so `gate.classify` returns `("other", [])` and the
+call is allowed, unlogged. Invoking the installed gate module 20 times with
+a synthetic `Read` `PreToolUse` payload measured a median of 86 ms per call
+(mean 86 ms, min 82 ms, max 93 ms) on this machine: interpreter start,
+argument parsing and one dictionary lookup, nothing else. The Phase 3 read
+gate adds a five-step fast path (repository lookup, policy read, glob match,
+one `stat`) before it can add a database read or a ledger write; that
+baseline is what its own timing is measured against, on this same machine,
+not asserted as a portable absolute across hosts.

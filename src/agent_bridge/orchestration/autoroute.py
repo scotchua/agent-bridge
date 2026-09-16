@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping
 
 #: Every route that exists. A paid API route is not absent by configuration,
 #: it is absent from the vocabulary.
@@ -85,6 +85,13 @@ class RepoPolicy:
     allowed_routes: tuple[str, ...] = ()
     #: Whether mechanical text work in this repository may go to a local model.
     mechanical_ok: bool = False
+    #: Glob patterns, matched against a POSIX-style path relative to this
+    #: repository's root, naming the mechanical artifacts (logs, captured test
+    #: output) a local digest may be compelled for before a cloud read. Empty
+    #: means the gate falls back to ``LocalFirstConfig.default_globs``; it is
+    #: not a second way to say "everything", so a narrow default stays narrow
+    #: unless the operator names their own patterns here.
+    mechanical_globs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.classification not in CLASSIFICATIONS:
@@ -92,6 +99,104 @@ class RepoPolicy:
         for route in self.allowed_routes:
             if route not in ROUTES:
                 raise PolicyError(f"unknown route {route!r}")
+
+
+#: Every key ``LocalFirstConfig`` recognises in the operator's document.
+#: Held as a frozenset so ``parse_policy`` can fail closed on an unknown one
+#: the same way it already does for the top level and for a repo entry.
+LOCAL_FIRST_KEYS = frozenset({
+    "enabled", "latency_budget_seconds", "read_gate_min_bytes",
+    "digest_max_output_chars", "calibration_max_age_days",
+    "digest_grace_seconds", "executor_liveness_seconds", "default_globs",
+})
+
+
+@dataclass(frozen=True)
+class LocalFirstConfig:
+    """The operator's local-first read-gate settings. See
+    ``docs/LOCAL-FIRST-DESIGN.md``. Every default here is documented in that
+    file's policy table, traced to an existing constant elsewhere in this
+    project rather than invented for this feature.
+    """
+
+    #: Off by default. Installing this feature must not start compelling
+    #: digests in a repository nobody has opted in, the same reasoning that
+    #: keeps a fresh routing policy's ``repos`` empty.
+    enabled: bool = False
+    #: Matched against a calibrated median for the smallest calibrated size at
+    #: or above the window being read. The direct local worker's own
+    #: per-request timeout (``local_worker.LocalWorkerServer.timeout_seconds``).
+    latency_budget_seconds: float = 30.0
+    #: A file at or above this size is a candidate for the read gate. Equal to
+    #: ``local_worker.MAX_OUTPUT_CHARS``: a file no larger than the largest
+    #: possible draft cannot be shortened by digesting it.
+    read_gate_min_bytes: int = 8_000
+    #: Half of ``read_gate_min_bytes``, so a digest is always materially
+    #: smaller than the smallest file that would have been gated.
+    digest_max_output_chars: int = 4_000
+    #: How long a calibration record is trusted before ``readiness`` reports
+    #: ``calibration_stale``. This project's existing retention default for
+    #: "old" (``DATA-RETENTION.md``'s 30-day cleanup window).
+    calibration_max_age_days: float = 30.0
+    #: How long a digest stays current when its file changes underneath it,
+    #: and how long a digest intent stays open before it is reported
+    #: ``declined`` rather than ``outstanding``. Equal to
+    #: ``autodecide.CLIENT_PRESENCE_SECONDS``, this codebase's existing
+    #: definition of "recent".
+    digest_grace_seconds: float = 900.0
+    #: How stale the local queue's own heartbeat file may be before
+    #: ``readiness`` reports ``executor_not_running``. Twelve times the
+    #: orchestration server's default 5-second service interval.
+    executor_liveness_seconds: float = 60.0
+    #: Used only when a repository entry names no ``mechanical_globs`` of its
+    #: own. Narrow by design: a repository opts a file shape in, not "every
+    #: large file".
+    default_globs: tuple[str, ...] = ("**/*.log", "**/logs/**")
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("latency_budget_seconds", self.latency_budget_seconds),
+            ("calibration_max_age_days", self.calibration_max_age_days),
+            ("digest_grace_seconds", self.digest_grace_seconds),
+            ("executor_liveness_seconds", self.executor_liveness_seconds),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise PolicyError(f"{name} must be a number above 0")
+        for name, value in (
+            ("read_gate_min_bytes", self.read_gate_min_bytes),
+            ("digest_max_output_chars", self.digest_max_output_chars),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise PolicyError(f"{name} must be a positive integer")
+        if not isinstance(self.enabled, bool):
+            raise PolicyError("local_first.enabled must be true or false")
+        if (not isinstance(self.default_globs, tuple)
+                or not self.default_globs
+                or any(not isinstance(glob, str) or not glob for glob in self.default_globs)):
+            raise PolicyError("local_first.default_globs must be a non-empty list of non-empty strings")
+
+
+def _parse_local_first(document: object) -> LocalFirstConfig:
+    """Build a ``LocalFirstConfig`` from the operator's ``local_first`` block.
+
+    Fail closed on shape, exactly like the rest of ``parse_policy``: an
+    operator who mistypes a key here must see a refusal, not a silently
+    ignored setting. An absent block parses as every default, which is
+    ``enabled: False`` and therefore inert.
+    """
+    if not isinstance(document, dict):
+        raise PolicyError("local_first must be an object")
+    unknown = set(document) - LOCAL_FIRST_KEYS
+    if unknown:
+        raise PolicyError("local_first has unknown keys: " + ", ".join(sorted(unknown)))
+    globs = document.get("default_globs", list(LocalFirstConfig.default_globs))
+    if not isinstance(globs, list) or any(not isinstance(glob, str) for glob in globs):
+        raise PolicyError("local_first.default_globs must be a list of strings")
+    kwargs: dict[str, Any] = {"default_globs": tuple(dict.fromkeys(globs))}
+    for key in LOCAL_FIRST_KEYS - {"default_globs"}:
+        if key in document:
+            kwargs[key] = document[key]
+    return LocalFirstConfig(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -129,6 +234,10 @@ class Policy:
     #: waiting for an observation to age out. An empty list means the only
     #: capacity evidence is a peer that has itself run the hook recently.
     declared_routes: tuple[str, ...] = ()
+    #: The local-first read-gate settings. Disabled by default, so an
+    #: existing policy file with no ``local_first`` block keeps behaving
+    #: exactly as it does today.
+    local_first: LocalFirstConfig = field(default_factory=LocalFirstConfig)
 
     def for_repo(self, repo: str) -> RepoPolicy:
         """The entry for ``repo``, matched on the real path, else the default."""
@@ -441,7 +550,8 @@ def parse_policy(document: object) -> Policy:
             raise PolicyError(f"routing policy repo key {repo!r} must be an absolute path")
         if not isinstance(entry, dict):
             raise PolicyError(f"routing policy entry for {repo!r} must be an object")
-        unknown = set(entry) - {"classification", "allowed_routes", "mechanical_ok"}
+        unknown = set(entry) - {"classification", "allowed_routes", "mechanical_ok",
+                                "mechanical_globs"}
         if unknown:
             raise PolicyError(f"routing policy entry for {repo!r} has unknown keys: "
                               + ", ".join(sorted(unknown)))
@@ -451,10 +561,14 @@ def parse_policy(document: object) -> Policy:
         mechanical = entry.get("mechanical_ok", False)
         if not isinstance(mechanical, bool):
             raise PolicyError(f"mechanical_ok for {repo!r} must be true or false")
+        globs = entry.get("mechanical_globs", [])
+        if not isinstance(globs, list) or any(not isinstance(g, str) or not g for g in globs):
+            raise PolicyError(f"mechanical_globs for {repo!r} must be a list of non-empty strings")
         repos[os.path.realpath(repo)] = RepoPolicy(
             classification=entry.get("classification", "unclassified"),
             allowed_routes=tuple(dict.fromkeys(routes)),
-            mechanical_ok=mechanical)
+            mechanical_ok=mechanical,
+            mechanical_globs=tuple(dict.fromkeys(globs)))
     ceiling = document.get("max_local_load_ratio", DEFAULT_MAX_LOCAL_LOAD)
     if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 64:
         raise PolicyError("max_local_load_ratio must be a number above 0 and at most 64")
@@ -474,14 +588,16 @@ def parse_policy(document: object) -> Policy:
     unknown_top = {key for key in document
                    if not key.startswith("_")} - {"version", "repos",
                                                   "max_local_load_ratio", "prefer",
-                                                  "declared_available"}
+                                                  "declared_available", "local_first"}
     if unknown_top:
         raise PolicyError("routing policy has unknown keys: "
                           + ", ".join(sorted(unknown_top)))
+    local_first = _parse_local_first(document.get("local_first", {}))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
                   peer_classifications=PEER_CLASSIFICATIONS,
                   max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
-                  declared_routes=tuple(dict.fromkeys(declared)))
+                  declared_routes=tuple(dict.fromkeys(declared)),
+                  local_first=local_first)
 
 
 def load_policy(state_root: str) -> Policy:

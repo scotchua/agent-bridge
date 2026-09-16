@@ -129,6 +129,25 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])(?i:Remove-Item|Set-Content|Add-Content|Clear-Content|New-Item|"
     r"Copy-Item|Move-Item|Rename-Item|Out-File|Set-ItemProperty|New-ItemProperty|"
     r"Remove-ItemProperty|Set-Acl|Start-Process)(\s|$)",
+    # The bridge's own state-changing launchers. Their boundary set is widened
+    # with a path separator, forward and back, because all three are almost
+    # always invoked by their documented ``bin/`` relative path
+    # (``./bin/agent-bridge-gate-hook install``), which the boundary set every
+    # other pattern here uses does not recognise as a command start: the
+    # character right before the name is ``/``, not whitespace or a shell
+    # operator. ``agent-bridge-orchestration-verify`` makes real provider
+    # calls or, with the local-first read gate, measures this machine's own
+    # latency for the calibration record the gate then trusts; blocked
+    # outright regardless of subcommand, the same posture the README already
+    # asks a human to take toward live verification. ``gate-hook install``
+    # and ``onboard apply`` change the gate's own installation and are
+    # refused by the protected-path rule the moment they name the
+    # orchestration config, which both require as an argument; only their
+    # write-shape is added here; ``gate-hook report``/``audit`` are read-only
+    # and stay unmatched.
+    r"(^|[\s;&|('\"/\\])agent-bridge-orchestration-verify(\.cmd)?(\s|$)",
+    r"(^|[\s;&|('\"/\\])agent-bridge-gate-hook(\.cmd)?\b[^;&|]*\binstall\b",
+    r"(^|[\s;&|('\"/\\])(setup_bridge\.py|agent-bridge-setup(\.cmd)?)\b[^;&|]*\bonboard\s+apply\b",
 ))
 #: Formatters that write unless asked only to report.
 _FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")
@@ -413,18 +432,36 @@ _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 
 
 def protected_paths(state_root: str, config_path: str | None, home: str,
-                    capacity_db: str | None = None) -> tuple[str, ...]:
+                    capacity_db: str | None = None,
+                    local_queue_root: str | None = None) -> tuple[str, ...]:
     """The gate's own state, the stage router's database (with its SQLite
     sidecars), and the files that install or disable the hook. An editing
     tool aimed under any of these is refused whatever repository they are
     in, so a client cannot write itself a receipt, replace the database the
-    live check trusts, or unhook itself with a covered tool."""
+    live check trusts, or unhook itself with a covered tool.
+
+    ``local_queue_root``, when given, adds the local queue's own database
+    (``localq.sqlite3``), the automatic intake's routing database
+    (``routing.sqlite3``), and the service heartbeat (``runtime-state.json``)
+    the read gate's readiness check trusts. Named as specific files, exactly
+    as ``capacity_db`` is, not the whole directory: a client that could
+    forge or age the heartbeat could force ``local_first``'s readiness check
+    to waive on demand and read a gated file without ever digesting it,
+    which is the mirror image of the escape a forged capacity row would
+    have been for the write gate.
+    """
     paths = [state_root]
     if config_path:
         paths.append(config_path)
     if capacity_db:
         paths.append(capacity_db)
         paths.extend(capacity_db + suffix for suffix in _SQLITE_SIDECARS)
+    if local_queue_root:
+        for name in ("localq.sqlite3", "routing.sqlite3"):
+            full = os.path.join(local_queue_root, name)
+            paths.append(full)
+            paths.extend(full + suffix for suffix in _SQLITE_SIDECARS)
+        paths.append(os.path.join(local_queue_root, "runtime-state.json"))
     paths.extend(install_paths(home).values())
     return tuple(sorted({os.path.realpath(path) for path in paths}))
 
@@ -994,14 +1031,23 @@ def state_root_from_config(config_path: str) -> str:
     return gate_paths_from_config(config_path)[0]
 
 
-def gate_paths_from_config(config_path: str) -> tuple[str, str]:
-    """``(state_root, capacity_db)`` from the private orchestration config."""
+def gate_paths_from_config(config_path: str) -> tuple[str, str, str]:
+    """``(state_root, capacity_db, local_queue_root)`` from the private
+    orchestration configuration. ``local_queue_root`` defaults to
+    ``<state_root>/local-queue`` when the config omits it, matching
+    ``config/orchestration.example.json``, so an existing config written
+    before the local-first read gate existed keeps working."""
     loaded = store.read_json(config_path)
     if not isinstance(loaded, dict) or not isinstance(loaded.get("state_root"), str):
         raise ValueError("orchestration config has no state_root")
     if not isinstance(loaded.get("capacity_db"), str):
         raise ValueError("orchestration config has no capacity_db")
-    return loaded["state_root"], loaded["capacity_db"]
+    local_queue_root = loaded.get("local_queue_root")
+    if local_queue_root is None:
+        local_queue_root = os.path.join(loaded["state_root"], "local-queue")
+    elif not isinstance(local_queue_root, str):
+        raise ValueError("orchestration config local_queue_root must be a string")
+    return loaded["state_root"], loaded["capacity_db"], local_queue_root
 
 
 def _hook_input() -> str:
@@ -1530,10 +1576,13 @@ def main(argv: list[str] | None = None) -> int:
         if not args.client:
             raise ValueError("--client is required in hook mode")
         if args.state_root:
-            state_root, capacity_db = args.state_root, os.path.join(args.state_root, "capacity.sqlite3")
+            state_root = args.state_root
+            capacity_db = os.path.join(args.state_root, "capacity.sqlite3")
+            local_queue_root = os.path.join(args.state_root, "local-queue")
         else:
-            state_root, capacity_db = gate_paths_from_config(args.config or "")
-        protected = protected_paths(state_root, args.config, home, capacity_db)
+            state_root, capacity_db, local_queue_root = gate_paths_from_config(args.config or "")
+        protected = protected_paths(state_root, args.config, home, capacity_db,
+                                    local_queue_root)
         payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")

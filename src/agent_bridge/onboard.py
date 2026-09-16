@@ -1200,16 +1200,24 @@ def _routing_policy_scaffold() -> bytes:
             "is the only standing statement of availability; no assistant "
             "can make one. A route left out is dispatched to only while it "
             "has itself run the gate hook in the last fifteen minutes.",
+            "local_first: off by default. Turning it on is your decision, "
+            "not something an installer does for you. It also needs "
+            "\"local\" under declared_available above, and a run of "
+            "'agent-bridge-orchestration-verify calibrate' so the gate has "
+            "a measured latency for this machine to compel against. See "
+            "docs/LOCAL-FIRST-DESIGN.md.",
         ],
         "prefer": [],
         "declared_available": [],
         "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
+        "local_first": {"enabled": False},
         "repos": {},
         "_example": {
             "/absolute/path/to/a/repository": {
                 "classification": "internal_nonclient",
                 "allowed_routes": ["claude", "codex"],
                 "mechanical_ok": False,
+                "mechanical_globs": ["**/*.log", "test-output/**"],
             }
         },
     }

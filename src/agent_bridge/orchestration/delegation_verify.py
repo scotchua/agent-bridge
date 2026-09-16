@@ -8,13 +8,26 @@ client-derived/confidential input. It requires this machine's own signed-in
 provider CLIs and a supported platform for the execution harnesses, so it
 cannot be exercised from an offline test; ``delegation.validate_evidence``
 is what an offline test checks against a fixed, synthetic result document.
+
+The ``calibrate`` subcommand is a separate live check for the local-first
+read gate (``docs/LOCAL-FIRST-DESIGN.md``): it measures the configured local
+model's own latency at three window sizes on this machine and writes the
+record ``readiness()`` reads. It shares this module's isolation discipline
+(a disposable queue root, never the operator's real one) but nothing else:
+it makes no provider calls, and it refuses outright rather than measuring a
+machine that is busy or throttled, because a number measured under load is
+not a number the gate should trust.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import platform
 import shutil
+import sqlite3
+import statistics
 import stat
 import subprocess
 import sys
@@ -24,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import setup_cmd, store
-from . import delegation
+from . import autoroute, delegation, localfirst
 from .config import load as load_orchestration_config
 from .execution_queue import (
     ExecutionAdmissionError,
@@ -232,6 +245,157 @@ def _local_model_check_in(cfg: Any, service: Any) -> dict[str, Any]:
     return {"status": "complete", "source_classification": "synthetic"}
 
 
+#: A fixed, deterministic ASCII line so the synthetic input is exactly the
+#: requested byte length: every character is one UTF-8 byte, so slicing the
+#: repeated string to ``length`` characters is slicing it to ``length``
+#: bytes. No real or invented user content, matching every other synthetic
+#: fixture in this module.
+_CALIBRATION_LINE = ("Synthetic calibration line for the agent-bridge "
+                    "local-first read gate's digest timing measurement. ")
+
+
+def _synthetic_calibration_input(byte_length: int) -> str:
+    repeated = _CALIBRATION_LINE * (byte_length // len(_CALIBRATION_LINE) + 1)
+    return repeated[:byte_length]
+
+
+def _production_queue_busy(local_queue_root: Any) -> bool:
+    """Whether the operator's real local queue currently shows a running job.
+
+    Read-only, and never creates the database: a queue that has never run a
+    job is not busy. Calibration must not compete with a real job for the
+    same physical model, so this is checked against the *configured*
+    ``local_queue_root`` before anything is submitted to the disposable
+    queue calibration actually measures against.
+    """
+    database = os.path.join(str(local_queue_root), "localq.sqlite3")
+    if not os.path.isfile(database):
+        return False
+    uri = ("file:" + os.path.realpath(database).replace("%", "%25")
+          .replace("?", "%3F").replace("#", "%23") + "?mode=ro")
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return False
+    try:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()
+        return bool(row and row[0])
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+
+
+def calibrate(config_path: str, *, clock: Any = time.time,
+              sampler: Any = None) -> dict[str, Any]:
+    """Measure the configured local model's latency at three window sizes.
+
+    Refuses rather than measuring, in order: the production queue showing a
+    job in flight right now (``calibration_refused:executor_busy``); no
+    usable worker configured (``calibration_refused:worker_not_configured``);
+    and this machine's own resource sample not admitting interactive work
+    (``calibration_refused:resource_<reason>``). Only past all three does it
+    submit anything, and everything it submits goes to a queue root created
+    and destroyed inside this call, never the configured one.
+
+    ``sampler`` is the same seam ``localq.service.Service`` already exposes,
+    threaded through rather than re-invented: omitted (the CLI never passes
+    one), this measures with the real ``MacSampler``, exactly what
+    production does. A test supplies a portable stand-in so the happy path
+    is exercised on every CI platform, not only macOS, the same reasoning
+    ``tests/test_automatic_delegation_e2e.py`` already applies to the local
+    lane's own end-to-end coverage.
+    """
+    cfg = load_orchestration_config(config_path)
+    if _production_queue_busy(cfg.local_queue_root):
+        return {"ok": False, "error": "calibration_refused:executor_busy"}
+
+    worker = Path(cfg.worker_executable)
+    if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
+        return {"ok": False, "error": "calibration_refused:worker_not_configured"}
+
+    from ..localq.service import Service  # deferred: only needed on this path
+
+    queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-calibrate-"))
+    try:
+        service = Service(str(queue_root), str(cfg.worker_executable), str(cfg.worker_state),
+                          sampler=sampler)
+        resource = service.queue.state_report().get("resource", {})
+        verdict = resource.get("verdict")
+        if isinstance(verdict, dict):
+            admissible = verdict.get("interactive") == "admissible"
+            detail = "interactive_not_admissible"
+        else:
+            admissible = False
+            detail = resource.get("reason", "unavailable") if isinstance(resource, dict) else "unavailable"
+        if not admissible:
+            return {"ok": False, "error": f"calibration_refused:resource_{detail}"}
+
+        sizes: dict[str, Any] = {}
+        for size in localfirst.CALIBRATION_SIZES:
+            text = _synthetic_calibration_input(size)
+            runs_s: list[float] = []
+            outcomes: list[str] = []
+            for run_index in range(localfirst.CALIBRATION_RUNS_PER_SIZE):
+                submitted = service.queue.submit(
+                    task_type="summarize", input=text,
+                    # ``calibration_run`` makes each run's payload distinct.
+                    # LocalQueue.submit deduplicates on a content hash of the
+                    # *whole* payload in addition to the idempotency key
+                    # (``WHERE idem_key=? OR content_key=?``), so three runs
+                    # with identical input and params collapse onto the
+                    # first job regardless of how unique idempotency_key is:
+                    # measured directly, all three runs came back reporting
+                    # the first run's own outcome. This field's only job is
+                    # to make the content differ; nothing reads its value.
+                    params={"instruction": "Summarize in one sentence.", "provider": "qwen",
+                           "calibration_run": run_index},
+                    priority="interactive", classification="synthetic", caller="codex",
+                    purpose="test",
+                    idempotency_key=f"calibrate-{size}-{run_index}-{int(clock() * 1000)}")
+                job_id = submitted["job_id"]
+                started = clock()
+                for _ in range(MAX_DRAIN_ATTEMPTS):
+                    if service.queue.status(job_id)["status"] in ("complete", "failed"):
+                        break
+                    service.once()
+                elapsed = clock() - started
+                outcome = service.queue.result(job_id)
+                status = outcome.get("status", "failed")
+                outcomes.append("complete" if status == "complete" else "failed")
+                runs_s.append(elapsed)
+            eligible = [seconds for seconds, outcome in zip(runs_s, outcomes)
+                       if outcome == "complete"]
+            # A run that never reached ``complete`` makes the whole tier
+            # ineligible: a median over a failure is not a latency, and
+            # ``readiness`` refuses to trust a size unless every one of its
+            # measured runs actually finished (see ``_covering_calibration``).
+            sizes[str(size)] = {
+                "runs_s": runs_s, "outcomes": outcomes,
+                "median_s": statistics.median(eligible) if len(eligible) == len(runs_s) else None,
+                "max_s": max(eligible) if len(eligible) == len(runs_s) else None,
+            }
+
+        host = {"platform": platform.system(), "cpu_count": os.cpu_count(),
+               "python_version": platform.python_version()}
+        record = localfirst.build_calibration_record(
+            worker_executable=str(cfg.worker_executable), sizes=sizes,
+            sampler_snapshot=resource, host=host, clock=clock)
+        localfirst.write_calibration_record(str(cfg.state_root), record)
+    finally:
+        shutil.rmtree(queue_root, ignore_errors=True)
+
+    try:
+        budget = autoroute.load_policy(str(cfg.state_root)).local_first.latency_budget_seconds
+    except autoroute.PolicyError:
+        budget = autoroute.LocalFirstConfig().latency_budget_seconds
+    fits_budget = {size: (entry["median_s"] is not None and entry["median_s"] <= budget)
+                  for size, entry in sizes.items()}
+    return {"ok": True, "record": record, "latency_budget_seconds": budget,
+            "fits_budget": fits_budget}
+
+
 def run(config_path: str, *, callers: tuple[str, ...]) -> dict[str, Any]:
     cfg = load_orchestration_config(config_path)
     cfg_doc = store.read_json(config_path)
@@ -269,12 +433,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Live synthetic verification for the automatic-delegation opt-in. "
                     "Never applies, commits, pushes, or merges.")
-    parser.add_argument("--config", required=True, help="Private orchestration config path.")
-    parser.add_argument("--callers", required=True,
+    # Kept directly on the main parser, and not required here, so the
+    # documented invocation (INSTALL.md: no subcommand, --config/--callers/
+    # --out) keeps working unchanged. The default branch below enforces that
+    # all three are present exactly as ``required=True`` used to.
+    parser.add_argument("--config", help="Private orchestration config path.")
+    parser.add_argument("--callers",
                         help="Comma-separated subset of codex,claude naming which side is verified.")
-    parser.add_argument("--out", required=True, help="Durable path for the result artifact.")
+    parser.add_argument("--out", help="Durable path for the result artifact.")
+    sub = parser.add_subparsers(dest="command")
+    calibrate_parser = sub.add_parser(
+        "calibrate",
+        help="Measure the configured local model's latency for the local-first read gate. "
+             "Writes <state_root>/local/calibration.json. Makes no provider calls.")
+    calibrate_parser.add_argument("--config", required=True,
+                                  help="Private orchestration config path.")
     args = parser.parse_args(argv)
     store.set_umask()
+
+    if args.command == "calibrate":
+        try:
+            result = calibrate(args.config)
+        except Exception as exc:  # noqa: BLE001 - always leave a durable, honest record
+            print(f"calibration failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 1
+
+    if not args.config or not args.callers or not args.out:
+        parser.error("--config, --callers and --out are required")
     callers = tuple(sorted({part.strip() for part in args.callers.split(",") if part.strip()}))
     if not callers or any(c not in ("codex", "claude") for c in callers):
         parser.error("--callers must name codex, claude, or both")
