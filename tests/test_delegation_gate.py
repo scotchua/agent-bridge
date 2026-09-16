@@ -16,9 +16,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from agent_bridge import store  # noqa: E402
 from agent_bridge.capacity_router import CapacityObservation, RoutingError, StageRouter  # noqa: E402
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot  # noqa: E402
-from agent_bridge.orchestration import gate  # noqa: E402
+from agent_bridge.orchestration import autoroute, gate, localfirst  # noqa: E402
 from agent_bridge.orchestration.server import Server  # noqa: E402
 
 
@@ -165,7 +166,10 @@ class ClassificationTests(GateCase):
         self.assertEqual(paths, [absolute])
         kind, paths = gate.classify("claude", "NotebookEdit", {"notebook_path": "n.ipynb"}, cwd)
         self.assertEqual(paths, [os.path.join(cwd, "n.ipynb")])
-        self.assertEqual(gate.classify("claude", "Read", {"file_path": "x"}, cwd), ("other", []))
+        # Read is not an edit tool: it is the read gate's own kind (see
+        # ReadClassificationTests), never classified as an implementation write.
+        kind, paths = gate.classify("claude", "Read", {"file_path": "x"}, cwd)
+        self.assertEqual(kind, "read")
 
     def test_codex_apply_patch_names_every_file_in_the_patch(self):
         patch = ("*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n"
@@ -1410,6 +1414,517 @@ class TheTrustStateKeyMatchesCodexsOwnCodexHomeResolution(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.link_dir)}):
             self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
                              "needs_review")
+
+
+# ---------------------------------------------------------------- read gate
+
+
+class ReadClassificationTests(unittest.TestCase):
+    """classify's fourth kind (design section 2.1). Claude's Read tool is
+    matched by name, deterministically; Codex has no such tool, so its
+    whole-file readers (cat, type, Get-Content, more, less, bat) are
+    recognised from the shell command text instead, scoped to Codex only --
+    Claude's Bash tool is judged exactly as it was before this phase."""
+
+    def setUp(self):
+        self.cwd = os.path.abspath(os.sep + "w")
+
+    def test_claude_read_tool_is_classified_as_a_read(self):
+        kind, paths = gate.classify("claude", "Read", {"file_path": "a.log"}, self.cwd)
+        self.assertEqual((kind, paths), ("read", [os.path.join(self.cwd, "a.log")]))
+
+    def test_claude_read_with_an_absolute_path_is_unchanged(self):
+        absolute = os.path.abspath(os.sep + "abs" + os.sep + "a.log")
+        kind, paths = gate.classify("claude", "Read", {"file_path": absolute}, self.cwd)
+        self.assertEqual((kind, paths), ("read", [absolute]))
+
+    def test_claude_read_offset_and_limit_do_not_change_the_classification(self):
+        kind, paths = gate.classify(
+            "claude", "Read", {"file_path": "a.log", "offset": 100, "limit": 20}, self.cwd)
+        self.assertEqual((kind, paths), ("read", [os.path.join(self.cwd, "a.log")]))
+
+    def test_codex_cat_is_classified_as_a_read(self):
+        kind, paths = gate.classify("codex", "Bash", {"command": "cat a.log b.log"}, self.cwd)
+        self.assertEqual(kind, "read")
+        self.assertEqual(paths, [os.path.join(self.cwd, "a.log"), os.path.join(self.cwd, "b.log")])
+
+    def test_codex_windows_whole_file_readers_are_classified_as_reads(self):
+        for command in ("type a.log", "Get-Content a.log", "more a.log", "less a.log", "bat a.log"):
+            with self.subTest(command=command):
+                kind, _ = gate.classify("codex", "Bash", {"command": command}, self.cwd)
+                self.assertEqual(kind, "read")
+
+    def test_codex_get_content_with_tail_or_totalcount_is_a_bounded_read(self):
+        """A caller-scoped exception matching design section 2.1's own
+        example ("Get-Content without -TotalCount or -Tail")."""
+        for command in ("Get-Content a.log -Tail 5", "Get-Content a.log -TotalCount 10"):
+            with self.subTest(command=command):
+                kind, _ = gate.classify("codex", "Bash", {"command": command}, self.cwd)
+                self.assertEqual(kind, "shell_read")
+
+    def test_codex_head_tail_sed_grep_rg_are_exact_reads_not_gated(self):
+        for command in ("head -n 40 a.log", "tail -n 40 a.log", "sed -n 1,5p a.log",
+                        "grep ERROR a.log", "rg ERROR a.log"):
+            with self.subTest(command=command):
+                kind, _ = gate.classify("codex", "Bash", {"command": command}, self.cwd)
+                self.assertEqual(kind, "shell_read")
+
+    def test_claude_bash_cat_is_not_classified_as_a_read(self):
+        """The whole-file-read heuristic is Codex-only (design section 2.1):
+        Claude's own read gate is its Read tool, matched by name."""
+        kind, _ = gate.classify("claude", "Bash", {"command": "cat a.log"}, self.cwd)
+        self.assertEqual(kind, "shell_read")
+
+    def test_a_write_shaped_command_is_classified_as_a_write_not_a_read(self):
+        """shell_writes wins first: cat piped into a file still writes."""
+        kind, _ = gate.classify("codex", "Bash", {"command": "cat a.log > b.log"}, self.cwd)
+        self.assertEqual(kind, "shell")
+
+
+class ReadGateCase(unittest.TestCase):
+    """_judge_read_path/judge_read (design section 2.1, steps 3-9; step 1-2
+    are the fast-path repo/enabled checks judge_read itself makes). In-process
+    rather than through the installed launcher: several fixtures here (a
+    corrupt calibration record, an aged heartbeat, a mocked load probe) are
+    most reliably produced by writing the exact file or patching the exact
+    seam, which a subprocess boundary would only obscure. The full loop
+    through a real digest and a real installed hook is
+    test_automatic_delegation_e2e.py's ReadGate class."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        (self.state / "routing").mkdir(parents=True)
+        os.chmod(self.state, 0o700)
+        self.repo = self.base / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.local_root = self.base / "local-queue"
+        self.local_root.mkdir()
+        self.worker = self.base / "worker"
+        self.worker.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        os.chmod(self.worker, 0o755)
+        self.now = 2_000_000.0
+        self.clock = lambda: self.now
+
+    # ---------------------------------------------------------------- fixtures
+
+    def write_policy(self, *, globs=("**/*.log",), enabled=True,
+                     classification="internal_nonclient", mechanical_ok=True,
+                     read_gate_min_bytes=None, digest_grace_seconds=None,
+                     latency_budget_seconds=None, declared=("local",)):
+        entry = {"classification": classification, "allowed_routes": ["claude", "codex"],
+                "mechanical_ok": mechanical_ok, "mechanical_globs": list(globs)}
+        local_first = {"enabled": enabled}
+        for key, value in (("read_gate_min_bytes", read_gate_min_bytes),
+                          ("digest_grace_seconds", digest_grace_seconds),
+                          ("latency_budget_seconds", latency_budget_seconds)):
+            if value is not None:
+                local_first[key] = value
+        document = {"version": 1, "declared_available": list(declared), "local_first": local_first,
+                   "repos": {str(self.repo): entry}}
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def write_calibration(self, *, sha=None, created_at=None, sizes=None):
+        sha = sha if sha is not None else store.sha256_file(str(self.worker))
+        created_at = created_at if created_at is not None else self.now
+        sizes = sizes if sizes is not None else {
+            "16000": {"median_s": 2.0, "outcomes": ["complete"] * 3},
+        }
+        store.atomic_write_json(localfirst.calibration_path(str(self.state)), {
+            "version": 1, "created_at": created_at, "worker_sha256": sha, "sizes": sizes})
+
+    def write_heartbeat(self, *, updated_at=None, verdict="admissible"):
+        updated_at = updated_at if updated_at is not None else self.now
+        if verdict == "admissible":
+            resource = {"verdict": {"interactive": "admissible", "bulk": "deferred"}}
+        else:
+            resource = {"verdict": {"interactive": "deferred", "bulk": "deferred"}}
+        store.atomic_write_json(localfirst.heartbeat_path(str(self.local_root)), {
+            "version": 1, "updated_at": updated_at, "queue": {"resource": resource}})
+
+    def make_ready(self):
+        """Every readiness() condition passing: the ordinary case."""
+        self.write_calibration()
+        self.write_heartbeat()
+
+    def write_log(self, name="app.log", *, size=8_500):
+        target = self.repo / name
+        target.write_text("x" * size, encoding="utf-8")
+        return target
+
+    def submit_job(self, *, status="queued", error=None):
+        queue = LocalQueue(str(self.local_root), sampler=Sampler(), backend=FakeBackend(), clock=self.clock)
+        result = queue.submit(task_type="log_triage", input="x" * 100,
+                              params={"instruction": "i"}, priority="interactive",
+                              classification="internal_nonclient", caller="codex", purpose="work")
+        job_id = result["job_id"]
+        if status != "queued" or error is not None:
+            with sqlite3.connect(str(self.local_root / "localq.sqlite3")) as db:
+                db.execute("UPDATE jobs SET status=?, error=? WHERE job_id=?",
+                          (status, error, job_id))
+                db.commit()
+        return job_id
+
+    def write_receipt(self, target, *, job_id="job-1", created_at=None):
+        info = os.stat(target)
+        return localfirst.write_digest_receipt(
+            str(self.state), path=str(target), repo=str(self.repo), size=info.st_size,
+            mtime_ns=info.st_mtime_ns, offset=0, window_bytes=info.st_size,
+            window_sha256="deadbeef", decode_replacements=0, task_type="log_triage",
+            classification="internal_nonclient", caller="codex", job_id=job_id,
+            intake_receipt_id="r1", clock=created_at or self.clock)
+
+    def read(self, client, path, *, cwd=None, command=None):
+        cwd = cwd or str(self.repo)
+        if client == "claude":
+            tool_name, tool_input = "Read", {"file_path": str(path)}
+        else:
+            tool_name, tool_input = "Bash", {"command": command or f"cat {path}"}
+        return gate.judge(client, tool_name, tool_input, cwd, state_root=str(self.state),
+                          clock=self.clock, local_queue_root=str(self.local_root),
+                          worker_executable=str(self.worker))
+
+
+class ReadGateFastPathTests(ReadGateCase):
+    """Steps 1-5: allowed with nothing logged. No calibration or heartbeat
+    fixture is written for these -- the fast path must never need them."""
+
+    def test_outside_any_repository_is_allowed_and_unlogged(self):
+        outside = self.base / "outside.log"
+        outside.write_text("x" * 8_500, encoding="utf-8")
+        self.write_policy()
+        decision = self.read("claude", outside, cwd=str(self.base))
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_local_first_disabled_allows_a_matching_large_file(self):
+        self.write_policy(enabled=False)
+        target = self.write_log()
+        decision = self.read("claude", target)
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_a_repository_without_mechanical_ok_allows_a_matching_large_file(self):
+        self.write_policy(mechanical_ok=False)
+        target = self.write_log()
+        decision = self.read("claude", target)
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_a_non_matching_extension_is_allowed_even_when_large(self):
+        self.write_policy(globs=("**/*.log",))
+        target = self.repo / "app.py"
+        target.write_text("x" * 8_500, encoding="utf-8")
+        decision = self.read("claude", target)
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_a_file_under_the_size_threshold_is_allowed(self):
+        self.write_policy()
+        target = self.write_log(size=100)
+        decision = self.read("codex", target)
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_a_protected_or_state_path_is_never_gated(self):
+        """A digest could never satisfy an intent for the gate's own state
+        (work_digest_file refuses it by the same rule): compelling one here
+        would be a deny nothing could ever answer."""
+        (self.state / ".git").mkdir(parents=True, exist_ok=True)
+        self.write_policy(globs=("**/*",))
+        target = self.state / "routing" / "leak.log"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x" * 8_500, encoding="utf-8")
+        decision = self.read("claude", target, cwd=str(self.state))
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+
+class ReadGateReadinessWaiverTests(ReadGateCase):
+    """Step 6: every readiness() reason waives rather than blocks (design
+    section 2.1); each is its own fixture, matching Phase 1's own
+    ReadinessTests style."""
+
+    def assert_waived(self, decision, code):
+        self.assertTrue(decision.allowed, decision)
+        self.assertTrue(decision.logged)
+        self.assertEqual(decision.code, "local_first_waived")
+        self.assertEqual(decision.extra.get("waiver_reason"), code)
+        self.assertEqual(decision.extra.get("bytes_estimate"), 8_500)
+
+    def test_waived_when_calibration_is_missing(self):
+        self.write_policy()
+        self.write_heartbeat()
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "calibration_missing")
+
+    def test_waived_when_calibration_is_stale(self):
+        self.write_policy()
+        self.write_calibration(created_at=self.now - 40 * 86400)
+        self.write_heartbeat()
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "calibration_stale")
+
+    def test_waived_when_the_worker_no_longer_matches_the_calibration(self):
+        self.write_policy()
+        self.write_calibration(sha="not-the-real-hash")
+        self.write_heartbeat()
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "calibration_worker_changed")
+
+    def test_waived_when_the_heartbeat_is_missing(self):
+        self.write_policy()
+        self.write_calibration()
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "executor_not_running")
+
+    def test_waived_when_the_heartbeat_is_aged(self):
+        self.write_policy()
+        self.write_calibration()
+        self.write_heartbeat(updated_at=self.now - 120)
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "executor_not_running")
+
+    def test_waived_when_the_heartbeat_carries_a_deferred_verdict(self):
+        self.write_policy()
+        self.write_calibration()
+        self.write_heartbeat(verdict="deferred")
+        target = self.write_log()
+        self.assert_waived(self.read("claude", target), "resource_deferred")
+
+    def test_waived_when_load_is_unknown(self):
+        self.write_policy()
+        self.make_ready()
+        target = self.write_log()
+        with mock.patch("agent_bridge.orchestration.autoroute.probe_load",
+                        return_value=autoroute.Load(known=False)):
+            self.assert_waived(self.read("claude", target), "load_unknown")
+
+    def test_waived_when_load_is_high(self):
+        self.write_policy()
+        self.make_ready()
+        target = self.write_log()
+        with mock.patch("agent_bridge.orchestration.autoroute.probe_load",
+                        return_value=autoroute.Load(ratio=5.0, known=True)):
+            self.assert_waived(self.read("claude", target), "load_high")
+
+    def test_waived_when_over_the_latency_budget(self):
+        self.write_policy(latency_budget_seconds=1.0)
+        self.write_calibration(sizes={"16000": {"median_s": 30.0, "outcomes": ["complete"] * 3}})
+        self.write_heartbeat()
+        target = self.write_log()
+        with mock.patch("agent_bridge.orchestration.autoroute.probe_load",
+                        return_value=autoroute.Load(ratio=0.1, known=True)):
+            self.assert_waived(self.read("claude", target), "over_latency_budget")
+
+
+class ReadGateReceiptTests(ReadGateCase):
+    """Steps 7-9: a digest receipt's job status, the grace window, and
+    writing a fresh intent."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_policy()
+        self.make_ready()
+        self.target = self.write_log()
+
+    def test_allowed_with_digest_present_when_the_job_is_complete(self):
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(self.target, job_id=job_id)
+        decision = self.read("claude", self.target)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_present")
+        self.assertEqual(decision.extra.get("job_id"), job_id)
+
+    def test_the_other_client_is_also_allowed_on_the_shared_receipt(self):
+        """The receipt is shared by both clients (design section 2.5)."""
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(self.target, job_id=job_id)
+        self.assertEqual(self.read("claude", self.target).code, "local_digest_present")
+        self.assertEqual(self.read("codex", self.target).code, "local_digest_present")
+
+    def test_denied_pending_when_the_job_is_queued(self):
+        job_id = self.submit_job(status="queued")
+        self.write_receipt(self.target, job_id=job_id)
+        decision = self.read("codex", self.target)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_pending")
+        self.assertIn(job_id, decision.reason)
+        self.assertIn("work_result", decision.reason)
+
+    def test_denied_pending_when_the_job_is_running(self):
+        job_id = self.submit_job(status="running")
+        self.write_receipt(self.target, job_id=job_id)
+        self.assertEqual(self.read("codex", self.target).code, "local_digest_pending")
+
+    def test_denied_pending_when_the_job_state_cannot_be_confirmed(self):
+        """The receipt names a job the queue database does not have (or the
+        database itself is unreadable): treated as not yet confirmed
+        complete, the same fail-closed posture stage_db_unavailable already
+        carries for the write gate, never a silent allow."""
+        self.write_receipt(self.target, job_id="no-such-job")
+        decision = self.read("codex", self.target)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_pending")
+
+    def test_waived_when_the_job_ended_failed_unknown_cancelled_or_expired(self):
+        for state in ("failed", "unknown", "cancelled", "expired"):
+            with self.subTest(state=state):
+                target = self.write_log(name=f"{state}.log")
+                job_id = self.submit_job(status=state)
+                self.write_receipt(target, job_id=job_id)
+                decision = self.read("claude", target)
+                self.assertTrue(decision.allowed, decision)
+                self.assertEqual(decision.code, "local_first_waived")
+                self.assertEqual(decision.extra.get("waiver_reason"), f"digest_{state}")
+
+    def test_waived_when_the_job_is_queued_and_deferred(self):
+        job_id = self.submit_job(status="queued", error="deferred:resource_pressure")
+        self.write_receipt(self.target, job_id=job_id)
+        decision = self.read("claude", self.target)
+        self.assertTrue(decision.allowed, decision)
+        self.assertEqual(decision.code, "local_first_waived")
+        self.assertEqual(decision.extra.get("waiver_reason"), "digest_deferred:resource_pressure")
+
+    def test_waived_recent_digest_changed_file_within_the_grace_window(self):
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(self.target, job_id=job_id)
+        # Changes the file's identity, so the receipt no longer matches.
+        self.target.write_text("y" * 9_000, encoding="utf-8")
+        self.now += 60  # well within the default 900s grace window
+        decision = self.read("claude", self.target)
+        self.assertTrue(decision.allowed, decision)
+        self.assertEqual(decision.code, "local_first_waived")
+        self.assertEqual(decision.extra.get("waiver_reason"), "recent_digest_changed_file")
+
+    def test_required_again_once_the_grace_window_has_passed(self):
+        job_id = self.submit_job(status="complete")
+        self.write_receipt(self.target, job_id=job_id)
+        self.target.write_text("y" * 9_000, encoding="utf-8")
+        self.now += 901  # past the default 900s digest_grace_seconds
+        self.write_heartbeat()  # keeps the lane itself ready; isolates the grace check
+        decision = self.read("claude", self.target)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_required")
+
+    def test_required_when_there_is_no_receipt_at_all(self):
+        decision = self.read("claude", self.target)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_required")
+        self.assertIn("work_digest_file", decision.reason)
+        self.assertIn(str(self.target), decision.reason)
+
+    def test_a_fresh_intent_is_written_and_matches_the_binding_fields(self):
+        self.read("claude", self.target)
+        intent = localfirst.read_digest_intent(str(self.state), str(self.target))
+        self.assertIsNotNone(intent)
+        info = os.stat(self.target)
+        self.assertEqual(intent["path"], os.path.realpath(str(self.target)))
+        self.assertEqual(intent["size"], info.st_size)
+        self.assertEqual(intent["mtime_ns"], info.st_mtime_ns)
+        self.assertEqual(intent["matched_glob"], "**/*.log")
+        self.assertEqual(intent["classification"], "internal_nonclient")
+        self.assertEqual(intent["client"], "claude")
+        self.assertEqual(intent["next_call"], "work_digest_file")
+
+    def test_a_digest_naming_a_different_file_does_not_retire_this_intent(self):
+        """DIGEST_INTENT_BINDING: a receipt for a different size/mtime must
+        not be mistaken for having satisfied this file's intent."""
+        self.read("claude", self.target)
+        other = self.write_log(name="other.log")
+        localfirst.retire_digest_intent(
+            str(self.state), str(self.target),
+            binding={"path": os.path.realpath(str(self.target)),
+                    "size": os.stat(other).st_size, "mtime_ns": os.stat(other).st_mtime_ns})
+        self.assertIsNotNone(localfirst.read_digest_intent(str(self.state), str(self.target)))
+
+
+class ReadGatePolicyAndMultiPathTests(ReadGateCase):
+    def test_unreadable_policy_denies_a_gated_shape_read_inside_a_repository(self):
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        target = self.write_log()
+        decision = self.read("claude", target)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "gate_auto_decision_failed")
+        self.assertIn("policy_unreadable", decision.reason)
+
+    def test_unreadable_policy_still_allows_a_read_outside_any_repository(self):
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        outside = self.base / "outside.log"
+        outside.write_text("x" * 8_500, encoding="utf-8")
+        decision = self.read("claude", outside, cwd=str(self.base))
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.logged)
+
+    def test_two_files_named_in_one_call_denies_on_the_first_gated_one(self):
+        self.write_policy()
+        self.make_ready()
+        small = self.write_log(name="small.log", size=100)     # fast-path allow
+        large = self.write_log(name="large.log", size=8_500)   # gated, no receipt
+        decision = self.read("codex", None, command=f"cat {small} {large}")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "local_digest_required")
+        self.assertIn(str(large), decision.reason)
+
+
+class RunHookReadEventTests(ReadGateCase):
+    """run_hook, not judge: only run_hook writes the event ledger, so this is
+    where "that reason in the event" (design section 2.1/2.5) is actually
+    checked against the persisted record rather than just the return value."""
+
+    def _events(self):
+        ledger = os.path.join(gate.receipt_dir(str(self.state)), gate.EVENT_LEDGER)
+        with open(ledger, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_a_waiver_reason_and_bytes_estimate_reach_the_event_ledger(self):
+        self.write_policy()
+        self.write_heartbeat()  # calibration missing -> waived
+        target = self.write_log()
+        payload = {"tool_name": "Read", "tool_input": {"file_path": str(target)},
+                  "cwd": str(self.repo)}
+        decision = gate.run_hook("claude", str(self.state), payload, clock=self.clock,
+                                 local_queue_root=str(self.local_root),
+                                 worker_executable=str(self.worker))
+        self.assertEqual(decision.code, "local_first_waived")
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["code"], "local_first_waived")
+        self.assertEqual(events[0]["waiver_reason"], "calibration_missing")
+        self.assertEqual(events[0]["bytes_estimate"], 8_500)
+
+    def test_local_digest_required_reaches_the_event_ledger_with_the_matched_glob(self):
+        self.write_policy()
+        self.make_ready()
+        target = self.write_log()
+        payload = {"tool_name": "Read", "tool_input": {"file_path": str(target)},
+                  "cwd": str(self.repo)}
+        decision = gate.run_hook("claude", str(self.state), payload, clock=self.clock,
+                                 local_queue_root=str(self.local_root),
+                                 worker_executable=str(self.worker))
+        self.assertEqual(decision.code, "local_digest_required")
+        events = self._events()
+        self.assertEqual(events[-1]["code"], "local_digest_required")
+        self.assertEqual(events[-1]["matched_glob"], "**/*.log")
+        self.assertEqual(events[-1]["bytes_estimate"], 8_500)
+
+    def test_a_fast_path_allow_writes_no_event_at_all(self):
+        self.write_policy(enabled=False)
+        target = self.write_log()
+        payload = {"tool_name": "Read", "tool_input": {"file_path": str(target)},
+                  "cwd": str(self.repo)}
+        gate.run_hook("claude", str(self.state), payload, clock=self.clock,
+                      local_queue_root=str(self.local_root), worker_executable=str(self.worker))
+        ledger = os.path.join(gate.receipt_dir(str(self.state)), gate.EVENT_LEDGER)
+        self.assertFalse(os.path.exists(ledger))
 
 
 if __name__ == "__main__":

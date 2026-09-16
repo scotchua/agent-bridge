@@ -37,7 +37,7 @@ import time
 from typing import Any, Iterable
 
 from .. import store
-from . import autodecide, autoroute, gate
+from . import autodecide, autoroute, gate, localfirst
 
 #: Decision codes that moved work off the deciding assistant.
 ROUTED_PREFIX = "routed_"
@@ -283,6 +283,119 @@ def _queue_report(root: str | None) -> dict[str, Any]:
             "failures": failures}
 
 
+#: The four gate-event codes a gated-shape read produces (design section 2.1).
+READ_GATE_CODES = frozenset({
+    "local_digest_required", "local_digest_pending", "local_digest_present", "local_first_waived",
+})
+
+
+def _local_first_report(state_root: str, *, events: list[dict[str, Any]],
+                        audit_entries: list[dict[str, Any]], local_root: str | None,
+                        worker_executable: str | None, policy: "autoroute.Policy | None",
+                        now: float) -> dict[str, Any]:
+    """The local_first section (design section 2.6): every gated-shape read
+    this window, partitioned so a reader can see where each one landed.
+
+    ``compelled`` is every gate event carrying one of the four read-gate
+    codes. Three of the five buckets below come straight from that code;
+    the other two (``declined``/``outstanding``) come from the
+    ``digest_intent`` audit-ledger line the same call already writes
+    alongside its ``local_digest_required`` event, classified by whether
+    that specific intent's own ``expires_at`` has passed -- not by whether
+    the file was later digested, which is a different, later event and
+    already counted for itself under ``digested``. The two counts line up
+    (``compelled == digested + pending + waived + declined + outstanding``)
+    by construction: every compelled event falls into exactly one bucket.
+    """
+    reads = [event for event in events if event.get("code") in READ_GATE_CODES]
+
+    def count(code: str) -> int:
+        return sum(1 for event in reads if event.get("code") == code)
+
+    digested = count("local_digest_present")
+    pending = count("local_digest_pending")
+    waived_events = [event for event in reads if event.get("code") == "local_first_waived"]
+    waived = len(waived_events)
+
+    intents = [row for row in audit_entries if row.get("event") == "digest_intent"]
+    declined = sum(1 for row in intents
+                  if isinstance(row.get("expires_at"), (int, float)) and now >= row["expires_at"])
+    outstanding_count = len(intents) - declined
+    compelled = len(reads)
+
+    if policy is not None and local_root and worker_executable:
+        try:
+            result = localfirst.readiness(
+                policy=policy, state_root=state_root, local_queue_root=local_root,
+                worker_executable=worker_executable, window_bytes=localfirst.MAX_WINDOW_BYTES)
+            readiness_now: dict[str, Any] = {
+                "ready": result.ready, "code": result.code, "reason": result.reason,
+                "considered": result.considered}
+        except Exception as exc:  # noqa: BLE001  a report never crashes
+            readiness_now = {"ready": False, "error": type(exc).__name__}
+    else:
+        readiness_now = {"ready": False, "code": "unknown",
+                         "reason": "local_queue_root, worker_executable or the routing "
+                                   "policy is not available to this report"}
+
+    return {
+        "readiness_now": readiness_now,
+        "read_gate_strength": {"claude": "deterministic", "codex": "heuristic"},
+        "compelled": {
+            "count": compelled,
+            "definition": "gated-shape reads: passed the mechanical-artifact fast path "
+                          "(in a repository, local_first enabled, mechanical_ok, a glob "
+                          "match, at or above read_gate_min_bytes) and were judged",
+            "by_client": _histogram(event.get("client") for event in reads),
+            "by_repo": _histogram(repo for event in reads for repo in event.get("repos") or []),
+            "by_glob": _histogram(event.get("matched_glob") for event in reads
+                                  if event.get("matched_glob")),
+        },
+        "digested": {
+            "count": digested,
+            "meaning": "allowed because a matching digest had already completed "
+                      "(local_digest_present); reading the file in full after that is "
+                      "expected -- it is the cloud's own judgment pass, not a bypass",
+        },
+        "pending": {
+            "count": pending,
+            "meaning": "denied because a digest is queued or running; the caller was "
+                      "told to retry with work_result",
+        },
+        "waived": {
+            "count": waived,
+            "by_reason": _histogram(event.get("waiver_reason") for event in waived_events),
+            "meaning": "allowed uncompelled: the local lane was not ready, or the digest "
+                      "that would have covered this file ended failed/unknown/cancelled/"
+                      "expired/deferred, or the file changed inside the grace window",
+        },
+        "declined": {
+            "count": declined,
+            "meaning": "a digest was required and the intent expired before it was met; "
+                      "the same honest label this project's write-gate accounting uses "
+                      "(design section 6, finding 22): answering a deny with grep is not "
+                      "a bypass this mechanism can tell apart from giving up",
+        },
+        "outstanding": {
+            "count": outstanding_count,
+            "meaning": "a digest was required within this window and has neither been "
+                      "met nor expired yet",
+        },
+        "adds_up": compelled == digested + pending + waived + declined + outstanding_count,
+        "bytes": {
+            "estimated_reaching_cloud_context": sum(
+                int(event.get("bytes_estimate") or 0) for event in reads
+                if event.get("code") in ("local_first_waived", "local_digest_present")),
+            "digested_locally_exact": sum(
+                int(row.get("window_bytes") or 0) for row in audit_entries
+                if row.get("event") == "digest_submitted"),
+            "meaning": "the first is an upper bound (design section 2.5): the file's "
+                      "on-disk size, or the caller's own range when one was given; the "
+                      "second is exact, from the digest receipts",
+        },
+    }
+
+
 def report(state_root: str, *, home: str | None = None,
            config_path: str | None = None, since_hours: float = 24.0,
            clock: Any = time.time) -> dict[str, Any]:
@@ -315,12 +428,14 @@ def report(state_root: str, *, home: str | None = None,
     capacity_db = None
     execution_root = None
     local_root = None
+    worker_executable = None
     if config_path and os.path.exists(config_path):
         loaded = store.read_json_or_none(config_path)
         if isinstance(loaded, dict):
             capacity_db = loaded.get("capacity_db")
             execution_root = loaded.get("execution_queue_root")
             local_root = loaded.get("local_queue_root")
+            worker_executable = loaded.get("worker_executable")
 
     stages: dict[str, Any] = {"available": False}
     if capacity_db and os.path.exists(capacity_db):
@@ -334,17 +449,22 @@ def report(state_root: str, *, home: str | None = None,
     unmet = outstanding_intents(state_root)
     coverage = _hook_coverage(home)
 
+    policy_obj = None
     try:
-        policy = autoroute.load_policy(state_root)
+        policy_obj = autoroute.load_policy(state_root)
         policy_state: dict[str, Any] = {
             "readable": True,
-            "classified_repositories": len(policy.repos),
-            "default_allows_dispatch": bool(policy.default.allowed_routes),
+            "classified_repositories": len(policy_obj.repos),
+            "default_allows_dispatch": bool(policy_obj.default.allowed_routes),
         }
     except Exception as exc:  # noqa: BLE001
         policy_state = {"readable": False, "error": type(exc).__name__,
                         "consequence": "the gate denies every gated call until "
                                        "the policy can be read"}
+
+    local_first_section = _local_first_report(
+        state_root, events=events, audit_entries=audit_entries, local_root=local_root,
+        worker_executable=worker_executable, policy=policy_obj, now=now)
 
     return {
         "generated_at": now,
@@ -419,6 +539,7 @@ def report(state_root: str, *, home: str | None = None,
         },
         "hook_coverage": coverage,
         "stages": stages,
+        "local_first": local_first_section,
     }
 
 
@@ -484,4 +605,15 @@ def render(document: dict[str, Any]) -> str:
         if entry.get("consequence"):
             lines.append(f"    {entry['consequence']}")
     lines.append(f"  codex hook trust: {document['hook_coverage'].get('codex_trust')}")
+    lf = document.get("local_first", {})
+    if lf:
+        lines.append("")
+        lines.append(f"  local-first read gate: ready now = {lf['readiness_now'].get('ready')} "
+                     f"({lf['readiness_now'].get('code')})")
+        lines.append(f"    compelled {lf['compelled']['count']}: digested {lf['digested']['count']}, "
+                     f"pending {lf['pending']['count']}, waived {lf['waived']['count']}, "
+                     f"declined {lf['declined']['count']}, outstanding {lf['outstanding']['count']}"
+                     f"{'' if lf['adds_up'] else '  MISMATCH'}")
+        strength = lf["read_gate_strength"]
+        lines.append(f"    read gate: claude {strength['claude']}, codex {strength['codex']}")
     return "\n".join(lines) + "\n"

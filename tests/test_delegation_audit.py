@@ -390,5 +390,93 @@ class TheAuditNamesWhoSaidARouteWasAvailable(unittest.TestCase):
         self.assertIn("no peer is dispatched to", rendered)
 
 
+class LocalFirstAccounting(AuditCase):
+    """The local_first section (design section 2.6): every gated-shape read
+    partitioned into compelled == digested + pending + waived + declined +
+    outstanding, the acceptance criterion the design's own build plan names."""
+
+    def repo_path(self):
+        return str(self.base / "repo")
+
+    def intent(self, **fields):
+        row = {"event": "digest_intent", "path": str(self.base / "repo" / "app.log"),
+              "repo": self.repo_path(), "size": 8_500, "mtime_ns": 1,
+              "matched_glob": "**/*.log", "classification": "internal_nonclient",
+              "client": "claude", "readiness": {"ready": True}, "created_at": self.now,
+              "expires_at": self.now + 900, "state": "awaiting_digest",
+              "next_call": "work_digest_file"}
+        row.update(fields)
+        store.append_ledger(str(self.routing / gate.AUDIT_LEDGER), row)
+
+    def submission(self, **fields):
+        row = {"event": "digest_submitted", "path": str(self.base / "repo" / "app.log"),
+              "repo": self.repo_path(), "size": 8_500, "mtime_ns": 1, "offset": 0,
+              "window_bytes": 8_500, "window_sha256": "x", "decode_replacements": 0,
+              "task_type": "log_triage", "classification": "internal_nonclient",
+              "caller": "codex", "job_id": "j1", "intake_receipt_id": "r1",
+              "created_at": self.now}
+        row.update(fields)
+        store.append_ledger(str(self.routing / gate.AUDIT_LEDGER), row)
+
+    def test_the_five_buckets_add_up_to_compelled(self):
+        repo = self.repo_path()
+        self.event(code="local_digest_present", client="claude", repos=[repo], bytes_estimate=8_500)
+        self.event(code="local_digest_pending", client="codex", repos=[repo],
+                  job_id="j2", bytes_estimate=9_000)
+        self.event(code="local_first_waived", client="claude", repos=[repo],
+                  waiver_reason="calibration_missing", bytes_estimate=7_000)
+        self.event(code="local_digest_required", client="codex", repos=[repo],
+                  matched_glob="**/*.log", bytes_estimate=8_200)
+        self.intent(expires_at=self.now + 900)             # not yet expired: outstanding
+        self.event(code="local_digest_required", client="claude", repos=[repo],
+                  matched_glob="**/*.log", bytes_estimate=8_300)
+        self.intent(expires_at=self.now - 1)                # already expired: declined
+
+        lf = self.run_audit()["local_first"]
+        self.assertEqual(lf["compelled"]["count"], 5)
+        self.assertEqual(lf["digested"]["count"], 1)
+        self.assertEqual(lf["pending"]["count"], 1)
+        self.assertEqual(lf["waived"]["count"], 1)
+        self.assertEqual(lf["declined"]["count"], 1)
+        self.assertEqual(lf["outstanding"]["count"], 1)
+        self.assertTrue(lf["adds_up"])
+        self.assertEqual(lf["waived"]["by_reason"], {"calibration_missing": 1})
+        self.assertEqual(lf["compelled"]["by_client"], {"claude": 3, "codex": 2})
+        self.assertEqual(lf["compelled"]["by_glob"], {"**/*.log": 2})
+
+    def test_bytes_split_estimated_upper_bound_from_exact_digested(self):
+        self.event(code="local_digest_present", bytes_estimate=1_000)
+        self.event(code="local_first_waived", bytes_estimate=2_000, waiver_reason="x")
+        # A deny never reaches the cloud, so its bytes must not count here.
+        self.event(code="local_digest_pending", bytes_estimate=99_999)
+        self.submission(window_bytes=500)
+        lf = self.run_audit()["local_first"]
+        self.assertEqual(lf["bytes"]["estimated_reaching_cloud_context"], 3_000)
+        self.assertEqual(lf["bytes"]["digested_locally_exact"], 500)
+
+    def test_read_gate_strength_is_reported(self):
+        lf = self.run_audit()["local_first"]
+        self.assertEqual(lf["read_gate_strength"], {"claude": "deterministic", "codex": "heuristic"})
+
+    def test_readiness_now_is_reported_unknown_without_a_configured_lane(self):
+        """run_audit here passes no config_path, so local_root/worker_executable
+        are unavailable; the section must say so rather than crash or guess."""
+        lf = self.run_audit()["local_first"]
+        self.assertFalse(lf["readiness_now"]["ready"])
+
+    def test_an_empty_window_adds_up_to_zero(self):
+        lf = self.run_audit()["local_first"]
+        self.assertEqual(lf["compelled"]["count"], 0)
+        self.assertTrue(lf["adds_up"])
+
+    def test_render_includes_the_local_first_summary_without_a_mismatch(self):
+        self.event(code="local_digest_present", client="claude", repos=[self.repo_path()],
+                  bytes_estimate=100)
+        rendered = audit.render(self.run_audit())
+        self.assertIn("local-first read gate", rendered)
+        self.assertIn("compelled 1", rendered)
+        self.assertNotIn("MISMATCH", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

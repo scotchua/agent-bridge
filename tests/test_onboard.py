@@ -31,6 +31,20 @@ def active_in(directory):
 
 
 class OnboardingTests(unittest.TestCase):
+    def test_shared_instructions_state_the_read_gate_before_the_local_worker(self):
+        """Design section 2.7: the old single sentence ("use exact tools
+        first, then an explicitly available local model...") is replaced by
+        three, naming the read gate's own compulsion and its one answer.
+        No prior test asserted on the old sentence (there was nothing to
+        update), so this is the snapshot the design's build plan calls for
+        adding rather than changing."""
+        text = onboard._shared_instructions(answers())
+        self.assertIn("Exact tools first: grep, rg, head, tail, and bounded reads.", text)
+        self.assertIn("the gate requires a local digest before you read it whole", text)
+        self.assertIn("Answer the denial with the one call it names.", text)
+        self.assertIn("work_route_local", text)
+        self.assertIn("None of this is enforcement; the hook is.", text)
+
     def test_privacy_never_widens_blocked_labels(self):
         bad = answers(privacy={"mode": "custom", "peers": {"claude": ["public", "secret"], "codex": ["synthetic"]}})
         with self.assertRaisesRegex(ValueError, "client and secret"):

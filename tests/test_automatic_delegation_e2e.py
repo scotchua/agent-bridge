@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FAKES = Path(__file__).resolve().parent / "fakes"
 sys.path.insert(0, str(ROOT / "src"))
 
+from agent_bridge import store  # noqa: E402
 from agent_bridge.capacity_router import CapacityObservation, StageRouter  # noqa: E402
 from agent_bridge.execution import hostenv  # noqa: E402
 from agent_bridge.localq.spool import ResourceSnapshot  # noqa: E402
@@ -883,6 +884,200 @@ class DigestLane(Workflow):
         self.assertTrue(second["ok"], second)
         self.assertNotEqual(first["receipt_id"], second["receipt_id"])
         self.assertFalse(second.get("deduplicated", False))
+
+
+class ReadGate(Workflow):
+    """The read gate (design section 2.1) through the real installed
+    launcher: Read/cat denied, a real digest through the real MCP server,
+    the real worker drained, then allowed on the shared receipt. Phase 3's
+    own in-process unit coverage of judge_read/_judge_read_path's full
+    branch set -- every readiness waiver, every job-state branch, the grace
+    window, multi-path aggregation, an unreadable policy -- lives in
+    test_delegation_gate.py's ReadGate* classes instead: several of those
+    fixtures need a corrupted file or a mocked load probe, which a
+    subprocess boundary would only obscure."""
+
+    def write_read_gate_policy(self, *, globs=("**/*.log",), mechanical_ok=True,
+                              classification="internal_nonclient"):
+        entry = {"classification": classification, "allowed_routes": ["claude", "codex", "local"],
+                "mechanical_ok": mechanical_ok, "mechanical_globs": list(globs)}
+        document = {"version": 1, "prefer": [], "declared_available": ["local"],
+                   "local_first": {"enabled": True}, "repos": {str(self.repo): entry}}
+        path = Path(autoroute.policy_path(str(self.state)))
+        path.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def write_log(self, name="app.log", *, lines=400):
+        target = self.repo / name
+        target.write_text("\n".join(f"2026-09-16T00:{i:02d}:00 line {i}" for i in range(lines)) + "\n",
+                          encoding="utf-8")
+        return target
+
+    def make_lane_ready(self, size_hint=20_000):
+        """A real calibration record and a real heartbeat, so readiness()
+        says ready without needing the local worker actually timed (Phase
+        1's own calibrate command is exercised in test_local_first.py)."""
+        record = localfirst.build_calibration_record(
+            worker_executable=str(self.bin / "local-worker"), worker_state=str(self.worker_state),
+            sizes={str(size_hint): {"median_s": 1.0, "outcomes": ["complete"] * 3}},
+            sampler_snapshot={}, host={})
+        record["worker_sha256"] = store.sha256_file(str(self.bin / "local-worker"))
+        localfirst.write_calibration_record(str(self.state), record)
+        self.drain_local()  # writes a fresh heartbeat; no job is queued yet
+
+    def drain_local(self):
+        from agent_bridge.localq.service import Service
+
+        service = Service(str(self.local_root), str(self.bin / "local-worker"),
+                          str(self.worker_state), sampler=PortableSampler())
+        return service.once()
+
+    def read_claude(self, target):
+        return self.run_installed_hook("claude", {
+            "hook_event_name": "PreToolUse", "tool_name": "Read",
+            "tool_input": {"file_path": str(target)}, "cwd": str(self.repo)})
+
+    def read_codex(self, target, command=None):
+        return self.run_installed_hook("codex", {
+            "hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": command or f"cat {target}"}, "cwd": str(self.repo)})
+
+    def assertDenied(self, result, code):
+        self.assertIn("hookSpecificOutput", result)
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(reason.endswith(f"[{code}]"), reason)
+        return reason
+
+    def assertAllowed(self, result):
+        self.assertEqual(result, {}, result)
+
+    def test_claude_read_of_a_large_log_is_denied_and_a_py_file_is_not(self):
+        self.install_gate()
+        self.write_read_gate_policy()
+        self.make_lane_ready()
+        target = self.write_log()
+        self.assertDenied(self.read_claude(target), "local_digest_required")
+
+        code = self.repo / "app.py"
+        code.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertAllowed(self.read_claude(code))
+
+    def test_the_same_log_without_mechanical_ok_is_allowed(self):
+        self.install_gate()
+        self.write_read_gate_policy(mechanical_ok=False)
+        self.make_lane_ready()
+        target = self.write_log()
+        self.assertAllowed(self.read_claude(target))
+
+    def test_codex_cat_is_denied_tail_grep_rg_are_allowed_and_a_small_file_is_allowed(self):
+        self.install_gate()
+        self.write_read_gate_policy()
+        self.make_lane_ready()
+        target = self.write_log()
+        self.assertDenied(self.read_codex(target), "local_digest_required")
+        for command in (f"tail -n 40 {target}", f"grep line1 {target}", f"rg line1 {target}"):
+            self.assertAllowed(self.read_codex(target, command=command))
+        tiny = self.repo / "tiny.log"
+        tiny.write_text("short\n", encoding="utf-8")
+        self.assertAllowed(self.read_codex(tiny))
+
+    def test_the_full_loop_deny_digest_drain_allow_shared_grace_then_required_again(self):
+        self.install_gate()
+        self.write_read_gate_policy()
+        self.make_lane_ready()
+        target = self.write_log()
+
+        # 1. Denied, and an intent exists.
+        self.assertDenied(self.read_claude(target), "local_digest_required")
+        self.assertIsNotNone(localfirst.read_digest_intent(str(self.state), str(target)))
+
+        # 2. Satisfied through the real MCP server.
+        replies = self.mcp("claude", [("work_digest_file", {
+            "path": str(target), "task_type": "log_triage"})])
+        result = self.tool_result(replies, 2)
+        self.assertTrue(result["ok"], result)
+        job_id = result["job_id"]
+        self.assertIsNone(localfirst.read_digest_intent(str(self.state), str(target)))
+
+        # 3. The real worker runs it. The orchestration server subprocess
+        #    just spawned its own background executor against the default
+        #    (macOS-only) sampler, which fails outright on this host and
+        #    overwrites the heartbeat with a "resource_sample_unavailable"
+        #    verdict as a side effect of that call -- harmless for Phase 2
+        #    (nothing there reads the heartbeat) but fatal to readiness()
+        #    here, so it is refreshed with the portable one before relying
+        #    on it again.
+        self.drain_local()
+        replies = self.mcp("claude", [("work_result", {"job_id": job_id})])
+        outcome = self.tool_result(replies, 2)
+        self.assertTrue(outcome["ok"], outcome)
+        self.assertEqual(outcome["status"], "complete")
+        self.drain_local()
+
+        # 4. Allowed now, and the other client is allowed on the same receipt.
+        self.assertAllowed(self.read_claude(target))
+        self.assertAllowed(self.read_codex(target))
+
+        # 5. Append inside the grace window: waived, not required again.
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write("one more line\n")
+        self.assertAllowed(self.read_claude(target))
+
+        # 6. Move the receipt's own created_at past the grace window. A real
+        #    subprocess hook has no injectable clock, so the receipt --
+        #    already a plain JSON file on disk -- is backdated directly.
+        receipt_path = localfirst.digest_receipt_path(str(self.state), str(target))
+        receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+        receipt["created_at"] -= 2_000  # past the default 900s digest_grace_seconds
+        Path(receipt_path).write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertDenied(self.read_claude(target), "local_digest_required")
+
+    def test_hook_wall_time_on_an_ordinary_read_stays_within_a_generous_bound(self):
+        """Phase 0 measured an 86ms median for an unmatched Read call before
+        this feature existed (docs/verified-cli-behaviour.md); Read is now
+        matched and judged, so this bounds the ordinary allowed path
+        instead of repeating that exact number -- generously enough to
+        survive a slow CI runner while still catching a real regression (a
+        stray network call, an O(n) scan), not a mere startup difference."""
+        self.install_gate()
+        self.write_read_gate_policy()  # local_first enabled: the ordinary installed case
+        target = self.repo / "app.py"  # never matches **/*.log: the fast path
+        target.write_text("x = 1\n", encoding="utf-8")
+        started = time.monotonic()
+        self.assertAllowed(self.read_claude(target))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0, f"hook took {elapsed:.2f}s for an ordinary allowed Read")
+
+    def test_gate_report_names_the_read_gate_strength_per_client(self):
+        self.install_gate()
+        result = gate.report(str(self.home), str(self.state))
+        self.assertEqual(result["read_gate"], {"claude": "deterministic", "codex": "heuristic"})
+
+    def test_the_audit_local_first_section_adds_up_over_this_loop(self):
+        self.install_gate()
+        self.write_read_gate_policy()
+        self.make_lane_ready()
+        target = self.write_log()
+        self.read_claude(target)  # local_digest_required
+        replies = self.mcp("claude", [("work_digest_file", {
+            "path": str(target), "task_type": "log_triage"})])
+        job_id = self.tool_result(replies, 2)["job_id"]
+        self.drain_local()
+        self.mcp("claude", [("work_result", {"job_id": job_id})])
+        self.drain_local()  # the mcp() call above just re-poisoned the heartbeat; see test_the_full_loop's note
+        self.read_claude(target)   # local_digest_present
+        self.read_codex(target)    # local_digest_present, shared receipt
+
+        document = audit.report(str(self.state), home=str(self.home),
+                                config_path=str(self.config), since_hours=0.0)
+        lf = document["local_first"]
+        self.assertEqual(lf["compelled"]["count"],
+                         lf["digested"]["count"] + lf["pending"]["count"] + lf["waived"]["count"]
+                         + lf["declined"]["count"] + lf["outstanding"]["count"])
+        self.assertTrue(lf["adds_up"], lf)
+        self.assertEqual(lf["digested"]["count"], 2)
+        self.assertGreaterEqual(lf["compelled"]["count"], 3)
 
 
 class RestartRecovery(Workflow):

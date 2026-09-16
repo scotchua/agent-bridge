@@ -273,6 +273,15 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
   context.** That produces no tool call, so no local mechanism intercepts it.
   This is a limit of the hook surface. An instruction file does not fix it
   and we do not describe one as if it did.
+* **It cannot compel a digest of text that was never read from disk.** The
+  read gate (below) judges `Read` calls and recognised shell readers; inline
+  test and build output an assistant never captures to a file is the largest
+  mechanical stream and none of it is covered.
+* **On Codex the read gate is a text heuristic**, exactly the same strength
+  limit the write heuristic already has, and for the same reason: shell
+  commands are read as text, not executed and observed. `gate report`'s
+  `read_gate` field says so per client rather than leaving a reader to
+  assume both are equally strong.
 
 ### Turning it off
 
@@ -280,6 +289,74 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
 repository with no receipt is refused outright and an assistant must claim a
 route explicitly. Stricter, and more friction. The audit reports which
 posture each installed client is running under.
+
+## Read gate
+
+The same hook also judges reads, not just writes: before a cloud model reads
+a large mechanical artifact (a log, captured test output) whole, the
+operator's own local model gets first look, in a repository the operator has
+both opted into (`local_first.enabled`) and marked `mechanical_ok`. This is
+separate from automatic routing -- it never decides who *implements*
+anything -- and it is off by default, the same posture every local-first
+setting in this project takes.
+
+**What is judged.** For Claude Code, the `Read` tool: matched by name, so
+every call is judged, deterministically. For Codex, whose reads are shell
+commands, a text heuristic recognises whole-file readers (`cat`, `type`,
+`Get-Content` without `-TotalCount`/`-Tail`, `more`, `less`, `bat`); `head`,
+`tail`, `sed -n`, `grep` and `rg` are exact or bounded reads and stay
+ungated on purpose, the same "exact tools first" the instruction file asks
+for. The heuristic is Codex-only: Claude's own shell tool is not also
+judged by it, since Claude already has a deterministic surface. `gate
+report`'s `read_gate` field states each client's strength as
+`"deterministic"` or `"heuristic"` rather than leaving a reader to assume.
+
+**The fast path**, taken on almost every read, with nothing logged: outside
+any repository; `local_first.enabled` not true; the repository not marked
+`mechanical_ok` or classified outside the local-eligible set; the path
+matching none of the repository's `mechanical_globs` (or the operator's
+project-wide default); smaller than `read_gate_min_bytes`, or not a regular
+file; or under the gate's own protected paths (a digest can never be
+submitted for those, so compelling one would be a deny nothing could ever
+answer). Only a read that survives every one of these is judged further and
+logged.
+
+**Judged further**, in order: the local lane's own readiness (calibrated,
+the executor's heartbeat fresh, load acceptable, within the latency budget)
+-- not ready waives the read rather than blocking it, with the reason
+recorded; a digest receipt already covering this exact file (by realpath,
+size and mtime) whose job completed lets the read through
+(`local_digest_present`); one whose job is still queued or running denies
+(`local_digest_pending`) naming the job id and `work_result`; one that ended
+failed, unknown, cancelled or expired waives; a receipt for a since-changed
+file inside the grace window waives (`recent_digest_changed_file`) so a log
+that grows every minute is not re-digested every minute; anything else
+writes a digest intent and denies (`local_digest_required`), naming the one
+call owed:
+
+```text
+delegation-first gate: /abs/repo/logs/test.log is a mechanical artifact
+(38,412 bytes, matches **/*.log) in a repository the operator marked
+mechanical_ok, and the local lane is ready (calibrated 24,000 bytes in 11.2 s
+against a 30 s budget). Call work_digest_file with path='/abs/repo/logs/test.log',
+task_type one of log_triage|summarize|extract|checklist, then work_result on
+the returned job_id; this read is allowed once the digest completes. Exact
+tools (grep, rg, tail -n) are allowed now. [local_digest_required]
+```
+
+A digest receipt is shared by both clients: once either has digested a
+file, both may read it. An unreadable or malformed routing policy denies a
+gated-shape read the same way it already denies an edit
+(`gate_auto_decision_failed`); a read outside every repository is allowed
+regardless, since the policy has nothing to say about it.
+
+The audit's `local_first` section accounts for every judged read:
+`compelled` (all of them) partitions into `digested`, `pending`, `waived`,
+`declined` (an intent that expired unmet) and `outstanding` (one still
+open), and the two sides are asserted equal. It also reports current
+readiness, bytes reaching cloud context (an upper bound) against bytes
+digested locally (exact, from the receipts), and the same per-client
+`read_gate` strength `gate report` shows.
 
 ## The audit
 
@@ -381,7 +458,9 @@ with `--apply` takes out only our entries and the managed block.
 prints, as JSON: which clients have the hook entry, Codex trust state
 (`recorded`, `needs_review`, `not_installed`), every receipt with `valid` or
 `expired`, the most recent gate events with their decision codes, the count
-of denials in that window, and the not-covered list above. The report is a
+of denials in that window, `read_gate` (`{"claude": "deterministic", "codex":
+"heuristic"}`, a static fact about the mechanism, not conditioned on whether
+it is installed here), and the not-covered list above. The report is a
 record of what the gate saw; it does not observe the surfaces it cannot hook.
 
 ## Hook wire

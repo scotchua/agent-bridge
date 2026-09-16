@@ -163,7 +163,11 @@ more than consultation. It can:
   declares in the policy file or the gate hook observes first-hand; no tool
   lets an assistant declare a route available;
 - queue a bounded implementation job for the other provider's subscription
-  CLI; and
+  CLI;
+- **compel a local digest of a large log or other mechanical artifact before
+  a cloud model reads it whole**, in a repository the operator opts in and
+  marks `mechanical_ok` -- off by default, and never for text an assistant
+  never captured to a file; and
 - **make the routing decision automatically, and refuse implementation
   without one.**
 
@@ -320,6 +324,14 @@ registration and configuration.
   harness. A bundled harness proves the lane can be constructed and its
   offline contract tested; it is not a substitute for the live synthetic
   verification this machine's signed-in CLIs still have to pass.
+- **The read gate's two clients are not equally strong, and it does not
+  compel everything.** Claude's `Read` tool is matched by name;
+  deterministic. Codex has no such tool, so its reads are recognised from
+  shell command text; a heuristic, the same strength its write gate already
+  is. Neither sees mechanical text an assistant never captures to a file,
+  which is the largest mechanical stream there is, or a shell reader the
+  heuristic does not recognise. `gate report`'s `read_gate` field states
+  each client's strength rather than leaving it implied.
 
 ## Checking it yourself
 

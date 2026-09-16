@@ -55,6 +55,7 @@ import os
 import re
 import shlex
 import sqlite3
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -62,7 +63,7 @@ from typing import Any
 
 from .. import store
 from ..capacity_router import RoutingError, capacity_fingerprint
-from . import autoroute
+from . import autoroute, localfirst
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -87,9 +88,18 @@ SHELL_TOOLS = {
     "codex": frozenset({"Bash", "local_shell", "shell", "shell_command", "exec_command"}),
 }
 PATH_FIELDS = ("file_path", "notebook_path", "path")
+#: Tools whose call reads a named file whole. Claude Code's ``Read`` is
+#: deterministic: the read gate judges every call, the same way ``EDIT_TOOLS``
+#: is judged, rather than reading command text. Codex has no equivalent tool;
+#: its reads are shell commands and are recognised by ``_shell_whole_file_read``
+#: instead, so its entry here is deliberately empty (see ``classify``).
+READ_TOOLS = {
+    "claude": frozenset({"Read"}),
+    "codex": frozenset(),
+}
 #: The matcher each client's hook entry carries.
 MATCHERS = {
-    "claude": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+    "claude": "Edit|Write|MultiEdit|NotebookEdit|Bash|Read",
     "codex": "apply_patch|Bash|local_shell|shell|shell_command|exec_command",
 }
 
@@ -183,6 +193,31 @@ _GIT_TAG = re.compile(r"(^|[\s;&|('\"])git\s+tag(\s+(?P<rest>[^;&|]*))?")
 _GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at",
                        "--merged", "--no-merged", "--sort", "--format", "--verify", "-v", "--column")
 
+#: Codex whole-file readers (design section 2.1): a shell command naming one
+#: of these reads a file's entire content, the read-gate equivalent of
+#: Claude's ``Read`` tool. ``head``, ``tail``, ``sed -n``, ``grep`` and ``rg``
+#: are deliberately absent -- exact or bounded reads, the "exact tools first"
+#: the instruction file already asks for, and allowed on purpose. Windows'
+#: ``type`` and PowerShell's ``Get-Content`` are the same word other contexts
+#: use for something else (a POSIX shell builtin that reports what a name
+#: resolves to; a bare ``Get-Content`` invocation without a matching argument);
+#: a false match here still only widens what gets a digest offered before a
+#: read, never what gets refused outright, and an operand that turns out not
+#: to be a regular file falls straight through the fast-path allow below.
+_WHOLE_FILE_READERS = re.compile(
+    r"(^|[\s;&|('\"/\\])(?i:cat|less|more|bat|type|Get-Content)(\s|$)")
+#: ``Get-Content -TotalCount N`` / ``-Tail N`` is a bounded read, like
+#: ``head``/``tail``; checked over the whole command text rather than scoped
+#: to one invocation, the same simplification ``_formatter_writes`` already
+#: makes for report-only flags in this file.
+_BOUNDED_READ_FLAGS = re.compile(r"(^|\s)(?i:-TotalCount|-Tail)(\s|=|$)")
+
+
+def _shell_whole_file_read(command: str) -> bool:
+    """Whether ``command`` reads a named file whole. A heuristic, scoped to
+    Codex only (see ``classify``); Claude's Bash tool is not judged by it."""
+    return bool(_WHOLE_FILE_READERS.search(command)) and not _BOUNDED_READ_FLAGS.search(command)
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -192,6 +227,11 @@ class Decision:
     repos: tuple[str, ...] = ()
     receipt: dict[str, Any] | None = None
     logged: bool = True        # False for calls the gate does not judge at all
+    #: Extra fields merged into this decision's event-ledger record: a read
+    #: gate's ``waiver_reason``, ``bytes_estimate`` and ``job_id``, present
+    #: only where the design calls for them. Routing decisions leave this
+    #: empty; their own extra fields come from ``receipt`` instead.
+    extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def allowed(self) -> bool:
@@ -451,6 +491,38 @@ def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str 
     if not isinstance(lease, (int, float)) or not math.isfinite(float(lease)) or float(lease) <= now:
         return "stage_lease_expired"
     return None
+
+
+def _digest_job_state(local_queue_root: str, job_id: str) -> "dict[str, Any] | None":
+    """A digest job's own ``status``/``error``, read directly from the local
+    queue's database, read-only, the same way :func:`stage_binding` reads the
+    stage router's. The hook must never construct ``LocalQueue`` itself:
+    that class's constructor creates the queue's directory and tables as a
+    side effect, which a call that only judges a ``Read`` must not do.
+
+    None when the database or the job cannot be read; the read gate treats
+    that as "not yet confirmed complete" rather than as evidence either way
+    (see the read gate's own judgment), the same fail-closed posture
+    ``stage_db_unavailable`` already carries for the write gate.
+    """
+    if not job_id:
+        return None
+    database = os.path.join(local_queue_root, "localq.sqlite3")
+    uri = "file:" + _sqlite_uri_path(database) + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT status, error FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    if row is None:
+        return None
+    return {"status": row["status"], "error": row["error"]}
 
 
 #: SQLite keeps its journal beside the database; replacing one is replacing the store.
@@ -816,12 +888,39 @@ def infer_task_type(paths: list[str]) -> str:
     return "implementation"
 
 
+def _shell_read_paths(command: str, cwd: str) -> list[str]:
+    """The files a whole-file-read command names, excluding the program name
+    itself. ``_command_paths`` includes that word too: harmless for the
+    write gate's own purpose (a bogus "path" that fails the regular-file
+    check downstream and changes nothing), but the read gate's event log and
+    digest intent should name only the files actually read, and the fast
+    path here specifically wants "no operand" (a bare ``cat``, reading
+    stdin) to mean no read target -- which dropping the leading word also
+    gets right, since nothing remains to drop it from."""
+    paths = _command_paths(command, cwd)
+    return paths[1:] if paths else paths
+
+
+def _read_tool_paths(tool_input: Any, cwd: str) -> list[str]:
+    """The file a ``Read``-kind tool call names. ``offset``/``limit``/``pages``
+    are recorded by the caller for the event, not read here: the read gate
+    judges the file's own on-disk size, never the requested range (design
+    section 2.1)."""
+    path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    if not isinstance(path, str) or not path:
+        return []
+    return [path if os.path.isabs(path) else os.path.join(cwd, path)]
+
+
 def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[str, list[str]]:
-    """``("edit", paths)``, ``("shell", [cwd, *named paths])`` for a writing
-    command, ``("shell_read", [])`` for one that does not look like it
-    writes, or ``("other", [])``."""
+    """``("edit", paths)``, ``("read", paths)`` for a whole-file read,
+    ``("shell", [cwd, *named paths])`` for a writing command, ``("shell_read",
+    [])`` for one that neither writes nor reads a file whole, or
+    ``("other", [])``."""
     if tool_name in EDIT_TOOLS[client]:
         return "edit", _edit_paths(client, tool_input, cwd)
+    if tool_name in READ_TOOLS[client]:
+        return "read", _read_tool_paths(tool_input, cwd)
     if tool_name in SHELL_TOOLS[client]:
         command = _command_text(tool_input)
         if shell_writes(command):
@@ -830,6 +929,12 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
             # path counts as a place the command may write, so each
             # repository among them needs its own receipt.
             return "shell", [cwd, *_command_paths(command, cwd)]
+        # The whole-file-read heuristic is Codex-only: Claude has its own
+        # deterministic Read tool (matched above), and design section 2.1
+        # states the two clients' read gates as separate mechanisms rather
+        # than layering the shell heuristic under Claude's Bash tool too.
+        if client == "codex" and _shell_whole_file_read(command):
+            return "read", _shell_read_paths(command, cwd)
         return "shell_read", []
     return "other", []
 
@@ -889,9 +994,184 @@ def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
     return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
 
 
+# ------------------------------------------------------------- read judgment
+
+
+def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
+                     state_root: str, local_queue_root: str,
+                     worker_executable: str, protected: tuple[str, ...],
+                     clock: Any) -> "Decision | None":
+    """One file named by a gated-shape read: the design's steps 1 (repository
+    membership already checked by the caller; here from step 3 on) through 9.
+    None means the fast path allowed it with nothing logged; a ``Decision``
+    means it was judged and must be logged, allow or deny.
+    """
+    real_path = os.path.realpath(path)
+    # A protected path can never be a valid work_digest_file target (it
+    # refuses one by the same rule), so compelling a digest for one here
+    # would be a deny nothing could ever satisfy. Checked before repo_key,
+    # not after: state_root itself may sit inside a repository (the write
+    # gate's own protected-path tests construct exactly that layout).
+    if any(_under(real_path, root) for root in protected) or _under(real_path, state_root):
+        return None
+    repo_root = repo_key(real_path)
+    if repo_root is None:
+        return None
+    if not policy.local_first.enabled:
+        return None
+    repo_policy = policy.for_repo(repo_root)
+    if not repo_policy.mechanical_ok or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS:
+        return None
+    globs = localfirst.effective_globs(repo_policy, policy.local_first)
+    if not localfirst.matches_any(real_path, repo_root, globs):
+        return None
+    try:
+        info = os.stat(real_path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size < policy.local_first.read_gate_min_bytes:
+        return None
+
+    # Gated-shape from here on: every branch below is logged.
+    size, mtime_ns = info.st_size, info.st_mtime_ns
+    now = float(clock())
+    readiness = localfirst.readiness(
+        policy=policy, state_root=state_root, local_queue_root=local_queue_root,
+        worker_executable=worker_executable, window_bytes=size, clock=clock)
+    if not readiness.ready:
+        return Decision(
+            "allow", "local_first_waived",
+            f"delegation-first gate: {real_path} is a mechanical artifact but the local lane "
+            f"is not ready ({readiness.reason}); read allowed uncompelled",
+            (repo_root,), logged=True,
+            extra={"waiver_reason": readiness.code, "bytes_estimate": size})
+
+    receipt = localfirst.read_digest_receipt(state_root, real_path)
+    matches_current = (receipt is not None and receipt.get("path") == real_path
+                       and receipt.get("size") == size and receipt.get("mtime_ns") == mtime_ns)
+    if matches_current:
+        job_id = str(receipt.get("job_id") or "")
+        state = _digest_job_state(local_queue_root, job_id)
+        if state is None:
+            return Decision(
+                "deny", "local_digest_pending",
+                f"delegation-first gate: {real_path} was submitted for a local digest "
+                f"(job {job_id}) but its outcome could not be confirmed. Call work_result "
+                f"with job_id={job_id!r} and retry the read once it completes.",
+                (repo_root,), logged=True, extra={"job_id": job_id, "bytes_estimate": size})
+        job_status = str(state.get("status") or "")
+        if job_status == "complete":
+            return Decision(
+                "allow", "local_digest_present",
+                f"a local digest of {real_path} has already completed (job {job_id})",
+                (repo_root,), logged=True, extra={"job_id": job_id, "bytes_estimate": size})
+        if job_status in ("failed", "unknown", "cancelled", "expired"):
+            return Decision(
+                "allow", "local_first_waived",
+                f"delegation-first gate: the local digest of {real_path} ended {job_status} "
+                f"(job {job_id}); read allowed uncompelled", (repo_root,), logged=True,
+                extra={"waiver_reason": f"digest_{job_status}", "job_id": job_id,
+                       "bytes_estimate": size})
+        error = str(state.get("error") or "")
+        if job_status == "queued" and error.startswith("deferred:"):
+            deferred_reason = error[len("deferred:"):]
+            return Decision(
+                "allow", "local_first_waived",
+                f"delegation-first gate: the local digest of {real_path} is deferred "
+                f"({deferred_reason}); read allowed uncompelled", (repo_root,), logged=True,
+                extra={"waiver_reason": f"digest_deferred:{deferred_reason}", "job_id": job_id,
+                       "bytes_estimate": size})
+        # queued (not deferred) or running: the digest is in flight.
+        return Decision(
+            "deny", "local_digest_pending",
+            f"delegation-first gate: {real_path} is being digested (job {job_id}, "
+            f"{job_status}). Call work_result with job_id={job_id!r} and retry the read "
+            f"once it completes. Exact tools (grep, rg, tail -n) are allowed now.",
+            (repo_root,), logged=True, extra={"job_id": job_id, "bytes_estimate": size})
+
+    if (receipt is not None and receipt.get("path") == real_path
+            and isinstance(receipt.get("created_at"), (int, float))
+            and now - receipt["created_at"] <= policy.local_first.digest_grace_seconds):
+        return Decision(
+            "allow", "local_first_waived",
+            f"delegation-first gate: {real_path} changed since its last digest, within the "
+            f"{policy.local_first.digest_grace_seconds}s grace window; read allowed uncompelled",
+            (repo_root,), logged=True,
+            extra={"waiver_reason": "recent_digest_changed_file", "bytes_estimate": size})
+
+    matched_glob = next((glob for glob in globs if localfirst.matches_any(real_path, repo_root, (glob,))),
+                        globs[0])
+    readiness_info = {"ready": readiness.ready,
+                      "calibrated_median_s": readiness.considered.get("calibrated_median_s"),
+                      "budget_s": readiness.considered.get("budget_s")}
+    localfirst.write_digest_intent(
+        state_root, path=real_path, repo=repo_root, size=size, mtime_ns=mtime_ns,
+        matched_glob=matched_glob, classification=repo_policy.classification, client=client,
+        readiness_info=readiness_info, digest_grace_seconds=policy.local_first.digest_grace_seconds,
+        clock=clock)
+    return Decision(
+        "deny", "local_digest_required",
+        f"delegation-first gate: {real_path} is a mechanical artifact ({size:,} bytes, "
+        f"matches {matched_glob}) in a repository the operator marked mechanical_ok, and "
+        f"the local lane is ready ({readiness.reason}). Call work_digest_file with "
+        f"path={real_path!r}, task_type one of {'|'.join(localfirst.DIGEST_TASK_TYPES)}, then "
+        f"work_result on the returned job_id; this read is allowed once the digest completes. "
+        f"Exact tools (grep, rg, tail -n) are allowed now.",
+        (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob})
+
+
+def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
+              local_queue_root: str, worker_executable: str,
+              protected: tuple[str, ...] = (), clock: Any = time.time) -> Decision:
+    """Allow or deny one whole-file read across every path it names.
+
+    Each path is judged independently (design section 2.1); the first that
+    denies wins the call, since the tool call as given would otherwise
+    surface content from a file that has not cleared the gate. A path the
+    fast path allows contributes nothing (``None``); when every path does,
+    the whole call is fast-path allowed and unlogged, matching the design's
+    "no ledger write" rule for the ordinary case.
+
+    An unreadable or malformed routing policy is a deny, the same as an
+    edit -- but only once at least one path is inside a repository: outside
+    every repository a read is unconditionally allowed (step 1), whatever
+    state the policy is in.
+    """
+    in_repo = [(path, repo_key(os.path.realpath(path))) for path in paths]
+    in_repo = [(path, repo) for path, repo in in_repo if repo is not None]
+    if not in_repo:
+        return Decision("allow", "outside_repository",
+                        "no repository holds any target this read names", logged=False)
+    try:
+        policy = autoroute.load_policy(state_root)
+    except autoroute.PolicyError as exc:
+        repos = tuple(sorted({repo for _, repo in in_repo}))
+        return Decision(
+            "deny", "gate_auto_decision_failed",
+            f"delegation-first gate: the routing policy could not be read "
+            f"({type(exc).__name__}); a gated-shape read cannot be judged until it can "
+            f"[policy_unreadable]", repos, logged=True)
+    decisions = []
+    for path, _repo in in_repo:
+        outcome = _judge_read_path(
+            path, client, policy=policy, state_root=state_root,
+            local_queue_root=local_queue_root, worker_executable=worker_executable,
+            protected=protected, clock=clock)
+        if outcome is not None:
+            decisions.append(outcome)
+    for decision in decisions:
+        if not decision.allowed:
+            return decision
+    if decisions:
+        return decisions[0]
+    return Decision("allow", "not_gated_shape",
+                    "no read target matched the mechanical-artifact shape", logged=False)
+
+
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
           capacity_db: str | None = None,
+          local_queue_root: str = "", worker_executable: str = "",
           decide: Any = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
@@ -906,7 +1186,13 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     work the policy retains proceeds with no friction and work it routes
     elsewhere is refused here and owed to the route the receipt names.
     Without ``decide`` the gate behaves as it did: a missing receipt is a
-    deny telling the agent which calls to make."""
+    deny telling the agent which calls to make.
+
+    ``local_queue_root``/``worker_executable`` are needed only for a
+    ``kind == "read"`` call (:func:`judge_read`); every other kind ignores
+    them, so a caller that never enables local-first can leave them at their
+    empty-string default.
+    """
     if client not in CLIENTS:
         return Decision("deny", "client_invalid", "gate configured with an unknown client")
     kind, paths = classify(client, tool_name, tool_input, cwd)
@@ -915,6 +1201,11 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     if kind == "shell_read":
         return Decision("allow", "shell_read_only_heuristic",
                         "command does not look like it writes (heuristic)", logged=False)
+    if kind == "read":
+        return judge_read(client, paths, cwd, state_root=state_root,
+                          local_queue_root=local_queue_root,
+                          worker_executable=worker_executable,
+                          protected=protected, clock=clock)
     if kind == "edit":
         hit = [path for path in paths if any(_under(path, root) for root in protected)]
     else:
@@ -1036,6 +1327,8 @@ def record_event(state_root: str, client: str, tool_name: str, decision: Decisio
         record["item_id"] = decision.receipt.get("item_id")
         record["stage"] = decision.receipt.get("stage")
         record["owner_route"] = decision.receipt.get("owner_route")
+    if decision.extra:
+        record.update(decision.extra)
     store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
 
 
@@ -1057,12 +1350,18 @@ def state_root_from_config(config_path: str) -> str:
     return gate_paths_from_config(config_path)[0]
 
 
-def gate_paths_from_config(config_path: str) -> tuple[str, str, str]:
-    """``(state_root, capacity_db, local_queue_root)`` from the private
-    orchestration configuration. ``local_queue_root`` defaults to
+def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
+    """``(state_root, capacity_db, local_queue_root, worker_executable)`` from
+    the private orchestration configuration. ``local_queue_root`` defaults to
     ``<state_root>/local-queue`` when the config omits it, matching
     ``config/orchestration.example.json``, so an existing config written
-    before the local-first read gate existed keeps working."""
+    before the local-first read gate existed keeps working.
+    ``worker_executable`` defaults to the empty string when absent, the same
+    reasoning: a config predating this feature (or a test's minimal one) has
+    no worker to name, and an empty string is exactly what
+    ``localfirst.readiness`` already reads as "no local worker configured"
+    (``worker_not_configured``), never a crash.
+    """
     loaded = store.read_json(config_path)
     if not isinstance(loaded, dict) or not isinstance(loaded.get("state_root"), str):
         raise ValueError("orchestration config has no state_root")
@@ -1073,7 +1372,12 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str]:
         local_queue_root = os.path.join(loaded["state_root"], "local-queue")
     elif not isinstance(local_queue_root, str):
         raise ValueError("orchestration config local_queue_root must be a string")
-    return loaded["state_root"], loaded["capacity_db"], local_queue_root
+    worker_executable = loaded.get("worker_executable")
+    if worker_executable is None:
+        worker_executable = ""
+    elif not isinstance(worker_executable, str):
+        raise ValueError("orchestration config worker_executable must be a string")
+    return loaded["state_root"], loaded["capacity_db"], local_queue_root, worker_executable
 
 
 def _hook_input() -> str:
@@ -1113,7 +1417,9 @@ def _hook_input() -> str:
 
 def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
-             protected: tuple[str, ...] = (), decide: Any = None) -> Decision:
+             protected: tuple[str, ...] = (),
+             local_queue_root: str = "", worker_executable: str = "",
+             decide: Any = None) -> Decision:
     tool_name = payload.get("tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     if not isinstance(tool_name, str):
@@ -1122,7 +1428,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
     else:
         decision = judge(client, tool_name, payload.get("tool_input"), cwd,
                          state_root=state_root, clock=clock, protected=protected,
-                         capacity_db=capacity_db, decide=decide)
+                         capacity_db=capacity_db, local_queue_root=local_queue_root,
+                         worker_executable=worker_executable, decide=decide)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -1393,6 +1700,17 @@ NOT_COVERED = [
     "covers work an assistant sends it, not work it never sends",
     "the brief itself: a PreToolUse payload names a tool and some paths, not the task, so "
     "automatic routing compels the dispatch but the brief's words are the assistant's",
+    "mechanical text already in the assistant's own context: no Read or shell call names a "
+    "file, so the read gate never sees it, the same limit infer_task_type already states "
+    "for the write gate",
+    "inline test and build output the assistant never captures to a file: the largest "
+    "mechanical stream, and nothing here can compel a digest of text that was never read "
+    "from disk",
+    "files under read_gate_min_bytes, and shell reads through a spelling the whole-file-read "
+    "heuristic does not recognise (Codex only; Claude's Read tool is matched by name, not text)",
+    "on Codex the read gate is a text heuristic over the shell command, the same strength "
+    "limit the write gate's own heuristic states; on Claude it is the Read tool, "
+    "deterministic (see read_gate in this report)",
 ]
 
 
@@ -1532,6 +1850,14 @@ def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.ti
         "receipts": receipts,
         "recent_events": recent,
         "denials_in_window": sum(1 for event in recent if event.get("permission") == "deny"),
+        # Claude's read gate is its Read tool, matched by name: deterministic,
+        # the same strength its editing tools already have. Codex has no
+        # such tool; its read gate is the whole-file-read shell heuristic
+        # (design section 2.1), the same strength its write heuristic
+        # already is. Static, not read from installation state: it is a
+        # fact about the mechanism, not about whether this host has it
+        # installed (``installed`` above already answers that).
+        "read_gate": {"claude": "deterministic", "codex": "heuristic"},
         "not_covered": NOT_COVERED,
     }
 
@@ -1605,15 +1931,18 @@ def main(argv: list[str] | None = None) -> int:
             state_root = args.state_root
             capacity_db = os.path.join(args.state_root, "capacity.sqlite3")
             local_queue_root = os.path.join(args.state_root, "local-queue")
+            worker_executable = ""
         else:
-            state_root, capacity_db, local_queue_root = gate_paths_from_config(args.config or "")
+            state_root, capacity_db, local_queue_root, worker_executable = \
+                gate_paths_from_config(args.config or "")
         protected = protected_paths(state_root, args.config, home, capacity_db,
                                     local_queue_root)
         payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
         decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
-                            protected=protected,
+                            protected=protected, local_queue_root=local_queue_root,
+                            worker_executable=worker_executable,
                             decide=None if args.no_automatic_routing else
                             automatic_decider(args.client, state_root, capacity_db))
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class

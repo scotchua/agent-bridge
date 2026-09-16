@@ -1185,9 +1185,11 @@ class GatePathsFromConfigTests(unittest.TestCase):
             config_path = os.path.join(base, "orchestration.json")
             store.atomic_write_json(config_path, {"state_root": state,
                                                   "capacity_db": os.path.join(state, "capacity.sqlite3")})
-            state_root, capacity_db, local_queue_root = gate.gate_paths_from_config(config_path)
+            state_root, capacity_db, local_queue_root, worker_executable = \
+                gate.gate_paths_from_config(config_path)
             self.assertEqual(state_root, state)
             self.assertEqual(local_queue_root, os.path.join(state, "local-queue"))
+            self.assertEqual(worker_executable, "")
 
     def test_returns_the_configured_local_queue_root_when_present(self):
         with tempfile.TemporaryDirectory() as base:
@@ -1197,8 +1199,29 @@ class GatePathsFromConfigTests(unittest.TestCase):
             store.atomic_write_json(config_path, {"state_root": state,
                                                   "capacity_db": os.path.join(state, "capacity.sqlite3"),
                                                   "local_queue_root": custom})
-            _, _, local_queue_root = gate.gate_paths_from_config(config_path)
+            _, _, local_queue_root, _ = gate.gate_paths_from_config(config_path)
             self.assertEqual(local_queue_root, custom)
+
+    def test_returns_the_configured_worker_executable_when_present(self):
+        with tempfile.TemporaryDirectory() as base:
+            state = os.path.join(base, "state")
+            worker = os.path.join(base, "bin", "local-worker")
+            config_path = os.path.join(base, "orchestration.json")
+            store.atomic_write_json(config_path, {"state_root": state,
+                                                  "capacity_db": os.path.join(state, "capacity.sqlite3"),
+                                                  "worker_executable": worker})
+            _, _, _, worker_executable = gate.gate_paths_from_config(config_path)
+            self.assertEqual(worker_executable, worker)
+
+    def test_a_non_string_worker_executable_is_refused(self):
+        with tempfile.TemporaryDirectory() as base:
+            state = os.path.join(base, "state")
+            config_path = os.path.join(base, "orchestration.json")
+            store.atomic_write_json(config_path, {"state_root": state,
+                                                  "capacity_db": os.path.join(state, "capacity.sqlite3"),
+                                                  "worker_executable": 7})
+            with self.assertRaises(ValueError):
+                gate.gate_paths_from_config(config_path)
 
     def test_state_root_from_config_is_unaffected_by_the_third_value(self):
         with tempfile.TemporaryDirectory() as base:
