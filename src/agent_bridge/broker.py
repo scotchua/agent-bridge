@@ -12,6 +12,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -93,18 +94,65 @@ def _sqlite_uri_path(path: str) -> str:
             .replace("?", "%3F").replace("#", "%23"))
 
 
-def _digest_receipt_routed_locally(local_queue_root: str, receipt_id: str) -> bool:
-    """Whether ``receipt_id`` names a row in the orchestration local queue's
-    ``routing_receipts`` table (``localq/intake.py``) whose own decision was
-    ``"local"`` -- an admission that actually queued the caller's earlier
-    text for local digestion, not merely an attempt that was refused (too
-    small, a prohibited flag, task type needing cloud judgment). Read-only,
-    direct SQLite by path: this module must never construct
+def _consume_receipt_once(cfg: Config, receipt_id: str, now: float) -> bool:
+    """Atomically record that ``receipt_id`` has just satisfied a
+    ``local_first`` declaration, returning False if it already had.
+
+    Found by adversarial review: existence and ``decision == "local"``
+    alone let a single honestly-obtained receipt satisfy every future
+    large consultation forever, for any peer, regardless of content --
+    reusable with no dishonesty at all, unlike a typed ``bypass``, which at
+    least leaves a visible, questionable claim in the ledger. A receipt
+    proves one file was routed locally once; this makes it usable once.
+
+    Tracked in the consultation bridge's own state (``cfg.state(...)``),
+    not the orchestration package's ``routing_receipts`` table, whose
+    immutability triggers exist for a different reason (an auditable,
+    tamper-evident intake record) and are not this package's to touch.
+    ``INSERT ... PRIMARY KEY`` gives single-use semantics atomically, the
+    same idempotency mechanism ``routing_receipts`` itself already uses via
+    its own ``request_key TEXT UNIQUE``.
+    """
+    store.secure_mkdir(cfg.state_root)
+    db_path = cfg.state("local-first-consumed-receipts.sqlite3")
+    db = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS consumed_receipts (
+            receipt_id TEXT PRIMARY KEY, consumed_at REAL NOT NULL)""")
+        try:
+            db.execute("INSERT INTO consumed_receipts(receipt_id, consumed_at) VALUES(?, ?)",
+                      (receipt_id, now))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        db.close()
+
+
+def _digest_receipt_routed_locally(cfg: Config, receipt_id: str) -> bool:
+    """Whether ``receipt_id`` names a fresh, not-yet-consumed row in the
+    orchestration local queue's ``routing_receipts`` table (``localq/
+    intake.py``) whose own decision was ``"local"`` -- an admission that
+    actually queued the caller's earlier text for local digestion, not
+    merely an attempt that was refused (too small, a prohibited flag, task
+    type needing cloud judgment).
+
+    Existence and decision alone are not enough (see ``_consume_receipt_
+    once``'s docstring): the receipt must also be no older than
+    ``local_first.receipt_max_age_seconds`` (default 900) and not already
+    used to satisfy an earlier declaration. Both checks together close the
+    "one receipt satisfies everything forever" gap; freshness alone would
+    not, since two calls made moments apart would both fall inside any
+    reasonable window.
+
+    Read-only, direct SQLite by path: this module must never construct
     ``AutomaticIntake``/``LocalQueue`` itself, whose constructors create the
     queue's directory and tables as a side effect a read must not have
     (the same reasoning ``orchestration.gate._digest_job_state`` states for
     its own read-only query against the sibling job database).
     """
+    local_queue_root = cfg.local_first_queue_root()
     if not local_queue_root or not receipt_id:
         return False
     database = os.path.join(local_queue_root, "routing.sqlite3")
@@ -115,13 +163,21 @@ def _digest_receipt_routed_locally(local_queue_root: str, receipt_id: str) -> bo
         return False
     try:
         row = db.execute(
-            "SELECT decision FROM routing_receipts WHERE receipt_id=?", (receipt_id,)
+            "SELECT decision, created_at FROM routing_receipts WHERE receipt_id=?", (receipt_id,)
         ).fetchone()
     except sqlite3.Error:
         return False
     finally:
         db.close()
-    return row is not None and row[0] == "local"
+    if row is None or row[0] != "local":
+        return False
+    created_at = row[1]
+    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+        return False
+    now = time.time()
+    if now - created_at > cfg.local_first_receipt_max_age_seconds():
+        return False
+    return _consume_receipt_once(cfg, receipt_id, now)
 
 
 def _validate_local_first(cfg: Config, prompt: str, local_first: Any) -> None:
@@ -137,30 +193,38 @@ def _validate_local_first(cfg: Config, prompt: str, local_first: Any) -> None:
     supplied, because the assistant can always type ``needs_judgment`` and
     that is by design, not a gap to close.
 
-    A supplied field is validated for shape regardless of whether it was
+    A supplied field is validated for *shape* regardless of whether it was
     required, so a malformed declaration is refused (and never silently
-    dropped) even when the caller volunteered it unprompted.
+    dropped) even when the caller volunteered it unprompted. The live
+    receipt lookup is different: it only runs when this call actually
+    needs one. An adversarial review found that skipping this distinction
+    made an installation where local-first is not (or not fully)
+    configured -- ``local_queue_root`` unset is the out-of-box default --
+    refuse a caller that defensively volunteered a real, well-formed
+    receipt id on a tiny prompt that never needed one at all, since the
+    live lookup always fails without a queue root to check against
+    regardless of whether the call was ever gated.
     """
-    if local_first is not None:
-        if not isinstance(local_first, dict) or len(local_first) != 1:
-            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
-        if "digest_receipt_id" in local_first:
-            receipt_id = local_first["digest_receipt_id"]
-            if not isinstance(receipt_id, str) or not receipt_id:
-                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
-            if not _digest_receipt_routed_locally(cfg.local_first_queue_root(), receipt_id):
-                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
-        elif "bypass" in local_first:
-            if local_first["bypass"] not in LOCAL_FIRST_BYPASS_REASONS:
-                raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
-        else:
+    required = (cfg.local_first_enabled()
+               and len(prompt.encode("utf-8")) >= cfg.local_first_min_bytes())
+    if local_first is None:
+        if required:
             raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
         return
-    if not cfg.local_first_enabled():
-        return
-    if len(prompt.encode("utf-8")) < cfg.local_first_min_bytes():
-        return
-    raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    if not isinstance(local_first, dict) or len(local_first) != 1:
+        raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    if "digest_receipt_id" in local_first:
+        receipt_id = local_first["digest_receipt_id"]
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        if required and not _digest_receipt_routed_locally(cfg, receipt_id):
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    elif "bypass" in local_first:
+        bypass = local_first["bypass"]
+        if not isinstance(bypass, str) or bypass not in LOCAL_FIRST_BYPASS_REASONS:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    else:
+        raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
 
 
 def _validate_identifier_request(args: Any, field: str) -> str:

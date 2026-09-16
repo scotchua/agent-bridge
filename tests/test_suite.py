@@ -553,7 +553,13 @@ def test_local_first_declaration() -> None:
     only that one was given. Driven through the real MCP server subprocess,
     the same way test_input_validation is, because the requirement depends
     on the operator's own configuration and this prompt's size, evaluated
-    per call.
+    per call. Also covers three gaps an adversarial review found: the live
+    receipt check ran even on a call that never needed one at all (refusing
+    a caller that defensively volunteered a declaration on an unconfigured
+    or below-threshold install); a receipt had no freshness or single-use
+    binding, so one honestly-obtained receipt would satisfy every future
+    large consultation forever; and a non-string bypass value crashed
+    instead of being refused.
     """
     print("\n[local_first declaration]")
     from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
@@ -568,31 +574,43 @@ def test_local_first_declaration() -> None:
                               "params": {"name": tool, "arguments": args}}])
         return out[0]["result"]["structuredContent"]
 
-    # Unconfigured (the default): nothing is required regardless of size.
+    # Unconfigured (the default): nothing is required regardless of size,
+    # and a caller that defensively volunteers a declaration anyway is not
+    # refused for a feature this install never turned on.
     sb = Sandbox()
     try:
         r = call(sb, "codex", "claude_start",
                 {"prompt": "x" * 5000, "source_classification": "internal"})
         check("LF: unconfigured install requires nothing regardless of size",
               r.get("ok") is True, json.dumps(r))
+        volunteered = call(sb, "codex", "claude_start", {
+            "prompt": "hi", "source_classification": "internal",
+            "local_first": {"digest_receipt_id": "no-such-receipt-and-no-queue-either"},
+        })
+        check("LF: a volunteered declaration on an unconfigured install is not refused",
+              volunteered.get("ok") is True, json.dumps(volunteered))
     finally:
         sb.cleanup()
 
-    # Configured: a real routing_receipts row to check declarations against,
-    # built the same way orchestration's work_digest_file builds one.
+    # Configured: real routing_receipts rows to check declarations against,
+    # built the same way orchestration's work_digest_file builds one. A
+    # real clock, not a fixed one: the broker checks a receipt's freshness
+    # against wall-clock time, so a fixture receipt has to be mintable
+    # fresh (and, for the staleness check below, mintable in the past).
     local_queue_root = tempfile.mkdtemp(prefix="agent-bridge-test-localq-")
     try:
         queue = LocalQueue(local_queue_root, sampler=_FixedSampler(), backend=FakeBackend(),
-                          caps=QueueCaps(), clock=lambda: 1000.0)
+                          caps=QueueCaps(), clock=time.time)
         intake = AutomaticIntake(
-            queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1),
-            clock=lambda: 1000.0)
-        local_receipt = intake.route(
-            task_type="summarize", input="synthetic operating note " * 8,
-            params={"instruction": "Select operating facts."}, priority="interactive",
-            classification="internal_nonclient", caller="codex", purpose="work", risk_flags=[])
-        check("LF: fixture receipt actually routed locally",
-              local_receipt["decision"] == "local", json.dumps(local_receipt))
+            queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1), clock=time.time)
+
+        def local_receipt(idempotency_key, intake_instance=intake):
+            return intake_instance.route(
+                task_type="summarize", input="synthetic operating note " * 8,
+                params={"instruction": "Select operating facts."}, priority="interactive",
+                classification="internal_nonclient", caller="codex", purpose="work",
+                risk_flags=[], idempotency_key=idempotency_key)
+
         refused_receipt = intake.route(
             task_type="summarize", input="synthetic operating note " * 8, params=None,
             priority="interactive", classification="client_derived", caller="codex",
@@ -605,7 +623,15 @@ def test_local_first_declaration() -> None:
             "local_queue_root": local_queue_root,
         })
         try:
-            for caller, tool in (("codex", "claude_start"), ("claude", "codex_start")):
+            small_volunteered = call(sb, "codex", "claude_start", {
+                "prompt": "hi", "source_classification": "internal",
+                "local_first": {"digest_receipt_id": "does-not-matter-below-threshold"},
+            })
+            check("LF: a volunteered declaration under the size threshold is not refused",
+                  small_volunteered.get("ok") is True, json.dumps(small_volunteered))
+
+            for n, (caller, tool) in enumerate(
+                    (("codex", "claude_start"), ("claude", "codex_start"))):
                 small = call(sb, caller, tool,
                             {"prompt": "hi", "source_classification": "internal"})
                 check(f"LF: {caller}: a small prompt needs nothing even when configured",
@@ -632,6 +658,14 @@ def test_local_first_declaration() -> None:
                       bad_bypass.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
                       json.dumps(bad_bypass))
 
+                malformed_bypass = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"bypass": ["needs_judgment"]},
+                })
+                check(f"LF: {caller}: a non-string bypass value is refused, not a crash",
+                      malformed_bypass.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(malformed_bypass))
+
                 fake_receipt = call(sb, caller, tool, {
                     "prompt": "x" * 200, "source_classification": "internal",
                     "local_first": {"digest_receipt_id": "no-such-receipt"},
@@ -648,33 +682,56 @@ def test_local_first_declaration() -> None:
                       refused_used.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
                       json.dumps(refused_used))
 
+                this_receipt = local_receipt(f"lf-fixture-both-{n}")
                 both = call(sb, caller, tool, {
                     "prompt": "x" * 200, "source_classification": "internal",
-                    "local_first": {"digest_receipt_id": local_receipt["receipt_id"],
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"],
                                    "bypass": "needs_judgment"},
                 })
                 check(f"LF: {caller}: a receipt and a bypass together is refused",
                       both.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
                       json.dumps(both))
-
-                good_receipt = call(sb, caller, tool, {
+                # Refused above for carrying two keys, so it is still unused.
+                still_good = call(sb, caller, tool, {
                     "prompt": "x" * 200, "source_classification": "internal",
-                    "local_first": {"digest_receipt_id": local_receipt["receipt_id"]},
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"]},
                 })
-                check(f"LF: {caller}: a receipt that actually routed locally is accepted",
-                      good_receipt.get("ok") is True, json.dumps(good_receipt))
-                status = sb.wait(good_receipt["job_id"])
+                check(f"LF: {caller}: that same receipt alone is accepted",
+                      still_good.get("ok") is True, json.dumps(still_good))
+                status = sb.wait(still_good["job_id"])
                 check(f"LF: {caller}: the accepted call still completes normally",
                       status.get("status") == "complete", json.dumps(status))
+
+                reused = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"]},
+                })
+                check(f"LF: {caller}: the same receipt cannot satisfy a second call",
+                      reused.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(reused))
+
+            # A receipt minted long ago: a second, past-clocked intake onto
+            # the SAME database, since routing_receipts is immutable (its
+            # own triggers refuse an UPDATE) and a fixture cannot age one
+            # any other way.
+            stale_intake = AutomaticIntake(
+                queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1),
+                clock=lambda: time.time() - 100_000)
+            stale_receipt = local_receipt("lf-fixture-stale", intake_instance=stale_intake)
+            stale = call(sb, "codex", "claude_start", {
+                "prompt": "x" * 200, "source_classification": "internal",
+                "local_first": {"digest_receipt_id": stale_receipt["receipt_id"]},
+            })
+            check("LF: a receipt older than receipt_max_age_seconds does not satisfy it",
+                  stale.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                  json.dumps(stale))
 
             ledger = sb.ledger()
             declared = [row for row in ledger
                        if isinstance(row.get("local_first"), dict)
                        and "digest_receipt_id" in row["local_first"]]
-            check("LF: the digest_receipt_id declaration reaches the ledger",
-                  len(declared) >= 1
-                  and declared[-1]["local_first"]["digest_receipt_id"]
-                  == local_receipt["receipt_id"], json.dumps(declared))
+            check("LF: a digest_receipt_id declaration reaches the ledger",
+                  len(declared) >= 1, json.dumps(declared))
         finally:
             sb.cleanup()
     finally:
@@ -747,6 +804,14 @@ def test_local_first_config_validation() -> None:
          lambda cfg: cfg.local_first_min_bytes()),
         ({"local_queue_root": 123}, "local_queue_root must be a string",
          lambda cfg: cfg.local_first_queue_root()),
+        ({"local_queue_root": "relative/path"}, "local_queue_root must be an absolute path",
+         lambda cfg: cfg.local_first_queue_root()),
+        ({"receipt_max_age_seconds": "900"}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
+        ({"receipt_max_age_seconds": -1}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
+        ({"receipt_max_age_seconds": True}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
     ):
         sb = Sandbox(local_first=bad)
         try:
@@ -777,6 +842,8 @@ def test_local_first_config_validation() -> None:
               sb.cfg.local_first_min_bytes() == 8000)
         check("LF config: absent local_first defaults the queue root to empty",
               sb.cfg.local_first_queue_root() == "")
+        check("LF config: absent local_first defaults the receipt age to 900",
+              sb.cfg.local_first_receipt_max_age_seconds() == 900)
     finally:
         sb.cleanup()
 

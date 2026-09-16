@@ -178,11 +178,49 @@ class Config:
         supplied `digest_receipt_id` can be checked against its
         `routing_receipts` table. Empty when local_first is not configured
         to point at one; a receipt then never verifies, so the only way to
-        satisfy a live requirement is a typed `bypass` reason."""
+        satisfy a live requirement is a typed `bypass` reason.
+
+        Required absolute when set, matching this same conceptual field's
+        own existing requirement in orchestration/config.py
+        (`local_queue_root_must_be_absolute`): a relative value resolves
+        against whatever cwd the checking process happens to have, which
+        this project never pins to one value across the MCP server, the
+        worker and `agent-bridge-admin`, so it could silently point at a
+        different directory in each -- a portability review found the two
+        conceptually-identical fields had diverged on exactly this check.
+        """
         value = self._local_first().get("local_queue_root", "")
         if not isinstance(value, str):
             raise ValueError("local_first.local_queue_root must be a string")
-        return os.path.expanduser(value) if value else ""
+        if not value:
+            return ""
+        expanded = os.path.expanduser(value)
+        if not os.path.isabs(expanded):
+            raise ValueError("local_first.local_queue_root must be an absolute path")
+        return expanded
+
+    def local_first_receipt_max_age_seconds(self) -> int:
+        """How fresh a `digest_receipt_id` must be to satisfy `local_first`
+        (design section 2.8, hardened after adversarial review).
+
+        Existence and `decision == "local"` alone are not enough: nothing
+        would otherwise bind a receipt to the call declaring it, so one
+        honestly-obtained receipt for some small, unrelated routine text
+        would satisfy every future large consultation forever, for any
+        peer, regardless of content -- a stronger and more misleading claim
+        of assurance than "accountability, not enforcement" concedes, since
+        it takes no dishonesty at all, only reuse. Bounding the receipt's
+        age closes most of that; broker._consume_receipt_once closes the
+        rest (reusing one receipt twice within the window).
+
+        Defaults to 900 seconds, the same value and reasoning
+        `digest_grace_seconds` already uses elsewhere in this project (the
+        `CLIENT_PRESENCE_SECONDS` definition of "recent").
+        """
+        value = self._local_first().get("receipt_max_age_seconds", 900)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("local_first.receipt_max_age_seconds must be a non-negative integer")
+        return value
 
     def peer(self, name: str) -> dict[str, Any]:
         if name not in PEERS:
