@@ -924,3 +924,539 @@ running the suite, the hundred skipped tests were found by moving a block, and
 the rejection marker was found by a rerun; all three are the kind of thing
 that is only ever found by running something, which is the argument for the
 runbook rather than a substitute for it.
+
+## Round five: the automatic delegation work, 2026-09-15
+
+Three defects found by running the thing rather than by reading it. Recorded
+here because the pattern transfers: each one passed every test that existed,
+and each one was found within minutes of driving the real workflow end to end.
+
+41. **Both execution lanes could only run on one macOS layout, and the only
+    tests that would have caught it never ran anywhere it was broken.**
+    `GIT_BIN` was the standalone Command Line Tools path and `_assert_macos()`
+    refused every other host, so the first git call spawned a file that does
+    not exist and the lane reported `TaskError: command spawn failed`. CI ran
+    `test_claude_task.py` and `test_codex_task.py` on macOS only, precisely
+    because they could not pass elsewhere. A platform-conditional test step is
+    a place defects go to live. Both modules now run on macOS and Linux and
+    assert what the *selected* confinement backend claims rather than macOS
+    semantics everywhere.
+
+42. **A completed stage bricked its repository.** The automatic decision used
+    one stage name per repository, so the first ordinary `stage_complete` left
+    every later edit denied with `stage_not_owned` and an instruction to claim
+    a stage by hand. The gate was working exactly as written and the result
+    was the opposite of the feature. Stages carry a generation now.
+
+43. **A plausible-sounding signal produced an unsatisfiable instruction.**
+    `infer_task_type` guessed "mechanical" when every target path looked like
+    a test file, and routed such edits to the local model. It read well. But
+    the local worker processes inline text and returns a draft; it does not
+    edit files, so the dispatch intent named a call that could never be made.
+    A signal that is cheap to compute is not the same as a signal that means
+    something.
+
+44. **Editing the policy looked like it did nothing, and fixing that exposed
+    the real bug.** A receipt decided under one policy stayed authoritative
+    until it expired, so classifying a repository took effect up to four
+    hours later. Recording the policy's fingerprint in each receipt fixed
+    that and immediately surfaced worse: the stage router never reassigns an
+    owned stage, so when the route changed the old stage was still owned on
+    the old route, the receipt was written naming *that* route while the
+    decision said the new one, and the gate allowed the edit. A decision to
+    delegate had silently become a decision to retain.
+
+    Two lessons, both familiar from earlier rounds. Individually correct
+    fixes interact: this one only became visible because another fix started
+    exercising a path that had never run. And the invariant that mattered
+    ("a receipt never names a route its decision did not choose") was true by
+    construction right up until it was not, which is exactly the kind of
+    thing to assert rather than reason about. It is asserted now.
+
+45. **Walking the documentation found what reading the code did not.** Both
+    of the above came from running the commands `INSTALL.md` tells a user to
+    type, in order, against a fresh state, and looking at what actually came
+    back. The unit tests were green throughout. A test suite checks the cases
+    somebody thought of; the documented workflow is the case the user will
+    actually hit.
+
+46. **I called an intermittent failure "load-induced" on two clean runs.**
+    Two main-suite checks about orphan processes (`codex->claude` and
+    `claude->codex: no orphan processes survive in the killed groups`) failed
+    during this work. Two consecutive runs came back clean, so I recorded
+    them as load-induced and moved on. Three further runs then produced 2, 4
+    and 3 total failures: the checks are **intermittent in this container**,
+    not reliably clean, and "two runs passed" did not support the conclusion
+    I drew from it.
+
+    Attribution rests on a branch-versus-main comparison instead, which is
+    the thing that actually answers the question: the same suite alternated
+    between this branch and a pristine worktree of `origin/main`, four rounds
+    each, on the same machine. `runner.py`, `broker.py`, `platform/` and
+    `backends/` are untouched by this branch, which is a reason to expect no
+    difference, not evidence of none.
+
+    The lesson is the one this document already makes about tests that
+    certify a defect, pointed the other way: a green run is not evidence that
+    a flaky check is benign, and two of them are not evidence either. Count
+    the runs before naming a cause.
+
+## Round six: an adversarial review of the automatic delegation work
+
+Commit `58e4d8c` and the four that followed it were reviewed adversarially
+and rejected before merge, with two critical defects and four high-impact
+gaps. The review's evidence was independent: 544 core tests passed with five
+environmental skips and 118 focused gate, routing and audit tests passed, and
+none of those passing tests covered any of the defects. That sentence is the
+whole round in miniature, so it goes first.
+
+47. **Routing could be escaped one directory down.** Judgment keyed on the
+    nearest ancestor holding `.git`. An assistant routed away from a
+    repository could therefore run `git init src` and edit freely inside the
+    repository it had just created, because the nested root keyed to a
+    different receipt and had none. Judgment considers every enclosing
+    repository now, and creating a repository counts as a write.
+
+    The escape needed no exotic mechanism and no privileged call. It is the
+    kind of thing a test written from the inside does not think to try,
+    which is what adversarial review is for.
+
+48. **Confinement that confined nothing much.** Linux verification denied
+    the network and then let generated code write anywhere the account
+    could reach. The receipt said `sandbox` and the source repository was
+    checked afterwards, so the evidence looked complete while proving
+    nothing about the rest of the machine. It now runs inside a mount
+    namespace and, more to the point, **refuses to run at all** unless a
+    write outside the worktree, a write to `$HOME` and a remount of `/` all
+    actually fail on this host at that moment.
+
+    Building that boundary produced four defects of its own, each of which
+    left a boundary that passed its own tests while restricting nothing:
+    sealing `/` before binding the worktree made the worktree unwritable
+    (the kernel refuses to remount a bind read-write over a read-only
+    source); an inherited working directory left a handle on the sealed
+    mount, so relative writes failed and absolute ones succeeded; retaining
+    `CAP_SYS_ADMIN` let the payload remount `/` read-write and get zero back;
+    and `os.execv` does not search `PATH`, so the verification command never
+    ran. The self-check exists because of the third one.
+
+49. **Capacity was evidence in name only.** The MCP tool `capacity_observe`
+    let either assistant name the route, the availability, the source string
+    and a freshness window of any length. So "a fresh observation from an
+    authorized source" meant whatever the model typed, for a route it knew
+    nothing about, lasting years, and there was no collector to compare it
+    against. The tool is gone; capacity has two writers, neither on the wire;
+    a `trusted` column set by the writer rather than read from the row
+    decides what routes work, and defaults to untrusted so an installed
+    ledger's existing rows stop counting on upgrade.
+
+    The general shape is worth naming: a field that only a trustworthy
+    caller would fill in honestly is not a security property, it is a
+    convention. The fix was not to validate the field harder. It was to
+    remove the caller.
+
+50. **Two fixes for staleness, and the second one taught the first a lesson.**
+    Finding 44 recorded the policy fingerprint so an operator's edit took
+    effect at once. Capacity had exactly the same four-hour lag and nobody
+    noticed, because the first fix looked like it had settled the category.
+    A receipt now records a capacity digest too.
+
+    The first attempt at that digest re-decided on every single call, because
+    the hook rewrites its own presence row every time it runs, so a digest
+    over the table changed every time. The digest is route names only, minus
+    the asking client's own presence row: eight re-decisions became three.
+    A fingerprint has to cover exactly what the decision depended on, and a
+    self-observation is not something the decision depended on.
+
+51. **Withdrawing the operator's declaration did not withdraw it.** The
+    replacement for `capacity_observe` is a list in the operator's own
+    policy file, replayed into the ledger with a short freshness so that
+    deleting a route takes effect promptly. A test asked whether it actually
+    did, and it did not: the row the previous replay wrote stayed eligible
+    until it aged out, so a deletion meant nothing for fifteen minutes. The
+    withdrawal is replayed too, matched on its own source so it cannot
+    remove a peer's real first-hand presence.
+
+    I had written the fifteen-minute freshness *as* the withdrawal
+    mechanism in the docstring before checking that it was one.
+
+52. **Cleanup keyed on the repository answered for the wrong job.** A
+    dispatch intent names a route, item, stage, owner and revision, and
+    retiring it was keyed on the repository alone. An assistant holding any
+    other owned stage in that repository could dispatch that instead and the
+    intent for the stage it was actually refused would be recorded as met.
+    The audit's "routed but never dispatched" column is the one thing that
+    catches a routing nobody honoured, so a cleanup that clears more than it
+    dispatched is the single bug that column cannot survive. Every field of
+    the binding is compared now, and a mismatch is recorded rather than
+    silent.
+
+53. **Independence was enforced in one direction only.** A review of the
+    asking client's own work was correctly sent to the peer. A review of the
+    *peer's* work fell through to the ordinary branch, where the peer was
+    allowed and had capacity, and went straight back to its author. Half a
+    guard reads like a whole one.
+
+54. **Two failing checks were about the account, not the code.** Two suite
+    checks prove the bridge fails closed when a directory cannot be listed
+    or written, and both create that condition with `chmod`. Running as uid
+    0, the condition cannot be created at all: the restriction is a no-op and
+    the check reports a failure that has nothing to do with the code, on the
+    same line a real regression would use. They measure whether mode bits
+    bind this account and skip by name when they do not.
+
+55. **My fix for the staleness gap livelocked the two clients, and its own
+    regression test could not have caught it.** Finding 50's digest
+    subtracted the asking client's own presence row, on the reasoning that a
+    client's own presence is not news to itself. That reasoning is fine and
+    the conclusion was wrong, because **a receipt is one shared
+    per-repository artifact**. Claude and Codex therefore computed different
+    digests from the identical ledger, each found the other's receipt
+    overtaken, each re-decided it to route the work to the other, and both
+    ended up permanently denied, each holding an instruction to dispatch to
+    the other. Worse than the four-hour staleness it replaced.
+
+    The general rule, which I did not have before this: anything compared
+    against a shared artifact has to be computed identically by everyone who
+    compares it. Route names only already solved the churn the subtraction
+    was for, so the subtraction was buying nothing and costing everything.
+
+    The part worth dwelling on is how it survived. The test written to guard
+    exactly this drove the Codex hook with `tool="Edit"`. Codex has no `Edit`
+    tool, so the gate classified the call as not gated and allowed it without
+    reading the receipt. **The test passed while exercising nothing**, and it
+    was the only test standing between this defect and a merge. A test that
+    asserts the right thing about the wrong call is not a weaker test than
+    none; it is worse, because it reports coverage.
+
+    Found by walking `INSTALL.md` by hand again, which is now three for three
+    on finding what the suites did not (findings 44, 45 and this one).
+
+56. **Two wrong causes for one intermittent check, and then a third.** The
+    orphan-process checks were attributed to machine load (finding 46,
+    corrected), then to zombie accounting (finding 46's correction, also
+    incomplete). A run after the zombie filter landed reported a survivor
+    that was not a zombie.
+
+    The check samples once, half a second after the group kill, and asks
+    whether a live process survived. SIGKILL is asynchronous, the kernel
+    still has to run the exit path, and a parent still has to reap, so one
+    sample at a fixed instant measures scheduling, not containment. It now
+    polls until the groups drain or five seconds pass, and reports each
+    survivor's actual process state, because a pid on its own does not say
+    whether it is running, sleeping uninterruptibly, stopped or already dead,
+    and those have different causes. A process that genuinely leaked stays
+    forever, so the deadline costs nothing and the old single sample cost
+    false failures.
+
+    I have now been wrong about this check three times, each time from a
+    message that printed pids and nothing else. The diagnostic was the fix
+    that mattered.
+
+57. **The Windows hook command could not have run on most Windows accounts.**
+    `hook_command` quoted both paths with `shlex.quote`, which is POSIX
+    quoting. It wraps a value containing a space in *single* quotes, and
+    `cmd.exe` does not treat single quotes as quoting at all: it would look
+    for a program literally named `'C:\Users\First`. So on any Windows
+    account whose home contains a space, which is the ordinary shape of a
+    Windows home, the installed command was malformed, the hook never ran,
+    and nothing said so. A hook that never runs is a gate that never gates.
+
+    Found by static reading while working the review's "live-test the Windows
+    launcher and command quoting" item, which I cannot do from here. The
+    quoting is fixed and tested as a function; the launcher still has not
+    been run under either host on Windows, and the installer's `not_covered`
+    list still says exactly that. A cross-platform string built with one
+    platform's quoting rules is worth looking for wherever else it appears,
+    and pulling that thread found three more of the same shape, all in the
+    gate:
+
+    * **the write heuristic listed only POSIX verbs**, so on Windows a
+      `cmd.exe` call that wrote with a built-in (`del`, `move`, `ren`, `rd`)
+      or a PowerShell cmdlet (`Remove-Item`, `Set-Content`, `Out-File`) read
+      as a read;
+    * **the tree-verb list had the same gap**, so a recursive delete of the
+      directory holding the gate's own state read as touching only that
+      directory;
+    * **the protected-path comparison was case- and separator-sensitive**,
+      and Windows paths are neither, so the same path named in a different
+      case or with forward slashes compared unequal and the rule did not
+      fire. Both sides go through `os.path.normcase` now, a no-op on POSIX.
+
+    None of the four is verified on a live Windows host, and that is the
+    honest summary of the Windows position: the code is now written for the
+    platform instead of assuming the other one, and nobody has run it there.
+
+58. **I duplicated three findings into two earlier rounds while writing
+    them up.** `str.replace` on the heading "What is still not true, after
+    this round", which appears once per round, inserted findings 55 to 57
+    under the consolidation round and the slicing round as well as this
+    one. Three rounds each claimed to have found the same three things.
+
+    Caught by reading the file rather than by anything automated, which is
+    the point: a document whose whole purpose is an accurate record of what
+    was found when had silently become inaccurate, and nothing in the
+    repository checks that. An anchor that is not unique is not an anchor.
+
+59. **The protected-path predicate resolved one of its two arguments, and CI
+    on two platforms said so.** `_under(path, root)` ran `realpath` on
+    `path` and not on `root`. That is an undocumented precondition on every
+    caller: a root reached through a symlink, or on Windows through a short
+    8.3 name, is a different spelling of the same directory and compared
+    unequal. `protected_paths` happens to resolve its roots, so production
+    was correct by coincidence rather than by construction.
+
+    It surfaced because the test I wrote for the case-folding fix passed an
+    unresolved root. It passed on Linux, whose `/tmp` is neither a symlink
+    nor a short name, and failed on both macOS runners, where `/var` is a
+    symlink to `/private/var`, and both Windows runners, where
+    `gettempdir` can return the 8.3 form. Both arguments are resolved now,
+    so the predicate has no precondition to forget.
+
+    Two things worth keeping. A predicate is the wrong place for a
+    precondition nobody states; it will be correct until a caller is added.
+    And the platform-split tests are better evidence than the mock they
+    replaced: the Windows case-folding behaviour is now asserted **by the
+    Windows runners**, which is the difference between a claim and a
+    measurement, and it is the reviewer's standard applied to my own work.
+
+60. **The gate allowed every edit, silently, for anyone whose path was not
+    pure ASCII.** Hook mode read its payload with `sys.stdin.read()`, which
+    decodes using the locale encoding. On Windows that is the ANSI code page,
+    and both hosts emit raw UTF-8: Node's `JSON.stringify` and Rust's
+    `serde_json` do not escape non-ASCII. So for a repository whose path held
+    any non-ASCII character the payload arrived as mojibake,
+    `enclosing_repos` found no `.git` above the mangled path, and `judge`
+    returned `allow` with `outside_repository`. **The gate printed an empty
+    object and the edit proceeded ungated.**
+
+    Measured rather than reasoned: the same payload naming a repository with
+    an e-acute is denied `routed_elsewhere` under a UTF-8 stdin and allowed
+    under `cp1252`. This is the worst defect this project has had. It is not
+    an edge case but a whole population: every user whose name or project
+    path is not pure ASCII, which is most of the world.
+
+    The fix reads bytes and names the encoding, in the gate rather than in a
+    launcher, because a launcher fix would not protect a host that invokes
+    the module directly. Non-UTF-8 bytes are a deny rather than a guess, and
+    a byte-order mark is tolerated because a BOM is not a disagreement about
+    the encoding, only about announcing it. The launchers set `PYTHONUTF8`
+    too, for everything else in the process.
+
+    The general rule: **a decoding default is a platform assumption**, and
+    this codebase had already been caught four times by platform assumptions
+    in cross-platform components. I had been looking for them in path
+    handling and quoting. Encoding is the same class and I did not think of
+    it until a sweep did.
+
+61. **A launcher that could not start Python failed open, and on Windows that
+    was the default case.** The gate always exits 0 and carries its decision
+    in the JSON, but that contract only begins once the interpreter is
+    running. Both launchers exited with the interpreter's status and nothing
+    on stdout when it could not start, and a host reads a hook that produced
+    no decision as a non-blocking error and runs the tool anyway. On a stock
+    Windows account with no Python the bare name `python` resolves to the
+    Microsoft Store App Execution Alias stub, so the fail-open was the
+    ordinary path there, not an unlucky one.
+
+    Both launchers now turn a launch failure into a deny and exit 0, while
+    passing the operator subcommands' own exit status through untouched,
+    because turning `report`'s failure into a fake hook decision would hide
+    it. Writing that fix produced a smaller lesson of its own: `$?` after an
+    `if` whose branches did not run is defined as zero, so the first version
+    reported "launcher exit 0" for a failure that was exit 127.
+
+62. **My quoted-character set for `cmd.exe` had only the obvious delimiters.**
+    Finding 57 fixed the quoting and I chose the set by intuition: space,
+    tab, quote, and the redirection and grouping characters. NTFS forbids
+    only `< > : " / \ | ? *`, so a comma, a semicolon, an equals sign, a
+    percent and an exclamation mark are all legal in a directory name and all
+    significant to `cmd.exe`, which truncates the program name at the
+    delimiter or expands a variable. `C:\dev\a=b\hook.cmd` came back bare.
+
+    Worth noticing that this is a fix to a fix, found by asking a fresh
+    reader to attack the same area rather than by re-reading it myself. The
+    matrix is now asserted per platform: the delimiter set on Windows, and on
+    POSIX a measured round trip through the real shell, because a comma needs
+    no quoting in `sh` and asserting that it did would be the same mistake
+    pointed the other way.
+
+63. **The evidence collector I wrote to test the launcher tested the harness
+    instead.** Its fixture seeded `PYTHONPATH` and `PYTHONDONTWRITEBYTECODE`
+    into every child, including every launcher invocation, and those are
+    precisely the two variables the `.cmd` exists to set. So all eight
+    launcher checks would have passed even if `%~dp0`, the `..` segment or
+    the quoted `set` produced nothing usable, because the gate would have
+    imported through the inherited path. A launcher invocation now gets those
+    removed and a hostile `PYTHONPATH` in their place, and deleting the
+    launcher's own `export PYTHONPATH` now fails three checks where it
+    previously failed none.
+
+    It also ran the installed command string through Python's `shell=True`,
+    which formats `%COMSPEC% /c` without `/d` or `/s`, where a Node host uses
+    `/d /s /c`. Testing a different invocation from the one the host uses
+    answers a different question.
+
+    Third time in this session that the same defect shape has appeared in my
+    own test code. The pattern is stable enough to name as a rule: **ask of
+    every new test what its pass would look like if the mechanism were
+    absent**, and if the answer is "the same", the test is decoration. The
+    collector now carries an assertion self-test whose result is embedded in
+    every record, so the next reader does not have to take the question on
+    trust.
+
+64. **Four Windows spellings walked straight through the protected-path
+    rule.** The rule reads a command's operands and refuses one that reaches
+    the gate's own state. Every mechanism it used to do that was written for
+    POSIX, so on Windows the ordinary spellings were invisible to it. All four
+    reproduced with `ntpath` in place, all four now refused:
+
+    * `cmd /c "del C:\Users\me\.agent-bridge\routing\x.json"` was
+      **allowed**, because `cmd` was not a recognised shell, so the quoted
+      command stayed one word, and the colon split then severed the drive
+      letter out of it;
+    * `bash.exe -c "..."` was **allowed** where the identical `bash -c "..."`
+      was refused, because the basename still carried `.exe`;
+    * `powershell -Command "..."` was **allowed**, because neither the program
+      nor the flag was recognised at all;
+    * `rm -rf /c/Users/me/.agent-bridge` was **allowed**, because
+      `ntpath.isabs` calls that absolute, so it was kept verbatim and later
+      resolved against the current drive as `C:\c\Users\me\...`, a
+      different directory.
+
+    The last is the one that matters most: **Claude Code's Bash tool on
+    Windows runs through Git for Windows**, so `/c/...` is the spelling that
+    shell actually produces. The gate covered `sh -c` and nothing else.
+
+    Fixing it produced a false positive of exactly the kind that makes a rule
+    worthless in the other direction. Translating a Git-Bash drive turned a
+    bare `/c`, which is `cmd.exe`'s own command flag, into `C:\`, an
+    ancestor of every protected path, so with a tree verb in the command
+    every `cmd /c` was refused. Caught by the test that asks whether an
+    unrelated write is *still allowed*, which is why that test exists: a rule
+    that refuses everything is not a rule, and it fails safe, so nothing else
+    would have complained.
+
+65. **A percent in the database path denied every call in both clients.**
+    SQLite percent-decodes a `file:` URI path, and the read-only URI escaped
+    `?` and `#` but not `%`. With the database under a directory named
+    `App%20Data` the open failed, `stage_binding` returned
+    `stage_db_unavailable`, which is a deny on every gated call, and
+    `capacity_digest` returned None. Fail-closed, and unusable. The ordering
+    is the fix: `%` has to be escaped first, or the function mangles its own
+    escapes.
+
+66. **The sweep that found these was cheap and I should have run it earlier.**
+    Findings 60 to 65 all came from asking five fresh readers to attack one
+    dimension each of the Windows surface, in order to decide what a Windows
+    VM should test. Between them they produced a silent total bypass for
+    non-ASCII paths, two fail-opens, four bypasses of the protected-path
+    rule, a fix to one of my own fixes, and two vacuity bugs in the collector
+    I had just written to test all of it.
+
+    I had been reading the same code myself for a long stretch and had found
+    the last of my own defects some time before. The asymmetry is worth
+    naming: **re-reading my own work has sharply diminishing returns, and
+    handing one narrow dimension to a reader with no memory of writing it does
+    not.** Several of the findings were demonstrated by execution in the
+    report rather than argued, which is also what made them quick to confirm
+    and impossible to wave away.
+
+### Still open from that sweep, recorded rather than fixed
+
+Nine further defects were reported with reasoning I found credible but have
+not yet verified or fixed. They are listed here so they are not lost, in the
+order I would take them:
+
+ • **The execution lanes would not run on Windows at all.** `os.fchmod` in
+   `_atomic_json` does not exist there, `os.set_blocking` is Unix-only
+   through 3.11, `_hash_regular_file` omits `O_BINARY` so the descriptor is
+   opened in text mode, and `_env()` passes none of `SYSTEMROOT`, `COMSPEC`
+   or `PATHEXT`, which `runner.scrubbed_env` in this same repository keeps
+   and explains why. Masked today only by ordering: `_require_confinement`
+   refuses on Windows before the first receipt is written. CI skips both lane
+   modules there, so nothing says so.
+ • **`shutil.which` puts the current directory first on Windows**, and with
+   `GIT_CANDIDATES["Windows"]` empty every Windows git resolution goes
+   through that line, so a `git.cmd` in the working directory beats a real
+   `git.exe` on PATH.
+ • **The keying asymmetry.** `receipt_name`, `item_id_for` and the policy
+   lookup hash or match `realpath` with no `normcase`, while `_under`
+   normcases both sides. So the same module treats Windows as
+   case-insensitive for refusing a write and case-sensitive for identifying a
+   repository: two spellings of one repository produce two receipts, and only
+   the spelling the operator typed matches their own policy entry. The
+   collector's `repo-keying-is-stable` check will fail on Windows if this is
+   right.
+ • **`own_home` is plain string equality** between two Windows paths, so
+   three ordinary spellings of one home flip the branch and `CODEX_HOME` is
+   silently dropped, which writes the Codex hook where Codex never reads it
+   while the report says installed.
+ • **`codex_trust_state` compares an exact dict key** across a process
+   boundary on a platform where one file has many spellings, so trust can
+   read as `needs_review` forever and the audit then prints that the Codex
+   half of the gate does not run.
+ • **`read_receipt` uses `os.path.exists` then `read_json`**, where
+   `store.py`'s own docstring says to use `read_json_atomic` on Windows
+   because a reader can arrive mid-replace.
+ • **Job directories and artefacts are protected with mode bits only**, which
+   Windows ignores; this project already owns the ACL seam
+   (`store.secure_mkdir`, `platform.enforce_owner_only_file`).
+ • **`store.atomic_write_bytes` plus `os.replace`** may carry an
+   inheritance-blocked owner-only DACL onto the user's own `settings.json`.
+ • **BOM and mixed line endings** in an existing `config.toml` or
+   `settings.json` abort the install with a message that names neither cause.
+
+Each needs verifying before it is believed, which is the standard the rest of
+this document is held to and the reason they are here rather than in the list
+above.
+
+### What is still not true, after this round
+
+* **The two desktop products and Codex on the web cannot be intercepted.**
+  They expose no hook surface. This is stated in the README, in
+  `DELEGATION-GATE.md` and in the installer's `not_covered` list, and it is
+  why the honest name for this feature is "automatic routing in Claude Code
+  and the Codex CLI, with assistant-mediated dispatch". If that is not where
+  someone works, this changes nothing for them.
+* **The brief is the assistant's words.** A `PreToolUse` payload names a tool
+  and some paths. The gate compels the dispatch and names the route, item,
+  stage, owner and revision; it cannot write the task.
+* **Mechanical work an assistant simply does in its own context is not
+  intercepted,** because it produces no tool call. What is automatic at the
+  local lane is the admission: classification, the privacy refusal, the
+  submission and the absence of any paid fallback. The choice to use the lane
+  is still the assistant's, and the end-to-end test that says so used to
+  claim otherwise.
+* **The Linux confinement confines writes and the network, not reads.** The
+  receipt records `confines_reads: false`. It is offered for synthetic
+  material only, and only after proving its own boundary on the host.
+* **Generation is unconfined on every platform.** The provider CLI runs with
+  the real `HOME` and its own Read and Write tools inside the generation
+  worktree. That is the direct worktree-to-patch channel and confining
+  verification does not touch it.
+* **What has and has not run on macOS and Windows.** I said "nothing here
+  has been live-tested on Windows or macOS" several times in this round, and
+  that understated the evidence. Reading the workflow settles it:
+
+  Run and passing on all three runners: the whole offline suite, and
+  `test_delegation_gate`, `test_automatic_gate`, `test_delegation_audit` and
+  `test_hostenv`. So the gate's own logic, including classification,
+  routing, receipts, capacity, dispatch intents, the protected-path rule and
+  the write heuristic, is exercised on real macOS and Windows hosts. The
+  Windows case-folding behaviour above is asserted by the Windows runners
+  rather than by patching `os.path`.
+
+  Run on macOS and Linux, skipped on Windows: `test_claude_task`,
+  `test_codex_task` and the end-to-end workflow. So the macOS
+  `sandbox-exec` confinement is exercised on macOS, and neither execution
+  lane nor the full workflow is exercised on Windows at all.
+
+  Never run anywhere: **the gate hook's own `.cmd` launcher.** The Windows
+  smoke test in CI runs `agent-bridge-windows-setup.cmd`, a different
+  launcher. And on no platform has the hook been invoked by Claude Code or
+  Codex themselves; every test drives the gate module as a subprocess, which
+  is the same interface but not the same integration.
+
+  Being imprecise about this cut both ways: it understated what CI proves
+  and it blurred the one thing that genuinely has no coverage.

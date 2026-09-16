@@ -774,6 +774,15 @@ class BriefReadingTests(unittest.TestCase):
         target.write_bytes(b"do the thing\n")
         self.assertEqual(wd.read_brief(target), "do the thing\n")
 
+    def test_a_bom_prefixed_brief_does_not_embed_a_stray_character(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM. Plain "utf-8" decodes this without raising, so the bug
+        # is silent: a literal U+FEFF ends up embedded at the start of the
+        # text sent to the provider.
+        target = self.base / "b.txt"
+        target.write_bytes(b"\xef\xbb\xbf" + b"do the thing\n")
+        self.assertEqual(wd.read_brief(target), "do the thing\n")
+
     def test_a_symlinked_brief_is_refused(self):
         platform_support.require_symlinks(self)
         import os as _os
@@ -1048,6 +1057,24 @@ class VerifiedExecutorTests(unittest.TestCase):
         self.assertEqual(executor.refusal(_request()),
                          "provisioning_unverified:evidence_canaries_incomplete")
 
+
+class ABomPrefixedManifestOrSidecarIsStillValidJson(unittest.TestCase):
+    # A Windows editor or PowerShell's default encoding can prepend a UTF-8
+    # BOM to manifest.json/sidecar.json. Both files are read with
+    # Path.read_text(encoding=...); the BOM must be stripped there, not left
+    # for json.loads to reject.
+    def test_load_manifest_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps(MANIFEST).encode())
+            manifest = wd.load_manifest(str(path))
+            self.assertEqual(manifest.node_version, MANIFEST["node_version"])
+
+    def test_load_sidecar_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sidecar.json"
+            path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"a": 1}).encode())
+            self.assertEqual(wd.load_sidecar(str(path)), {"a": 1})
 
 
 if __name__ == "__main__":

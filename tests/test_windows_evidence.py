@@ -231,6 +231,16 @@ class LoadTests(unittest.TestCase):
         _, _, reason = self._load()
         self.assertEqual(reason, "evidence_malformed")
 
+    def test_a_bom_prefixed_record_is_still_valid_json(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM. The record is otherwise well-formed and must load, not
+        # be reported as evidence_malformed.
+        self._write(_evidence(provider_lane=_open_lane()),
+                    text="﻿" + json.dumps(_evidence(provider_lane=_open_lane()).as_dict()))
+        state, evidence, reason = self._load()
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(evidence)
+
     def test_a_valid_record_produces_a_ready_state(self):
         self._write(_evidence(provider_lane=_open_lane()))
         state, evidence, reason = self._load()

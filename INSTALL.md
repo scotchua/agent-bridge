@@ -61,20 +61,30 @@ have. If you walk the whole install on Windows, watch CLI discovery and pinning
 in step 2 and use the `.cmd` launchers shown in step 5. Please report what you
 find either way.
 
-**Automatic delegation is not available on Windows.** Its persistent execution
-worker is verified on macOS only. `onboard questionnaire` does not offer it
-here and `onboard plan` and `apply` refuse it, because no Windows machine
-carries the boundary-verification record the gate requires. Everything below
-describes provisioning work in progress, not a feature you can turn on.
+**Automatic delegation is not available on Windows.** `onboard questionnaire`
+does not offer it here, and `onboard plan` and `apply` refuse it, because no
+Windows machine carries the boundary-verification record it requires. Its
+persistent execution worker is verified on macOS only. So on Windows today:
+consultation works, the offline suite passes, and automatic delegation does
+not turn on.
 
-**You do not need to install WSL.** Automatic delegation on Windows runs jobs in
-an ephemeral WSL2 guest, but that is an implementation detail: setup detects
-what is missing, enables the Windows features, installs or updates WSL, installs
-the pinned guest image, and verifies the containment boundary, asking separately
-before anything that needs an administrator and before anything that restarts
-the machine, and resuming itself after a restart. `onboard plan` and
-`onboard status` report the current stage under `windows_setup`. Delegation
-stays off until every stage is satisfied.
+Two things that are easy to read as a contradiction, so stated plainly:
+
+ • **The gate is a separate component from the execution lane.** The hook
+   installer writes a `.cmd` launcher for Windows, and the gate's own logic
+   is portable. That launcher has never been run under either host, so we do
+   not describe the Windows gate as working. It is written, not verified.
+ • **The WSL2 paragraphs below describe provisioning work in progress**, not
+   a feature you can enable. The design is that jobs would run in an
+   ephemeral WSL2 guest and you would not install WSL yourself: setup detects
+   what is missing, enables the Windows features, installs or updates WSL,
+   installs the pinned guest image, and verifies the containment boundary,
+   asking separately before anything needing an administrator and before
+   anything that restarts the machine, then resuming itself afterwards.
+   `onboard plan` and `onboard status` report the current stage under
+   `windows_setup`. None of that path has been run on a live Windows host,
+   and delegation stays off until every stage is satisfied, which no machine
+   has reached.
 
 The command that does it is `bin\agent-bridge-windows-setup` (equivalently
 `python setup_bridge.py windows-setup`). `plan` shows where you are, `step`
@@ -464,15 +474,62 @@ register the worker as a per-user logon task in your own Task Scheduler
 namespace, with no administrator rights and no other account, and you can remove
 it yourself; that path has not been exercised on a live Windows host.
 
-## Delegation-first gate (optional, after automatic delegation)
+## Delegation-first gate
 
-With automatic delegation on, a PreToolUse hook can make the routing decision
-mandatory: Claude Code and the Codex CLI refuse to edit a repository until a
-stage for it is claimed and `routing_decide` has written a receipt, and the
-client whose route does not own the stage is told to dispatch instead.
-Install with `./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply`,
-then accept the hook once in Codex's `/hooks`. What it covers and what it
-cannot (desktop and web chats have no hook surface) is in
+`onboard apply` installs this for you when you enable automatic delegation.
+The steps below are the manual path, and what to do next either way.
+
+A PreToolUse hook makes the routing decision mandatory *and* automatic.
+Claude Code and the Codex CLI refuse to edit a repository unless a durable
+receipt names the route that owns the work, and when there is no receipt the
+hook computes one itself from your routing policy, the routes with fresh
+capacity, and this host's load. You are never asked to say "send this to
+Codex".
+
+Install by hand with:
+
+```
+./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply
+```
+
+Then do three things, in this order:
+
+1. **Classify the repositories you want delegated**, in
+   `<state_root>/routing/routing-policy.json`. `onboard apply` writes an inert
+   scaffold with the shape and a worked example in it. A repository with no
+   entry is retained and never dispatched, so until you edit this file the
+   gate records decisions and changes nothing about where work runs.
+2. **Start Codex once and accept the new hook** in its `/hooks` view. Until
+   then Codex shows "New hook - review required", the hook does not run, and
+   every Codex call is un-gated. `gate report` shows the trust state.
+3. **List the routes installed on this machine** under `declared_available`
+   in that same file. A route with no fresh capacity is not eligible, so a
+   machine nobody has declared anything for retains everything. There are
+   two ways a route gets there and no third: you declare it in the policy
+   file, or it has itself run the gate hook in the last fifteen minutes. No
+   assistant can declare itself or its peer available; the tool that used to
+   allow that is gone.
+
+Check what it did:
+
+```
+./bin/agent-bridge-gate-hook report --config <orchestration.json>
+./bin/agent-bridge-gate-hook audit  --config <orchestration.json>
+```
+
+`report` is the status page: which clients hold the hook, whether each one is
+running with automatic routing on, the policy summary, live receipts and
+recent events. `audit` is the accounting: eligible, routed, retained,
+bypassed, failed, and the reason in each case. Add `--since-hours 0` for
+everything on record and `--json` for the full document.
+
+`--no-automatic-routing` on the hook command reverts to the stricter posture:
+a repository with no receipt is refused outright and a route must be claimed
+explicitly. More friction, no silent allows.
+
+What it covers and what it cannot (desktop and web chats have no hook
+surface; a tool call does not contain the brief; mechanical work an assistant
+does in its own context produces no tool call to intercept) is in
 [docs/DELEGATION-GATE.md](docs/DELEGATION-GATE.md).
 
 ## Day to day

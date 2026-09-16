@@ -1,8 +1,24 @@
 """Durable, conservative stage ownership and capacity-aware routing.
+
 This module decides *who may own a stage*.  It does not execute work, call a
 provider, or change the consultation bridge.  Capacity observations are an
 explicit input and expire closed: missing, unknown, or stale observations can
 never make a route eligible.
+
+Two limits on what an observation can be, both added because an adversarial
+review found the original table was evidence in name only:
+
+* **Only a trusted writer counts.**  ``trusted`` is set by the code path that
+  records the observation, never read from the observation itself, and only a
+  trusted row can make a route eligible.  An untrusted row is stored and
+  reported, so an operator can see what was claimed, and ignored when routing.
+  The column defaults to untrusted, so rows an earlier version accepted from a
+  model-facing tool stop counting the moment this version runs.
+* **No observation outlasts the work it would authorise.**  A window longer
+  than :data:`MAX_FRESHNESS_SECONDS` is refused rather than clamped: an
+  observation that claims a year is a configuration statement wearing
+  evidence's clothes, and the operator's policy file is where a standing
+  statement belongs.
 """
 
 from __future__ import annotations
@@ -13,11 +29,27 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 
 ROUTES = frozenset({"claude", "codex", "local"})
 TERMINAL_STATES = frozenset({"complete", "blocked"})
+
+#: The longest window one capacity observation may claim.  Matched to the
+#: routing lease, because nothing else in this system claims validity for
+#: longer than that and a capacity claim has no reason to be the exception.
+MAX_FRESHNESS_SECONDS = 4 * 3600.0
+
+#: Source recorded when the gate hook notices that the client calling it is,
+#: by definition, running.  Named here rather than in ``autodecide`` because
+#: :func:`capacity_fingerprint` has to tell that row apart from every other
+#: one and must not import the module that writes it.
+PRESENCE_SOURCE = "gate-hook:client-present"
+
+#: What :func:`capacity_fingerprint` returns when no route is eligible.  A
+#: word rather than an empty string, so a receipt shows the state was computed
+#: rather than missing.
+CAPACITY_NONE = "none"
 
 
 class RoutingError(ValueError):
@@ -67,7 +99,17 @@ class StageRouter:
             db.execute("""CREATE TABLE IF NOT EXISTS capacity (
                 route TEXT PRIMARY KEY, observed_at REAL NOT NULL,
                 fresh_until REAL NOT NULL, available INTEGER NOT NULL,
-                source TEXT NOT NULL)""")
+                source TEXT NOT NULL,
+                trusted INTEGER NOT NULL DEFAULT 0)""")
+            # An installed ledger predates the column.  Adding it with a
+            # default of 0 is the migration and also the fix: every row an
+            # earlier version accepted through the model-facing tool becomes
+            # untrusted, so upgrading does not inherit a model's claim about
+            # who was available.
+            if "trusted" not in {row["name"] for row in
+                                 db.execute("PRAGMA table_info(capacity)")}:
+                db.execute("ALTER TABLE capacity ADD COLUMN "
+                           "trusted INTEGER NOT NULL DEFAULT 0")
             db.execute("""CREATE TABLE IF NOT EXISTS stages (
                 item_id TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL,
                 allowed_routes TEXT NOT NULL, preferred_routes TEXT NOT NULL,
@@ -87,21 +129,33 @@ class StageRouter:
             raise RoutingError("routes_invalid")
         return result
 
-    def observe_capacity(self, observation: CapacityObservation) -> None:
+    def observe_capacity(self, observation: CapacityObservation, *,
+                         trusted: bool) -> None:
+        """Record one observation.  ``trusted`` says whether it may route work.
+
+        ``trusted`` is keyword-only and has no default on purpose.  A trust
+        flag with a default is a trust flag somebody forgets, so every writer
+        states its own provenance at the call site.  It is never taken from
+        the observation, so a caller that can only supply an observation
+        cannot make itself trusted by naming a convincing ``source``.
+        """
         if observation.route not in ROUTES:
             raise RoutingError("route_invalid")
         if (not observation.source or observation.fresh_until <= observation.observed_at
                 or observation.observed_at > self.clock() + 1):
             raise RoutingError("capacity_observation_invalid")
+        if observation.fresh_until - observation.observed_at > MAX_FRESHNESS_SECONDS:
+            raise RoutingError("capacity_freshness_excessive")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("""INSERT INTO capacity(route,observed_at,fresh_until,available,source)
-                VALUES(?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET
+            db.execute("""INSERT INTO capacity(route,observed_at,fresh_until,available,source,trusted)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET
                 observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,
-                available=excluded.available,source=excluded.source""",
+                available=excluded.available,source=excluded.source,
+                trusted=excluded.trusted""",
                        (observation.route, observation.observed_at,
                         observation.fresh_until, int(observation.available),
-                        observation.source))
+                        observation.source, int(bool(trusted))))
             db.execute("COMMIT")
 
     def register(self, item_id: str, stage: str, *, allowed_routes: Iterable[str],
@@ -147,9 +201,42 @@ class StageRouter:
         return row
 
     def _fresh_routes(self, db: sqlite3.Connection, now: float) -> set[str]:
+        """Routes a *trusted* writer currently reports as available.
+
+        ``trusted=1`` is part of the WHERE clause rather than a check on the
+        way out, so there is no path through this class where an untrusted row
+        reaches an assignment decision.
+        """
         return {row["route"] for row in db.execute(
-            "SELECT route FROM capacity WHERE available=1 AND observed_at<=? AND fresh_until>=?",
+            "SELECT route FROM capacity WHERE available=1 AND trusted=1 "
+            "AND observed_at<=? AND fresh_until>=?",
             (now + 1, now)).fetchall()}
+
+    def retract_capacity(self, route: str, *, source: str) -> bool:
+        """Remove this route's row, but only if ``source`` is what wrote it.
+
+        The operator withdrawing a declaration has to take effect at once, for
+        the same reason a policy edit does: a control surface that keeps
+        working for another quarter of an hour is one the operator cannot
+        trust.  Matching on ``source`` is what makes the withdrawal safe: it
+        deletes the evidence derived from the declaration and cannot touch a
+        different writer's row, so a peer that really has been running keeps
+        its own first-hand presence.
+        """
+        if route not in ROUTES:
+            raise RoutingError("route_invalid")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute("DELETE FROM capacity WHERE route=? AND source=?",
+                                (route, source))
+            db.execute("COMMIT")
+            return cursor.rowcount > 0
+
+    def capacity_rows(self) -> list[dict]:
+        """Every capacity row as a plain mapping, for the fingerprint."""
+        with self._db() as db:
+            return [dict(row) for row in
+                    db.execute("SELECT * FROM capacity ORDER BY route")]
 
     def assign(self, item_id: str, stage: str, *, owner_id: str,
                lease_seconds: float, expected_revision: int,
@@ -288,8 +375,56 @@ class StageRouter:
                 status = "available" if row["available"] and row["fresh_until"] >= now else "unavailable"
                 if row["fresh_until"] < now:
                     status = "stale"
+                elif not row["trusted"]:
+                    # Graded before availability is reported, so a caller that
+                    # only looks for "available" never counts it.  Reported
+                    # rather than dropped: an operator should be able to see
+                    # that something claimed a route was up.
+                    status = "untrusted"
                 capacities[row["route"]] = {"status": status, "observed_at": row["observed_at"],
-                                            "fresh_until": row["fresh_until"], "source": row["source"]}
+                                            "fresh_until": row["fresh_until"], "source": row["source"],
+                                            "trusted": bool(row["trusted"])}
             blocked = [dict(row) for row in db.execute(
                 "SELECT item_id,stage,blocked_reason FROM stages WHERE state='blocked' ORDER BY item_id,stage")]
         return {"states": states, "capacity": capacities, "blocked": blocked}
+
+
+def capacity_fingerprint(rows: Iterable[Mapping], now: float) -> str:
+    """A digest of the capacity a routing decision actually depended on.
+
+    Recorded in every automatic receipt for the same reason the policy
+    fingerprint is: a decision made when the peer was unavailable should be
+    re-made when it becomes available, not whenever the receipt happens to
+    expire four hours later.
+
+    **Route names only, no timestamps, and nothing about who is asking.**
+    Both halves of that are load-bearing, and the second was learned the hard
+    way.
+
+    Names only, because the gate refreshes its own presence row on every hook
+    call.  A digest over the rows themselves changes every call, so every call
+    re-decides: measured at eight decisions where one was correct.  A set of
+    names does not move when a timestamp does, which is the whole fix.
+
+    Nothing about who is asking, because **a receipt is one shared
+    per-repository artifact**.  An earlier version subtracted the asking
+    client's own presence row, on the reasoning that a client's own presence
+    is not news to itself.  That made the digest client-relative, so the two
+    clients computed different values from the identical ledger, each found
+    the other's receipt overtaken, and each re-decided it to route the work to
+    the other.  Both were then permanently denied, each holding an instruction
+    to dispatch to the other.  A livelock, not churn, and worse than the
+    staleness the digest exists to fix.  Anything compared against a shared
+    artifact has to be computed the same way by everyone who compares it.
+
+    Pure, and shared: the gate hook reads the table read-only and
+    ``autodecide`` reads it through the router, and both call this, so the
+    value stamped in a receipt and the value checked against it cannot drift
+    apart through two implementations.
+    """
+    eligible = sorted(
+        str(row["route"]) for row in rows
+        if row.get("available") and row.get("trusted")
+        and float(row.get("observed_at", 0.0)) <= now + 1
+        and float(row.get("fresh_until", 0.0)) >= now)
+    return ",".join(eligible) if eligible else CAPACITY_NONE

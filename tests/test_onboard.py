@@ -142,13 +142,42 @@ class HardeningTests(unittest.TestCase):
             first,second=[os.path.join(tmp,n) for n in ("first","second")]
             Path(first).write_bytes(b"old");Path(second).write_bytes(b"other")
             original_writer=store.atomic_write_bytes
-            def writer(path,data):
+            def writer(path,data,**kwargs):
                 if path==second:raise OSError("synthetic failure")
-                return original_writer(path,data)
+                return original_writer(path,data,**kwargs)
             with mock.patch.object(store,"atomic_write_bytes",side_effect=writer):
                 with self.assertRaises(OSError):onboard._commit_updates({first:b"new",second:b"next"},{first:b"old",second:b"other"})
             self.assertEqual(Path(first).read_bytes(),b"old")
             self.assertEqual(Path(second).read_bytes(),b"other")
+
+    def test_shared_paths_skip_the_owner_only_lockdown(self):
+        """A file this project does not own (named in shared_paths) is written
+        with owner_only=False, so an atomic replace does not strip whatever
+        ACL/permissions it already had; an unnamed path keeps owner_only=True."""
+        with tempfile.TemporaryDirectory() as tmp:
+            host_owned, own_state = [os.path.join(tmp, n) for n in ("host_owned", "own_state")]
+            Path(host_owned).write_bytes(b"old"); Path(own_state).write_bytes(b"old")
+            calls = {}
+            original_writer = store.atomic_write_bytes
+            def writer(path, data, owner_only=True):
+                calls[path] = owner_only
+                return original_writer(path, data, owner_only=owner_only)
+            with mock.patch.object(store, "atomic_write_bytes", side_effect=writer):
+                onboard._commit_updates(
+                    {host_owned: b"new", own_state: b"new"},
+                    {host_owned: b"old", own_state: b"old"},
+                    shared_paths=frozenset({host_owned}))
+            self.assertEqual(calls[host_owned], False)
+            self.assertEqual(calls[own_state], True)
+
+    def test_host_owned_paths_names_the_files_this_project_does_not_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = onboard._paths(tmp)
+            shared = onboard._host_owned_paths(paths)
+            for key in ("codex_toml", "claude_json", "desktop_json", "agents", "claude_md"):
+                self.assertIn(paths[key], shared)
+            for key in ("shared", "receipt", "delegation_config", "delegation_receipt", "launch_agent"):
+                self.assertNotIn(paths[key], shared)
 
     def test_concurrent_edit_refused_before_any_write(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,6 +311,27 @@ class LauncherTests(unittest.TestCase):
             messages = [json.loads(line) for line in proc.stdout.splitlines()]
             names = {t["name"] for m in messages if m.get("id") == 2 for t in m["result"]["tools"]}
             self.assertEqual(names, {"local_worker_info", "local_worker_process"})
+
+
+class ReadTextBomTests(unittest.TestCase):
+    # A BOM-prefixed hooks.json/config.toml (Windows editor, PowerShell
+    # default encoding) must not surface as U+FEFF inside the text handed to
+    # tomllib.loads or the managed-marker scan.
+    def test_strips_a_leading_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.toml")
+            Path(path).write_bytes(b"\xef\xbb\xbf" + b'key = "value"\n')
+            self.assertEqual(onboard._read_text(path), 'key = "value"\n')
+
+    def test_without_a_bom_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.toml")
+            Path(path).write_bytes(b'key = "value"\n')
+            self.assertEqual(onboard._read_text(path), 'key = "value"\n')
+
+    def test_missing_file_is_still_empty_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(onboard._read_text(os.path.join(tmp, "absent.toml")), "")
 
 
 if __name__ == "__main__":

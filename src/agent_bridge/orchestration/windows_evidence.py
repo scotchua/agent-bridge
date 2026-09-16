@@ -320,7 +320,7 @@ def read_evidence(path: str, *, runtime_root: str | None = None,
     except wpv.PrivacyError as exc:
         raise _as_evidence_error(exc) from exc
     try:
-        raw = json.loads(payload.decode("utf-8"))
+        raw = json.loads(payload.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise EvidenceError("evidence_malformed") from exc
     return parse_evidence(raw)
@@ -347,7 +347,7 @@ def read_evidence_with_identity(path: str, *, runtime_root: str | None = None,
     except wpv.PrivacyError as exc:
         raise _as_evidence_error(exc) from exc
     try:
-        raw = json.loads(payload.decode("utf-8"))
+        raw = json.loads(payload.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise EvidenceError("evidence_malformed") from exc
     return parse_evidence(raw), identity

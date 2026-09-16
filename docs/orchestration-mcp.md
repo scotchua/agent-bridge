@@ -43,9 +43,24 @@ bin/agent-bridge-orchestration --caller claude --config /absolute/private/orches
 bin/agent-bridge-orchestration --caller codex --config /absolute/private/orchestration.json
 ```
 
-`capacity_observe` accepts only time-bounded observations. Missing, stale or
-unavailable capacity never grants a stage claim. Capacity remains advisory:
-it does not expand task authority, permitted data routes, or review rules.
+**There is no tool for declaring capacity.** There was one, `capacity_observe`,
+and it was the wrong shape: the assistant chose the route, the availability,
+the source string and the freshness window, so "a fresh observation from an
+authorized source" meant whatever the model typed, for as long as it liked.
+
+Capacity has exactly two writers now, neither of them on the wire:
+
+ • the gate hook records that the client calling it is running. First-hand,
+   its own route only, fifteen minutes.
+ • `declared_available` in `routing-policy.json` lists the routes installed
+   on this machine. That is a standing operator declaration, not a health
+   check, and it is recorded as one: the ledger shows the source, and
+   removing a route from the list withdraws it on the next decision.
+
+Missing, stale, untrusted or unavailable capacity never grants a stage claim,
+and no observation may claim a window longer than the routing lease. Capacity
+remains advisory: it does not expand task authority, permitted data routes, or
+review rules.
 
 The local Ollama executor runs in the server's background thread while either
 app is connected. A local result is an untrusted draft until its supervising
@@ -137,6 +152,24 @@ a PreToolUse hook in Claude Code and the Codex CLI that refuses editing tools
 and writing shell commands in a repository with no fresh receipt, or one whose
 `owner_route` is the other provider. Install, coverage, and the plainly stated
 surfaces it cannot intercept are in [DELEGATION-GATE.md](DELEGATION-GATE.md).
+
+**`routing_decide` is the manual path.** By default the hook does not wait to
+be called: with no valid receipt it computes the route itself from the
+operator's `routing-policy.json`, the routes with fresh capacity in this
+database, and the host's load average per core, then registers, claims and
+records the decision before the edit is judged. So a decision always exists
+before implementation, it was computed rather than requested, and a receipt
+written that way carries `automatic: true`, its decision `code`, and the
+`considered` inputs so it can be re-derived. `routing_decide` remains
+available for an assistant that wants to record a decision of its own, and
+the audit counts the two separately.
+
+When the automatic decision routes work away from the asking client, the hook
+also writes a dispatch intent
+(`<state_root>/routing/intents/<hash>.json`) carrying the route and the full
+stage binding, and the deny message names the single call that is now owed.
+`execution_dispatch` retires the intent when it accepts the job, which is
+what keeps the audit's "routed but never dispatched" column meaningful.
 
 The Codex harness's confinement is different from the Claude harness's, and
 this is stated plainly rather than glossed over: Claude's lane trusts a tool

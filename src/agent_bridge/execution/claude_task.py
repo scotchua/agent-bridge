@@ -5,11 +5,15 @@ import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tem
 from pathlib import Path
 try:
     from .. import runner
-    from . import claude_config, verify_policy
+    from ..platform import platform as agent_platform
+    from ..orchestration import windows_privacy as wpv
+    from . import claude_config, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner
-    from agent_bridge.execution import claude_config, verify_policy
+    from agent_bridge.platform import platform as agent_platform
+    from agent_bridge.orchestration import windows_privacy as wpv
+    from agent_bridge.execution import claude_config, hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -18,23 +22,58 @@ ALLOWED_SUBSCRIPTIONS={"pro","max","team","enterprise","business"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
-GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
+_GIT_BIN:Path|None=None
+
+def _git_bin()->Path:
+    """The host's git, resolved once and named in the refusal when absent.
+
+    This used to be a constant pointing at the standalone macOS Command Line
+    Tools. On a Mac without them, and on every other host, the first git call
+    spawned a path that does not exist and the lane reported only "command
+    spawn failed".
+    """
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        try: _GIT_BIN=hostenv.resolve_git()
+        except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
+    return _GIT_BIN
 
 def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:bytes|None=None):
     """Use the bridge's measured streaming caps and bounded post-kill drain."""
     r=runner.run(argv,cwd=str(cwd),env=env,stdin_data=(input_bytes or b"").decode("utf-8"),timeout=timeout,
                  grace=2,stdout_cap=MAX_STREAM_BYTES,stderr_cap=MAX_STREAM_BYTES)
-    if r.spawn_failed: raise TaskError("command spawn failed")
+    if r.spawn_failed: raise TaskError(_spawn_detail(argv))
     if r.timed_out: raise TaskError(f"command timed out after {timeout}s")
     if r.cap_exceeded: raise TaskError("command output exceeded bounded capture")
     if r.descendant_held_pipes: raise TaskError("command output stream did not close")
     return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
+
+def _spawn_detail(argv:list[str])->str:
+    """Why a process would not start, named. A receipt saying only "command
+    spawn failed" cannot be told from a failed login or a killed process, so
+    this states the program, its path and what is wrong with it."""
+    program=argv[0] if argv else "(no argv)"
+    if not os.path.exists(program): reason="no such file"
+    elif os.path.isdir(program): reason="is a directory"
+    elif not os.access(program,os.X_OK): reason="not executable by this account"
+    else: reason="the operating system refused to start it"
+    return f"could not start {program!r}: {reason}"
 
 def _env(claude_config_dir:Path|None=None):
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
        "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
+    if os.name=="nt":
+        # Measured on a live Windows 11 VM: without SYSTEMROOT in the child's
+        # environment, plain `git --version` still succeeds, but any git
+        # operation that touches the network (ls-remote, clone, fetch) fails
+        # with "Could not resolve host" -- Windows's resolver needs it to load
+        # its own DLLs. USERPROFILE is included because ntpath.expanduser
+        # checks it, not HOME, so Path.home() above resolves correctly but a
+        # git subprocess doing its own home lookup would not see HOME either.
+        for k in ("SYSTEMROOT","COMSPEC","PATHEXT","USERPROFILE"):
+            if os.environ.get(k): e[k]=os.environ[k]
     # A store selector, never a token. Without it the CLI resolves ~/.claude,
     # the store the desktop app and interactive sessions also refresh; a
     # concurrent invalid-grant cleanup there blanks the tokens and this lane
@@ -53,7 +92,7 @@ def _git(repo:Path,*args:str,timeout:int=30,env=None):
     return r.stdout.decode().strip()
 
 def _git_argv(*args:str):
-    return [GIT_BIN,"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
+    return [str(_git_bin()),"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
             "-c","diff.external=","-c","core.attributesFile=/dev/null",*args]
 
 def _sha(path:Path):
@@ -140,7 +179,13 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
     that grows or is replaced mid-read is a refusal, never a hash of a prefix
     that would compare equal to the one taken before the task.
     """
-    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
+    # O_BINARY matters as much as the other two on Windows: without it,
+    # os.open() defaults to text mode, os.read() then translates "\r\n" to
+    # "\n" in whatever it returns, and the bytes read fall short of fstat's
+    # raw st_size for any file that has one -- indistinguishable from this
+    # function's own "file changed size mid-read" refusal (measured: a
+    # 14-byte CRLF file reads back as 12 bytes without this flag).
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)|getattr(os,"O_BINARY",0)
     try: descriptor=os.open(target,flags)
     except OSError as exc: raise TaskError("source snapshot could not read a changed file") from exc
     try:
@@ -151,7 +196,12 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
             raise TaskError("source snapshot exceeds the per-file byte bound; refusing to run without integrity coverage")
         if opened.st_size>budget:
             raise TaskError("source snapshot exceeds the byte bound; refusing to run without integrity coverage")
-        os.set_blocking(descriptor,True)
+        if hasattr(os,"O_NONBLOCK"):
+            # Only undoing what was only ever set on a platform that has it:
+            # Windows never opened with O_NONBLOCK (the flag above is 0
+            # there), and os.set_blocking() on a Windows file descriptor
+            # raises OSError (WinError 87) rather than being a no-op.
+            os.set_blocking(descriptor,True)
         digest.update(b"file\x00");digest.update(str(opened.st_mode&0o777).encode("ascii"));digest.update(b"\x00")
         read=0
         while True:
@@ -177,14 +227,31 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
-def _assert_macos():
-    if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise TaskError("Claude execution lane requires supported macOS sandbox-exec")
+def _require_confinement(classification:str)->hostenv.Confinement:
+    """The verification confinement this host will apply, or a named refusal.
+
+    Only the verification step needs confinement: generation runs under the
+    Claude CLI's own tool allowlist and the patch steps are git. The old
+    ``_assert_macos`` refused the entire lane on any non-Darwin host, which
+    is why this direction could not run anywhere else even to be diagnosed.
+    Checked up front rather than after generation, because Claude
+    verification is mandatory, so a host that cannot confine it can never
+    complete a job and should say so before spending a provider turn."""
+    try: return hostenv.confinement(classification)
+    except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
 
 def _atomic_json(path:Path,value:dict):
     fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
     try:
-        os.fchmod(fd,0o600)
+        # os.fchmod does not exist on Windows at all (AttributeError, measured
+        # on a live VM), unlike the POSIX mode bits this used to assume every
+        # host has. agent_platform picks the real primitive per host: fchmod
+        # on POSIX, an owner-only ACL on Windows.
+        try: agent_platform.enforce_owner_only_file(fd)
+        except BaseException:
+            try: os.close(fd)
+            except OSError: pass
+            raise
         with os.fdopen(fd,"w") as f: json.dump(value,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
         os.replace(tmp,path)
     finally:
@@ -196,6 +263,33 @@ def _json(raw:bytes,label:str):
     except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise TaskError(f"{label} was not one valid JSON document") from exc
     if not isinstance(v,dict): raise TaskError(f"{label} must be a JSON object")
     return v
+
+#: Longest piece of Claude's own error text folded into a TaskError message.
+RESULT_DETAIL_LIMIT=200
+
+def _result_detail(stdout:bytes)->str|None:
+    """Claude's own explanation for a failed turn (``result`` when
+    ``is_error`` is true), bounded and printable-only.
+
+    A bare exit status or "failed the success contract" told an operator
+    nothing about *why* (job d8e5763d: an expired OAuth session read back as
+    a bare "TaskError"). Claude's JSON envelope already carries the reason in
+    ``result`` when it ran and reported one; this is the only place that
+    reads it back out. Printable characters only and length-bounded, so a
+    provider payload cannot inflate or corrupt the receipt; ``None`` when
+    stdout is not that shape, in which case the caller falls back to its
+    fixed message alone."""
+    try: parsed=json.loads(stdout.decode())
+    except (UnicodeDecodeError,json.JSONDecodeError,RecursionError): return None
+    if not isinstance(parsed,dict) or parsed.get("is_error") is not True: return None
+    result=parsed.get("result")
+    if not isinstance(result,str) or not result: return None
+    cleaned="".join(ch for ch in result if ch.isprintable())[:RESULT_DETAIL_LIMIT]
+    return cleaned or None
+
+def _with_result_detail(message:str,stdout:bytes)->str:
+    detail=_result_detail(stdout)
+    return f"{message}: {detail}" if detail else message
 
 def _verify_argv(commands:list[list[str]]):
     if not commands: raise TaskError("at least one structured verification command is required")
@@ -241,11 +335,72 @@ def _remove(repo:Path,tree:Path,env):
     # users' stale-but-recoverable worktree registrations.
     return result.returncode==0 and not tree.exists()
 
-def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int):
+def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+               backend:hostenv.Confinement|None=None):
+    """Run one verification command under this host's confinement backend."""
+    backend=backend or _require_confinement("synthetic")
+    if backend.name==hostenv.LINUX_USERNS:
+        return _netns_confined(command,tree,scratch,env,timeout,backend)
+    return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
+
+def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                    backend:hostenv.Confinement):
+    """Network denied and writes confined by a mount namespace. Reads are not.
+
+    The boundary re-proves itself for this worktree on every command: the
+    helper refuses to exec anything until a write to each canary path has
+    actually failed. A failed boundary is a refusal with its own name, never a
+    verification result, because a command that did not run under the
+    confinement it claims has told us nothing."""
+    scratch.mkdir(mode=0o700)
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
+    if command[0]=="git": command=_git_argv(*command[1:])
+    started=time.monotonic()
+    result=_run(hostenv.confined_argv(command,tree=tree,scratch=scratch,
+                                      canaries=_confinement_canaries(tree)),
+                cwd=tree,env=sandbox_env,timeout=timeout)
+    if result.returncode==hostenv.CONFINEMENT_SELFTEST_EXIT:
+        raise TaskError("verification confinement failed its own canary check on this host "
+                        "[confinement_selftest_failed]")
+    result.sandbox_backend=backend.name
+    result.sandbox_profile_sha256=None
+    result.duration_seconds=time.monotonic()-started
+    return result
+
+def _confinement_canaries(tree:Path)->list[str]:
+    """Paths a verification command must not be able to write.
+
+    The source repository is first because a write there is the exact damage
+    the old post-run snapshot was supposed to catch and could only report
+    after the fact. The job directory is next: the scratch directory inside it
+    is deliberately writable, the directory itself is not. Then the two places
+    any escape would naturally aim for."""
+    canaries=[str(tree.parent)]
+    marker=tree/".git"
+    try:
+        text=marker.read_text().strip() if marker.is_file() else ""
+    except OSError:
+        text=""
+    if text.startswith("gitdir: "):
+        gitdir=Path(text[8:])
+        try:
+            commondir=(gitdir/(gitdir/"commondir").read_text().strip()).resolve()
+        except OSError:
+            commondir=None
+        if commondir is not None and commondir.parent.is_dir():
+            canaries.append(str(commondir.parent))
+    for extra in (str(Path.home()),tempfile.gettempdir()):
+        if extra not in canaries and os.path.isdir(extra):
+            canaries.append(extra)
+    return canaries
+
+def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                           backend:hostenv.Confinement):
     scratch.mkdir(mode=0o700)
     profile=scratch/"verify.sb"
     def quoted(value:Path): return str(value).replace('\\','\\\\').replace('"','\\"')
-    executable=Path(GIT_BIN if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
+    executable=Path(_git_bin() if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
     runtime_root=executable.parent.parent if str(executable).startswith("/Users/") else executable.parent
     read_roots=[Path("/System"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/Library/Frameworks"),Path("/Library/Developer"),
                 Path("/etc"),Path("/var/db"),Path("/var/select"),Path("/var/run"),Path("/private/etc"),
@@ -277,7 +432,8 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
     sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
-    result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result=_run([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
     result.sandbox_profile_sha256=_sha(profile)
     result.duration_seconds=time.monotonic()-started
     return result
@@ -285,7 +441,6 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
 def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
              classification:str,model:str,effort:str,
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    _assert_macos()
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,claude_bin)): raise TaskError("all paths must be absolute")
     claude_config_dir=_checked_config_dir(claude_config_dir)
@@ -293,18 +448,35 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     if not claude_bin.is_file() or not os.access(claude_bin,os.X_OK): raise TaskError("Claude executable unavailable")
     raw=brief.read_bytes()
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
-    try: brief_text=raw.decode()
+    try: brief_text=raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
     checks=_verify_argv(verify_argv); env=_env(claude_config_dir); source_before=_source_state(repo,env)
+    # The host is probed only after the REQUEST has been validated. Ordering
+    # matters for the message an operator sees: with the probe first, a
+    # refused verification command on a host with no confinement backend
+    # reported the host refusal and buried the real mistake, which broke a
+    # pre-existing test and would have misdirected anybody reading the
+    # receipt. Validate what was asked, then interrogate the machine.
+    backend=_require_confinement(classification)
     base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(claude_bin),"--version"],cwd=claude_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Claude executable")
     task_root.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(task_root,0o700)
+    # mkdir(mode=) and chmod are no-ops on Windows; without this, task_root and
+    # every job directory under it inherit whatever their parent grants there.
+    try: wpv.require_private_directory(task_root,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution task root could not be protected [{exc.reason}]") from exc
     job=task_root/uuid.uuid4().hex; job.mkdir(mode=0o700); gen=job/"generation-worktree"; fresh=job/"verification-worktree"
+    try: wpv.require_private_directory(job,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution job directory could not be protected [{exc.reason}]") from exc
     receipt={"schema":2,"job_id":job.name,"status":"running","route":"claude-subscription-cli","classification":classification,
              "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,"effort_requested":effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(claude_bin.resolve()),
-             "claude_config_dir":str(claude_config_dir),
+             "claude_config_dir":str(claude_config_dir),"host_platform":platform.system(),
+             "git_executable":str(_git_bin()),"verification_confinement":backend.name,
+             "confinement_denies_network":backend.denies_network,
+             "confinement_confines_reads":backend.confines_reads,
+             "confinement_confines_writes":backend.confines_writes,
              "executable_sha256":_sha(claude_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
              "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
@@ -315,13 +487,15 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         for n,data in (("claude.stdout",r.stdout),("claude.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
             receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
-        if r.returncode: raise TaskError(f"Claude exited with status {r.returncode}")
+        if r.returncode:
+            raise TaskError(_with_result_detail(f"Claude exited with status {r.returncode}",r.stdout))
         response=_json(r.stdout,"Claude output")
         usage_models=response.get("modelUsage")
         receipt["response_metadata"]={"session_id":response.get("session_id"),"subtype":response.get("subtype"),
                                       "terminal_reason":response.get("terminal_reason"),"stop_reason":response.get("stop_reason"),
                                       "num_turns":response.get("num_turns"),"observed_models":sorted(usage_models) if isinstance(usage_models,dict) else []}
-        if response.get("is_error") is not False or not isinstance(response.get("result"),str): raise TaskError("Claude output failed success contract")
+        if response.get("is_error") is not False or not isinstance(response.get("result"),str):
+            raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
         patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
@@ -332,12 +506,20 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout)
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
-            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":"macos-no-network-scratch-home",
+            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+        # The delivered patch is a file path, and verification ran between
+        # writing it and returning it. Confinement is what stops a verify
+        # command reaching the job directory, and this is the check that does
+        # not depend on confinement being correct: re-read the bytes and
+        # compare them to what was generated. Without it the receipt could
+        # record one digest while the caller applied different bytes.
+        if hashlib.sha256(pp.read_bytes()).digest()!=hashlib.sha256(patch).digest():
+            raise TaskError("delivered patch changed during verification")
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",
                        generated_patch_sha256=hashlib.sha256(patch).hexdigest(),applied_patch_sha256=hashlib.sha256(applied).hexdigest(),
                        patch_sha256=hashlib.sha256(patch).hexdigest(),patch_bytes=len(patch),verification=evidence,

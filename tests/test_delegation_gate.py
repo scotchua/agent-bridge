@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -374,7 +376,8 @@ class StageBindingTests(GateCase):
         self.db = str(self.base / "capacity.sqlite3")
         self.router = StageRouter(self.db, clock=self.clock)
         self.router.observe_capacity(CapacityObservation(
-            route="claude", observed_at=1000.0, fresh_until=5000.0, available=True, source="test"))
+            route="claude", observed_at=1000.0, fresh_until=5000.0, available=True,
+            source="test"), trusted=True)
         self.router.register("item-1", "implement", allowed_routes=["claude"])
         self.owned = self.router.assign("item-1", "implement", owner_id="claude-session",
                                         lease_seconds=600, expected_revision=0)
@@ -445,7 +448,8 @@ class HookProcessTests(GateCase):
         """A stage the router really owns on the claude route, plus its receipt."""
         router = StageRouter(str(self.state / "capacity.sqlite3"))
         router.observe_capacity(CapacityObservation(route="claude", observed_at=time.time(),
-                                                    fresh_until=time.time() + 3600, available=True, source="test"))
+                                                    fresh_until=time.time() + 3600, available=True,
+                                                    source="test"), trusted=True)
         router.register("item-1", "implement", allowed_routes=["claude"])
         owned = router.assign("item-1", "implement", owner_id="claude-session", lease_seconds=600,
                               expected_revision=0)
@@ -454,9 +458,12 @@ class HookProcessTests(GateCase):
         return router, owned
 
     def test_a_denied_edit_is_reported_on_stdout_and_logged(self):
+        # --no-automatic-routing is the pre-automatic posture: no receipt is a
+        # deny, full stop. With automatic routing on (the default) this same
+        # call creates a decision first, which the AutomaticGate tests cover.
         completed = self.run_hook("claude", {"hook_event_name": "PreToolUse", "tool_name": "Edit",
                                              "tool_input": {"file_path": str(self.repo / "a.py")},
-                                             "cwd": str(self.repo)})
+                                             "cwd": str(self.repo)}, "--no-automatic-routing")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         out = json.loads(completed.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
@@ -487,7 +494,7 @@ class HookProcessTests(GateCase):
             self.skipTest("the sh launcher is for POSIX hosts; the .cmd launcher is not exercised here")
         self.owned_now()
         config = self.write_config()
-        command = gate.hook_command(str(ROOT), "claude", str(config))
+        command = gate.hook_command(str(ROOT), "claude", str(config)) + " --no-automatic-routing"
         denied = subprocess.run(command, shell=True, input=json.dumps({
             "tool_name": "Write", "tool_input": {"file_path": str(self.other / "b.py")},
             "cwd": str(self.other)}).encode(), capture_output=True, timeout=60)
@@ -570,7 +577,8 @@ class RoutingDecideToolTests(GateCase):
         self.router = StageRouter(str(self.base / "capacity.sqlite3"), clock=self.clock)
         for route in ("claude", "codex"):
             self.router.observe_capacity(CapacityObservation(
-                route=route, observed_at=1000.0, fresh_until=5000.0, available=True, source="test"))
+                route=route, observed_at=1000.0, fresh_until=5000.0, available=True,
+                source="test"), trusted=True)
 
     def call(self, server, name, arguments):
         reply = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -726,6 +734,682 @@ class InstallTests(GateCase):
             handle.write(f'\n[hooks.state."{key}"]\ntrusted_hash = "sha256:abc"\n')
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
             self.assertEqual(gate.report(str(self.home), str(self.state), clock=self.clock)["codex_trust"], "recorded")
+
+
+class EachClientHasItsOwnEditingTool(unittest.TestCase):
+    """The trap that hid a livelock, stated where a test author will see it.
+
+    Claude edits through ``Edit`` and friends; Codex edits through
+    ``apply_patch``. Naming the wrong one does not fail: the gate classifies
+    the call as not gated and allows it, which is correct behaviour and a
+    silent trap for a test. Two tests were written that way, one of them the
+    only guard against the two clients routing work at each other forever,
+    and both passed while reaching none of the code they named.
+    """
+
+    def test_each_client_gates_its_own_editing_tool(self):
+        for client, tool in (("claude", "Edit"), ("codex", "apply_patch")):
+            kind, _ = gate.classify(client, tool, {"file_path": "/tmp/a.py",
+                                                   "input": "*** Begin Patch\n"
+                                                            "*** Update File: a.py\n"
+                                                            "*** End Patch\n"},
+                                    "/tmp")
+            self.assertEqual(kind, "edit", f"{client} does not gate {tool}")
+
+    def test_the_other_client_editing_tool_is_not_gated_at_all(self):
+        """Not a defect. The reason a test must use the right name."""
+        for client, foreign in (("claude", "apply_patch"), ("codex", "Edit")):
+            kind, _ = gate.classify(client, foreign, {"file_path": "/tmp/a.py"},
+                                    "/tmp")
+            self.assertEqual(kind, "other",
+                             f"{foreign} is unexpectedly gated for {client}; "
+                             f"if that changed, the fixtures that rely on this "
+                             f"asymmetry need revisiting")
+
+    def test_the_two_edit_tool_sets_do_not_overlap(self):
+        self.assertFalse(gate.EDIT_TOOLS["claude"] & gate.EDIT_TOOLS["codex"])
+
+    def test_both_clients_gate_the_same_shell_tool(self):
+        """Bash is shared, which is why shell fixtures work for both."""
+        self.assertIn("Bash", gate.SHELL_TOOLS["claude"])
+        self.assertIn("Bash", gate.SHELL_TOOLS["codex"])
+
+
+class TheWindowsHookCommandQuoting(unittest.TestCase):
+    r"""A static fix for a defect that would have silenced the Windows gate.
+
+    ``hook_command`` quoted both paths with ``shlex.quote``, which is POSIX
+    quoting: it wraps a value containing a space in single quotes, and
+    ``cmd.exe`` does not treat single quotes as quoting at all. On any Windows
+    account whose home contains a space, which is ``C:\Users\First Last`` and
+    therefore most of them, the installed command was malformed and the hook
+    never ran. A hook that never runs is a gate that never gates, and nothing
+    would have said so.
+
+    These tests exercise the quoting function, not a Windows host. The
+    launcher still has not been run under either host on Windows, and the
+    installer's ``not_covered`` list still says so.
+    """
+
+    def quoted(self, value, name):
+        with mock.patch.object(gate.os, "name", name):
+            return gate.quote_for_host_shell(value)
+
+    def test_posix_quoting_is_unchanged(self):
+        self.assertEqual(self.quoted("/home/some one/x", "posix"),
+                         "'/home/some one/x'")
+
+    def test_a_windows_path_with_a_space_gets_double_quotes(self):
+        self.assertEqual(self.quoted(r"C:\Users\First Last\x.cmd", "nt"),
+                         r'"C:\Users\First Last\x.cmd"')
+
+    def test_no_single_quotes_ever_reach_a_windows_command(self):
+        """The specific defect: cmd.exe cannot read them."""
+        self.assertNotIn("'", self.quoted(r"C:\Users\First Last\x.cmd", "nt"))
+
+    def test_every_cmd_delimiter_legal_in_a_path_is_quoted(self):
+        r"""The first version of the quoted set had only the obvious ones.
+
+        NTFS forbids only < > : " / \ | ? * , so a comma, a semicolon, an
+        equals sign, a percent and an exclamation mark are all legal in a
+        directory name and all significant to cmd.exe: it truncates the
+        program name at the delimiter, or expands a variable, and the hook
+        never runs. Found by sweeping for more instances of the pattern that
+        had already produced four defects.
+        """
+        for character in (" ", "\t", ",", ";", "=", "%", "!", "&", "^", "(", ")"):
+            path = "C:\\dev\\a" + character + "b\\hook.cmd"
+            quoted = self.quoted(path, "nt")
+            with self.subTest(character=character):
+                self.assertNotEqual(quoted, path,
+                                    f"a path containing {character!r} was left bare")
+                self.assertTrue(quoted.startswith('"') and quoted.endswith('"'), quoted)
+
+    def test_a_windows_path_without_metacharacters_is_left_alone(self):
+        self.assertEqual(self.quoted(r"C:\Users\a\x.cmd", "nt"),
+                         r"C:\Users\a\x.cmd")
+
+    def test_a_cmd_builtin_write_is_recognised(self):
+        r"""The heuristic listed only POSIX verbs, so `del` read as a read.
+
+        Found while checking the Windows quoting, and the same class of
+        oversight: one platform's conventions written into a cross-platform
+        component. Still a heuristic, and still not a security boundary.
+        """
+        for command in (r"cmd /c del C:\Users\First Last\app.py",
+                        "DEL app.py", "move a b", "ren a b", "rd /s /q build",
+                        "attrib +r app.py"):
+            self.assertTrue(gate.shell_writes(command), command)
+
+    def test_a_powershell_write_cmdlet_is_recognised(self):
+        for command in (r"Remove-Item .\app.py", r"remove-item .\app.py",
+                        "Set-Content app.py 'x'", "Out-File -FilePath app.py"):
+            self.assertTrue(gate.shell_writes(command), command)
+
+    def test_windows_reads_are_still_reads(self):
+        """A deny fails closed, but a heuristic that denies everything is no
+        heuristic, so the ordinary read commands must stay reads."""
+        for command in ("dir", "type app.py", "Get-Content app.py",
+                        "Get-ChildItem", "where python", "findstr x app.py"):
+            self.assertFalse(gate.shell_writes(command), command)
+
+    def test_a_windows_tree_command_reaches_a_protected_ancestor(self):
+        r"""The matching half: `rd /s` reaches a tree just as `rm -r` does.
+
+        The tree-verb list decides whether naming an *ancestor* of a
+        protected path counts as reaching it. It listed POSIX verbs only, so
+        on Windows a recursive delete of a directory holding the gate's own
+        state read as touching only that directory.
+        """
+        for command in (r"rd /s /q C:\Users\x\.agent-bridge",
+                        r"Remove-Item -Recurse .\state",
+                        "xcopy /s a b", "robocopy a b /e"):
+            self.assertTrue(gate._TREE_VERBS.search(command), command)
+        for command in ("dir", "Get-Content x", "type x"):
+            self.assertFalse(gate._TREE_VERBS.search(command), command)
+
+    def test_the_protected_path_check_resolves_and_folds_both_sides(self):
+        r"""Windows paths are case-insensitive and take either separator.
+
+        Without normalisation, a protected path named in a different case, or
+        with forward slashes, compared unequal to the same path and the
+        protected-path rule did not fire.
+        """
+        import inspect
+        source = inspect.getsource(gate._under)
+        self.assertIn("os.path.normcase(os.path.realpath(path))", source)
+        self.assertIn("os.path.normcase(os.path.realpath(root))", source)
+
+    def test_a_path_inside_the_root_is_under_it_on_any_platform(self):
+        """The first version of this test failed on Windows CI, and was right
+        to: it passed an unresolved root, and only ``path`` was resolved. On a
+        Windows runner ``gettempdir`` can return a short 8.3 name, so the two
+        sides were different spellings of one directory. Both are resolved
+        now, so the caller no longer has to know."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "state")
+            os.makedirs(os.path.join(root, "routing"))
+            self.assertTrue(gate._under(os.path.join(root, "routing", "x.json"), root))
+            self.assertTrue(gate._under(root, root))
+            self.assertFalse(gate._under(os.path.join(tmp, "elsewhere", "x"), root))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX case semantics")
+    def test_case_is_significant_on_posix(self):
+        """/etc/Passwd really is a different file from /etc/passwd."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "state")
+            os.makedirs(root)
+            self.assertFalse(gate._under(os.path.join(tmp, "STATE", "x.json"), root))
+
+    @unittest.skipUnless(os.name == "nt", "Windows case semantics")
+    def test_case_is_not_significant_on_windows(self):
+        """The actual fix, verified by the Windows runners rather than mocked.
+
+        A protected path named in a different case is the same file on
+        Windows, so it has to reach the protected-path rule.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "state")
+            os.makedirs(root)
+            self.assertTrue(gate._under(os.path.join(tmp, "STATE", "x.json"), root))
+            self.assertTrue(gate._under(os.path.join(tmp, "state/x.json"), root))
+
+    def test_flattening_an_argv_for_the_heuristic_is_a_different_direction(self):
+        r"""``shlex.join`` elsewhere in this module is not the same defect.
+
+        It flattens a tool call's argv list into text so the write heuristic
+        can read it, rather than building a command for a shell to run, and
+        the quoting it adds only makes the patterns easier to match. Checked
+        with a Windows-shaped argv, including a path with a space.
+        """
+        argv = ["cmd", "/c", r"del C:\Users\First Last\app.py"]
+        self.assertTrue(gate.shell_writes(gate._command_text({"command": argv})))
+        self.assertTrue(gate.shell_writes(gate._command_text(
+            {"command": ["sh", "-c", r"rm -f 'C:\Users\First Last\app.py'"]})))
+
+    def test_the_command_builder_uses_it_for_both_paths(self):
+        """Neither the launcher nor the config path may be POSIX-quoted."""
+        import inspect
+        source = inspect.getsource(gate.hook_command)
+        self.assertEqual(source.count("quote_for_host_shell"), 2)
+        self.assertNotIn("shlex.quote", source)
+
+
+class TheHookPayloadIsUtf8WhateverTheLocaleSays(unittest.TestCase):
+    r"""The worst defect this project has had: a silent, total bypass.
+
+    Hook mode read its payload with ``sys.stdin.read()``, which decodes using
+    the locale encoding. On Windows that is the ANSI code page, and both hosts
+    emit raw UTF-8: Node's ``JSON.stringify`` and Rust's ``serde_json`` do not
+    escape non-ASCII. So for a repository whose path contained any non-ASCII
+    character the payload arrived as mojibake, ``enclosing_repos`` found no
+    ``.git`` above the mangled path, and ``judge`` returned ``allow`` with
+    ``outside_repository``. The gate printed an empty object and the edit
+    proceeded ungated, for every user whose name or project path is not pure
+    ASCII.
+
+    Measured before the fix: the same payload naming a repository with an
+    e-acute was denied ``routed_elsewhere`` under a UTF-8 stdin and allowed
+    under ``cp1252``.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        (self.state / "routing").mkdir(parents=True)
+        self.db = self.state / "capacity.sqlite3"
+        self.config = self.base / "orchestration.json"
+        self.config.write_text(json.dumps(
+            {"state_root": str(self.state), "capacity_db": str(self.db)}), encoding="utf-8")
+        # An e-acute and a CJK character, so the test is not about one codec.
+        self.repo = self.base / "caf\u00e9-\u9879\u76ee"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, timeout=60,
+                       capture_output=True)
+        (self.repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (self.state / "routing" / "routing-policy.json").write_text(
+            json.dumps({"version": 1, "declared_available": ["codex"],
+                        "repos": {str(self.repo): {
+                            "classification": "internal_nonclient",
+                            "allowed_routes": ["claude", "codex"]}}}, ensure_ascii=False),
+            encoding="utf-8")
+
+    def judge_with(self, encoding: str) -> dict:
+        """Drive the gate as a subprocess with its stdio encoding forced.
+
+        ``PYTHONIOENCODING`` is how this test reproduces on Linux what a
+        Windows ANSI code page does by default. The payload goes in as raw
+        UTF-8 bytes, which is what a host writes.
+        """
+        payload = json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+             "tool_input": {"file_path": str(self.repo / "app.py")},
+             "cwd": str(self.repo)}, ensure_ascii=False).encode("utf-8")
+        environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"),
+                       "PYTHONIOENCODING": encoding}
+        environment.pop("PYTHONUTF8", None)
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=payload, capture_output=True, timeout=120, env=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def code(self, payload: dict) -> str:
+        output = payload.get("hookSpecificOutput")
+        if not output:
+            return "ALLOWED"
+        reason = str(output.get("permissionDecisionReason", ""))
+        return reason.rsplit("[", 1)[-1].rstrip("]")
+
+    def test_a_non_ascii_repository_is_judged_under_every_stdio_encoding(self):
+        for encoding in ("utf-8", "cp1252", "latin-1", "ascii"):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(self.code(self.judge_with(encoding)),
+                                 "routed_elsewhere",
+                                 f"the gate did not judge the call under {encoding}")
+
+    def test_the_gate_reads_bytes_rather_than_the_locale(self):
+        """Pinned in the source too, because the defect is invisible in the
+        output on a host whose locale happens to be UTF-8, which is every
+        Linux CI runner this project has."""
+        import inspect
+        source = inspect.getsource(gate._hook_input)
+        self.assertIn('decode("utf-8")', source)
+        self.assertIn("sys.stdin", source)
+        self.assertNotIn("sys.stdin.read()", inspect.getsource(gate.main))
+
+    def test_a_byte_order_mark_is_tolerated(self):
+        payload = b"\xef\xbb\xbf" + json.dumps(
+            {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+             "tool_input": {"file_path": str(self.repo / "app.py")},
+             "cwd": str(self.repo)}).encode("utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=payload, capture_output=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(self.code(json.loads(completed.stdout)), "routed_elsewhere")
+
+    def test_bytes_that_are_not_utf8_are_a_deny_rather_than_a_guess(self):
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+             "--client", "claude", "--config", str(self.config)],
+            input=b"\xff\xfe{not even close}", capture_output=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(self.code(json.loads(completed.stdout)), "gate_error")
+
+
+class TheLauncherNeverFailsOpen(unittest.TestCase):
+    """A hook that produces no decision is read as a non-blocking error.
+
+    The gate always exits 0 and carries its decision in the JSON, but that
+    contract only starts once the interpreter is running. Both launchers used
+    to exit with the interpreter's status and nothing on stdout when it could
+    not start, which a host treats as a failed hook and then runs the tool
+    anyway. On a stock Windows account with no Python the bare name ``python``
+    resolves to the Microsoft Store App Execution Alias stub, so this was the
+    default case there, not an edge case.
+    """
+
+    def launcher(self) -> Path:
+        return ROOT / "bin" / ("agent-bridge-gate-hook"
+                               + (".cmd" if os.name == "nt" else ""))
+
+    def run_launcher(self, *args, python: str | None = None):
+        environment = dict(os.environ)
+        if python is not None:
+            environment["AGENT_BRIDGE_PYTHON"] = python
+        argv = [str(self.launcher()), *args]
+        if os.name == "nt":
+            argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+                    subprocess.list2cmdline(argv)]
+        return subprocess.run(argv, input="{}", capture_output=True, text=True,
+                              timeout=120, env=environment, cwd=str(ROOT))
+
+    def test_an_interpreter_that_cannot_start_is_a_deny(self):
+        completed = self.run_launcher("--client", "claude", "--state-root",
+                                      "/nonexistent-state-root",
+                                      python="definitely-not-an-interpreter")
+        self.assertEqual(completed.returncode, 0,
+                         f"a launch failure must still exit 0: {completed.stderr[-500:]}")
+        payload = json.loads(completed.stdout)
+        reason = payload["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertTrue(reason.endswith("[gate_launcher_failed]"), reason)
+        self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_subcommand_keeps_its_own_exit_status(self):
+        """The subcommands are operator tools. Turning their failure into a
+        fake hook decision would hide it."""
+        completed = self.run_launcher("report", "--config", "/nonexistent.json")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("hookSpecificOutput", completed.stdout)
+
+    def test_both_launchers_set_utf8_mode(self):
+        for name in ("agent-bridge-gate-hook", "agent-bridge-gate-hook.cmd"):
+            text = (ROOT / "bin" / name).read_text(encoding="utf-8")
+            self.assertIn("PYTHONUTF8", text, name)
+
+
+class WindowsSpellingsOfAProtectedWrite(unittest.TestCase):
+    r"""Four ways past the protected-path rule, all on Windows, all measured.
+
+    The rule reads a command's operands and refuses one that reaches the
+    gate's own state. Every mechanism it used to do that was written for
+    POSIX, so on Windows the ordinary spellings walked through it:
+
+    * ``cmd /c "del C:\Users\me\.agent-bridge\..."`` was allowed, because
+      ``cmd`` was not a recognised shell, so the quoted command was treated as
+      one word, and the colon split then severed the drive letter out of it;
+    * ``bash.exe -c "..."`` was allowed where ``bash -c "..."`` was refused,
+      because the basename still carried ``.exe``;
+    * ``powershell -Command "..."`` was allowed, because neither the program
+      nor the flag was recognised;
+    * ``rm -rf /c/Users/me/.agent-bridge`` was allowed, because
+      ``ntpath.isabs`` calls that absolute, so it was kept verbatim and later
+      resolved against the current drive as ``C:\c\Users\me\...``, a
+      different directory. This is the one that matters most: Claude Code's
+      Bash tool on Windows runs through Git for Windows, so that is the
+      spelling that shell produces.
+
+    These tests run everywhere, with ``ntpath`` and ``os.name`` standing in
+    for the platform, because the whole lesson of this round is that a
+    Windows-only test which only ever runs on one runner is a test that stops
+    being read. The gate's own Windows CI runners exercise the same code with
+    the real ``ntpath``.
+    """
+
+    PROTECTED = (ntpath.normpath(r"C:\Users\me\.agent-bridge"),)
+
+    def verdict(self, command: str, cwd: str = r"C:\proj") -> str:
+        """Whether the protected-path branch of judge() would refuse."""
+        with mock.patch.object(gate, "os") as fake:
+            for attribute in dir(os):
+                if not attribute.startswith("_"):
+                    try:
+                        setattr(fake, attribute, getattr(os, attribute))
+                    except Exception:      # noqa: BLE001  a few are read-only
+                        pass
+            fake.path = ntpath
+            fake.name = "nt"
+            fake.sep = "\\"
+            named = gate._command_paths(command, cwd)
+            trees = bool(gate._TREE_VERBS.search(command))
+            hit = [root for root in self.PROTECTED
+                   if any(gate._reaches(path, root, through_ancestors=trees)
+                          for path in named)]
+        return "refused" if hit else "allowed"
+
+    def test_a_nested_command_under_cmd_is_read(self):
+        for command in (r'cmd /c "del C:\Users\me\.agent-bridge\routing\x.json"',
+                        r'cmd.exe /C "del C:\Users\me\.agent-bridge\routing\x.json"',
+                        r'cmd /k "del C:\Users\me\.agent-bridge\routing\x.json"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_an_executable_suffix_does_not_hide_a_shell(self):
+        for command in (r'bash.exe -c "rm -rf C:\Users\me\.agent-bridge"',
+                        r'sh.exe -c "rm -rf C:\Users\me\.agent-bridge"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_powershell_is_a_shell(self):
+        for command in (
+                r'powershell -Command "Remove-Item -Recurse C:\Users\me\.agent-bridge"',
+                r'powershell.exe -command "Remove-Item C:\Users\me\.agent-bridge\x"',
+                r'pwsh -Command "Remove-Item C:\Users\me\.agent-bridge\x"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_a_git_bash_drive_path_names_the_same_directory(self):
+        for command in (r"rm -rf /c/Users/me/.agent-bridge",
+                        r"rm -rf //c/Users/me/.agent-bridge",
+                        r"rm -rf /cygdrive/c/Users/me/.agent-bridge",
+                        r"rm -rf /C/Users/me/.agent-bridge"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_the_plain_windows_spellings_still_work(self):
+        """The cases that were already refused, so a fix cannot have traded
+        one spelling for another."""
+        for command in (r"del C:\Users\me\.agent-bridge\routing\x.json",
+                        r"rm -rf c:\users\me\.agent-bridge",
+                        r'del "C:\Users\me\.agent-bridge\routing\x.json"',
+                        r"del C:/Users/me/.agent-bridge/routing/x.json"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "refused")
+
+    def test_an_unrelated_write_is_still_allowed(self):
+        """A rule that refuses everything is not a rule."""
+        for command in (r"del C:\proj\app.py", r"rm -rf /c/other/place",
+                        r'cmd /c "del C:\proj\build"', "type app.py"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "allowed")
+
+    def test_a_shell_command_flag_is_not_an_operand(self):
+        r"""``cmd /c`` is a flag, not the drive root.
+
+        The first version of the Git-Bash translation turned a bare ``/c``
+        into ``C:\``, which is an ancestor of every protected path, so with a
+        tree verb in the command every ``cmd /c`` was refused. Caught by the
+        test that asks whether an unrelated write is still allowed, which is
+        why that test is there.
+        """
+        self.assertEqual(gate._windows_drive_path("/c"), "/c")
+        for command in (r'cmd /c "del C:\proj\build"',
+                        r'cmd /k "rm -rf C:\proj\build"',
+                        r'powershell -Command "Remove-Item C:\proj\build"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(command), "allowed")
+
+    # The two assertions below are about behaviour that differs by platform,
+    # so each is stated twice: once for the platform it is true on, and once
+    # for the platform it is false on. Writing only the POSIX half is a
+    # mistake I have now made three times in this project, and it fails on
+    # the Windows runners every time, which is the only reason it gets
+    # caught. The rule I keep relearning: when a function branches on
+    # os.name, so must its test.
+
+    @unittest.skipUnless(os.name == "posix", "POSIX path semantics")
+    def test_a_slash_c_path_is_left_alone_on_posix(self):
+        """On POSIX, /c/Users/me really is that path."""
+        self.assertEqual(gate._windows_drive_path("/c/Users/me"), "/c/Users/me")
+
+    @unittest.skipUnless(os.name == "nt", "Windows path semantics")
+    def test_a_slash_c_path_is_translated_on_windows(self):
+        """And on Windows it is Git Bash's spelling of a drive.
+
+        Asserted by the Windows runners rather than through a stand-in, which
+        is what makes it a measurement.
+        """
+        self.assertEqual(gate._windows_drive_path("/c/Users/me"), r"C:\Users\me")
+        self.assertEqual(gate._windows_drive_path("/cygdrive/d/x"), r"D:\x")
+        self.assertEqual(gate._windows_drive_path("/c"), "/c")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX operand semantics")
+    def test_a_colon_operand_is_split_on_posix(self):
+        """``a:b`` can be two operands in a POSIX shell."""
+        found = gate._command_paths("cp a:b /tmp/x", "/cwd")
+        self.assertIn("/cwd/a", found)
+        self.assertIn("/cwd/b", found)
+
+    @unittest.skipUnless(os.name == "nt", "Windows operand semantics")
+    def test_a_colon_operand_is_not_split_on_windows(self):
+        """On Windows a colon is a drive or a stream, never a separator, and
+        splitting on it severed the drive letter out of a nested command."""
+        found = gate._command_paths("copy a:b x", r"C:\cwd")
+        self.assertNotIn(r"C:\cwd\a", found)
+        self.assertIn("a:b", [os.path.basename(entry) for entry in found]
+                      + [entry for entry in found])
+
+
+class EveryOperandOfACommandIsRead(unittest.TestCase):
+    """The operand set itself, which nothing was asserting.
+
+    A fix of mine silently dropped every command's own program name from the
+    parsed operands, and 88 tests in this file plus the 559-check suite all
+    passed. The cause is worth keeping: ``A and B`` returns A itself when A is
+    falsy, A was the empty ``previous`` list, and the very next line appends
+    to that same object, so the name held a list that had since become
+    non-empty and therefore truthy.
+
+    Nothing caught it because every test here asserts a *verdict*, and the
+    program name is nearly always redundant with the working directory that
+    ``classify`` adds alongside it. A test that pins the operands directly is
+    the only kind that would have.
+    """
+
+    def test_the_program_name_and_the_operands_are_all_present(self):
+        self.assertEqual(gate._command_paths("rm -f /tmp/x", "/cwd"),
+                         ["/cwd/rm", "/tmp/x"])
+
+    def test_a_bare_flag_names_nothing_but_its_value_does(self):
+        found = gate._command_paths("git --git-dir=/tmp/g status", "/cwd")
+        self.assertIn("/cwd/git", found)
+        self.assertIn("/tmp/g", found)
+
+    def test_a_redirection_target_is_an_operand(self):
+        self.assertIn("/cwd/out.txt", gate._command_paths("echo hi > out.txt", "/cwd"))
+
+    def test_a_nested_shell_command_contributes_its_own_operands(self):
+        found = gate._command_paths('sh -c "rm -f /tmp/inner"', "/cwd")
+        self.assertIn("/tmp/inner", found)
+
+    def test_the_shells_own_flag_is_not_an_operand(self):
+        """And this is what the dropped-name bug was introduced to do."""
+        found = gate._command_paths('sh -c "rm -f /tmp/inner"', "/cwd")
+        self.assertNotIn("/cwd/-c", found)
+
+
+class TheSqliteUriEscapesEveryReservedCharacter(unittest.TestCase):
+    """A percent in the database path made the gate deny every call.
+
+    SQLite percent-decodes a ``file:`` URI path, so a directory named
+    ``App%20Data`` was rewritten and the open failed. ``stage_binding`` turns
+    that into ``stage_db_unavailable``, which is a deny on every gated call in
+    both clients, and ``capacity_digest`` returns None. Fail-closed, and
+    unusable. The ordering is the fix: percent must be escaped before the
+    question mark and hash, or this function mangles its own escapes.
+    """
+
+    def test_a_percent_in_the_path_opens(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            awkward = Path(temporary) / "App%20Data"
+            awkward.mkdir()
+            database = awkward / "capacity.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE capacity (route TEXT)")
+            connection.commit()
+            connection.close()
+            uri = "file:" + gate._sqlite_uri_path(str(database)) + "?mode=ro"
+            opened = sqlite3.connect(uri, uri=True)
+            try:
+                self.assertEqual(opened.execute("SELECT count(*) FROM capacity")
+                                 .fetchone()[0], 0)
+            finally:
+                opened.close()
+
+    def test_the_unescaped_form_is_what_used_to_fail(self):
+        """Stated so the test cannot pass by the path simply working anyway."""
+        with tempfile.TemporaryDirectory() as temporary:
+            awkward = Path(temporary) / "App%20Data"
+            awkward.mkdir()
+            database = awkward / "capacity.sqlite3"
+            sqlite3.connect(database).close()
+            naive = "file:" + str(database) + "?mode=ro"
+            with self.assertRaises(sqlite3.OperationalError):
+                sqlite3.connect(naive, uri=True)
+
+    def test_percent_is_escaped_before_the_others(self):
+        escaped = gate._sqlite_uri_path("/tmp/a%b")
+        self.assertIn("%25", escaped)
+        self.assertNotIn("%2525", escaped)
+
+
+class ABomPrefixedCodexTomlIsStillValidToml(unittest.TestCase):
+    # A Windows editor or PowerShell's default encoding can prepend a UTF-8
+    # BOM to config.toml. tomllib.loads sees the raw bytes only after this
+    # module's own decode, so the BOM must already be gone by then.
+    def test_codex_hooks_flag_update_reads_a_bom_prefixed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b"\xef\xbb\xbf" + b'[other]\nkey = "value"\n')
+            updated = gate.codex_hooks_flag_update(str(path))
+            self.assertIsNotNone(updated)
+            self.assertIn(b'key = "value"', updated)
+
+    def test_codex_trust_state_reads_a_bom_prefixed_toml(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hooks_path = Path(temporary) / "hooks.json"
+            ours = {"hooks": [{"command": f"...{gate.HOOK_NAME}..."}]}
+            hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": [ours]}}))
+            codex_toml = Path(temporary) / "config.toml"
+            # No matching trusted_hash entry: BOM-prefixed but otherwise-valid
+            # TOML must parse (not raise) and yield "needs_review", never a
+            # TOMLDecodeError from the leading BOM.
+            codex_toml.write_bytes(b"\xef\xbb\xbf" + b'[hooks]\n')
+            self.assertEqual(gate.codex_trust_state(str(codex_toml), str(hooks_path)), "needs_review")
+
+
+class TheTrustStateKeyMatchesCodexsOwnCodexHomeResolution(unittest.TestCase):
+    """codex-rs canonicalizes CODEX_HOME (symlinks, Windows on-disk casing) only
+    when the CODEX_HOME environment variable is set (utils/home-dir/src/lib.rs::
+    find_codex_home); the default ``~/.codex`` gets no resolution at all before
+    it is used to build a trust-state key (hooks/src/engine/discovery.rs). This
+    module's own key must track that exact branch, or a real trust decision
+    never shows as recorded because the two sides spell the same file two
+    different ways.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        real_dir = Path(self.temp.name) / "real"
+        real_dir.mkdir()
+        self.link_dir = Path(self.temp.name) / "link"
+        self.link_dir.symlink_to(real_dir)
+        self.hooks_path = self.link_dir / "hooks.json"
+        ours = {"hooks": [{"command": f"...{gate.HOOK_NAME}..."}]}
+        self.hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": [ours]}}))
+        self.codex_toml = self.link_dir / "config.toml"
+
+    def _write_state_for_key(self, key):
+        escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+        self.codex_toml.write_text(f'[hooks.state."{escaped}"]\ntrusted_hash = "abc"\n')
+
+    def test_with_codex_home_unset_the_key_is_not_resolved_through_the_symlink(self):
+        # Codex's default ~/.codex branch applies no canonicalization; the key
+        # it writes names the path as configured, symlink and all.
+        self._write_state_for_key(f"{self.hooks_path}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "recorded")
+
+    def test_with_codex_home_unset_a_realpath_style_key_does_not_match(self):
+        # The bug this guards against: unconditionally resolving through the
+        # symlink would look for a key Codex never writes in this branch.
+        self._write_state_for_key(f"{os.path.realpath(self.hooks_path)}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "needs_review")
+
+    def test_with_codex_home_set_the_key_is_resolved_through_the_symlink(self):
+        # Codex calls std::fs::canonicalize on an explicit CODEX_HOME.
+        self._write_state_for_key(f"{os.path.realpath(self.hooks_path)}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.link_dir)}):
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "recorded")
+
+    def test_with_codex_home_set_the_unresolved_symlink_style_key_does_not_match(self):
+        self._write_state_for_key(f"{self.hooks_path}:pre_tool_use:0:0")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.link_dir)}):
+            self.assertEqual(gate.codex_trust_state(str(self.codex_toml), str(self.hooks_path)),
+                             "needs_review")
 
 
 if __name__ == "__main__":

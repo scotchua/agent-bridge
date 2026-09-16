@@ -18,9 +18,33 @@ CODEX_TASK = Path(__file__).resolve().parent.parent / "src" / "agent_bridge" / "
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import codex_task as module
+from agent_bridge.execution import hostenv
+
+
+def requires_confinement(case):
+    """Skip, by name, a test that needs a verification confinement backend.
+
+    GitHub's Ubuntu runners cannot enter an unprivileged network namespace and
+    a Mac without sandbox-exec is equally unserved, so on those hosts
+    ``hostenv.confinement`` refuses and the lane cannot run verification at
+    all. These tests exercise the lane end to end, or the boundary itself, so
+    they genuinely need one. Saying so and skipping is how this project
+    already treats a host that cannot satisfy a fixture (see
+    tests/platform_support.py); failing would report a defect in the code
+    when the fact is a property of the machine.
+
+    It is deliberately NOT applied to tests about request validation. Those
+    must pass everywhere, which is why ``run_task`` validates the request
+    before it probes the host.
+    """
+    try:
+        hostenv.confinement("synthetic")
+    except hostenv.HostCapabilityError as exc:
+        case.skipTest("no verification confinement backend on this host: " + exc.code)
+
 from agent_bridge.execution.codex_task import (
     TaskError, _env, _git, _relevant_paths, _remove, _run, _sandboxed,
-    _source_state, main, run_task)
+    _source_state, _with_error_detail, main, run_task)
 
 # `_env()` builds a fixed, minimal environment from scratch (see the module
 # under test): it does not forward arbitrary variables from the parent
@@ -130,7 +154,16 @@ class CodexTaskTests(unittest.TestCase):
         kwargs.update(overrides)
         return run_task(**kwargs)
 
+    def test_a_bom_prefixed_brief_is_not_rejected(self):
+        # A Windows editor or PowerShell's default encoding can prepend a
+        # UTF-8 BOM to a brief file this project never wrote itself.
+        requires_confinement(self)
+        self.brief.write_bytes(b"\xef\xbb\xbf" + b"Append the verification marker.\n")
+        result = self.run_default()
+        self.assertEqual(result["status"], "complete")
+
     def test_returns_patch_and_does_not_touch_source(self):
+        requires_confinement(self)
         result = self.run_default()
         error_log = Path(result["job_dir"]) / "verify-1.stderr"
         self.assertEqual(result["status"], "complete",
@@ -151,7 +184,37 @@ class CodexTaskTests(unittest.TestCase):
             self.run_default(classification="client_derived")
         self.assertFalse((self.root / "tasks").exists())
 
+    def test_refuses_when_task_root_cannot_be_protected(self):
+        # mkdir(mode=) and chmod are no-ops on Windows; task_root must be
+        # brought under a real ACL through the platform layer, and a host
+        # that cannot do that must refuse before any job directory exists.
+        # The check under test runs after the confinement-backend probe, so
+        # a host with no backend at all (not yet wired for Windows) never
+        # reaches it -- same reason other full-path tests in this file skip.
+        requires_confinement(self)
+        with mock.patch.object(module.wpv, "require_private_directory",
+                              side_effect=module.wpv.PrivacyError("directory_not_owner_only")):
+            with self.assertRaises(TaskError) as caught:
+                self.run_default()
+        self.assertIn("task root could not be protected", str(caught.exception))
+        self.assertEqual(list((self.root / "tasks").iterdir()), [])
+
+    def test_refuses_when_job_directory_cannot_be_protected(self):
+        requires_confinement(self)
+        task_root = self.root / "tasks"
+
+        def fails_only_for_job(path, *, root):
+            if Path(path) != task_root:
+                raise module.wpv.PrivacyError("directory_not_owner_only")
+
+        with mock.patch.object(module.wpv, "require_private_directory",
+                              side_effect=fails_only_for_job):
+            with self.assertRaises(TaskError) as caught:
+                self.run_default()
+        self.assertIn("job directory could not be protected", str(caught.exception))
+
     def test_verify_argv_empty_is_permitted_for_codex(self):
+        requires_confinement(self)
         result = self.run_default(verify_argv=[])
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["verification"], [])
@@ -174,6 +237,7 @@ class CodexTaskTests(unittest.TestCase):
                                    "error_detail": "verification executable is not allowlisted"})
 
     def test_refuses_api_key_auth(self):
+        requires_confinement(self)
         self._write_fake(login="apikey")
         with self.assertRaises(TaskError):
             self.run_default()
@@ -200,6 +264,17 @@ class CodexTaskTests(unittest.TestCase):
         self._write_fake(mode="fail")
         with self.assertRaises(TaskError):
             self.run_default()
+
+    def test_turn_failure_carries_codexs_own_reason(self):
+        """A bare exit status told an operator nothing about *why* (the same
+        defect claude_task carries the identical fix for). The fake's
+        ``turn.failed`` event reports "synthetic failure"; that text belongs
+        in the TaskError message, not just the receipt's event count."""
+        requires_confinement(self)
+        self._write_fake(mode="fail")
+        with self.assertRaises(TaskError) as ctx:
+            self.run_default()
+        self.assertEqual(str(ctx.exception), "Codex exited with status 1: synthetic failure")
 
     def test_refuses_empty_patch(self):
         self._write_fake(mode="nochange")
@@ -232,25 +307,73 @@ class CodexTaskTests(unittest.TestCase):
         time.sleep(0.8)
         self.assertFalse(marker.exists())
 
-    def test_macos_sandbox_denies_network_and_outside_write(self):
-        tree = self.root / "sandbox-tree"
-        tree.mkdir()
-        scratch = self.root / "sandbox-scratch"
-        outside = self.root / "outside"
-        code = ("import pathlib,socket; "
-                f"pathlib.Path({str(outside)!r}).write_text('escape'); "
-                "socket.socket().connect(('127.0.0.1',9))")
-        result = _sandboxed([sys.executable, "-c", code], tree, scratch, _env(), 5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(outside.exists())
+    # The confinement backend is now selected per host (execution/hostenv.py),
+    # so these assert what the *selected* backend claims rather than what one
+    # operating system happens to provide. A test that asserted macOS
+    # semantics everywhere would have to be skipped off macOS, and a skipped
+    # boundary test is one nobody reads.
 
-    def test_macos_sandbox_denies_outside_read(self):
+    def test_selected_backend_denies_network(self):
+        """Every backend must deny network. None is selected if it cannot."""
+        requires_confinement(self)
+        backend = hostenv.confinement("synthetic")
+        tree = self.root / "net-tree"; tree.mkdir()
+        code = ("import socket,sys\n"
+                "try:\n"
+                "    socket.create_connection(('1.1.1.1', 443), timeout=3)\n"
+                "except OSError:\n"
+                "    sys.exit(0)\n"
+                "sys.exit(9)\n")
+        result = _sandboxed([sys.executable, "-c", code], tree,
+                            self.root / "net-scratch", _env(), 20, backend)
+        self.assertTrue(backend.denies_network)
+        self.assertEqual(result.returncode, 0, result.stderr[:400])
+        self.assertEqual(result.sandbox_backend, backend.name)
+
+    def test_backend_write_confinement_matches_its_claim(self):
+        """A write above the worktree is refused exactly when claimed."""
+        requires_confinement(self)
+        backend = hostenv.confinement("synthetic")
+        tree = self.root / "write-tree"; tree.mkdir()
+        outside = self.root / "outside"
+        result = _sandboxed(
+            [sys.executable, "-c", f"open({str(outside)!r},'w').write('escape')"],
+            tree, self.root / "write-scratch", _env(), 20, backend)
+        if backend.confines_writes:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(outside.exists())
+        else:
+            # Stated, not assumed: this backend is not the write boundary.
+            # run_task's source-integrity snapshot is, and
+            # test_detects_source_checkout_mutation proves it.
+            self.assertTrue(outside.exists())
+
+    def test_backend_read_confinement_matches_its_claim(self):
+        requires_confinement(self)
+        backend = hostenv.confinement("synthetic")
         tree = self.root / "read-tree"; tree.mkdir()
         protected = self.root / "client-secret"; protected.write_text("canary-secret")
         result = _sandboxed([sys.executable, "-c", f"print(open({str(protected)!r}).read())"],
-                            tree, self.root / "read-scratch", _env(), 5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn(b"canary-secret", result.stdout + result.stderr)
+                            tree, self.root / "read-scratch", _env(), 20, backend)
+        if backend.confines_reads:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(b"canary-secret", result.stdout + result.stderr)
+        else:
+            # Why such a backend carries synthetic material only.
+            self.assertIn(b"canary-secret", result.stdout)
+            self.assertEqual(backend.classifications, frozenset({"synthetic"}))
+
+    def test_a_backend_that_confines_no_reads_refuses_real_material(self):
+        requires_confinement(self)
+        backend = hostenv.confinement("synthetic")
+        if backend.confines_reads:
+            self.assertTrue(backend.permits("internal_nonclient"))
+            return
+        for classification in ("internal_nonclient", "public"):
+            with self.assertRaises(hostenv.HostCapabilityError) as caught:
+                hostenv.confinement(classification)
+            self.assertEqual(caught.exception.code,
+                             "verification_confinement_insufficient")
 
     def test_cleanup_timeout_is_bounded_failure(self):
         tree = self.root / "cleanup-tree"; tree.mkdir()
@@ -260,6 +383,7 @@ class CodexTaskTests(unittest.TestCase):
             self.assertFalse(_remove(self.repo, tree, _env()))
 
     def test_detects_source_checkout_mutation(self):
+        requires_confinement(self)
         self._write_fake(mode="corrupt", corrupt_target=str(self.repo / "value.txt"))
         with self.assertRaises(TaskError):
             self.run_default()
@@ -284,6 +408,7 @@ class CodexTaskTests(unittest.TestCase):
             (self.root / "AGENTS.md").unlink()
 
     def test_isolated_codex_home_is_created_owner_only_and_never_shared_desktop_home(self):
+        requires_confinement(self)
         result = self.run_default()
         self.assertTrue(self.codex_home.is_dir())
         if os.name != "nt":
@@ -316,18 +441,21 @@ class CodexExitStatusTests(CodexTaskTests):
         return code, json.loads(lines[-1])
 
     def test_a_clean_run_reports_ok_and_exits_zero(self):
+        requires_confinement(self)
         code, payload = self._main(["git", "diff", "--check"])
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "complete")
 
     def test_a_failed_verification_exits_nonzero(self):
+        requires_confinement(self)
         code, payload = self._main(["git", "diff", "--exit-code"])
         self.assertNotEqual(code, 0)
         self.assertFalse(payload["ok"], payload)
         self.assertEqual(payload["status"], "verification_failed", payload)
 
     def test_the_failing_check_is_recorded_in_the_receipt(self):
+        requires_confinement(self)
         _, payload = self._main(["git", "diff", "--exit-code"])
         self.assertTrue(any(entry["returncode"] != 0
                             for entry in payload["verification"]))
@@ -423,6 +551,8 @@ class CodexSourceIntegrityTests(unittest.TestCase):
 
     def test_a_socket_is_refused(self):
         import socket
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("no AF_UNIX on this host")
         endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(endpoint.close)
         try:
@@ -444,7 +574,11 @@ class CodexSourceIntegrityTests(unittest.TestCase):
         outside = self.root / "outside.txt"
         outside.write_text("secret\n")
         link = self.repo / "link.txt"
-        link.symlink_to(outside)
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("cannot create a symlink on this host "
+                          "(elevation or Developer Mode required)")
         with self.assertRaises(TaskError) as caught:
             module._hash_regular_file(link, hashlib.sha256(), 4096)
         self.assertIn("could not read", str(caught.exception))
@@ -525,6 +659,34 @@ class CodexSourceIntegrityTests(unittest.TestCase):
         self.assertNotEqual(self._snapshot(), before)
 
 
+class ErrorDetailTests(unittest.TestCase):
+    """``_with_error_detail`` folds Codex's own first reported error message
+    into a fixed TaskError message, bounded and printable-only."""
+
+    def test_appends_the_first_error_message(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["synthetic failure"]),
+                         "Codex exited with status 1: synthetic failure")
+
+    def test_uses_only_the_first_of_several_messages(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["first", "second"]),
+                         "Codex exited with status 1: first")
+
+    def test_falls_back_when_there_are_no_messages(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", []),
+                         "Codex exited with status 1")
+
+    def test_strips_non_printable_characters(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["line one\x00\x07line two"]),
+                         "Codex exited with status 1: line oneline two")
+
+    def test_truncates_to_the_bound(self):
+        long_message = "x" * 500
+        detail = _with_error_detail("Codex exited with status 1", [long_message])
+        self.assertEqual(detail, "Codex exited with status 1: " + "x" * module.ERROR_MESSAGE_DETAIL_LIMIT)
+
+    def test_falls_back_when_the_message_has_no_printable_content(self):
+        self.assertEqual(_with_error_detail("Codex exited with status 1", ["\x00\x07"]),
+                         "Codex exited with status 1")
 
 
 

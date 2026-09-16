@@ -1,5 +1,28 @@
 # Audits
 
+## automatic-delegation-2026-09-15.md
+
+The delegation-first gate was real enforcement but not automatic: it refused an
+un-decided edit and asked the assistant to make the decision. This records the
+three repairs (a macOS-only hard-code in both execution lanes that reduced
+every failure to `TaskError: command spawn failed`, a route that was requested
+rather than computed, and no accounting at all), the three defects found while
+building them, and a live end-to-end run of the complete workflow.
+
+A second section, "The adversarial review round", records the response to an
+external adversarial review that rejected the first five commits before merge:
+two critical defects (a routing escape through a nested repository, and Linux
+verification that confined nothing much) and four high-impact gaps, each with
+the measurement rather than the claim. It carries the escape matrix for the
+confinement boundary and a list of what remains unconfined.
+
+Read the "What was NOT proven" section before quoting any of it. Nothing here
+contacted a provider account: the provider CLIs and the local model were
+stand-in executables, so this is evidence about the dispatch machinery and not
+about any provider's login. Everything ran on Linux; macOS and Windows are
+unverified by this run. Raw output in
+[`automatic-delegation-2026-09-15.log`](automatic-delegation-2026-09-15.log).
+
 ## verification-path-audit-2026-08-30.md
 
 An audit of whether this project's own verification procedure can be executed,

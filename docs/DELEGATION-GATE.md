@@ -1,13 +1,25 @@
 # Delegation-first gate
 
 The gate makes the routing decision come first. Neither Claude Code nor the
-Codex CLI can edit a repository through its editing tools until an
-orchestration stage for that repository has been registered, claimed, and
-recorded as a durable routing receipt naming the route that owns it. A
-client whose route does not own the stage is told to dispatch instead of
-editing. This is enforced by the host's own hook mechanism: the tool call is
-refused by Claude Code or Codex when the hook says deny, not by a sentence
-in an instruction file.
+Codex CLI can edit a repository through its editing tools until a durable
+routing receipt names the route that owns the work. A client whose route
+does not own it is told to dispatch instead of editing. This is enforced by
+the host's own hook mechanism: the tool call is refused by Claude Code or
+Codex when the hook says deny, not by a sentence in an instruction file.
+
+**The decision is made automatically.** By default the hook computes the
+route itself when a repository has no valid receipt: it reads the operator's
+routing policy, asks the stage router what capacity is fresh, reads this
+host's load, claims the stage the route implies, and writes the receipt. No
+user sentence and no assistant tool call is involved. Work the policy
+retains is then allowed with no friction; work it routes elsewhere is
+refused here and owed to the route the receipt names.
+
+That is the difference from the first version of this gate, which refused an
+un-decided call and printed instructions telling the assistant to make three
+MCP calls. The refusal was enforcement, but the decision was optional and
+the assistant named its own `allowed_routes` when it made one. An assistant
+that wanted to keep the work asked for its own route and got it.
 
 ## What it covers, and what it cannot
 
@@ -54,11 +66,19 @@ Not covered, stated plainly:
   subcommand says whether trust has been recorded.
 * Shell commands that write in a way the text heuristic does not recognise.
   The heuristic (redirection, `tee`, `sed -i`, `rm`/`mv`/`cp`/`touch`/...,
-  writing `git` subcommands including a `git tag` that creates or deletes,
-  package installs, inline interpreters, here-documents, archive creation
-  and extraction, `find -delete`/`-exec rm`, formatters that are not run in
-  their report-only mode) catches the ordinary ways a shell
-  writes and can be evaded by an agent that means to. Reads, `--check` and
+  writing `git` subcommands including `init`, `clone`, `submodule` and a
+  `git tag` that creates or deletes, package installs, inline interpreters,
+  here-documents, archive creation and extraction, `find -delete`/`-exec
+  rm`, formatters that are not run in their report-only mode, and on
+  Windows the `cmd.exe` built-ins `del`/`move`/`ren`/`rd` and their kin plus
+  the PowerShell `Remove-Item`/`Set-Content`/`Out-File` family) catches the
+  ordinary ways a shell writes and can be evaded by an agent that means to.
+
+  The Windows half of that list was missing until a check of the Windows
+  command quoting turned it up, which is worth knowing when judging how much
+  weight this part carries: it is one platform's conventions written into a
+  cross-platform component, and it is the reason we describe this as a
+  heuristic rather than a boundary. Reads, `--check` and
   `--diff` runs, `git tag --list` and `ruff check` pass as reads. The
   editing tools are the deterministic part. The protected-path rule for
   shell commands has the same limit: a write that reaches a protected file
@@ -77,6 +97,216 @@ each allow outside a repository, and an internal failure once the state root
 is known. Calls the gate classifies as reads or as non-editing tools are not
 logged, so a shell write the heuristic misses leaves no trace here; the log
 shows what the gate judged, not what it did not see.
+
+## Automatic routing
+
+### What decides
+
+`orchestration/autoroute.py` is a pure function of what the host can observe
+and what the operator configured. Four things decide a route, in this order,
+and the order is the point:
+
+1. **Privacy and eligibility.** A repository the operator has not classified
+   is retained, always. `client_derived` is refused outright. Capacity is
+   checked last precisely so it can never override this.
+2. **Task type.** Implementation work goes to a provider or stays. It is
+   never sent to a local model, for the reason under "What it cannot do".
+3. **Hardware load.** One-minute load average per core, against a ceiling
+   (`max_local_load_ratio`, default 0.75). A host that exposes no load
+   average defers rather than assuming the machine is idle.
+4. **Capacity.** A peer route needs a fresh, available observation in the
+   stage router. A stale observation never makes a route eligible, so a
+   machine nobody has reported capacity for retains everything.
+
+Anything that survives all four is dispatched. Anything that does not is
+retained by the assistant that asked, which is itself a decision with a
+reason, recorded like any other. `ROUTES` is `("claude", "codex", "local")`:
+a paid API route is not absent by configuration, it is absent from the
+vocabulary, and `parse_policy` refuses a policy that names one.
+
+### The operator's policy
+
+`<state_root>/routing/routing-policy.json`, owner-only, protected from every
+covered tool by the same rule that protects the receipts:
+
+```json
+{"version": 1,
+ "prefer": ["codex", "claude", "local"],
+ "max_local_load_ratio": 0.75,
+ "repos": {
+   "/abs/path/to/repo": {"classification": "internal_nonclient",
+                         "allowed_routes": ["claude", "codex"],
+                         "mechanical_ok": false}
+ }}
+```
+
+**A repository with no entry is retained and never dispatched.** That is the
+default, and it is deliberate: installing this feature must not begin sending
+repositories nobody has classified to a provider. `onboard apply` writes an
+inert scaffold with no repositories in it and never rewrites one that exists.
+
+**`prefer` is empty by default, and empty means the eligible peer wins.** That
+is what delegation-first means: when a repository permits both providers and
+both have fresh capacity, the work goes to the other one. Name a route in
+`prefer` to keep work with it instead. The default was briefly `["claude",
+"codex", "local"]`, which reads harmlessly and is not: it ranks Claude above
+Codex, so a Claude client kept every repository classified for both while a
+Codex client handed every one of them over. An asymmetry nobody chose does not
+belong in a default, so there is no longer one.
+
+An unreadable or malformed policy is a deny (`gate_auto_decision_failed`
+naming `policy_unreadable`), never a permissive default.
+
+### What the receipt records
+
+Beyond the fields the manual path writes, an automatic receipt carries
+`automatic: true`, the decision `code`, and the `considered` block: the
+classification, the allowed routes, the fresh routes, the load figure and the
+task type the decision actually saw. So a decision can be re-derived rather
+than taken on trust, and the audit can tell an automatic decision from one an
+assistant asked for. The `considered` block holds no task content.
+
+### Capacity evidence
+
+Capacity has exactly two writers, and neither of them is an assistant. There
+used to be a third, the MCP tool `capacity_observe`, and an adversarial
+review was right about it: the assistant chose the route, the availability,
+the source string and the freshness window, so "a fresh observation from an
+authorized source" meant whatever the model typed, for any route, lasting
+years. The tool is gone.
+
+**The hook's own presence.** On every decision the hook records one
+observation for **its own route only**, sourced `gate-hook:client-present`
+and fresh for 15 minutes. A client that just made a tool call is demonstrably
+running, so that is an observation rather than an assumption. It is never
+recorded for the peer or the local model.
+
+**The operator's declaration.** `declared_available` in
+`routing-policy.json` lists the routes installed on this machine. The hook
+replays it into the ledger on every decision, sourced
+`policy:operator-declared` and fresh for the same 15 minutes, and withdraws a
+route the operator has deleted. It is a **standing declaration, not a health
+check**, and nothing here claims otherwise: the ledger records the source,
+the audit prints it, and a route nobody has declared and that has not run the
+hook itself is not dispatched to.
+
+The withdrawal matches on that source, so deleting a route from your policy
+removes what the declaration put there and cannot remove a peer's own
+first-hand presence.
+
+Two hard limits on what a row can be:
+
+* **only a trusted row routes work.** `trusted` is set by the code path that
+  writes the row, never read from the row itself, and it defaults to
+  untrusted. So rows an older version accepted through the removed tool stop
+  counting the moment this version opens the database.
+* **no row outlasts the work it would authorise.** A window longer than the
+  routing lease (4 hours) is refused rather than clamped.
+
+### Decisions are re-made when they are overtaken
+
+An automatic receipt is replaced by a fresh decision, rather than refused,
+in five ordinary cases:
+
+* **the policy changed.** Every automatic receipt records a fingerprint of
+  the policy it was decided under, so editing `routing-policy.json` takes
+  effect on the very next gated call. Without this, classifying a repository
+  changed nothing until the receipt happened to expire, up to four hours
+  later, which makes your own document look inert.
+* **the set of routes with capacity changed.** Recorded the same way, and for
+  the same reason: a receipt saying "the peer has no fresh capacity" is
+  exactly the one that should stop being true the moment the peer appears.
+
+  The digest is **route names only, and identical for both clients**. Names
+  only because the hook rewrites its own presence row on every call, so a
+  digest over the rows would re-decide on every call. Identical for both
+  clients because a receipt is one shared artifact: a version that subtracted
+  the asking client's own presence row made claude and codex compute
+  different values from the same ledger, so each found the other's receipt
+  overtaken and re-decided it to route the work to the other, and both ended
+  up permanently denied.
+* it was decided for a different kind of work;
+* it has expired;
+* the stage it points at is finished, reassigned or its lease has lapsed,
+  which is what happens after a normal `stage_complete`. Before that was
+  handled, the first completed stage in a repository left every later edit
+  denied with `stage_not_owned` and an instruction to claim a stage by hand.
+
+Stages therefore carry a generation (`implementation`, `implementation#2`), so
+a completed or superseded decision is history rather than a wall, and a stage
+the decider itself still held on a route the policy no longer chooses is
+completed rather than left holding a lease for hours.
+
+**A receipt never names a route its decision did not choose.** That invariant
+is checked, not assumed, and it is checked because it was once violated: the
+stage router never reassigns an owned stage, so when a policy change moved
+work to the peer, the old stage was still owned on the old route, the receipt
+was written naming *that* route, and the gate allowed the edit. A decision to
+delegate had silently become a decision to retain, which is the one failure
+this mechanism exists to prevent. A route the decider cannot establish as the
+live owner is now `gate_auto_decision_failed`, a deny.
+
+An unreadable stage router is **not** treated as overtaken. That stays a deny
+(`stage_db_unavailable`): fail closed, and never decide without the router.
+
+### What it cannot do
+
+* **It cannot write the brief.** A PreToolUse payload names a tool and some
+  paths. It does not contain the task. So when the decision routes work to a
+  peer, the gate writes a durable dispatch intent carrying the route, the
+  repository and the full stage binding, and refuses the edit. The assistant
+  then makes exactly one call, `execution_dispatch`, with those identifiers
+  and its own brief. No `stage_register`, no `stage_claim`. The user is never
+  the messenger and the assistant cannot edit instead, but the brief's words
+  are the assistant's.
+* **It cannot route a file edit to a local model.** The local worker
+  processes bounded inline text and returns a draft; it does not read files,
+  run commands or edit anything. An intent telling it to edit a file would be
+  unmeetable. So the gate does not send local work: what is automatic at the
+  local lane is the *admission*, not the *choice of lane*. An assistant calls
+  `work_route_local`, and from that point nobody is asked anything: the
+  intake classifies the material, applies the privacy rules, refuses
+  client-derived text, submits the job and never falls back to a paid API.
+  The assistant still decides to call it, and we do not describe that as the
+  gate having routed the work.
+* **It cannot see mechanical work an assistant just does in its own
+  context.** That produces no tool call, so no local mechanism intercepts it.
+  This is a limit of the hook surface. An instruction file does not fix it
+  and we do not describe one as if it did.
+
+### Turning it off
+
+`--no-automatic-routing` on the hook command restores the earlier posture: a
+repository with no receipt is refused outright and an assistant must claim a
+route explicitly. Stricter, and more friction. The audit reports which
+posture each installed client is running under.
+
+## The audit
+
+```bash
+./bin/agent-bridge-gate-hook audit --config ~/.agent-bridge/orchestration/orchestration.json
+```
+
+Accounts for a window (default 24 hours, `--since-hours 0` for everything on
+record). `--json` for the full record. It reports:
+
+* **eligible**: decisions whose policy permitted a route other than the
+  assistant that asked.
+* **routed**: count, by route, by code, and every reason.
+* **retained**: the same, including why each one stayed.
+* **automatic share**: how many decisions the policy made against how many an
+  assistant requested through `routing_decide`.
+* **bypasses**, split in two on purpose:
+  * *observed*: work routed away and never dispatched (an intent still
+    `awaiting_brief`); clients the hook is not installed for, where every
+    call is un-gated and leaves no record at all; and writes aimed at the
+    gate's own state.
+  * *not countable*: the surfaces no local mechanism can see, enumerated.
+    A zero in the observed column means none this mechanism can see, not
+    none, and the report says so in its own output.
+* **failures**: gate failures separately from ordinary denials, plus every
+  failed or blocked job in both queues **with its diagnostic detail**, not
+  just an exception class name.
 
 ## How a stage becomes editable
 

@@ -61,7 +61,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import store
-from ..capacity_router import RoutingError
+from ..capacity_router import RoutingError, capacity_fingerprint
+from . import autoroute
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -104,7 +105,11 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])tee(\s|$)",
     r"(^|[\s;&|('\"])sed\s+(-[a-zA-Z]*i|--in-place)",
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|touch|mkdir|rmdir|chmod|chown|ln|install|truncate|dd|patch|unlink|shred)(\s|$)",
-    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|branch\s+-[dDmM])(\s|$)",
+    # ``init``, ``clone`` and ``submodule`` are here because creating a
+    # repository is how the nested-.git routing escape was manufactured: a
+    # second receipt key inside a repository the caller was routed away from.
+    # The trailing (\s|$) keeps ``git init-db-not-a-verb`` a read.
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|init|clone|submodule|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
@@ -113,6 +118,17 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])(unzip|zip|gunzip|gzip|bunzip2|bzip2|xz|unxz)(\s|$)",
     r"(^|[\s;&|('\"])find\s.*(\s-delete(\s|$)|\s-exec\s+(rm|mv|cp|sed\s+-i|chmod|chown|truncate)(\s|$))",
     r"(^|[\s;&|('\"])(gofmt\s+-w|rustfmt|eslint\s+--fix|ruff\s+format|ruff\s+(check\s+)?--fix)(\s|$)",
+    # Windows. The heuristic listed only POSIX verbs, so a cmd.exe call
+    # writing with a built-in read as a read: `del`, `move` and `ren` are the
+    # everyday ones and none of them was here. Case-insensitive, inline, so
+    # the POSIX alternations above stay case-sensitive, where `RM` is not
+    # `rm`. Found while checking the Windows command quoting.
+    r"(^|[\s;&|('\"])(?i:del|erase|move|copy|xcopy|robocopy|ren|rename|rd|md|"
+    r"mklink|attrib|icacls|takeown|fsutil)(\s|$)",
+    # PowerShell, whose cmdlets are the same verbs spelled differently.
+    r"(^|[\s;&|('\"])(?i:Remove-Item|Set-Content|Add-Content|Clear-Content|New-Item|"
+    r"Copy-Item|Move-Item|Rename-Item|Out-File|Set-ItemProperty|New-ItemProperty|"
+    r"Remove-ItemProperty|Set-Acl|Start-Process)(\s|$)",
 ))
 #: Formatters that write unless asked only to report.
 _FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")
@@ -154,6 +170,37 @@ def repo_key(path: str) -> str | None:
         current = parent
 
 
+def enclosing_repos(path: str) -> list[str]:
+    """EVERY ancestor of ``path`` that holds ``.git``, outermost last.
+
+    ``repo_key`` returns the nearest one, which is the right answer for
+    *keying* a receipt and the wrong answer for *judging* a call. An
+    adversarial review found the gap and it was reachable end to end with
+    gate-allowed commands only: a client denied at a routed repository root
+    ran ``git init vendor``, which the shell heuristic did not read as a
+    write, and ``vendor`` became its own receipt key. That key had no policy
+    entry, so the automatic decision retained it, and the client then edited
+    and overwrote files inside the very repository it had been routed away
+    from, including files that already existed. Worse, a repository that
+    already contains a submodule or a linked worktree has the same hole with
+    no command at all.
+
+    So judgment considers the whole chain. ``repo_key`` is deliberately left
+    alone: it is also what ``record_decision`` and ``read_receipt`` key
+    receipts by, and repointing it would re-key every receipt already on
+    disk.
+    """
+    found: list[str] = []
+    current = os.path.realpath(os.path.abspath(path))
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            found.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return found
+        current = parent
+
+
 def receipt_name(repo: str) -> str:
     return hashlib.sha256(os.path.realpath(repo).encode("utf-8")).hexdigest()[:32] + ".json"
 
@@ -176,7 +223,11 @@ def route_decision(caller: str, owner_route: str) -> str:
 
 def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any],
                     repo: str, reason: str, ttl_seconds: int,
-                    clock: Any = time.time) -> dict[str, Any]:
+                    clock: Any = time.time, code: str | None = None,
+                    considered: dict[str, Any] | None = None,
+                    automatic: bool = False,
+                    policy_fingerprint: str | None = None,
+                    capacity_fingerprint: str | None = None) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
 
     ``stage_record`` is the router's current view of the stage, already
@@ -226,6 +277,21 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         "decided_at": now,
         "valid_until": valid_until,
     }
+    # A receipt written by the automatic policy carries the code it decided
+    # under and the inputs it saw, so the decision can be re-derived rather
+    # than taken on trust. A receipt written by an agent calling
+    # routing_decide carries neither, and the absent ``automatic`` flag is
+    # how an audit tells the two apart.
+    if automatic:
+        receipt["automatic"] = True
+    if code is not None:
+        receipt["code"] = code
+    if considered is not None:
+        receipt["considered"] = considered
+    if policy_fingerprint is not None:
+        receipt["policy_fingerprint"] = policy_fingerprint
+    if capacity_fingerprint is not None:
+        receipt["capacity_fingerprint"] = capacity_fingerprint
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
@@ -236,11 +302,24 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
 
 
 def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
-    """The receipt for ``repo`` or None; ValueError for one that is not a receipt."""
+    """The receipt for ``repo`` or None; ValueError for one that is not a receipt.
+
+    Reads through ``store.read_json_atomic`` rather than an ``os.path.exists``
+    check followed by a separate open. ``atomic_write_json`` replaces this
+    file with ``os.replace``, which on Windows is not the clean swap it is on
+    POSIX: a reader can arrive in the instant there is no file, or be refused
+    for a sharing violation while the replace is in flight, and both surface
+    as ``OSError`` rather than "no receipt yet". ``read_json_atomic`` retries
+    across that window and only raises once a receipt is genuinely absent, at
+    which point this function reports that the ordinary way, as ``None``,
+    rather than letting an in-flight replace look like a caller-visible crash.
+    A corrupt document still fails immediately: only ``OSError`` is retried.
+    """
     path = receipt_path(state_root, repo)
-    if not os.path.exists(path):
+    try:
+        loaded = store.read_json_atomic(path)
+    except OSError:
         return None
-    loaded = store.read_json(path)
     valid_until = loaded.get("valid_until") if isinstance(loaded, dict) else None
     if not isinstance(loaded, dict) or loaded.get("version") != RECEIPT_VERSION \
             or not isinstance(valid_until, (int, float)) or isinstance(valid_until, bool) \
@@ -254,6 +333,49 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     return loaded
 
 
+def _sqlite_uri_path(path: str) -> str:
+    """A filesystem path as the path part of a SQLite ``file:`` URI.
+
+    Percent first, and that ordering is the fix: SQLite percent-decodes the
+    path, so a directory named ``App%20Data`` was rewritten and the open
+    failed with "unable to open database file". Escaping percent after the
+    question mark and hash would have mangled this function's own escapes.
+
+    The consequence was fail-closed and unusable: ``stage_binding`` returned
+    ``stage_db_unavailable``, which denies every gated call in both clients,
+    and ``capacity_digest`` returned None.
+    """
+    return (os.path.realpath(path).replace("%", "%25")
+            .replace("?", "%3F").replace("#", "%23"))
+
+
+def capacity_digest(capacity_db: str, now: float) -> str | None:
+    """The capacity fingerprint as the hook sees it, or None if unreadable.
+
+    Read-only, like :func:`stage_binding`: the hook never writes the router's
+    state. ``None`` on an unreadable table on purpose, and it means "do not
+    re-decide over this": an unreadable router is an infrastructure failure
+    that ``stage_binding`` turns into a deny, and a decision made without the
+    ledger would be worse than the stale one.
+
+    Takes no client, deliberately. See :func:`capacity_router.capacity_fingerprint`
+    for the livelock that a client-relative version caused.
+    """
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        db.row_factory = sqlite3.Row
+        rows = [dict(row) for row in db.execute("SELECT * FROM capacity")]
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    return capacity_fingerprint(rows, now)
+
+
 def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str | None:
     """None when the stage router still shows the receipt's stage owned by
     the receipt's owner on its route with an unexpired lease; otherwise the
@@ -261,7 +383,7 @@ def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str 
     it without changing who owns the stage. The database is opened
     read-only: the hook never writes the router's state. An unreadable
     database is ``stage_db_unavailable`` (a deny, fail closed)."""
-    uri = "file:" + os.path.realpath(capacity_db).replace("?", "%3F").replace("#", "%23") + "?mode=ro"
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=ro"
     try:
         db = sqlite3.connect(uri, uri=True, timeout=5.0)
     except sqlite3.Error:
@@ -308,7 +430,27 @@ def protected_paths(state_root: str, config_path: str | None, home: str,
 
 
 def _under(path: str, root: str) -> bool:
-    real = os.path.realpath(path)
+    r"""Whether ``path`` is ``root`` or inside it.
+
+    Both sides go through ``os.path.normcase``, which is a no-op on POSIX and
+    on Windows lowercases and turns ``/`` into ``\``. Windows paths are
+    case-insensitive and accept either separator, so without it a protected
+    path named in a different case, or with forward slashes, compared unequal
+    to the same path and the protected-path rule did not fire. The comparison
+    stays exact on POSIX, where ``/etc/Passwd`` really is a different file
+    from ``/etc/passwd``.
+
+    Both sides also go through ``os.path.realpath``. Only ``path`` did, and
+    that asymmetry was an undocumented precondition on every caller: a root
+    that had not been resolved compared unequal to the same directory reached
+    through a symlink, or, on Windows, through a short 8.3 name, which is the
+    form ``tempfile.gettempdir`` can return. ``protected_paths`` happened to
+    resolve its roots, so production was correct by coincidence rather than
+    by construction. A predicate this one is the wrong place for a
+    precondition nobody states.
+    """
+    real = os.path.normcase(os.path.realpath(path))
+    root = os.path.normcase(os.path.realpath(root))
     return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
 
 
@@ -316,7 +458,12 @@ def _under(path: str, root: str) -> bool:
 #: protected path reaches the protected path.
 _TREE_VERBS = re.compile(
     r"(^|[\s;&|('\"])(rm|mv|cp|rsync|rmdir|shred|ln|chmod|chown|dd|truncate|tar|unzip|zip|"
-    r"git\s+clean|git\s+worktree|find)(\s|$)")
+    r"git\s+clean|git\s+worktree|find"
+    # The Windows half, for the same reason it was added to the write
+    # patterns: naming an ancestor of a protected path reaches the protected
+    # path, and `rd /s` does that just as `rm -r` does.
+    r"|(?i:del|erase|rd|move|copy|xcopy|robocopy|ren|rename|mklink|attrib|icacls|"
+    r"takeown|Remove-Item|Copy-Item|Move-Item|Rename-Item|Set-Acl))(\s|$)")
 
 
 def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
@@ -328,8 +475,38 @@ def _reaches(path: str, root: str, *, through_ancestors: bool) -> bool:
     return through_ancestors and _under(root, os.path.realpath(path))
 
 
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
-_SHELL_COMMAND_FLAGS = re.compile(r"^-[a-zA-Z]*c[a-zA-Z]*$")
+#: Programs whose command argument is another command to read.
+#:
+#: The POSIX names were the whole list, and on Windows that left three
+#: ordinary spellings unread, each of them a way past the protected-path rule.
+#: Reproduced with ntpath in place: ``bash.exe -c "rm -rf C:/Users/me/
+#: .agent-bridge"`` was ALLOWED where the identical ``bash -c`` was refused,
+#: because the basename still carried ``.exe``; ``powershell -Command "..."``
+#: and ``cmd /c "..."`` were allowed because neither the program nor the flag
+#: was recognised at all. Claude Code's Bash tool on Windows runs through Git
+#: for Windows, so these are the spellings that actually occur there.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish",
+                     "cmd", "powershell", "pwsh"})
+#: Extensions Windows appends to an executable, stripped before matching the
+#: name above. PATHEXT holds more; these are the ones a shell is spelled with.
+_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+#: ``sh -c`` and the Windows equivalents: ``cmd /c`` and ``/k``, PowerShell's
+#: ``-Command`` and ``-EncodedCommand``. Case-insensitive, because Windows
+#: flags are. ``-File`` is deliberately absent: it names a script to run, not
+#: a command to read, so recursing into it would be reading a path as a
+#: command.
+_SHELL_COMMAND_FLAGS = re.compile(
+    r"^(?:-[a-zA-Z]*c[a-zA-Z]*|[-/](?i:c|k|command|encodedcommand))$")
+
+
+def _program_name(word: str) -> str:
+    """The basename of ``word`` with any Windows executable suffix removed."""
+    name = os.path.basename(word)
+    lowered = name.lower()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def _shell_words(command: str) -> list[str]:
@@ -367,10 +544,26 @@ def _command_paths(command: str, cwd: str) -> list[str]:
         raw = word
         word = word.strip("'\"")
         nested = (len(previous) >= 2 and _SHELL_COMMAND_FLAGS.match(previous[-1])
-                  and os.path.basename(previous[-2]) in _SHELLS)
+                  and _program_name(previous[-2]).lower() in _SHELLS)
+        # A shell's own command flag names nothing. ``/c`` looks like a path
+        # on Windows and ``-c`` does not look like one anywhere, so only the
+        # Windows spelling caused trouble, and it caused plenty: translated as
+        # a drive it became ``C:\``, an ancestor of every protected path, so
+        # every ``cmd /c`` carrying a tree verb was refused.
+        # ``bool(...)`` is load-bearing, and leaving it out cost the command
+        # name out of every parsed command. ``A and B`` returns A itself when
+        # A is falsy, A here was the empty ``previous`` list, and the very
+        # next line appends to that same object: so this name *was*
+        # ``previous``, and by the time it was tested it held one word and was
+        # truthy. Every command's own program name was skipped, and 88 gate
+        # tests and the 559-check suite all passed anyway.
+        consumed_flag = bool(previous and _SHELL_COMMAND_FLAGS.match(word)
+                             and _program_name(previous[-1]).lower() in _SHELLS)
         previous.append(raw)
         if nested:
             found.extend(_command_paths(word, cwd))
+            continue
+        if consumed_flag:
             continue
         word = word.lstrip("<>&|;")
         if not word or word in ("&&", "||", "|", ";", "&", ">", ">>", "<"):
@@ -382,15 +575,67 @@ def _command_paths(command: str, cwd: str) -> list[str]:
         candidates = [word]
         if "=" in word:
             candidates.append(word.split("=", 1)[1])
-        if ":" in word and not re.match(r"^[A-Za-z]:[\\/]", word):
+        # ``a:b`` can be two operands on POSIX, so it is split there. Not on
+        # Windows, where a colon is only ever a drive specification or an NTFS
+        # stream name, and where splitting severed the drive letter out of any
+        # path not at the start of the word. Reproduced: the nested command in
+        # ``cmd /c "del C:/Users/me/.agent-bridge/routing/x.json"`` produced a
+        # candidate with the drive gone, so the protected-path rule missed it.
+        if os.name != "nt" and ":" in word and not re.match(r"^[A-Za-z]:[\\/]", word):
             candidates.extend(word.split(":"))
         for part in candidates:
             part = part.strip("'\"")
             if not part:
                 continue
-            expanded = os.path.expanduser(part)
-            found.append(expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded))
+            expanded = _windows_drive_path(os.path.expanduser(part))
+            # A forward slash always, not ``os.path.join``: this module's
+            # documented contract for this function is a POSIX-style path
+            # (see the docstring's own examples), and ``os.path.join`` on
+            # Windows joins with a backslash instead, which any caller
+            # comparing this output directly (rather than through ``_under``,
+            # which normalizes separators itself) would read as a different
+            # path than the one named.
+            #
+            # Already-rooted is judged by a leading separator, not
+            # ``os.path.isabs``: ``ntpath.isabs("/tmp/x")`` is False on
+            # Python 3.11 and True on 3.13 (a stdlib behavior change, not a
+            # host difference), so a Windows CI job on one and not the other
+            # is proof this must not gate on it. A leading ``/`` or ``\\`` is
+            # what every candidate this function ever sees actually looks
+            # like when it is already rooted; drive-letter paths take the
+            # other branch below since ``os.path.isabs`` does agree on those
+            # across versions.
+            rooted = os.path.isabs(expanded) or expanded.startswith(("/", "\\"))
+            found.append(expanded if rooted else f"{cwd.rstrip('/')}/{expanded}")
     return found
+
+
+#: ``/c/Users/...`` and ``/cygdrive/c/Users/...``, the two ways a POSIX-style
+#: shell on Windows spells a drive.
+_MSYS_DRIVE = re.compile(r"^/{1,2}(?:cygdrive/)?([A-Za-z])(?=/)")
+
+
+def _windows_drive_path(path: str) -> str:
+    r"""``/c/Users/me`` as ``C:\Users\me``, on Windows only.
+
+    Claude Code's Bash tool on Windows runs through Git for Windows, so this
+    is the spelling that shell produces and accepts. ``ntpath.isabs`` calls
+    ``/c/Users/me`` absolute, so the value was kept verbatim and later
+    resolved against whatever the current drive happened to be, giving
+    ``C:\c\Users\me``: a different directory, so the protected-path rule did
+    not fire. Reproduced: ``rm -rf /c/Users/me/.agent-bridge`` was allowed
+    where all three Windows spellings of the same directory were refused.
+
+    A translation, not a validation. On POSIX ``/c/Users/me`` really is that
+    path and comes back untouched.
+    """
+    if os.name != "nt":
+        return path
+    match = _MSYS_DRIVE.match(path)
+    if match is None:
+        return path
+    remainder = path[match.end():]
+    return match.group(1).upper() + ":\\" + remainder.lstrip("/").replace("/", "\\")
 
 
 def list_receipts(state_root: str) -> list[dict[str, Any]]:
@@ -482,6 +727,32 @@ def _edit_paths(client: str, tool_input: Any, cwd: str) -> list[str]:
     return [path if os.path.isabs(path) else os.path.join(cwd, path) for path in paths]
 
 
+def infer_task_type(paths: list[str]) -> str:
+    """What kind of work this call is, from what the call can actually show.
+
+    Always ``"implementation"``. Stated as a function rather than a constant
+    because the decision needs a task type and this is where it would be
+    refined if a host ever gave the hook more than a tool name and a path.
+
+    It is deliberately not ``"mechanical"``, ever. Mechanical work is what the
+    local worker takes, and the local worker processes bounded inline text and
+    returns a draft: it does not read files, run commands or edit anything
+    (``localq.spool``). So routing a file edit to it would produce an intent
+    nothing could satisfy. An earlier version of this function guessed
+    "mechanical" when every target looked like a test file, which read well
+    and was wrong for exactly that reason.
+
+    The consequence, stated plainly rather than hidden: the gate compels a
+    routing decision for implementation work, and automatic *local* routing
+    happens at the local worker's own entry point (``work_route_local``,
+    whose ``AutomaticIntake`` classifies and submits without anyone asking).
+    Mechanical text work an assistant simply does in its own context produces
+    no tool call, so no local mechanism can intercept it. That is a limit of
+    the hook surface, not something an instruction file fixes.
+    """
+    return "implementation"
+
+
 def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[str, list[str]]:
     """``("edit", paths)``, ``("shell", [cwd, *named paths])`` for a writing
     command, ``("shell_read", [])`` for one that does not look like it
@@ -500,13 +771,79 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
     return "other", []
 
 
+#: Stage states that mean an automatic receipt has been overtaken by events
+#: rather than that something is wrong. Under automatic routing each of these
+#: is a reason to decide again; ``stage_db_unavailable`` is deliberately
+#: absent, because a router we cannot read is an infrastructure failure and
+#: must stay a deny rather than triggering a decision made without it.
+_OVERTAKEN = frozenset({"stage_not_found", "stage_not_owned", "stage_reassigned",
+                        "stage_lease_expired"})
+
+
+def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
+                                capacity_db: str | None, task_type: str,
+                                policy_fingerprint: str | None = None,
+                                capacity_fingerprint: str | None = None) -> bool:
+    """Whether an automatic receipt should be replaced by a fresh decision.
+
+    Five ways a recorded decision stops describing the call in front of it,
+    all of them ordinary rather than exceptional:
+
+    * the operator's routing policy has changed since it was decided, so the
+      decision was made under rules that no longer apply;
+    * the set of routes with eligible capacity has changed, so a decision
+      that retained the work because the peer was unavailable is re-made now
+      that it is, and one that routed to a peer is re-made when it goes away;
+    * it was decided for a different kind of work (one receipt per
+      repository, but a repository holds work of more than one kind);
+    * it has expired;
+    * the stage it points at is finished, reassigned or its lease lapsed,
+      which is what happens after a normal ``stage_complete``.
+
+    Before the stage case was handled, the first completed stage in a
+    repository left every later edit denied with ``stage_not_owned`` and an
+    instruction to claim a stage by hand, which is the opposite of automatic.
+    Before the policy case was handled, classifying a repository took effect
+    whenever its receipt happened to expire, up to four hours later, which
+    made the operator's own document look inert. Capacity had the same
+    four-hour lag for the same reason, and a receipt that says "the peer has
+    no fresh capacity observation" is exactly the one that should stop being
+    true the moment the peer appears.
+    """
+    if (policy_fingerprint is not None
+            and receipt.get("policy_fingerprint") != policy_fingerprint):
+        return True
+    if (capacity_fingerprint is not None
+            and receipt.get("capacity_fingerprint") != capacity_fingerprint):
+        return True
+    if str(receipt.get("stage", "")).split("#")[0] != task_type:
+        return True
+    valid_until = receipt.get("valid_until")
+    if not isinstance(valid_until, (int, float)) or valid_until <= now:
+        return True
+    if capacity_db is None:
+        return False
+    return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
+
+
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
-          capacity_db: str | None = None) -> Decision:
+          capacity_db: str | None = None,
+          decide: Any = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
     with ``capacity_db`` every allow also requires the receipt's stage to be
-    owned right now (:func:`stage_binding`)."""
+    owned right now (:func:`stage_binding`).
+
+    ``decide`` makes the gate automatic. When a repository has no receipt and
+    ``decide`` is supplied, it is called with ``(repo, task_type)`` and must
+    create the decision (see :mod:`autodecide`): compute the route from the
+    operator's policy, establish the ownership it implies, and write the
+    receipt. The call is then judged against that receipt like any other, so
+    work the policy retains proceeds with no friction and work it routes
+    elsewhere is refused here and owed to the route the receipt names.
+    Without ``decide`` the gate behaves as it did: a missing receipt is a
+    deny telling the agent which calls to make."""
     if client not in CLIENTS:
         return Decision("deny", "client_invalid", "gate configured with an unknown client")
     kind, paths = classify(client, tool_name, tool_input, cwd)
@@ -527,7 +864,9 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
         return Decision("deny", "gate_state_protected",
                         "delegation-first gate: the target is the gate's own state or a hook file; "
                         "nothing may write them through this client", tuple(sorted(set(hit))))
-    repos = tuple(sorted({repo for repo in (repo_key(path) for path in paths) if repo}))
+    # Every enclosing repository, so a nested .git cannot shadow an outer
+    # routed decision. See enclosing_repos for the escape this closes.
+    repos = tuple(sorted({repo for path in paths for repo in enclosing_repos(path)}))
     if not repos:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")
@@ -539,6 +878,37 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
             return Decision("deny", "gate_state_unavailable",
                             f"delegation-first gate: routing state could not be read "
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
+        task_type = infer_task_type(paths)
+        if (receipt is not None and decide is not None and receipt.get("automatic")
+                and automatic_receipt_overtaken(
+                    receipt, now, capacity_db, task_type,
+                    autoroute.policy_fingerprint(state_root),
+                    None if capacity_db is None
+                    else capacity_digest(capacity_db, now))):
+            receipt = None
+        if receipt is None and decide is not None:
+            # No receipt yet: make the decision now rather than refusing and
+            # asking the agent to make it. This is the automatic part.
+            try:
+                decide(repo, task_type)
+            except Exception as exc:  # noqa: BLE001  fail closed, name the class
+                # AutoDecisionError carries a fixed reason code this codebase
+                # wrote, so it is safe to repeat. Any other class's text is
+                # unvetted and is left out, the same rule ``errors.py`` applies
+                # to every caller-visible field.
+                named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
+                detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
+                return Decision(
+                    "deny", "gate_auto_decision_failed",
+                    f"delegation-first gate: the routing decision for {repo} could not be "
+                    f"created ({detail}); nothing is implemented until it can be", repos)
+            try:
+                receipt = read_receipt(state_root, repo)
+            except (OSError, ValueError) as exc:
+                return Decision("deny", "gate_state_unavailable",
+                                f"delegation-first gate: routing state could not be read "
+                                f"({type(exc).__name__}); nothing is implemented until it can",
+                                repos)
         if receipt is None:
             return Decision(
                 "deny", "no_routing_receipt",
@@ -553,12 +923,21 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                 f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
                 f"(stage_renew) and call routing_decide again.", repos, receipt)
         if receipt["owner_route"] != client:
+            route = receipt["owner_route"]
+            call = "work_route_local" if route == "local" else "execution_dispatch"
+            automatic = ((" The routing decision was made automatically: "
+                          + str(receipt.get("code", "")) + ".")
+                         if receipt.get("automatic") else "")
             return Decision(
                 "deny", "routed_elsewhere",
                 f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
-                f"in {repo} is owned by route {receipt['owner_route']}; this client does not "
-                f"implement it. Dispatch through execution_dispatch or wait for that stage to "
-                f"complete.", repos, receipt)
+                f"in {repo} is routed to {route}; this client does not implement it."
+                f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
+                f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
+                f"owner_id={receipt.get('owner_id')!r}, "
+                f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
+                f"already claimed, so no stage_register or stage_claim is needed.",
+                repos, receipt)
         if capacity_db is not None:
             stale = stage_binding(capacity_db, receipt, now)
             if stale is not None:
@@ -597,6 +976,20 @@ def record_event(state_root: str, client: str, tool_name: str, decision: Decisio
     store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
 
 
+def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:
+    """The callable :func:`judge` uses to create a decision that does not exist.
+
+    Imported lazily so ``gate`` stays importable without the stage router and
+    so the two modules do not import each other at module scope.
+    """
+    def decide(repo: str, task_type: str) -> Any:
+        from .autodecide import ensure_decision
+
+        return ensure_decision(client=client, repo=repo, state_root=state_root,
+                               capacity_db=capacity_db, task_type=task_type)
+    return decide
+
+
 def state_root_from_config(config_path: str) -> str:
     return gate_paths_from_config(config_path)[0]
 
@@ -611,9 +1004,44 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str]:
     return loaded["state_root"], loaded["capacity_db"]
 
 
+def _hook_input() -> str:
+    r"""The PreToolUse payload, decoded as UTF-8 whatever the locale says.
+
+    This was ``sys.stdin.read()``, which decodes with the locale encoding. On
+    Windows that is the ANSI code page, and both hosts emit raw UTF-8: Node's
+    ``JSON.stringify`` and Rust's ``serde_json`` do not escape non-ASCII. So a
+    repository whose path contained any non-ASCII character arrived as
+    mojibake, ``enclosing_repos`` found no ``.git`` above the mangled path, and
+    :func:`judge` returned ``allow`` with ``outside_repository``. **The gate
+    printed an empty object and the edit proceeded ungated.**
+
+    Measured, not inferred. The same payload naming a repository with an
+    e-acute in its path is denied ``routed_elsewhere`` under a UTF-8 stdin and
+    allowed under ``cp1252``. That is a silent, total bypass for every user
+    whose name or project path is not pure ASCII, which is most of the world.
+
+    Reading bytes and naming the encoding fixes it here, in the gate, rather
+    than in a launcher: a fix in the launcher would not protect a host that
+    invokes the module directly, and the launchers set ``PYTHONUTF8`` as well
+    for everything else in the process.
+
+    Strict decoding on purpose. A payload that is not valid UTF-8 is not
+    something to guess at; it raises, and hook mode turns that into a deny.
+    A leading byte-order mark is tolerated, because a BOM is not a
+    disagreement about the encoding, only about announcing it.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:                    # a replaced stdin, as in a test
+        return sys.stdin.read()
+    raw = buffer.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8")
+
+
 def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
-             protected: tuple[str, ...] = ()) -> Decision:
+             protected: tuple[str, ...] = (), decide: Any = None) -> Decision:
     tool_name = payload.get("tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     if not isinstance(tool_name, str):
@@ -621,7 +1049,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
         decision = Decision("deny", "hook_input_invalid", "delegation-first gate: hook input has no tool_name")
     else:
         decision = judge(client, tool_name, payload.get("tool_input"), cwd,
-                         state_root=state_root, clock=clock, protected=protected, capacity_db=capacity_db)
+                         state_root=state_root, clock=clock, protected=protected,
+                         capacity_db=capacity_db, decide=decide)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -636,11 +1065,49 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
 # ------------------------------------------------------------ installation
 
 
+#: Characters that make a Windows command line need quoting.
+#:
+#: Space is the one that matters, because an ordinary Windows home is
+#: ``C:/Users/First Last`` with backslashes. The rest are here because the
+#: first version of this set had only the obvious ones, and a comma, a
+#: semicolon, an equals sign, a percent and an exclamation mark are every
+#: bit as significant to ``cmd.exe`` while being perfectly legal in a
+#: Windows directory name: NTFS forbids only < > : " / \ | ? * . A path
+#: like ``C:/dev/a=b/hook.cmd`` came back unquoted, and ``cmd.exe`` then
+#: truncates the program name at the delimiter, so the hook never runs.
+#: Percent is variable expansion and exclamation is delayed expansion.
+_CMD_NEEDS_QUOTES = ' \t"&|<>^(),;=%!'
+
+
+def quote_for_host_shell(value: str) -> str:
+    r"""Quote one argument for the shell the host will run this command with.
+
+    ``shlex.quote`` is POSIX quoting and was being used on both platforms.
+    It wraps a value containing a space in **single** quotes, and
+    ``cmd.exe`` does not treat single quotes as quoting at all: it would
+    look for a program literally named ``'C:\Users\First``. So on any
+    Windows account whose home contains a space, which is the ordinary
+    case, the installed hook command was malformed, the hook never ran, and
+    a hook that never runs is a gate that never gates, silently.
+
+    Windows filenames cannot contain ``"``, so wrapping in double quotes is
+    sufficient for the paths this builds. It does not attempt general
+    ``cmd.exe`` escaping, and it is not a substitute for running the
+    launcher on a live Windows host, which has still not happened.
+    """
+    if os.name != "nt":
+        return shlex.quote(value)
+    if value and not any(char in value for char in _CMD_NEEDS_QUOTES):
+        return value
+    return '"' + value.replace('"', "") + '"'
+
+
 def hook_command(root: str, client: str, config_path: str) -> str:
     launcher = os.path.join(os.path.realpath(root), "bin", HOOK_NAME)
     if os.name == "nt":
         launcher += ".cmd"
-    return f"{shlex.quote(launcher)} --client {client} --config {shlex.quote(os.path.realpath(config_path))}"
+    return (f"{quote_for_host_shell(launcher)} --client {client} "
+            f"--config {quote_for_host_shell(os.path.realpath(config_path))}")
 
 
 def hook_entry(root: str, client: str, config_path: str) -> dict[str, Any]:
@@ -712,7 +1179,7 @@ def codex_hooks_flag_update(path: str, *, remove: bool = False) -> bytes | None:
     text = ""
     if os.path.exists(path):
         with open(path, "rb") as handle:
-            text = handle.read().decode("utf-8")
+            text = handle.read().decode("utf-8-sig")
     begin, end = BEGIN.format(name=HOOKS_FLAG_NAME), END.format(name=HOOKS_FLAG_NAME)
     if text.count(begin) != text.count(end) or text.count(begin) > 1:
         raise ValueError(f"{path} has damaged agent-bridge managed markers")
@@ -822,7 +1289,12 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
     report: dict[str, Any] = {"planned_files": sorted(updates), "applied": False,
                               "remove": remove, "clients": list(clients)}
     if apply:
-        report["backups"] = _commit_updates(updates, originals)
+        # claude_settings, codex_hooks and codex_toml are pre-existing files
+        # Claude Code/Codex own and already had inherited access (e.g. SYSTEM,
+        # Administrators on Windows) to; only the gate's own receipt is this
+        # project's file, which keeps the owner-only lockdown.
+        host_owned = frozenset({paths["claude_settings"], paths["codex_hooks"], paths["codex_toml"]})
+        report["backups"] = _commit_updates(updates, originals, shared_paths=host_owned)
         if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
         report["applied"] = True
@@ -841,11 +1313,35 @@ NOT_COVERED = [
     "Codex started with --dangerously-bypass-hook-trust, or a hook not yet trusted in /hooks",
     "shell commands that write in a way the text heuristic does not recognise, including one that "
     "reaches the gate's own state or the hook files without naming their paths",
-    "installation on Windows: the .cmd launcher is written but has not been run under either host",
+    "installation on Windows: the gate's own .cmd launcher is written and has never been run. "
+    "The gate's logic is exercised on Windows by CI; this launcher is not, and neither is the "
+    "hook being invoked by Claude Code or Codex rather than as a subprocess",
+    "mechanical text work an assistant performs in its own context: it produces no tool "
+    "call, so no local mechanism intercepts it. The local worker's automatic intake "
+    "covers work an assistant sends it, not work it never sends",
+    "the brief itself: a PreToolUse payload names a tool and some paths, not the task, so "
+    "automatic routing compels the dispatch but the brief's words are the assistant's",
 ]
 
 
 # ------------------------------------------------------------------ report
+
+
+def _codex_hook_key_path(hooks_path: str) -> str:
+    """The path string Codex itself uses in a trust-state key, not ours.
+
+    Traced from codex-rs (utils/home-dir/src/lib.rs::find_codex_home and
+    hooks/src/engine/discovery.rs's key_source): Codex canonicalizes CODEX_HOME
+    (std::fs::canonicalize -- symlinks resolved, Windows on-disk casing) only
+    when the CODEX_HOME environment variable is set; the default `~/.codex`
+    (dirs::home_dir() + ".codex") gets no resolution at all. Applying
+    os.path.realpath() unconditionally, as this function used to, canonicalizes
+    a path Codex itself never canonicalizes in the common no-CODEX_HOME-set
+    case, so the two sides can name the same file with different strings and
+    a real trust decision never shows as recorded."""
+    if os.environ.get("CODEX_HOME"):
+        return os.path.realpath(hooks_path)
+    return os.path.abspath(hooks_path)
 
 
 def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
@@ -870,13 +1366,60 @@ def codex_trust_state(codex_toml: str, hooks_path: str) -> str:
     if not os.path.exists(codex_toml):
         return "needs_review"
     with open(codex_toml, "rb") as handle:
-        parsed = tomllib.loads(handle.read().decode("utf-8"))
+        parsed = tomllib.loads(handle.read().decode("utf-8-sig"))
     state = parsed.get("hooks", {}) if isinstance(parsed.get("hooks"), dict) else {}
-    key = f"{os.path.realpath(hooks_path)}:pre_tool_use:{index}:0"
+    key = f"{_codex_hook_key_path(hooks_path)}:pre_tool_use:{index}:0"
     entry = state.get("state", {}).get(key) if isinstance(state.get("state"), dict) else None
     if isinstance(entry, dict) and entry.get("trusted_hash"):
         return "recorded"
     return "needs_review"
+
+
+def _automatic_routing_state(paths: dict[str, str]) -> dict[str, Any]:
+    """Whether each installed client decides automatically or refuses instead.
+
+    Read from the installed hook command, because that is what actually runs;
+    a flag recorded anywhere else would describe an intention.
+    """
+    state: dict[str, Any] = {}
+    for client, path in (("claude", paths["claude_settings"]),
+                         ("codex", paths["codex_hooks"])):
+        if not os.path.exists(path):
+            state[client] = "not_installed"
+            continue
+        try:
+            loaded = store.read_json(path)
+            pre = loaded.get("hooks", {}).get("PreToolUse", [])
+        except (OSError, ValueError, AttributeError):
+            state[client] = "unreadable"
+            continue
+        entry = next((item for item in pre if _is_ours(item)), None)
+        if entry is None:
+            state[client] = "not_installed"
+            continue
+        command = " ".join(str(hook.get("command", "")) for hook in entry.get("hooks", [])
+                           if isinstance(hook, dict))
+        state[client] = "off" if "--no-automatic-routing" in command else "on"
+    return state
+
+
+def _policy_state(state_root: str) -> dict[str, Any]:
+    """The operator's routing policy, summarised. Never its repository names."""
+    from .autoroute import load_policy, policy_path
+
+    path = policy_path(state_root)
+    if not os.path.exists(path):
+        return {"path": path, "present": False,
+                "consequence": "every repository is retained; nothing is dispatched"}
+    try:
+        policy = load_policy(state_root)
+    except Exception as exc:  # noqa: BLE001  a report never crashes
+        return {"path": path, "present": True, "readable": False,
+                "error": type(exc).__name__,
+                "consequence": "the gate denies every gated call until it can be read"}
+    return {"path": path, "present": True, "readable": True,
+            "classified_repositories": len(policy.repos),
+            "default_allows_dispatch": bool(policy.default.allowed_routes)}
 
 
 def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.time) -> dict[str, Any]:
@@ -911,6 +1454,8 @@ def report(home: str, state_root: str, *, events: int = 20, clock: Any = time.ti
     return {
         "state_root": state_root,
         "installed": installed,
+        "automatic_routing": _automatic_routing_state(paths),
+        "routing_policy": _policy_state(state_root),
         "codex_trust": codex_trust_state(paths["codex_toml"], paths["codex_hooks"]),
         "receipts": receipts,
         "recent_events": recent,
@@ -928,6 +1473,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--client", choices=CLIENTS)
     parser.add_argument("--config", help="private orchestration config (state_root is read from it)")
     parser.add_argument("--state-root", help="alternative to --config")
+    parser.add_argument("--no-automatic-routing", action="store_true",
+                        help="do not create the routing decision; refuse a call that has no "
+                             "receipt instead. The pre-automatic behaviour, kept for an "
+                             "operator who wants every route claimed explicitly.")
     ins = sub.add_parser("install", help="register the PreToolUse hook in Claude Code and/or Codex")
     ins.add_argument("--home"); ins.add_argument("--root", required=True); ins.add_argument("--config", required=True)
     ins.add_argument("--clients", default="claude,codex"); ins.add_argument("--apply", action="store_true")
@@ -935,11 +1484,16 @@ def main(argv: list[str] | None = None) -> int:
     rep = sub.add_parser("report", help="receipts, recent gate events, installation and trust state")
     rep.add_argument("--home"); rep.add_argument("--config"); rep.add_argument("--state-root")
     rep.add_argument("--events", type=int, default=20)
+    aud = sub.add_parser("audit", help="eligible, routed, retained, bypassed, failed, and why")
+    aud.add_argument("--home"); aud.add_argument("--config"); aud.add_argument("--state-root")
+    aud.add_argument("--since-hours", type=float, default=24.0,
+                     help="window to account for; 0 for everything on record")
+    aud.add_argument("--json", action="store_true", help="the full record rather than the summary")
     words = sys.argv[1:] if argv is None else argv
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        if exc.code in (0, None) or any(word in ("install", "report", "-h", "--help") for word in words):
+        if exc.code in (0, None) or any(word in ("install", "report", "audit", "-h", "--help") for word in words):
             raise
         # Hook mode with unusable arguments: the host must still read a deny.
         sys.stdout.write(json.dumps(hook_output(Decision(
@@ -958,6 +1512,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report(args.home or home, state_root, events=args.events),
                          indent=2, sort_keys=True))
         return 0
+    if args.command == "audit":
+        from .audit import render, report as audit_report
+
+        state_root = args.state_root or state_root_from_config(args.config)
+        document = audit_report(state_root, home=args.home or home,
+                                config_path=args.config,
+                                since_hours=args.since_hours)
+        print(json.dumps(document, indent=2, sort_keys=True) if args.json
+              else render(document), end="" if not args.json else "\n")
+        return 0
     # Hook mode: judge the call described on stdin. Always exit 0; the
     # decision travels in the JSON so the host applies it, and a deny is
     # a deny whatever went wrong on the way to it.
@@ -970,10 +1534,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             state_root, capacity_db = gate_paths_from_config(args.config or "")
         protected = protected_paths(state_root, args.config, home, capacity_db)
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
-        decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db, protected=protected)
+        decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
+                            protected=protected,
+                            decide=None if args.no_automatic_routing else
+                            automatic_decider(args.client, state_root, capacity_db))
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "

@@ -88,7 +88,7 @@ def _absolute_path(value: Any, field: str) -> Path:
 def load(path: str | Path) -> OrchestrationConfig:
     config_path = Path(path).expanduser()
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise OrchestrationConfigError("config_unreadable") from exc
     if not isinstance(raw, dict) or set(raw) - _KEYS:

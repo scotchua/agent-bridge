@@ -1,13 +1,23 @@
-"""MCP tool definitions for durable routing and local work intake."""
+"""MCP tool definitions for durable routing and local work intake.
+
+There is deliberately no tool here for recording capacity.  There used to be
+``capacity_observe``, and an adversarial review was right about it: the
+assistant chose the route, the availability, the source string and the
+freshness window, so "a fresh observation from an authorized source" meant
+whatever the model typed.  Capacity now has exactly two writers, neither of
+them model-facing: the gate hook, which records that the client calling it is
+running, and the operator's ``routing-policy.json``, which is a file only the
+operator edits.  See :mod:`agent_bridge.orchestration.autodecide`.
+"""
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..capacity_router import CapacityObservation, RoutingError, StageRouter
+from ..capacity_router import RoutingError, StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
-from . import gate
+from . import autodecide, gate
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
 
@@ -73,19 +83,18 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "expected_revision": {"type": "integer", "minimum": 0},
     }, ["item_id", "stage", "owner_id", "expected_revision"])
     status = _schema(identity, ["item_id", "stage"])
-    observe = _schema({
-        "route": {"type": "string", "enum": ["claude", "codex", "local"]},
-        "observed_at": {"type": "number"}, "fresh_until": {"type": "number"},
-        "available": {"type": "boolean"}, "source": {"type": "string"},
-    }, ["route", "observed_at", "fresh_until", "available", "source"])
     empty = _schema({}, [])
 
     def route_local(args: dict[str, Any]) -> dict[str, Any]:
+        # This call retires no dispatch intent, and cannot: it carries no
+        # repository, item or stage, so there is nothing to match an intent
+        # against, and retiring one on the strength of "some local work
+        # happened" is exactly the unbound cleanup ``clear_intent`` now
+        # refuses. It is also not currently reachable: the gate infers
+        # ``implementation`` from every tool call, because a local worker does
+        # not edit files, so no local intent is ever written. Anyone adding
+        # one has to add the stage identity to this schema first.
         return call(intake.route, {"params": None, "risk_flags": [], **args, "caller": caller})
-
-    def observe_capacity(args: dict[str, Any]) -> dict[str, Any]:
-        observation = CapacityObservation(**args)
-        return call(router.observe_capacity, {"observation": observation})
 
     tools = {
         "work_route_local": {
@@ -103,10 +112,6 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "work_feedback": {
             "description": "Record one immutable usefulness outcome for completed production work.",
             "inputSchema": feedback, "handler": lambda args: call(queue.feedback, args),
-        },
-        "capacity_observe": {
-            "description": "Record a time-bounded capacity observation from a supported source. It grants no new authority or data route.",
-            "inputSchema": observe, "handler": observe_capacity,
         },
         "stage_register": {
             "description": "Register one durable stage and its permitted routes before claiming it.",
@@ -198,12 +203,37 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                         or current["owner_route"] != args.get("provider")
                         or current["revision"] != args.get("stage_revision")):
                     raise RoutingError("execution_stage_binding_invalid")
-                return call(execution.submit, {
+                result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
                     **args, "caller": caller})
             except (RoutingError, TypeError, ValueError) as exc:
                 return {"ok": False, "error": str(exc) or type(exc).__name__}
+            if result.get("ok") and state_root is not None:
+                # The gate wrote a dispatch intent when it routed this
+                # repository away from its caller. The job now exists, so the
+                # intent is met: retiring it here is what keeps the audit's
+                # "routed but never dispatched" column meaningful instead of
+                # every satisfied intent sitting in it forever.
+                try:
+                    # Bound to this exact job. Keyed on the repository alone,
+                    # any owned stage in it could retire the intent for the
+                    # stage that was actually refused, and the audit's
+                    # "routed but never dispatched" column would record the
+                    # unhonoured routing as met.
+                    autodecide.clear_intent(
+                        state_root, args["repo"], clock=router.clock,
+                        binding={"route": current["owner_route"],
+                                 "item_id": current["item_id"],
+                                 "stage": current["stage"],
+                                 "owner_id": current["owner_id"],
+                                 "stage_revision": current["revision"]})
+                except (OSError, ValueError, KeyError):
+                    # A job was accepted. Failing the dispatch because its
+                    # bookkeeping could not be tidied would be the worse
+                    # outcome; the audit reports the stale intent instead.
+                    pass
+            return result
 
         tools.update({
             "execution_dispatch": {

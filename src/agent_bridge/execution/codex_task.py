@@ -54,38 +54,85 @@ import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tem
 from pathlib import Path
 try:
     from .. import runner, preflight, store
+    from ..platform import platform as agent_platform
+    from ..orchestration import windows_privacy as wpv
     from ..errors import BrokerError
-    from . import verify_policy
+    from . import hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store
+    from agent_bridge.platform import platform as agent_platform
+    from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.errors import BrokerError
-    from agent_bridge.execution import verify_policy
+    from agent_bridge.execution import hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
+
+#: Longest piece of Codex's own error text folded into a TaskError message.
+ERROR_MESSAGE_DETAIL_LIMIT=200
+
+def _with_error_detail(message:str,error_messages:list[str])->str:
+    """Fold Codex's own first error/turn.failed message into a fixed
+    TaskError message, bounded and printable-only.
+
+    A bare exit status told an operator nothing about *why* (the same defect
+    claude_task carries the identical fix for). ``error_messages`` already
+    comes from ``_parse_events`` reading structured JSON event fields, not
+    raw output, so this only bounds and sanitizes text Codex itself reported
+    as the reason; ``message`` alone is returned when there is none."""
+    if not error_messages: return message
+    cleaned="".join(ch for ch in error_messages[0] if ch.isprintable())[:ERROR_MESSAGE_DETAIL_LIMIT]
+    return f"{message}: {cleaned}" if cleaned else message
 
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=2_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
-GIT_BIN="/Library/Developer/CommandLineTools/usr/bin/git"
+_GIT_BIN:Path|None=None
+
+def _git_bin()->Path:
+    """The host's git, resolved once and named in the refusal when absent.
+
+    Same defect as the Claude lane carried: a constant pointing at the
+    standalone macOS Command Line Tools, so the first git call on any other
+    host reported only "command spawn failed".
+    """
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        try: _GIT_BIN=hostenv.resolve_git()
+        except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
+    return _GIT_BIN
 
 def _run(argv:list[str],*,cwd:Path,env:dict[str,str],timeout:int,input_bytes:bytes|None=None):
     """Use the bridge's measured streaming caps and bounded post-kill drain."""
     r=runner.run(argv,cwd=str(cwd),env=env,stdin_data=(input_bytes or b"").decode("utf-8"),timeout=timeout,
                  grace=2,stdout_cap=MAX_STREAM_BYTES,stderr_cap=MAX_STREAM_BYTES)
-    if r.spawn_failed: raise TaskError("command spawn failed")
+    if r.spawn_failed: raise TaskError(_spawn_detail(argv))
     if r.timed_out: raise TaskError(f"command timed out after {timeout}s")
     if r.cap_exceeded: raise TaskError("command output exceeded bounded capture")
     if r.descendant_held_pipes: raise TaskError("command output stream did not close")
     return subprocess.CompletedProcess(argv,r.returncode or 0,r.stdout,r.stderr)
+
+def _spawn_detail(argv:list[str])->str:
+    """Why a process would not start, named. See the Claude lane's copy."""
+    program=argv[0] if argv else "(no argv)"
+    if not os.path.exists(program): reason="no such file"
+    elif os.path.isdir(program): reason="is a directory"
+    elif not os.access(program,os.X_OK): reason="not executable by this account"
+    else: reason="the operating system refused to start it"
+    return f"could not start {program!r}: {reason}"
 
 def _env():
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
        "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
+    if os.name=="nt":
+        # See claude_task._env for the measured cause: without SYSTEMROOT a
+        # network-touching git operation fails with "Could not resolve host".
+        for k in ("SYSTEMROOT","COMSPEC","PATHEXT","USERPROFILE"):
+            if os.environ.get(k): e[k]=os.environ[k]
     return e
 
 def _git(repo:Path,*args:str,timeout:int=30,env=None):
@@ -94,7 +141,7 @@ def _git(repo:Path,*args:str,timeout:int=30,env=None):
     return r.stdout.decode().strip()
 
 def _git_argv(*args:str):
-    return [GIT_BIN,"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
+    return [str(_git_bin()),"--no-optional-locks","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",
             "-c","diff.external=","-c","core.attributesFile=/dev/null",*args]
 
 def _sha(path:Path):
@@ -181,7 +228,13 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
     that grows or is replaced mid-read is a refusal, never a hash of a prefix
     that would compare equal to the one taken before the task.
     """
-    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
+    # O_BINARY matters as much as the other two on Windows: without it,
+    # os.open() defaults to text mode, os.read() then translates "\r\n" to
+    # "\n" in whatever it returns, and the bytes read fall short of fstat's
+    # raw st_size for any file that has one -- indistinguishable from this
+    # function's own "file changed size mid-read" refusal (measured: a
+    # 14-byte CRLF file reads back as 12 bytes without this flag).
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)|getattr(os,"O_BINARY",0)
     try: descriptor=os.open(target,flags)
     except OSError as exc: raise TaskError("source snapshot could not read a changed file") from exc
     try:
@@ -192,7 +245,12 @@ def _hash_regular_file(target:Path,digest,budget:int)->int:
             raise TaskError("source snapshot exceeds the per-file byte bound; refusing to run without integrity coverage")
         if opened.st_size>budget:
             raise TaskError("source snapshot exceeds the byte bound; refusing to run without integrity coverage")
-        os.set_blocking(descriptor,True)
+        if hasattr(os,"O_NONBLOCK"):
+            # Only undoing what was only ever set on a platform that has it:
+            # Windows never opened with O_NONBLOCK (the flag above is 0
+            # there), and os.set_blocking() on a Windows file descriptor
+            # raises OSError (WinError 87) rather than being a no-op.
+            os.set_blocking(descriptor,True)
         digest.update(b"file\x00");digest.update(str(opened.st_mode&0o777).encode("ascii"));digest.update(b"\x00")
         read=0
         while True:
@@ -218,14 +276,28 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
-def _assert_macos():
-    if os.name!="posix" or platform.system()!="Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise TaskError("Codex execution lane requires supported macOS sandbox-exec")
+def _require_confinement(classification:str)->hostenv.Confinement:
+    """The verification confinement this host will apply, or a named refusal.
+
+    Only verification needs it: generation runs inside Codex's own
+    ``workspace-write`` sandbox and the patch steps are git. Unlike the
+    Claude lane, Codex verification commands are optional, so a host with no
+    backend still refuses here rather than running a job whose verification
+    would be silently skipped."""
+    try: return hostenv.confinement(classification)
+    except hostenv.HostCapabilityError as exc: raise TaskError(str(exc)) from None
 
 def _atomic_json(path:Path,value:dict):
     fd,tmp=tempfile.mkstemp(prefix=".receipt-",dir=path.parent)
     try:
-        os.fchmod(fd,0o600)
+        # os.fchmod does not exist on Windows at all (AttributeError, measured
+        # on a live VM). agent_platform picks the real primitive per host:
+        # fchmod on POSIX, an owner-only ACL on Windows.
+        try: agent_platform.enforce_owner_only_file(fd)
+        except BaseException:
+            try: os.close(fd)
+            except OSError: pass
+            raise
         with os.fdopen(fd,"w") as f: json.dump(value,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
         os.replace(tmp,path)
     finally:
@@ -301,11 +373,72 @@ def _remove(repo:Path,tree:Path,env):
     # users' stale-but-recoverable worktree registrations.
     return result.returncode==0 and not tree.exists()
 
-def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int):
+def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+               backend:hostenv.Confinement|None=None):
+    """Run one verification command under this host's confinement backend."""
+    backend=backend or _require_confinement("synthetic")
+    if backend.name==hostenv.LINUX_USERNS:
+        return _netns_confined(command,tree,scratch,env,timeout,backend)
+    return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
+
+def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                    backend:hostenv.Confinement):
+    """Network denied and writes confined by a mount namespace. Reads are not.
+
+    See the Claude lane for the full note. The boundary re-proves itself for this worktree on every command: the
+    helper refuses to exec anything until a write to each canary path has
+    actually failed. A failed boundary is a refusal with its own name, never a
+    verification result, because a command that did not run under the
+    confinement it claims has told us nothing."""
+    scratch.mkdir(mode=0o700)
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env.pop("CODEX_HOME",None)
+    if command[0]=="git": command=_git_argv(*command[1:])
+    started=time.monotonic()
+    result=_run(hostenv.confined_argv(command,tree=tree,scratch=scratch,
+                                      canaries=_confinement_canaries(tree)),
+                cwd=tree,env=sandbox_env,timeout=timeout)
+    if result.returncode==hostenv.CONFINEMENT_SELFTEST_EXIT:
+        raise TaskError("verification confinement failed its own canary check on this host "
+                        "[confinement_selftest_failed]")
+    result.sandbox_backend=backend.name
+    result.sandbox_profile_sha256=None
+    result.duration_seconds=time.monotonic()-started
+    return result
+
+def _confinement_canaries(tree:Path)->list[str]:
+    """Paths a verification command must not be able to write.
+
+    The source repository is first because a write there is the exact damage
+    the old post-run snapshot was supposed to catch and could only report
+    after the fact. The job directory is next: the scratch directory inside it
+    is deliberately writable, the directory itself is not. Then the two places
+    any escape would naturally aim for."""
+    canaries=[str(tree.parent)]
+    marker=tree/".git"
+    try:
+        text=marker.read_text().strip() if marker.is_file() else ""
+    except OSError:
+        text=""
+    if text.startswith("gitdir: "):
+        gitdir=Path(text[8:])
+        try:
+            commondir=(gitdir/(gitdir/"commondir").read_text().strip()).resolve()
+        except OSError:
+            commondir=None
+        if commondir is not None and commondir.parent.is_dir():
+            canaries.append(str(commondir.parent))
+    for extra in (str(Path.home()),tempfile.gettempdir()):
+        if extra not in canaries and os.path.isdir(extra):
+            canaries.append(extra)
+    return canaries
+
+def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
+                           backend:hostenv.Confinement):
     scratch.mkdir(mode=0o700)
     profile=scratch/"verify.sb"
     def quoted(value:Path): return str(value).replace('\\','\\\\').replace('"','\\"')
-    executable=Path(GIT_BIN if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
+    executable=Path(_git_bin() if command[0]=="git" else (shutil.which(command[0],path=env.get("PATH")) or command[0])).resolve()
     runtime_root=executable.parent.parent if str(executable).startswith("/Users/") else executable.parent
     read_roots=[Path("/System"),Path("/usr"),Path("/bin"),Path("/sbin"),Path("/Library/Frameworks"),Path("/Library/Developer"),
                 Path("/etc"),Path("/var/db"),Path("/var/select"),Path("/var/run"),Path("/private/etc"),
@@ -337,7 +470,8 @@ def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeou
     sandbox_env.pop("CODEX_HOME",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
-    result=_run(["/usr/bin/sandbox-exec","-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result=_run([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
+    result.sandbox_backend=backend.name
     result.sandbox_profile_sha256=_sha(profile)
     result.duration_seconds=time.monotonic()-started
     return result
@@ -360,27 +494,44 @@ def _assert_no_ancestor_contamination(job:Path):
 def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Path=DEFAULT_CODEX_HOME,
              classification:str,model:str|None=None,reasoning_effort:str|None=None,
              verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    _assert_macos()
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
     raw=brief.read_bytes()
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
-    try: brief_text=raw.decode()
+    try: brief_text=raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
     checks=_verify_argv(verify_argv or []); env=_env(); source_before=_source_state(repo,env)
+    # The host is probed only after the REQUEST has been validated. Ordering
+    # matters for the message an operator sees: with the probe first, a
+    # refused verification command on a host with no confinement backend
+    # reported the host refusal and buried the real mistake, which broke a
+    # pre-existing test and would have misdirected anybody reading the
+    # receipt. Validate what was asked, then interrogate the machine.
+    backend=_require_confinement(classification)
     base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(codex_bin),"--version"],cwd=codex_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Codex executable")
     task_root.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(task_root,0o700)
+    # mkdir(mode=) and chmod are no-ops on Windows; without this, task_root and
+    # every job directory under it inherit whatever their parent grants there.
+    try: wpv.require_private_directory(task_root,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution task root could not be protected [{exc.reason}]") from exc
     job=task_root/uuid.uuid4().hex; job.mkdir(mode=0o700); gen=job/"generation-worktree"; fresh=job/"verification-worktree"
+    try: wpv.require_private_directory(job,root=task_root)
+    except wpv.PrivacyError as exc: raise TaskError(f"execution job directory could not be protected [{exc.reason}]") from exc
     receipt={"schema":2,"job_id":job.name,"status":"running","route":"codex-subscription-cli","classification":classification,
              "base_sha":base_sha,"brief_sha256":hashlib.sha256(raw).hexdigest(),"model_requested":model,
              "reasoning_effort_requested":reasoning_effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(codex_bin.resolve()),
              "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
-             "codex_home":str(codex_home),"source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
+             "codex_home":str(codex_home),"host_platform":platform.system(),
+             "git_executable":str(_git_bin()),"verification_confinement":backend.name,
+             "confinement_denies_network":backend.denies_network,
+             "confinement_confines_reads":backend.confines_reads,
+             "confinement_confines_writes":backend.confines_writes,
+             "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
     try:
         _assert_no_ancestor_contamination(job)
@@ -404,7 +555,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
         receipt["response_metadata"]={"thread_id":thread_id,"event_count":len(events),
                                       "event_types":sorted({str(e.get("type")) for e in events})[:20],
                                       "error_event_count":len(error_messages)}
-        if failed: raise TaskError(f"Codex exited with status {r.returncode}")
+        if failed: raise TaskError(_with_error_detail(f"Codex exited with status {r.returncode}",error_messages))
         if not thread_id: raise TaskError("Codex did not report a thread id")
         last_message=last_message_file.read_bytes() if last_message_file.is_file() else b""
         if not last_message.strip(): raise TaskError("Codex produced no final message")
@@ -419,12 +570,20 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout)
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
-            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":"macos-no-network-scratch-home",
+            evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+        # The delivered patch is a file path, and verification ran between
+        # writing it and returning it. Confinement is what stops a verify
+        # command reaching the job directory, and this is the check that does
+        # not depend on confinement being correct: re-read the bytes and
+        # compare them to what was generated. Without it the receipt could
+        # record one digest while the caller applied different bytes.
+        if hashlib.sha256(pp.read_bytes()).digest()!=hashlib.sha256(patch).digest():
+            raise TaskError("delivered patch changed during verification")
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",
                        generated_patch_sha256=hashlib.sha256(patch).hexdigest(),applied_patch_sha256=hashlib.sha256(applied).hexdigest(),
                        patch_sha256=hashlib.sha256(patch).hexdigest(),patch_bytes=len(patch),verification=evidence,

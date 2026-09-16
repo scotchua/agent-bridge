@@ -27,7 +27,8 @@ class LauncherSecurityTests(unittest.TestCase):
             environment["PYTHONPATH"] = str(hostile)
             environment["LAUNCHER_SECURITY_MARKER"] = str(marker)
 
-            for name in ("agent-bridge-mcp", "agent-bridge-admin", "agent-bridge-setup"):
+            for name in ("agent-bridge-mcp", "agent-bridge-admin", "agent-bridge-setup",
+                         "agent-bridge-gate-hook"):
                 with self.subTest(launcher=name):
                     launcher = ROOT / "bin" / (name + (".cmd" if os.name == "nt" else ""))
                     argv = ([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher), "--help"]
@@ -40,7 +41,13 @@ class LauncherSecurityTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr.decode())
 
     def test_all_launchers_set_only_repo_pythonpath_and_enable_safe_path(self) -> None:
-        for name in ("agent-bridge-admin", "agent-bridge-mcp", "agent-bridge-setup"):
+        # agent-bridge-gate-hook is the launcher the delegation-first gate depends
+        # on, and it was in neither of these tuples, so neither the hostile-cwd
+        # execution test nor this lint covered it. The "Security regression
+        # tests" CI step runs this file on all three runners, which makes this
+        # the cheapest Windows coverage the gate launcher can have.
+        for name in ("agent-bridge-admin", "agent-bridge-mcp", "agent-bridge-setup",
+                     "agent-bridge-gate-hook"):
             with self.subTest(launcher=name, platform="posix"):
                 text = (ROOT / "bin" / name).read_text(encoding="utf-8")
                 self.assertIn('export PYTHONPATH="$REPO/src"', text)

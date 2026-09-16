@@ -194,7 +194,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
     def test_mcp_tools_bind_caller_and_only_queue_execution(self):
         router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)
         router.observe_capacity(CapacityObservation(
-            route="claude", observed_at=100.0, fresh_until=200.0, available=True, source="test"))
+            route="claude", observed_at=100.0, fresh_until=200.0, available=True,
+            source="test"), trusted=True)
         registered = router.register("item-1", "implement", allowed_routes=["claude"])
         owned = router.assign("item-1", "implement", owner_id="owner-1", lease_seconds=60,
                               expected_revision=registered["revision"])

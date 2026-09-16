@@ -215,7 +215,7 @@ class Config:
         with open(path, "rb") as handle:
             blob = handle.read()
         import json
-        schema = json.loads(blob.decode("utf-8"))
+        schema = json.loads(blob.decode("utf-8-sig"))
         from . import schema_validate
         schema_validate.assert_supported(schema)
         return schema, store.sha256_bytes(blob)
