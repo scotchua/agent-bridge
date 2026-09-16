@@ -32,6 +32,7 @@ express one: ``ROUTES`` is the complete set.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -160,8 +161,16 @@ class LocalFirstConfig:
             ("digest_grace_seconds", self.digest_grace_seconds),
             ("executor_liveness_seconds", self.executor_liveness_seconds),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                raise PolicyError(f"{name} must be a number above 0")
+            # math.isfinite rather than only `value <= 0`: Python's json
+            # module parses the bare tokens Infinity/-Infinity/NaN by
+            # default, and `float("inf") <= 0` is False, so an operator's
+            # (or a corrupted) policy naming Infinity here would otherwise
+            # parse successfully and permanently disable the readiness
+            # check that field exists to bound. Found by an adversarial
+            # review.
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise PolicyError(f"{name} must be a finite number above 0")
         for name, value in (
             ("read_gate_min_bytes", self.read_gate_min_bytes),
             ("digest_max_output_chars", self.digest_max_output_chars),

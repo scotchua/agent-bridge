@@ -380,8 +380,8 @@ def calibrate(config_path: str, *, clock: Any = time.time,
         host = {"platform": platform.system(), "cpu_count": os.cpu_count(),
                "python_version": platform.python_version()}
         record = localfirst.build_calibration_record(
-            worker_executable=str(cfg.worker_executable), sizes=sizes,
-            sampler_snapshot=resource, host=host, clock=clock)
+            worker_executable=str(cfg.worker_executable), worker_state=str(cfg.worker_state),
+            sizes=sizes, sampler_snapshot=resource, host=host, clock=clock)
         localfirst.write_calibration_record(str(cfg.state_root), record)
     finally:
         shutil.rmtree(queue_root, ignore_errors=True)

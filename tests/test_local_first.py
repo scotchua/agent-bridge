@@ -246,6 +246,24 @@ class LocalFirstPolicyParsingTests(unittest.TestCase):
                     autoroute.parse_policy({"version": 1, "repos": {},
                                             "local_first": {field: "45"}})
 
+    def test_infinity_and_nan_are_refused_not_silently_accepted(self):
+        """Found by adversarial review: json.loads parses the bare tokens
+        Infinity/-Infinity/NaN by default, and float("inf") <= 0 is False,
+        so the original `value <= 0` check alone let Infinity through for
+        every field in this group. An Infinity latency_budget_seconds would
+        never be exceeded (over_latency_budget could never fire); an
+        Infinity calibration_max_age_days would mean a calibration record
+        never goes stale."""
+        for field in ("latency_budget_seconds", "calibration_max_age_days",
+                     "digest_grace_seconds", "executor_liveness_seconds"):
+            for token in (json.loads('{"x": Infinity}')["x"],
+                         json.loads('{"x": -Infinity}')["x"],
+                         json.loads('{"x": NaN}')["x"]):
+                with self.subTest(field=field, token=token):
+                    with self.assertRaises(autoroute.PolicyError):
+                        autoroute.parse_policy({"version": 1, "repos": {},
+                                                "local_first": {field: token}})
+
     def test_default_globs_must_be_a_non_empty_list_of_strings(self):
         with self.assertRaises(autoroute.PolicyError):
             autoroute.parse_policy({"version": 1, "repos": {},
@@ -522,6 +540,36 @@ class ReadinessTests(unittest.TestCase):
         self.assertFalse(result.ready)
         self.assertEqual(result.code, "executor_not_running")
 
+    def test_readiness_never_raises_on_a_deeply_nested_calibration_record(self):
+        """Found by adversarial review: json.loads recurses per nesting
+        level with no bound of its own, so a calibration.json holding tens
+        of thousands of nested arrays exhausts Python's recursion limit and
+        raises RecursionError, which store.read_json_or_none did not catch.
+        This project has hit exactly this shape before (see the commit
+        fixing _result_detail's own JSON parse) and this is the same defect
+        reintroduced in a new place."""
+        nested = "[" * 100_000 + "]" * 100_000
+        path = localfirst.calibration_path(str(self.state))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(nested)
+        result = self._readiness(self._enabled_policy())
+        self.assertFalse(result.ready)
+        self.assertEqual(result.code, "calibration_missing")
+
+    def test_readiness_never_raises_on_a_calibration_sizes_key_past_the_int_digit_limit(self):
+        """Found by adversarial review: Python 3.11+ refuses to convert a
+        digit string longer than sys.set_int_max_str_digits (4,300 by
+        default) to int, raising ValueError, and _covering_calibration
+        called int() on every numeric-looking key in "sizes" with no bound
+        on its length."""
+        self._write_calibration(sizes={"9" * 5_000: {"median_s": 1.0, "outcomes": ["complete"] * 3}})
+        self._write_heartbeat()
+        result = self._readiness(self._enabled_policy(), load=autoroute.Load(ratio=0.1, known=True))
+        self.assertFalse(result.ready)
+        self.assertEqual(result.code, "over_latency_budget")
+        self.assertIsNone(result.considered["calibrated_size"])
+
 
 # ------------------------------------------------------------------ calibrate
 
@@ -659,6 +707,11 @@ class CalibrateTests(unittest.TestCase):
 
         self.assertEqual(result["record"]["version"], localfirst.CALIBRATION_VERSION)
         self.assertEqual(result["record"]["worker_sha256"], store.sha256_file(str(self.worker)))
+        # Found by adversarial review: build_calibration_record hardcoded
+        # worker_state to None and calibrate() never passed it through, even
+        # though it already builds the Service with cfg.worker_state a few
+        # lines earlier.
+        self.assertEqual(result["record"]["worker_state"], str(self.worker_state))
         self.assertIn("host", result["record"])
         self.assertIn("platform", result["record"]["host"])
 
@@ -752,6 +805,41 @@ class ProtectedLauncherTests(unittest.TestCase):
             "./bin/AGENT-BRIDGE-SETUP.CMD onboard apply --answers a.json"))
         # And the read-only subcommands stay reads regardless of case.
         self.assertFalse(gate.shell_writes("./bin/Agent-Bridge-Gate-Hook Report --config x"))
+
+    def test_the_module_invoked_directly_with_python_dash_m_is_also_protected(self):
+        """Found by adversarial review: every one of the four launcher
+        patterns above matches only the launcher SCRIPT's own filename.
+        orchestration/delegation_verify.py and orchestration/gate.py are
+        ordinary modules with their own __main__ guard, exactly like the
+        scripts that exec into them (bin/agent-bridge-gate-hook itself runs
+        `exec "$PY" -P -m agent_bridge.orchestration.gate "$@"`), so
+        `python3 -m agent_bridge.orchestration.delegation_verify --config
+        ... --callers ... --out ...` reaches the exact same main() the
+        launcher does while matching none of the filename-based patterns at
+        all. Measured live: this was allowed and unlogged
+        (shell_read_only_heuristic) for the full live-verification path,
+        which makes real, cost-incurring provider calls, not merely for
+        calibrate."""
+        self.assertTrue(gate.shell_writes(
+            "python3 -m agent_bridge.orchestration.delegation_verify calibrate --config x"))
+        self.assertTrue(gate.shell_writes(
+            "python3 -m agent_bridge.orchestration.delegation_verify --config x "
+            "--callers codex,claude --out y"))
+        self.assertTrue(gate.shell_writes(
+            "python -m agent_bridge.orchestration.gate install --root . --config x --apply"))
+        # Case-insensitive here too, for the same reason as the launcher names.
+        self.assertTrue(gate.shell_writes(
+            "PYTHON3 -M AGENT_BRIDGE.ORCHESTRATION.DELEGATION_VERIFY --config x "
+            "--callers codex --out y"))
+        # report/audit stay reads via -m, exactly as via the launcher script,
+        # and bare hook mode (no subcommand at all, what the installed hook
+        # actually runs) is not a write either.
+        self.assertFalse(gate.shell_writes(
+            "python3 -m agent_bridge.orchestration.gate report --config x"))
+        self.assertFalse(gate.shell_writes(
+            "python3 -m agent_bridge.orchestration.gate audit --config x --json"))
+        self.assertFalse(gate.shell_writes(
+            "python3 -m agent_bridge.orchestration.gate --client claude --config x"))
 
     def test_reading_a_launcher_that_requires_a_second_word_stays_a_read(self):
         """gate-hook and onboard-apply both require a second word ("install",

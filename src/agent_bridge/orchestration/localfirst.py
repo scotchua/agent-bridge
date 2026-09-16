@@ -410,6 +410,16 @@ def readiness(*, policy: "autoroute.Policy", state_root: str, local_queue_root: 
         considered)
 
 
+#: A calibrated size is a byte count; nothing plausible needs more than this
+#: many digits (10**18 bytes is already an exabyte). Filtered before any
+#: ``int()`` call on an operator- or attacker-influenced string, because
+#: Python 3.11+ refuses to convert a digit string past
+#: ``sys.set_int_max_str_digits`` (4,300 by default) and raises ``ValueError``
+#: instead, which ``readiness()`` must never do: found by an adversarial
+#: review feeding ``calibration.json`` a "sizes" key over 4,300 digits long.
+_MAX_SIZE_KEY_DIGITS = 18
+
+
 def _covering_calibration(calibration: dict[str, Any],
                           window_bytes: int) -> tuple["int | None", "float | None"]:
     """The smallest calibrated size at or above ``window_bytes`` whose every
@@ -419,7 +429,9 @@ def _covering_calibration(calibration: dict[str, Any],
     sizes = calibration.get("sizes")
     if not isinstance(sizes, dict):
         return None, None
-    numeric = sorted((key for key in sizes if str(key).lstrip("-").isdigit()), key=int)
+    numeric = sorted((key for key in sizes
+                      if str(key).lstrip("-").isdigit()
+                      and len(str(key).lstrip("-")) <= _MAX_SIZE_KEY_DIGITS), key=int)
     for key in numeric:
         if int(key) < window_bytes:
             continue
@@ -438,7 +450,8 @@ def _covering_calibration(calibration: dict[str, Any],
 # ------------------------------------------------------------ calibration record
 
 
-def build_calibration_record(*, worker_executable: str, sizes: dict[str, dict[str, Any]],
+def build_calibration_record(*, worker_executable: str, worker_state: str,
+                             sizes: dict[str, dict[str, Any]],
                              sampler_snapshot: dict[str, Any], host: dict[str, Any],
                              clock: Callable[[], float] = time.time) -> dict[str, Any]:
     """The durable shape ``delegation_verify calibrate`` writes.
@@ -450,7 +463,7 @@ def build_calibration_record(*, worker_executable: str, sizes: dict[str, dict[st
         "version": CALIBRATION_VERSION,
         "created_at": float(clock()),
         "worker_sha256": store.sha256_file(worker_executable),
-        "worker_state": None,
+        "worker_state": worker_state,
         "sizes": sizes,
         "sampler": sampler_snapshot,
         "host": host,

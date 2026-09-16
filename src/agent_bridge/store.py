@@ -175,9 +175,20 @@ def read_json_atomic(path: str) -> Any:
 
 
 def read_json_or_none(path: str) -> Any:
+    """A safe read: any reason the file cannot be read or parsed is ``None``.
+
+    ``RecursionError`` joins the caught set for the same reason
+    ``errors.py``'s own JSON-parsing paths already catch it (see the commit
+    fixing ``_result_detail``): ``json.loads`` recurses per nesting level
+    with no bound of its own, so a few tens of thousands of nested arrays or
+    objects exhausts the interpreter's recursion limit rather than raising
+    a parse error. Every caller of this function already treats a read
+    failure as "the document is not there to trust"; a document too deeply
+    nested to even finish parsing is exactly that, not a different case.
+    """
     try:
         return read_json(path)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
