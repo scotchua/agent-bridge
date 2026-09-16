@@ -1957,7 +1957,13 @@ class ReadGateReceiptTests(ReadGateCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "local_digest_required")
         self.assertIn("work_digest_file", decision.reason)
-        self.assertIn(str(self.target), decision.reason)
+        # realpath, not the fixture's own raw path: on a Windows runner
+        # whose account name has a short 8.3 alias (RUNNER~1 for
+        # runneradmin), tempfile's own path and os.path.realpath's
+        # normalization of it are two different strings for the identical
+        # file, and _judge_read_path builds its reason from the resolved
+        # one.
+        self.assertIn(os.path.realpath(str(self.target)), decision.reason)
 
     def test_a_fresh_intent_is_written_and_matches_the_binding_fields(self):
         self.read("claude", self.target)
@@ -2013,7 +2019,7 @@ class ReadGatePolicyAndMultiPathTests(ReadGateCase):
         decision = self.read("codex", None, command=f"cat {small} {large}")
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "local_digest_required")
-        self.assertIn(str(large), decision.reason)
+        self.assertIn(os.path.realpath(str(large)), decision.reason)
 
 
 class ReadGateWriteShapedOverlayTests(ReadGateCase):
@@ -2046,7 +2052,7 @@ class ReadGateWriteShapedOverlayTests(ReadGateCase):
         decision = self.read("codex", None, command=f"cat {target} > {self.repo / 'out.log'}")
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "local_digest_required")
-        self.assertIn(str(target), decision.reason)
+        self.assertIn(os.path.realpath(str(target)), decision.reason)
 
     def test_the_write_side_deny_still_wins_when_there_is_no_routing_receipt_at_all(self):
         """Without grant_write_access, the write side denies first on its
