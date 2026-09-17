@@ -546,6 +546,308 @@ def test_input_validation() -> None:
         sb.cleanup()
 
 
+def test_local_first_declaration() -> None:
+    """Consultation accountability (design section 2.8, optional Phase 4).
+
+    Not enforcement: the bridge cannot verify a bypass reason is honest,
+    only that one was given. Driven through the real MCP server subprocess,
+    the same way test_input_validation is, because the requirement depends
+    on the operator's own configuration and this prompt's size, evaluated
+    per call. Also covers three gaps an adversarial review found: the live
+    receipt check ran even on a call that never needed one at all (refusing
+    a caller that defensively volunteered a declaration on an unconfigured
+    or below-threshold install); a receipt had no freshness or single-use
+    binding, so one honestly-obtained receipt would satisfy every future
+    large consultation forever; and a non-string bypass value crashed
+    instead of being refused.
+    """
+    print("\n[local_first declaration]")
+    from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
+    from agent_bridge.localq.spool import FakeBackend, LocalQueue, QueueCaps, ResourceSnapshot
+
+    class _FixedSampler:
+        def sample(self):
+            return ResourceSnapshot(1000.0, "normal", "normal", True, 120.0)
+
+    def call(sb, caller, tool, args):
+        out = sb.mcp(caller, [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": tool, "arguments": args}}])
+        return out[0]["result"]["structuredContent"]
+
+    # Unconfigured (the default): nothing is required regardless of size,
+    # and a caller that defensively volunteers a declaration anyway is not
+    # refused for a feature this install never turned on.
+    sb = Sandbox()
+    try:
+        r = call(sb, "codex", "claude_start",
+                {"prompt": "x" * 5000, "source_classification": "internal"})
+        check("LF: unconfigured install requires nothing regardless of size",
+              r.get("ok") is True, json.dumps(r))
+        volunteered = call(sb, "codex", "claude_start", {
+            "prompt": "hi", "source_classification": "internal",
+            "local_first": {"digest_receipt_id": "no-such-receipt-and-no-queue-either"},
+        })
+        check("LF: a volunteered declaration on an unconfigured install is not refused",
+              volunteered.get("ok") is True, json.dumps(volunteered))
+    finally:
+        sb.cleanup()
+
+    # Configured: real routing_receipts rows to check declarations against,
+    # built the same way orchestration's work_digest_file builds one. A
+    # real clock, not a fixed one: the broker checks a receipt's freshness
+    # against wall-clock time, so a fixture receipt has to be mintable
+    # fresh (and, for the staleness check below, mintable in the past).
+    local_queue_root = tempfile.mkdtemp(prefix="agent-bridge-test-localq-")
+    try:
+        queue = LocalQueue(local_queue_root, sampler=_FixedSampler(), backend=FakeBackend(),
+                          caps=QueueCaps(), clock=time.time)
+        intake = AutomaticIntake(
+            queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1), clock=time.time)
+
+        def local_receipt(idempotency_key, intake_instance=intake):
+            return intake_instance.route(
+                task_type="summarize", input="synthetic operating note " * 8,
+                params={"instruction": "Select operating facts."}, priority="interactive",
+                classification="internal_nonclient", caller="codex", purpose="work",
+                risk_flags=[], idempotency_key=idempotency_key)
+
+        refused_receipt = intake.route(
+            task_type="summarize", input="synthetic operating note " * 8, params=None,
+            priority="interactive", classification="client_derived", caller="codex",
+            purpose="work", risk_flags=[])
+        check("LF: fixture receipt actually refused",
+              refused_receipt["decision"] == "refused", json.dumps(refused_receipt))
+
+        sb = Sandbox(local_first={
+            "enabled": True, "read_gate_min_bytes": 100,
+            "local_queue_root": local_queue_root,
+        })
+        try:
+            small_volunteered = call(sb, "codex", "claude_start", {
+                "prompt": "hi", "source_classification": "internal",
+                "local_first": {"digest_receipt_id": "does-not-matter-below-threshold"},
+            })
+            check("LF: a volunteered declaration under the size threshold is not refused",
+                  small_volunteered.get("ok") is True, json.dumps(small_volunteered))
+
+            for n, (caller, tool) in enumerate(
+                    (("codex", "claude_start"), ("claude", "codex_start"))):
+                small = call(sb, caller, tool,
+                            {"prompt": "hi", "source_classification": "internal"})
+                check(f"LF: {caller}: a small prompt needs nothing even when configured",
+                      small.get("ok") is True, json.dumps(small))
+
+                missing = call(sb, caller, tool,
+                               {"prompt": "x" * 200, "source_classification": "internal"})
+                check(f"LF: {caller}: a large prompt without local_first is refused",
+                      missing.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(missing))
+
+                bypassed = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"bypass": "needs_judgment"},
+                })
+                check(f"LF: {caller}: a typed bypass reason is accepted, unverified",
+                      bypassed.get("ok") is True, json.dumps(bypassed))
+
+                bad_bypass = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"bypass": "just because"},
+                })
+                check(f"LF: {caller}: a bypass reason outside the closed vocabulary is refused",
+                      bad_bypass.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(bad_bypass))
+
+                malformed_bypass = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"bypass": ["needs_judgment"]},
+                })
+                check(f"LF: {caller}: a non-string bypass value is refused, not a crash",
+                      malformed_bypass.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(malformed_bypass))
+
+                fake_receipt = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": "no-such-receipt"},
+                })
+                check(f"LF: {caller}: a receipt id that does not exist is refused",
+                      fake_receipt.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(fake_receipt))
+
+                refused_used = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": refused_receipt["receipt_id"]},
+                })
+                check(f"LF: {caller}: a receipt that was itself refused does not satisfy it",
+                      refused_used.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(refused_used))
+
+                this_receipt = local_receipt(f"lf-fixture-both-{n}")
+                both = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"],
+                                   "bypass": "needs_judgment"},
+                })
+                check(f"LF: {caller}: a receipt and a bypass together is refused",
+                      both.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(both))
+                # Refused above for carrying two keys, so it is still unused.
+                still_good = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"]},
+                })
+                check(f"LF: {caller}: that same receipt alone is accepted",
+                      still_good.get("ok") is True, json.dumps(still_good))
+                status = sb.wait(still_good["job_id"])
+                check(f"LF: {caller}: the accepted call still completes normally",
+                      status.get("status") == "complete", json.dumps(status))
+
+                reused = call(sb, caller, tool, {
+                    "prompt": "x" * 200, "source_classification": "internal",
+                    "local_first": {"digest_receipt_id": this_receipt["receipt_id"]},
+                })
+                check(f"LF: {caller}: the same receipt cannot satisfy a second call",
+                      reused.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                      json.dumps(reused))
+
+            # A receipt minted long ago: a second, past-clocked intake onto
+            # the SAME database, since routing_receipts is immutable (its
+            # own triggers refuse an UPDATE) and a fixture cannot age one
+            # any other way.
+            stale_intake = AutomaticIntake(
+                queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1),
+                clock=lambda: time.time() - 100_000)
+            stale_receipt = local_receipt("lf-fixture-stale", intake_instance=stale_intake)
+            stale = call(sb, "codex", "claude_start", {
+                "prompt": "x" * 200, "source_classification": "internal",
+                "local_first": {"digest_receipt_id": stale_receipt["receipt_id"]},
+            })
+            check("LF: a receipt older than receipt_max_age_seconds does not satisfy it",
+                  stale.get("error_category") == ErrorCategory.LOCAL_FIRST_REQUIRED.value,
+                  json.dumps(stale))
+
+            ledger = sb.ledger()
+            declared = [row for row in ledger
+                       if isinstance(row.get("local_first"), dict)
+                       and "digest_receipt_id" in row["local_first"]]
+            check("LF: a digest_receipt_id declaration reaches the ledger",
+                  len(declared) >= 1, json.dumps(declared))
+        finally:
+            sb.cleanup()
+    finally:
+        shutil.rmtree(local_queue_root, ignore_errors=True)
+
+
+def test_local_first_reporting() -> None:
+    """agent-bridge-admin local-first: counts by peer and reason, the same
+    three-population idiom (before/not-required/usable) cmd_reporting
+    already established for the CLI-model-and-cost report."""
+    print("\n[local_first reporting]")
+    import argparse
+    import io
+    import contextlib
+    from agent_bridge import admin
+
+    sb = Sandbox()
+    try:
+        store.secure_mkdir(os.path.dirname(sb.cfg.ledger_path))
+
+        def record(**kw):
+            row = {"peer": "claude", "caller": "codex"}
+            row.update(kw)
+            with open(sb.cfg.ledger_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+
+        record()                                              # pre-instrumentation
+        record(local_first=None)                              # not required for the call
+        record(local_first={"bypass": "needs_judgment"})
+        record(local_first={"bypass": "needs_judgment"})
+        record(local_first={"bypass": "not_mechanical"})
+        record(local_first={"digest_receipt_id": "r-1"})
+        record(peer="codex", local_first={"bypass": "local_unavailable"})
+
+        def run():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                admin.cmd_local_first(sb.cfg, argparse.Namespace(peer="claude"))
+            return buf.getvalue()
+
+        out = run()
+        check("LF report: this peer's population excludes the other peer's rows",
+              "peer=claude" in out and "6" in out.splitlines()[1], out)
+        check("LF report: a record from before this phase is its own bucket",
+              "before this phase existed    1" in out, out)
+        check("LF report: a null local_first is not required, not declared",
+              "not required for the call    1" in out, out)
+        check("LF report: needs_judgment is counted twice",
+              any(line.strip().startswith("needs_judgment") and line.strip().endswith("2")
+                  for line in out.splitlines()), out)
+        check("LF report: digest_receipt_id is counted once",
+              any(line.strip().startswith("digest_receipt_id") and line.strip().endswith("1")
+                  for line in out.splitlines()), out)
+        check("LF report: the other peer's declaration is not in this peer's reason table",
+              "local_unavailable" not in out, out)
+    finally:
+        sb.cleanup()
+
+
+def test_local_first_config_validation() -> None:
+    """local_first's config keys fail closed on a malformed shape, the same
+    bar peer_allowed_classifications already sets elsewhere in this file."""
+    print("\n[local_first config validation]")
+    for bad, message, accessor in (
+        ({"enabled": "yes"}, "enabled must be a boolean",
+         lambda cfg: cfg.local_first_enabled()),
+        ({"read_gate_min_bytes": "8000"}, "read_gate_min_bytes must be a non-negative integer",
+         lambda cfg: cfg.local_first_min_bytes()),
+        ({"read_gate_min_bytes": -1}, "read_gate_min_bytes must be a non-negative integer",
+         lambda cfg: cfg.local_first_min_bytes()),
+        ({"local_queue_root": 123}, "local_queue_root must be a string",
+         lambda cfg: cfg.local_first_queue_root()),
+        ({"local_queue_root": "relative/path"}, "local_queue_root must be an absolute path",
+         lambda cfg: cfg.local_first_queue_root()),
+        ({"receipt_max_age_seconds": "900"}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
+        ({"receipt_max_age_seconds": -1}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
+        ({"receipt_max_age_seconds": True}, "receipt_max_age_seconds must be a non-negative integer",
+         lambda cfg: cfg.local_first_receipt_max_age_seconds()),
+    ):
+        sb = Sandbox(local_first=bad)
+        try:
+            try:
+                accessor(sb.cfg)
+                check(f"LF config: {bad} is rejected", False, "it was accepted")
+            except ValueError as exc:
+                check(f"LF config: {bad} is rejected", message in str(exc), str(exc))
+        finally:
+            sb.cleanup()
+
+    sb = Sandbox(local_first="not an object")
+    try:
+        try:
+            sb.cfg.local_first_enabled()
+            check("LF config: a non-object local_first is rejected", False, "it was accepted")
+        except ValueError as exc:
+            check("LF config: a non-object local_first is rejected",
+                  "local_first must be an object" in str(exc), str(exc))
+    finally:
+        sb.cleanup()
+
+    sb = Sandbox()
+    try:
+        check("LF config: absent local_first defaults to disabled",
+              sb.cfg.local_first_enabled() is False)
+        check("LF config: absent local_first defaults the threshold to 8000",
+              sb.cfg.local_first_min_bytes() == 8000)
+        check("LF config: absent local_first defaults the queue root to empty",
+              sb.cfg.local_first_queue_root() == "")
+        check("LF config: absent local_first defaults the receipt age to 900",
+              sb.cfg.local_first_receipt_max_age_seconds() == 900)
+    finally:
+        sb.cleanup()
+
+
 def test_per_peer_classification_limits() -> None:
     """One peer can be allowed less than the other.
 
@@ -4392,6 +4694,9 @@ def main() -> int:
     test_schema_enforcement()
     test_corrective_retry_and_no_identical_retry()
     test_input_validation()
+    test_local_first_declaration()
+    test_local_first_reporting()
+    test_local_first_config_validation()
     test_syntax_targets_oldest_supported_python()
     test_windows_acl_parser_adversarial()
     test_platform_boundary()

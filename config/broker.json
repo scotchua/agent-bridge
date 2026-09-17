@@ -57,7 +57,14 @@
     "python_executable": null,
     "poll_interval_seconds": 0.25
   },
+  "local_first": {
+    "enabled": false,
+    "read_gate_min_bytes": 8000,
+    "local_queue_root": "",
+    "receipt_max_age_seconds": 900
+  },
   "_note_source_classifications": "Set peers.<name>.allowed_source_classifications to give one peer a narrower list than the other. See the Privacy choices section of README.md.",
   "_note_ledger": "The append-only ledger is never deleted by cleanup: it is the audit record. There is deliberately no ledger retention setting, because a number here would imply a rotation that does not happen.",
-  "_note_reasoning_effort": "null means the CLI's own default. Neither peer inherits your personal setting: the Codex peer runs with --ignore-user-config and the Claude peer is invoked fresh. Set one of low, medium, high, xhigh, max per peer in config/local.json. Higher effort costs more and takes longer, and is usually worth it for review work."
+  "_note_reasoning_effort": "null means the CLI's own default. Neither peer inherits your personal setting: the Codex peer runs with --ignore-user-config and the Claude peer is invoked fresh. Set one of low, medium, high, xhigh, max per peer in config/local.json. Higher effort costs more and takes longer, and is usually worth it for review work.",
+  "_note_local_first": "Consultation accountability (docs/LOCAL-FIRST-DESIGN.md section 2.8), off by default and a separate switch from the orchestration read gate's own local_first.enabled. Turning it on is the operator's decision: set enabled true and local_queue_root to the SAME local-queue directory the orchestration read gate uses (state_root/local-queue by default; must be an absolute path), so a claude_start/codex_start/*_continue call with a prompt at or above read_gate_min_bytes must then declare local_first. A digest_receipt_id only satisfies one call, and only within receipt_max_age_seconds of when it was minted -- both bound so one honestly-obtained receipt cannot cover every future consultation forever. This is accountability, not enforcement: the assistant can always satisfy it instead with a typed bypass reason. See agent-bridge-admin local-first."
 }

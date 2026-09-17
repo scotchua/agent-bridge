@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -21,8 +23,11 @@ from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_fro
 CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
-START_FIELDS = {"prompt", "source_classification", "label"}
-CONTINUE_FIELDS = {"conversation_id", "prompt", "source_classification", "label"}
+START_FIELDS = {"prompt", "source_classification", "label", "local_first"}
+CONTINUE_FIELDS = {"conversation_id", "prompt", "source_classification", "label", "local_first"}
+
+#: local_first.bypass's closed vocabulary (design section 2.8).
+LOCAL_FIRST_BYPASS_REASONS = frozenset({"needs_judgment", "not_mechanical", "local_unavailable"})
 
 
 # ------------------------------------------------------------------ responses
@@ -76,6 +81,150 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
             raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
         if len(label) > cfg.limit("label_max_chars"):
             raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+
+    _validate_local_first(cfg, prompt, args.get("local_first"))
+
+
+def _sqlite_uri_path(path: str) -> str:
+    """A filesystem path as the path part of a SQLite ``file:`` URI. Percent
+    must be escaped before ``?``/``#`` or SQLite's own percent-decoding of
+    the path mangles it first; see orchestration.gate's identically-named,
+    independently-discovered function for the failure this order avoids."""
+    return (os.path.realpath(path).replace("%", "%25")
+            .replace("?", "%3F").replace("#", "%23"))
+
+
+def _consume_receipt_once(cfg: Config, receipt_id: str, now: float) -> bool:
+    """Atomically record that ``receipt_id`` has just satisfied a
+    ``local_first`` declaration, returning False if it already had.
+
+    Found by adversarial review: existence and ``decision == "local"``
+    alone let a single honestly-obtained receipt satisfy every future
+    large consultation forever, for any peer, regardless of content --
+    reusable with no dishonesty at all, unlike a typed ``bypass``, which at
+    least leaves a visible, questionable claim in the ledger. A receipt
+    proves one file was routed locally once; this makes it usable once.
+
+    Tracked in the consultation bridge's own state (``cfg.state(...)``),
+    not the orchestration package's ``routing_receipts`` table, whose
+    immutability triggers exist for a different reason (an auditable,
+    tamper-evident intake record) and are not this package's to touch.
+    ``INSERT ... PRIMARY KEY`` gives single-use semantics atomically, the
+    same idempotency mechanism ``routing_receipts`` itself already uses via
+    its own ``request_key TEXT UNIQUE``.
+    """
+    store.secure_mkdir(cfg.state_root)
+    db_path = cfg.state("local-first-consumed-receipts.sqlite3")
+    db = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS consumed_receipts (
+            receipt_id TEXT PRIMARY KEY, consumed_at REAL NOT NULL)""")
+        try:
+            db.execute("INSERT INTO consumed_receipts(receipt_id, consumed_at) VALUES(?, ?)",
+                      (receipt_id, now))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        db.close()
+
+
+def _digest_receipt_routed_locally(cfg: Config, receipt_id: str) -> bool:
+    """Whether ``receipt_id`` names a fresh, not-yet-consumed row in the
+    orchestration local queue's ``routing_receipts`` table (``localq/
+    intake.py``) whose own decision was ``"local"`` -- an admission that
+    actually queued the caller's earlier text for local digestion, not
+    merely an attempt that was refused (too small, a prohibited flag, task
+    type needing cloud judgment).
+
+    Existence and decision alone are not enough (see ``_consume_receipt_
+    once``'s docstring): the receipt must also be no older than
+    ``local_first.receipt_max_age_seconds`` (default 900) and not already
+    used to satisfy an earlier declaration. Both checks together close the
+    "one receipt satisfies everything forever" gap; freshness alone would
+    not, since two calls made moments apart would both fall inside any
+    reasonable window.
+
+    Read-only, direct SQLite by path: this module must never construct
+    ``AutomaticIntake``/``LocalQueue`` itself, whose constructors create the
+    queue's directory and tables as a side effect a read must not have
+    (the same reasoning ``orchestration.gate._digest_job_state`` states for
+    its own read-only query against the sibling job database).
+    """
+    local_queue_root = cfg.local_first_queue_root()
+    if not local_queue_root or not receipt_id:
+        return False
+    database = os.path.join(local_queue_root, "routing.sqlite3")
+    uri = "file:" + _sqlite_uri_path(database) + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return False
+    try:
+        row = db.execute(
+            "SELECT decision, created_at FROM routing_receipts WHERE receipt_id=?", (receipt_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        db.close()
+    if row is None or row[0] != "local":
+        return False
+    created_at = row[1]
+    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+        return False
+    now = time.time()
+    if now - created_at > cfg.local_first_receipt_max_age_seconds():
+        return False
+    return _consume_receipt_once(cfg, receipt_id, now)
+
+
+def _validate_local_first(cfg: Config, prompt: str, local_first: Any) -> None:
+    """Consultation accountability (design section 2.8), not enforcement.
+
+    When the operator has configured local-first accountability and this
+    prompt is at or above its byte threshold, the call must carry
+    ``local_first``: a digest receipt that actually routed the earlier text
+    locally, or one of a closed set of typed bypass reasons. Whichever it
+    is, the field is recorded in the consultation ledger and counted by
+    peer and reason (``agent-bridge-admin local-first``); this function
+    never judges whether a bypass reason is honest, only that one was
+    supplied, because the assistant can always type ``needs_judgment`` and
+    that is by design, not a gap to close.
+
+    A supplied field is validated for *shape* regardless of whether it was
+    required, so a malformed declaration is refused (and never silently
+    dropped) even when the caller volunteered it unprompted. The live
+    receipt lookup is different: it only runs when this call actually
+    needs one. An adversarial review found that skipping this distinction
+    made an installation where local-first is not (or not fully)
+    configured -- ``local_queue_root`` unset is the out-of-box default --
+    refuse a caller that defensively volunteered a real, well-formed
+    receipt id on a tiny prompt that never needed one at all, since the
+    live lookup always fails without a queue root to check against
+    regardless of whether the call was ever gated.
+    """
+    required = (cfg.local_first_enabled()
+               and len(prompt.encode("utf-8")) >= cfg.local_first_min_bytes())
+    if local_first is None:
+        if required:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        return
+    if not isinstance(local_first, dict) or len(local_first) != 1:
+        raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    if "digest_receipt_id" in local_first:
+        receipt_id = local_first["digest_receipt_id"]
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+        if required and not _digest_receipt_routed_locally(cfg, receipt_id):
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    elif "bypass" in local_first:
+        bypass = local_first["bypass"]
+        if not isinstance(bypass, str) or bypass not in LOCAL_FIRST_BYPASS_REASONS:
+            raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
+    else:
+        raise BrokerError(ErrorCategory.LOCAL_FIRST_REQUIRED)
 
 
 def _validate_identifier_request(args: Any, field: str) -> str:
@@ -289,6 +438,7 @@ def _prepare_job(
         "prompt": args["prompt"],
         "source_classification": args["source_classification"].strip().lower(),
         "label": args.get("label"),
+        "local_first": args.get("local_first"),
         "resume": resume,
         "config_path": snapshot_path,
         "created_at": store.utc_now(),

@@ -373,6 +373,40 @@ must key on the exact tool name `Read`, in its own set disjoint from
 `EDIT_TOOLS`/`SHELL_TOOLS`, never on the presence of a `path`-shaped field,
 or a `Glob` or `Grep` call would be misread as a whole-file read.
 
+## Phase 5 (docs/LOCAL-FIRST-DESIGN.md section 2.9), added while building it
+
+Measured 2026-09-16 against the installed CLI's own bundled `cli.js`
+(`@anthropic-ai/claude-code@2.1.42` at `/opt/node22/lib/node_modules/`),
+the same kind of artifact-inspection Phase 0 above used, not a live hook
+invocation. An adversarial review of the Phase 5 commit found this fact had
+only ever been asserted from session memory, never written down here the
+way every other Phase 0 fact was -- closed now.
+
+**Confirmed.** `PostToolUse`'s payload is built by the CLI's own
+`executePostToolHooks` function (minified as `pSA` in this build) as
+`{...commonFields, hook_event_name: "PostToolUse", tool_name, tool_input,
+tool_response, tool_use_id}`, matching the design's assumption exactly.
+`tool_response` itself is typed `unknown` in the CLI's own Zod schema (no
+narrower guarantee from the schema alone), but the bundle's shell-execution
+plumbing (an `execa`-shaped result carrying `stdout`/`stderr` among other
+fields, `{command, escapedCommand, exitCode, stdout, stderr, all, failed,
+timedOut, isCanceled, killed}`) is what actually produces a Bash call's
+result throughout this same file, and `{stdout, stderr}`-shaped object
+literals recur pervasively wherever a command's output is threaded through.
+
+**Not fully traced, and named here rather than left silent.** The exact
+variable binding from a Bash tool call's own result object to the specific
+`tool_response` argument passed into `pSA` at its call site was not
+followed all the way through the minified bundle in this session -- doing
+so exhaustively was judged not worth the time against how this dependency
+actually fails: `gate._response_byte_length` already degrades to 0 for any
+field it does not find (see its own docstring), never raises, and Phase 5
+never blocks anything regardless. If the true field names ever differ from
+`stdout`/`stderr`, the practical consequence is Phase 5 quietly measuring 0
+bytes for every real call rather than a wrong number or a crash -- listed
+in `gate.NOT_COVERED` for the same reason every other heuristic-strength
+gap in this project is named rather than assumed away.
+
 **Not confirmed, and not built on:**
 
 * That a `PreToolUse` matcher actually fires for `tool_name: "Read"` inside a
@@ -385,8 +419,10 @@ or a `Glob` or `Grep` call would be misread as a whole-file read.
   host. The read gate inherits that same limit rather than closing it; see
   "What was NOT proven" in `docs/audits/automatic-delegation-2026-09-15.md`.
 * Whether Codex exposes `PostToolUse` at all. No `codex` binary is present
-  to check. Phase 5 of the build plan (inline output measurement) is not
-  attempted until this is confirmed on a host that has Codex installed.
+  to check. Phase 5 (inline output measurement) was built Claude-only per
+  the design's own stated fallback for exactly this case; nothing is
+  installed for Codex (`gate.POST_MATCHERS` has no `"codex"` key) and the
+  audit names its column not countable rather than assuming either way.
 * Whether Claude Desktop's own hook surface differs from the CLI's. Left
   exactly as documented (`NOT_COVERED`): no evidence was found either way,
   and the conservative default is to add nothing to that list without one.

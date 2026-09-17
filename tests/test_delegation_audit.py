@@ -491,5 +491,84 @@ class LocalFirstAccounting(AuditCase):
         self.assertNotIn("MISMATCH", rendered)
 
 
+class InlineMeasurementAccounting(AuditCase):
+    """The inline_measurement section (design section 2.9): a count and a
+    byte total from gate.INLINE_LEDGER, never a permission split -- Phase 5
+    never denies anything, so there is nothing here shaped like local_first's
+    own compelled/digested/pending/waived/declined/outstanding partition."""
+
+    def measurement(self, **fields):
+        row = {"at": self.now, "client": "claude", "matched_runner": "pytest", "bytes": 500}
+        row.update(fields)
+        store.append_ledger(str(self.routing / gate.INLINE_LEDGER), row)
+
+    def test_an_empty_window_is_zero(self):
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 0)
+        self.assertEqual(im["bytes_measured"], 0)
+
+    def test_count_and_bytes_and_by_runner_are_correct(self):
+        self.measurement(matched_runner="pytest", bytes=500)
+        self.measurement(matched_runner="pytest", bytes=300)
+        self.measurement(matched_runner="jest", bytes=1_200)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 3)
+        self.assertEqual(im["bytes_measured"], 2_000)
+        self.assertEqual(im["by_runner"], {"pytest": 2, "jest": 1})
+
+    def test_a_malformed_bytes_value_degrades_that_one_row_not_the_report(self):
+        # The same isinstance-guard precedent local_first's own bytes
+        # computation already uses (audit.py, after the crash-safety fix):
+        # a hand-edited or otherwise malformed ledger row is counted as 0
+        # rather than raising and taking the whole report down with it.
+        self.measurement(bytes="not a number")
+        self.measurement(bytes=500)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 2)
+        self.assertEqual(im["bytes_measured"], 500)
+
+    def test_a_nan_or_infinite_bytes_value_does_not_crash_the_report(self):
+        # Confirmed by adversarial review: isinstance(x, (int, float)) alone
+        # is True for NaN and Infinity too, and int(nan)/int(inf) raise --
+        # reintroducing the exact crash class this guard exists to prevent.
+        self.measurement(bytes=float("nan"))
+        self.measurement(bytes=float("inf"))
+        self.measurement(bytes=500)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 3)
+        self.assertEqual(im["bytes_measured"], 500)
+
+    def test_an_unparseable_ledger_line_is_not_counted(self):
+        # Confirmed by adversarial review: _read_ledger deliberately keeps an
+        # unparseable line as its own {"error": ...} row rather than dropping
+        # it, so this section must filter to its own rows before counting --
+        # otherwise a single corrupt line inflated count by one and added a
+        # spurious "None" bucket to by_runner.
+        path = self.routing / gate.INLINE_LEDGER
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("not json at all\n")
+        self.measurement(bytes=500)
+        im = self.run_audit()["inline_measurement"]
+        self.assertEqual(im["count"], 1)
+        self.assertNotIn("None", im["by_runner"])
+
+    def test_codex_is_named_not_countable(self):
+        im = self.run_audit()["inline_measurement"]
+        self.assertTrue(any("Codex" in item for item in im["not_countable"]))
+
+    def test_a_window_before_this_phase_existed_is_its_own_bucket(self):
+        # Reading the same ledger since_hours already filters by "at";
+        # a row entirely outside the window is simply absent, not an error.
+        self.measurement(at=self.now - 10_000)
+        document = audit.report(str(self.state), home=str(self.home),
+                                clock=lambda: self.now + 1, since_hours=0.001)
+        self.assertEqual(document["inline_measurement"]["count"], 0)
+
+    def test_render_includes_the_inline_measurement_summary(self):
+        self.measurement(matched_runner="pytest", bytes=500)
+        rendered = audit.render(self.run_audit())
+        self.assertIn("inline output measured: 1 calls, 500 bytes", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
