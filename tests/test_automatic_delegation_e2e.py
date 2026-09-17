@@ -497,6 +497,11 @@ class BothDirections(Workflow):
     """Codex to Claude and Claude to Codex, through the same queue."""
 
     def dispatch(self, caller, provider, item_suffix):
+        # execution_dispatch now derives classification from the operator's
+        # policy rather than the caller's own claim; admit this repo for
+        # both routes so the dispatch below is eligible, matching what the
+        # call itself asserts.
+        self.write_policy(classification="synthetic", allowed_routes=["claude", "codex"])
         router = StageRouter(str(self.db))
         now = time.time()
         router.observe_capacity(CapacityObservation(
@@ -545,6 +550,10 @@ class BothDirections(Workflow):
         self.assertEqual((self.repo / "calc.py").read_text(encoding="utf-8"), BUGGY)
 
     def test_a_caller_cannot_dispatch_to_its_own_provider(self):
+        # Admit the repo for both routes so the self-dispatch attempt below
+        # reaches the caller/provider check it means to exercise, rather
+        # than being refused earlier for having no eligible route at all.
+        self.write_policy(classification="synthetic", allowed_routes=["claude", "codex"])
         router = StageRouter(str(self.db))
         now = time.time()
         router.observe_capacity(CapacityObservation(
@@ -564,6 +573,7 @@ class BothDirections(Workflow):
         self.assertEqual(result["error"], "provider_not_eligible_for_caller")
 
     def test_paid_fallback_is_refused_at_the_queue(self):
+        self.write_policy(classification="synthetic", allowed_routes=["claude", "codex"])
         router = StageRouter(str(self.db))
         now = time.time()
         router.observe_capacity(CapacityObservation(
@@ -1141,6 +1151,13 @@ class RestartRecovery(Workflow):
     """A worker that dies mid-job must never silently repeat a provider send."""
 
     def queued_job(self):
+        # execution_dispatch now derives classification from the operator's
+        # policy rather than trusting the caller's own claim (an adversarial
+        # review found the old handler took a caller-supplied
+        # "classification" argument at face value), so this repo must
+        # actually be classified and codex actually admitted, matching what
+        # the dispatch call below asserts.
+        self.write_policy(classification="synthetic", allowed_routes=["claude", "codex"])
         router = StageRouter(str(self.db))
         now = time.time()
         router.observe_capacity(CapacityObservation(

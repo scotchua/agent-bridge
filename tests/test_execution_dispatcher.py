@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
+from agent_bridge.orchestration import autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
     _harness_summary, outcome_is_success)
@@ -192,6 +193,19 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(self.fake.requests, [])
 
     def test_mcp_tools_bind_caller_and_only_queue_execution(self):
+        # execution_dispatch now derives classification from the operator's
+        # routing policy rather than a caller-supplied argument (an
+        # adversarial review found the old handler trusted the caller's own
+        # claim outright), so a policy admitting this repo for both routes
+        # is required for the dispatch below to be eligible at all.
+        state_root = self.root / "state"
+        policy_path = Path(autoroute.policy_path(str(state_root)))
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        policy_path.write_text(json.dumps({
+            "version": 1,
+            "repos": {str(self.repo): {"classification": "synthetic",
+                                       "allowed_routes": ["claude", "codex"]}}}),
+            encoding="utf-8")
         router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)
         router.observe_capacity(CapacityObservation(
             route="claude", observed_at=100.0, fresh_until=200.0, available=True,
@@ -200,7 +214,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         owned = router.assign("item-1", "implement", owner_id="owner-1", lease_seconds=60,
                               expected_revision=registered["revision"])
         service = LocalService(self.root / "local")
-        server = Server("codex", service, router, execution=self.queue, interval=0.01)
+        server = Server("codex", service, router, execution=self.queue, interval=0.01,
+                        state_root=str(state_root))
         names = {tool["name"] for tool in server.handle({"jsonrpc": "2.0", "id": 1,
                  "method": "tools/list"})["result"]["tools"]}
         self.assertTrue({"execution_dispatch", "execution_status", "execution_result"} <= names)
@@ -339,6 +354,116 @@ class HarnessVerdictTests(unittest.TestCase):
         self.assertEqual(summary["harness_verdict"], "read")
         self.assertEqual(summary["error_detail"], "codex login status: not logged in")
 
+
+class ExecutionDispatchClassificationTests(unittest.TestCase):
+    """execution_dispatch (mcp.py) derives classification from the operator's
+    routing-policy.json, never from the caller's own argument.
+
+    A confirmed adversarial-review finding: the handler used to forward
+    args["classification"] straight to execution.submit(), whose own check
+    only validates that the string is a member of a fixed set, not that it
+    is the actual classification of the repository being dispatched. A
+    caller could declare "synthetic" for a repository the operator actually
+    classified internal_nonclient (or one the operator never classified at
+    all) and dispatch it to a peer's cloud CLI anyway. The same gap that
+    made ``capacity_observe`` a removed tool (mcp.py's own module docstring:
+    "an authorized source" meant whatever the model typed) applied here too.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = self.root / "brief.md"
+        self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
+        self.fake = FakeExecutor()
+        self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0)
+        self.state_root = self.root / "state"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_policy(self, **document):
+        path = Path(autoroute.policy_path(str(self.state_root)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "repos": {}, **document}), encoding="utf-8")
+
+    def dispatch(self, *, caller="claude", provider="codex", classification="synthetic",
+                item_id="item-1", owner_id="owner-1"):
+        router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)
+        router.observe_capacity(CapacityObservation(
+            route=provider, observed_at=100.0, fresh_until=200.0, available=True,
+            source="test"), trusted=True)
+        registered = router.register(item_id, "implement", allowed_routes=[provider])
+        owned = router.assign(item_id, "implement", owner_id=owner_id, lease_seconds=60,
+                              expected_revision=registered["revision"])
+        service = LocalService(self.root / "local")
+        server = Server(caller, service, router, execution=self.queue, interval=0.01,
+                        state_root=str(self.state_root))
+        return server.tools["execution_dispatch"]["handler"]({
+            "provider": provider, "repo": str(self.repo), "brief": str(self.brief),
+            "base": "HEAD", "classification": classification, "model": "sonnet",
+            "effort": "medium", "verify_argv": [["pytest", "-q"]], "item_id": item_id,
+            "stage": "implement", "owner_id": owner_id, "stage_revision": owned["revision"]})
+
+    def test_the_callers_classification_claim_is_ignored_not_forwarded(self):
+        # The policy says internal_nonclient; the caller claims synthetic.
+        # The dispatched job must carry the policy's truth, not the claim.
+        self.write_policy(repos={str(self.repo): {
+            "classification": "internal_nonclient", "allowed_routes": ["claude", "codex"]}})
+        result = self.dispatch(classification="synthetic")
+        self.assertTrue(result["ok"], result)
+        self.queue.run_once("worker-1")
+        receipt = self.queue.result(result["job_id"])
+        self.assertEqual(receipt["classification"], "internal_nonclient")
+
+    def test_an_unclassified_repository_is_refused_however_the_caller_labels_it(self):
+        # No policy entry for this repo at all: the operator never admitted
+        # it for any route. The caller's own claim of "synthetic" (a value
+        # that would otherwise sail through execution.submit's fixed-set
+        # check) must not be enough on its own.
+        self.write_policy()
+        result = self.dispatch(classification="synthetic")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "execution_dispatch_refused:classification_not_eligible_for_route")
+
+    def test_a_route_the_policy_does_not_admit_is_refused(self):
+        self.write_policy(repos={str(self.repo): {
+            "classification": "public", "allowed_routes": ["claude"]}})
+        result = self.dispatch(provider="codex", classification="public")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "execution_dispatch_refused:classification_not_eligible_for_route")
+
+    def test_route_classifications_is_enforced_live_at_dispatch_too(self):
+        # Not just at the earlier routing decision: dispatch re-derives and
+        # re-checks against the operator's policy for itself.
+        self.write_policy(
+            repos={str(self.repo): {"classification": "internal_nonclient",
+                                    "allowed_routes": ["claude", "codex"]}},
+            route_classifications={"codex": ["public"]})
+        result = self.dispatch(provider="codex", classification="internal_nonclient")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "execution_dispatch_refused:classification_not_eligible_for_route")
+
+    def test_no_state_root_refuses_rather_than_trusting_the_caller(self):
+        router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)
+        router.observe_capacity(CapacityObservation(
+            route="codex", observed_at=100.0, fresh_until=200.0, available=True,
+            source="test"), trusted=True)
+        registered = router.register("item-1", "implement", allowed_routes=["codex"])
+        owned = router.assign("item-1", "implement", owner_id="owner-1", lease_seconds=60,
+                              expected_revision=registered["revision"])
+        service = LocalService(self.root / "local")
+        server = Server("claude", service, router, execution=self.queue, interval=0.01)
+        result = server.tools["execution_dispatch"]["handler"]({
+            "provider": "codex", "repo": str(self.repo), "brief": str(self.brief),
+            "base": "HEAD", "classification": "synthetic", "model": "sonnet",
+            "effort": "medium", "verify_argv": [["pytest", "-q"]], "item_id": "item-1",
+            "stage": "implement", "owner_id": "owner-1", "stage_revision": owned["revision"]})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "execution_dispatch_unavailable:no_state_root")
 
 
 if __name__ == "__main__":
