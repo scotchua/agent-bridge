@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import platform_support
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration import autoroute
@@ -112,6 +113,38 @@ class ExecutionDispatcherTests(unittest.TestCase):
             self.submit(brief="brief.md")
         with self.assertRaisesRegex(ExecutionAdmissionError, "claude_verification_required"):
             self.submit(verify_argv=[])
+
+    def test_a_repo_symlink_is_resolved_once_at_admission_not_followed_later(self):
+        # An adversarial review found that submit() stored the caller's raw
+        # `repo` argument unresolved. autoroute.Policy.for_repo (the
+        # eligibility check upstream in mcp.py) already resolves through
+        # os.path.realpath before deciding whether a route may see this
+        # repository, so a caller could point `repo` through a symlink, get
+        # admitted (and classified) against the approved target the symlink
+        # happened to name at that moment, then repoint the symlink to an
+        # unapproved repository before the separately-scheduled worker
+        # actually ran run_once() -- the harness would then execute against
+        # whatever the symlink resolves to *now*, not what was approved at
+        # admission. brief already gets an analogous protection (a symlink
+        # is refused outright, and its content is rehashed at run_once); a
+        # repository is ordinarily reached through a symlink, so refusing it
+        # outright would be a needless behavior change -- resolving it once,
+        # immediately, is what actually closes the gap.
+        platform_support.require_symlinks(self)
+        approved = self.repo
+        other = self.root / "other-repo"
+        other.mkdir()
+        (other / ".git").mkdir()
+        link = self.root / "link-to-repo"
+        link.symlink_to(approved, target_is_directory=True)
+        result = self.submit(repo=str(link))
+        stored = json.loads((self.queue.root / result["job_id"] / "request.json")
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(stored["repo"], str(approved.resolve()))
+        link.unlink()
+        link.symlink_to(other, target_is_directory=True)
+        self.queue.run_once("worker-1")
+        self.assertEqual(self.fake.requests[0]["repo"], str(approved.resolve()))
 
     def test_a_command_the_harness_would_refuse_is_refused_at_admission(self):
         # Live jobs d8e5763d, 7a79ae7f and 19869b0e were admitted with commands
@@ -446,6 +479,27 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         result = self.dispatch(provider="codex", classification="internal_nonclient")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "execution_dispatch_refused:classification_not_eligible_for_route")
+
+    def test_an_unreadable_policy_is_refused_cleanly_not_left_to_crash(self):
+        # A confirmed adversarial-review finding: autoroute.load_policy
+        # raises a plain OSError, not autoroute.PolicyError, when the policy
+        # path exists but cannot be opened as a file (chmod 000, or, as
+        # here, a directory sitting where the policy file belongs) --
+        # autoroute.py's own open() call only catches FileNotFoundError,
+        # since an absent file is the retain-everything default, not an
+        # error. The handler used to catch only autoroute.PolicyError around
+        # this call, so the OSError escaped uncaught; called directly here
+        # (bypassing server.py's own blanket except Exception -> internal
+        # error), an uncaught OSError would fail this test with a real
+        # exception instead of the clean refusal asserted below.
+        policy_path = Path(autoroute.policy_path(str(self.state_root)))
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        policy_path.mkdir()
+        result = self.dispatch(classification="synthetic")
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            result["error"].startswith("execution_dispatch_refused:policy_unreadable:"),
+            result["error"])
 
     def test_no_state_root_refuses_rather_than_trusting_the_caller(self):
         router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)

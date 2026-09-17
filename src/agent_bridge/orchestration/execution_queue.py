@@ -394,6 +394,23 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("repo_and_brief_must_be_absolute")
         if not repo_path.is_dir() or not (repo_path / ".git").exists():
             raise ExecutionAdmissionError("repo_invalid")
+        # Resolved once, now, to the concrete directory: the value stored
+        # below is what run_once() eventually hands the harness subprocess as
+        # its cwd, on its own separate schedule well after this call returns.
+        # An adversarial review found that leaving repo unresolved let a
+        # caller point it through a symlink, get admitted (and classified)
+        # against the approved target, then repoint the symlink before the
+        # worker actually ran -- the classification check the caller went
+        # through (autoroute.Policy.for_repo, upstream in mcp.py) already
+        # resolves through realpath for this exact reason; resolving here too
+        # means both decisions name the same concrete directory, one an
+        # after-the-fact symlink swap cannot redirect. brief gets the
+        # analogous protection by refusing a symlink outright (below) and
+        # rehashing its content at run_once; a repository is ordinarily
+        # reached through a symlink, so refusing it here would be a needless
+        # behavior change -- resolving it once, immediately, is what actually
+        # closes the gap.
+        repo_path = Path(os.path.realpath(repo_path))
         if not brief_path.is_file() or brief_path.is_symlink():
             raise ExecutionAdmissionError("brief_invalid")
         brief_bytes = brief_path.read_bytes()

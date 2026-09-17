@@ -423,7 +423,17 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                     raise RoutingError("execution_stage_binding_invalid")
                 try:
                     policy = autoroute.load_policy(state_root)
-                except autoroute.PolicyError as exc:
+                except (OSError, ValueError, autoroute.PolicyError) as exc:
+                    # autoroute.py's own open() only catches FileNotFoundError
+                    # (an absent policy is the retain-everything default, not
+                    # an error); a genuinely unreadable file (chmod 000, or a
+                    # directory where the policy should be) raises a plain
+                    # OSError that PolicyError alone would not catch here, and
+                    # nothing enclosing this call catches it either -- it
+                    # would otherwise escape as server.py's generic
+                    # "internal_error" instead of this refusal, the same
+                    # OSError autodecide.ensure_decision already guards
+                    # against around the identical load call.
                     return {"ok": False, "error":
                             f"execution_dispatch_refused:policy_unreadable:{type(exc).__name__}"}
                 repo_policy = policy.for_repo(args.get("repo"))
