@@ -724,6 +724,77 @@ class PolicyParsing(unittest.TestCase):
                 "/tmp": {"allowed_routes": ["anthropic_api"]}}})
         self.assertEqual(autoroute.ROUTES, ("claude", "codex", "local"))
 
+    def test_route_classifications_is_absent_by_default(self):
+        policy = autoroute.parse_policy({"version": 1, "repos": {}})
+        self.assertEqual(policy.route_classifications, {})
+
+    def test_route_classifications_narrows_one_route(self):
+        policy = autoroute.parse_policy({
+            "version": 1, "repos": {},
+            "route_classifications": {"codex": ["public"]}})
+        self.assertEqual(policy.route_classifications, {"codex": frozenset({"public"})})
+
+    def test_route_classifications_unknown_route_key_is_refused(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {},
+                                    "route_classifications": {"local": ["public"]}})
+
+    def test_route_classifications_must_be_drawn_from_peer_classifications(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {},
+                                    "route_classifications": {"codex": ["client_derived"]}})
+
+    def test_route_classifications_rejects_a_non_list_value(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {},
+                                    "route_classifications": {"codex": "public"}})
+
+    def test_route_classifications_rejects_an_empty_list(self):
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy({"version": 1, "repos": {},
+                                    "route_classifications": {"codex": []}})
+
+
+class ARouteCanBeNarrowedBelowTheOtherPeer(unittest.TestCase):
+    """route_classifications (design closing an adversarial review's finding):
+    the consultation bridge's own peer_allowed_classifications already lets
+    an operator narrow one peer below the other; this is the routing/dispatch
+    side's equivalent, closing the gap where a caller refused a narrower
+    peer through consultation could still reach that same peer's cloud CLI
+    through execution_dispatch, because the routing decision had only ever
+    consulted one classification set shared by both peers.
+    """
+
+    def decide(self, client, classification="internal_nonclient", **policy_kwargs):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy(classification, ("claude", "codex"))},
+            **policy_kwargs)
+        return autoroute.decide(
+            autoroute.Signal(client=client, repo="/r"), policy,
+            fresh_routes=frozenset({"claude", "codex"}),
+            load=autoroute.Load(0.1, True))
+
+    def test_an_unnarrowed_route_still_uses_the_global_set(self):
+        decision = self.decide("claude")
+        self.assertEqual(decision.route, "codex")
+
+    def test_a_narrowed_peer_retains_material_outside_its_own_set(self):
+        decision = self.decide("claude", route_classifications={"codex": frozenset({"public"})})
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_is_the_policy")
+
+    def test_the_same_repository_still_reaches_the_unnarrowed_peer(self):
+        # Narrowing codex specifically must not narrow claude too: the
+        # asking client here is codex, so its peer is claude, which has no
+        # override and keeps the full global set.
+        decision = self.decide("codex", route_classifications={"codex": frozenset({"public"})})
+        self.assertEqual(decision.route, "claude")
+
+    def test_a_narrowed_peer_still_admits_what_its_own_set_allows(self):
+        decision = self.decide("claude", classification="public",
+                               route_classifications={"codex": frozenset({"public"})})
+        self.assertEqual(decision.route, "codex")
+
 
 class CapacityIsNotSomethingTheAssistantSays(AutoCase):
     """The review's third finding: capacity evidence was model-controlled.

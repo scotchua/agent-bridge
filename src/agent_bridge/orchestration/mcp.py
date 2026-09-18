@@ -381,7 +381,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         dispatch = _schema({
             "provider": {"type": "string", "enum": ["claude", "codex"]},
             "repo": {"type": "string"}, "brief": {"type": "string"},
-            "base": {"type": "string"}, "classification": {"type": "string"},
+            "base": {"type": "string"},
             "model": {"type": "string"}, "effort": {"type": "string"},
             "verify_argv": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200},
@@ -390,20 +390,63 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "item_id": {"type": "string"}, "stage": {"type": "string"},
             "owner_id": {"type": "string"},
             "stage_revision": {"type": "integer", "minimum": 0},
-        }, ["provider", "repo", "brief", "base", "classification", "model", "effort",
+        }, ["provider", "repo", "brief", "base", "model", "effort",
             "item_id", "stage", "owner_id", "stage_revision"])
 
         def dispatch_execution(args: dict[str, Any]) -> dict[str, Any]:
+            # classification is deliberately not a caller-supplied field (it
+            # was removed from the schema above, not merely ignored): the
+            # operator's routing-policy.json names the truth for a repo, the
+            # same reasoning work_digest_file's own docstring states ("no
+            # assistant-supplied classification ... ever reaches the local
+            # model"). An adversarial review found this handler previously
+            # took the caller's own "classification" argument at face value
+            # and forwarded it straight to execution.submit, whose own check
+            # only validates that the string is a member of a fixed set, not
+            # that it is the actual classification of this repository -- a
+            # caller could declare "synthetic" for a repository the operator
+            # classified internal_nonclient and dispatch it to a peer's cloud
+            # CLI anyway. allowed_routes and route_classifications are also
+            # re-checked live here, not merely trusted from the stage's
+            # original routing decision: the operator's policy can change
+            # after a stage is claimed, and the gate's own read/write checks
+            # already re-verify live rather than trust a receipt at face
+            # value (gate.judge's stage re-check is the same reasoning).
+            if state_root is None:
+                return {"ok": False, "error": "execution_dispatch_unavailable:no_state_root"}
             try:
                 current = router.get(args.get("item_id"), args.get("stage"))
+                provider = args.get("provider")
                 if (current["state"] != "owned" or current["owner_id"] != args.get("owner_id")
-                        or current["owner_route"] != args.get("provider")
+                        or current["owner_route"] != provider
                         or current["revision"] != args.get("stage_revision")):
                     raise RoutingError("execution_stage_binding_invalid")
+                try:
+                    policy = autoroute.load_policy(state_root)
+                except (OSError, ValueError, autoroute.PolicyError) as exc:
+                    # autoroute.py's own open() only catches FileNotFoundError
+                    # (an absent policy is the retain-everything default, not
+                    # an error); a genuinely unreadable file (chmod 000, or a
+                    # directory where the policy should be) raises a plain
+                    # OSError that PolicyError alone would not catch here, and
+                    # nothing enclosing this call catches it either -- it
+                    # would otherwise escape as server.py's generic
+                    # "internal_error" instead of this refusal, the same
+                    # OSError autodecide.ensure_decision already guards
+                    # against around the identical load call.
+                    return {"ok": False, "error":
+                            f"execution_dispatch_refused:policy_unreadable:{type(exc).__name__}"}
+                repo_policy = policy.for_repo(args.get("repo"))
+                peer_classifications = policy.route_classifications.get(
+                    provider, policy.peer_classifications)
+                if (provider not in repo_policy.allowed_routes
+                        or repo_policy.classification not in peer_classifications):
+                    return {"ok": False,
+                            "error": "execution_dispatch_refused:classification_not_eligible_for_route"}
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
-                    **args, "caller": caller})
+                    **args, "classification": repo_policy.classification, "caller": caller})
             except (RoutingError, TypeError, ValueError) as exc:
                 return {"ok": False, "error": str(exc) or type(exc).__name__}
             if result.get("ok") and state_root is not None:
@@ -434,7 +477,11 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
 
         tools.update({
             "execution_dispatch": {
-                "description": "Queue implementation on the opposite provider's bounded subscription harness. No paid fallback, apply, commit, push or merge.",
+                "description": "Queue implementation on the opposite provider's bounded subscription harness. "
+                               "No paid fallback, apply, commit, push or merge. The classification dispatched "
+                               "is always the operator's routing-policy.json entry for this repository, never "
+                               "a caller-supplied value; a repository or route the policy does not admit is "
+                               "refused, whatever this call claims.",
                 "inputSchema": dispatch,
                 "handler": dispatch_execution,
             },

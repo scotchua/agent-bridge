@@ -223,6 +223,18 @@ class Policy:
     default: RepoPolicy = RepoPolicy()
     local_classifications: frozenset[str] = LOCAL_CLASSIFICATIONS
     peer_classifications: frozenset[str] = PEER_CLASSIFICATIONS
+    #: Per-route narrowing of ``peer_classifications``. A route absent here
+    #: uses the global set unchanged. Exists because the two peers can be
+    #: different companies under different accounts, possibly different
+    #: plans: if one side's terms are weaker, that side should be able to
+    #: receive less classified material than the other -- the same
+    #: reasoning the consultation bridge's own ``peer_allowed_classifications``
+    #: (config.py) already applies on its side. Before this field existed,
+    #: this routing/dispatch path had no equivalent: an operator who
+    #: narrowed one peer through the consultation bridge got no such
+    #: protection here, so the same material could still reach that peer
+    #: through ``execution_dispatch`` (an adversarial review's finding).
+    route_classifications: Mapping[str, frozenset[str]] = field(default_factory=dict)
     max_local_load_ratio: float = DEFAULT_MAX_LOCAL_LOAD
     #: Tie-break order when more than one route survives every check.
     #:
@@ -431,8 +443,9 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
                         considered)
 
     # 4. Capacity, for the peer route.
+    peer_classifications = policy.route_classifications.get(peer, policy.peer_classifications)
     peer_allowed = (peer in repo_policy.allowed_routes
-                    and repo_policy.classification in policy.peer_classifications)
+                    and repo_policy.classification in peer_classifications)
     if signal.is_review and signal.author_route == peer:
         # The gap this closes. The guard below only fired when the client was
         # itself the author, so a review of the *peer's* work fell through to
@@ -589,6 +602,19 @@ def parse_policy(document: object) -> Policy:
     declared = document.get("declared_available", [])
     if not isinstance(declared, list) or any(route not in ROUTES for route in declared):
         raise PolicyError("declared_available must be a list of known routes")
+    raw_route_classifications = document.get("route_classifications", {})
+    if not isinstance(raw_route_classifications, dict):
+        raise PolicyError("route_classifications must be an object")
+    route_classifications: dict[str, frozenset[str]] = {}
+    for route, classes in raw_route_classifications.items():
+        if route not in PEER_FOR_CLIENT:
+            raise PolicyError(f"route_classifications key {route!r} must be claude or codex")
+        if (not isinstance(classes, list) or not classes
+                or any(not isinstance(c, str) or c not in PEER_CLASSIFICATIONS for c in classes)):
+            raise PolicyError(
+                f"route_classifications[{route!r}] must be a non-empty list drawn from "
+                + ", ".join(sorted(PEER_CLASSIFICATIONS)))
+        route_classifications[route] = frozenset(classes)
     # Fail closed on shape here too. A misspelled ``declaredAvailable`` that
     # parsed silently would leave the operator believing they had declared a
     # route available when they had not. An underscore-prefixed key is a
@@ -597,13 +623,15 @@ def parse_policy(document: object) -> Policy:
     unknown_top = {key for key in document
                    if not key.startswith("_")} - {"version", "repos",
                                                   "max_local_load_ratio", "prefer",
-                                                  "declared_available", "local_first"}
+                                                  "declared_available", "local_first",
+                                                  "route_classifications"}
     if unknown_top:
         raise PolicyError("routing policy has unknown keys: "
                           + ", ".join(sorted(unknown_top)))
     local_first = _parse_local_first(document.get("local_first", {}))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
                   peer_classifications=PEER_CLASSIFICATIONS,
+                  route_classifications=route_classifications,
                   max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
                   declared_routes=tuple(dict.fromkeys(declared)),
                   local_first=local_first)
