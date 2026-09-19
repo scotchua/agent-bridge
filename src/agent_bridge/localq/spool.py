@@ -43,6 +43,13 @@ class ResourceSnapshot:
     ac_power: bool
     idle_seconds: float
     cpu_load_ratio: float = 0.0
+    #: Fraction of CPU idle from a direct measurement (e.g. `top`), or None
+    #: when that probe was unavailable. Load-average-per-core conflates
+    #: waiting-on-I/O with genuine CPU contention; this is a second,
+    #: independent signal that can rescue admission when load looks high
+    #: but the CPU is demonstrably not busy. It never revokes admission
+    #: that cpu_load_ratio alone already grants.
+    cpu_idle_ratio: float | None = None
 
 
 class Sampler(Protocol):
@@ -63,6 +70,10 @@ class QueueCaps:
     lease_seconds: float = 120.0
     timeout_seconds: float = 60.0
     max_load_per_core: float = 0.75
+    #: Alternate admission threshold: a directly measured CPU idle fraction
+    #: at or above this rescues admission when cpu_load_ratio alone would
+    #: refuse it. See ResourceSnapshot.cpu_idle_ratio.
+    min_cpu_idle_ratio: float = 0.25
 
 
 #: Longest failure text the ``error`` column records.
@@ -256,7 +267,9 @@ class LocalQueue:
             raise AdmissionError("resource_sample_stale")
         if snapshot.memory_pressure != "normal" or snapshot.thermal_state != "normal":
             raise AdmissionError("resource_pressure")
-        if not 0 <= snapshot.cpu_load_ratio <= self.caps.max_load_per_core:
+        load_ok = 0 <= snapshot.cpu_load_ratio <= self.caps.max_load_per_core
+        idle_ok = snapshot.cpu_idle_ratio is not None and snapshot.cpu_idle_ratio >= self.caps.min_cpu_idle_ratio
+        if not (load_ok or idle_ok):
             raise AdmissionError("resource_cpu_load")
         if priority == "bulk" and (not snapshot.ac_power or snapshot.idle_seconds < self.caps.bulk_min_idle_seconds):
             raise AdmissionError("resource_bulk_policy")
@@ -480,12 +493,15 @@ class LocalQueue:
             age = self.clock() - snapshot.observed_at
             fresh = isinstance(snapshot, ResourceSnapshot) and -1 <= age <= self.caps.sample_max_age_seconds
             base_ok = fresh and snapshot.memory_pressure == "normal" and snapshot.thermal_state == "normal"
-            base_ok = base_ok and 0 <= snapshot.cpu_load_ratio <= self.caps.max_load_per_core
+            load_ok = 0 <= snapshot.cpu_load_ratio <= self.caps.max_load_per_core
+            idle_ok = snapshot.cpu_idle_ratio is not None and snapshot.cpu_idle_ratio >= self.caps.min_cpu_idle_ratio
+            base_ok = base_ok and (load_ok or idle_ok)
             interactive_verdict = "admissible" if base_ok else "deferred"
             bulk_verdict = "admissible" if base_ok and snapshot.ac_power and snapshot.idle_seconds >= self.caps.bulk_min_idle_seconds else "deferred"
             sample = {"age_seconds": age, "fresh": fresh, "memory_pressure": snapshot.memory_pressure,
                       "thermal_state": snapshot.thermal_state, "ac_power": snapshot.ac_power,
                       "idle_seconds": snapshot.idle_seconds, "cpu_load_ratio": snapshot.cpu_load_ratio,
+                      "cpu_idle_ratio": snapshot.cpu_idle_ratio,
                       "verdict": {"interactive": interactive_verdict, "bulk": bulk_verdict}}
         except Exception:
             sample = {"fresh": False, "verdict": "deferred", "reason": "resource_sample_unavailable"}

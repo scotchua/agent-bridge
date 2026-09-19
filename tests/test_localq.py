@@ -216,6 +216,22 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(deferred["status"], "queued")
         self.assertIn("resource_cpu_load", self.queue.status(job["job_id"])["error"])
 
+    def test_high_load_ratio_with_healthy_measured_idle_is_admitted(self):
+        job = self.submit(input="load average lags a genuinely idle cpu")
+        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 0.90, 0.40)
+        terminal = self.queue.run_once("runner")
+        self.assertEqual(terminal["job_id"], job["job_id"])
+        self.assertEqual(terminal["disposition"]["outcome"], "complete")
+        report = self.queue.state_report()
+        self.assertEqual(report["resource"]["verdict"]["interactive"], "admissible")
+
+    def test_high_load_ratio_with_unmeasured_idle_still_defers(self):
+        job = self.submit(input="load average high, no idle probe available")
+        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 0.90, None)
+        deferred = self.queue.run_once("runner")
+        self.assertEqual(deferred["status"], "queued")
+        self.assertIn("resource_cpu_load", self.queue.status(job["job_id"])["error"])
+
     def test_child_receives_minimal_environment_and_running_cancel_terminates_it(self):
         os.environ["EXAMPLE_API_KEY"] = "must-not-pass"
         try:

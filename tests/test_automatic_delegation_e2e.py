@@ -104,7 +104,8 @@ class PortableSampler:
         self.last_details = {"source": "portable-test-sampler"}
 
     def sample(self):
-        return ResourceSnapshot(self.clock(), "normal", "normal", True, 600.0, 0.0)
+        return ResourceSnapshot(self.clock(), "normal", "normal", True, 600.0, 0.0,
+                                cpu_idle_ratio=0.9)
 
 
 class ModelService(BaseHTTPRequestHandler):
