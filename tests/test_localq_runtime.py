@@ -26,15 +26,39 @@ class RuntimeTests(unittest.TestCase):
             "/usr/bin/pmset": "Now drawing from 'AC Power'\n -InternalBattery-0 100%; charging;\n",
             "/usr/sbin/ioreg": '"HIDIdleTime" = 120000000000\n',
             "/usr/bin/uptime": " 10:00 up 1 day, 1 user, load averages: 0.42 0.31 0.22\n",
+            "/usr/bin/top": "Processes: 400 total\nCPU usage: 12.5% user, 7.5% sys, 80.0% idle\n",
         }
         sampler = MacSampler(lambda argv: fixtures[argv[0]], thermal_probe=lambda: "normal",
                              cores_probe=lambda: 8, clock=lambda: 100.0)
         snap = sampler.sample()
-        self.assertEqual(snap, ResourceSnapshot(100.0, "normal", "normal", True, 120.0, 0.0525))
+        self.assertEqual(snap, ResourceSnapshot(100.0, "normal", "normal", True, 120.0, 0.0525, 0.80))
         self.assertEqual(sampler.last_details["load_1"], 0.42)
         self.assertEqual(sampler.last_details["cpu_cores"], 8)
         with self.assertRaises(ValueError):
             MacSampler(lambda _: "bad").sample()
+
+    def test_mac_sampler_tolerates_unparseable_or_failing_top_probe(self):
+        fixtures = {
+            "/usr/bin/memory_pressure": "System-wide memory free percentage: 42%\n",
+            "/usr/bin/pmset": "Now drawing from 'AC Power'\n -InternalBattery-0 100%; charging;\n",
+            "/usr/sbin/ioreg": '"HIDIdleTime" = 120000000000\n',
+            "/usr/bin/uptime": " 10:00 up 1 day, 1 user, load averages: 0.42 0.31 0.22\n",
+            "/usr/bin/top": "unexpected output with no CPU usage line\n",
+        }
+        sampler = MacSampler(lambda argv: fixtures[argv[0]], thermal_probe=lambda: "normal",
+                             cores_probe=lambda: 8, clock=lambda: 100.0)
+        snap = sampler.sample()
+        self.assertIsNone(snap.cpu_idle_ratio)
+
+        def raising_runner(argv):
+            if argv[0] == "/usr/bin/top":
+                raise RuntimeError("top unavailable")
+            return fixtures[argv[0]]
+
+        sampler = MacSampler(raising_runner, thermal_probe=lambda: "normal",
+                             cores_probe=lambda: 8, clock=lambda: 100.0)
+        snap = sampler.sample()
+        self.assertIsNone(snap.cpu_idle_ratio)
 
     def test_worker_child_uses_explicit_paths_auto_provider_and_queue_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:

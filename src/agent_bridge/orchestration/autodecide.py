@@ -63,7 +63,7 @@ from typing import Any
 from .. import store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                                StageRouter, capacity_fingerprint as _fingerprint)
-from . import autoroute, gate
+from . import autoroute, gate, localfirst
 
 #: How long an automatically claimed stage is leased for. Long enough that an
 #: ordinary editing session does not re-decide on every call, short enough
@@ -418,13 +418,34 @@ def retire_superseded_intent(state_root: str, repo: str, *, reason: str,
     return True
 
 
+def _measured_cpu_idle_ratio(local_queue_root: str | None) -> float | None:
+    """The local queue's own last-sampled CPU idle fraction, best-effort.
+
+    Reads the same heartbeat ``readiness()`` consults, rather than probing
+    again, so the two checks can never disagree about the machine's state.
+    A missing, stale or malformed heartbeat simply means no rescue is
+    available here -- this is an optional signal that can only help a
+    decision along, never one this function fails closed over.
+    """
+    if not local_queue_root:
+        return None
+    heartbeat = store.read_json_or_none(localfirst.heartbeat_path(local_queue_root))
+    queue_state = heartbeat.get("queue") if isinstance(heartbeat, dict) else None
+    resource = queue_state.get("resource") if isinstance(queue_state, dict) else None
+    cpu_idle_ratio = resource.get("cpu_idle_ratio") if isinstance(resource, dict) else None
+    if isinstance(cpu_idle_ratio, (int, float)) and not isinstance(cpu_idle_ratio, bool):
+        return cpu_idle_ratio
+    return None
+
+
 def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str,
                     task_type: str = "implementation", is_review: bool = False,
                     author_route: str | None = None,
                     lease_seconds: float = DEFAULT_LEASE_SECONDS,
                     ttl_seconds: int = DEFAULT_TTL_SECONDS,
                     clock: Any = time.time,
-                    load: autoroute.Load | None = None) -> Outcome:
+                    load: autoroute.Load | None = None,
+                    local_queue_root: str | None = None) -> Outcome:
     """Compute, establish and record the routing decision for one repository.
 
     Raises :class:`AutoDecisionError` for anything it cannot do, so the gate
@@ -460,6 +481,7 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
     signal = autoroute.Signal(client=client, repo=repo_root, task_type=task_type,
                               is_review=is_review, author_route=author_route)
     reading = load if load is not None else autoroute.probe_load()
+    cpu_idle_ratio = _measured_cpu_idle_ratio(local_queue_root)
 
     # Capacity is written before the decision reads it, because a retained
     # decision needs its own route to be a fresh eligible one for the router
@@ -472,7 +494,7 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
         raise AutoDecisionError(f"capacity_record_failed:{type(exc).__name__}") from None
 
     decision = autoroute.decide(signal, policy, fresh_routes=fresh_routes(router),
-                                load=reading)
+                                load=reading, cpu_idle_ratio=cpu_idle_ratio)
     # Read after the decision, from the same ledger the decision read, so the
     # receipt records the capacity it was actually made under.
     capacity_digest = capacity_fingerprint(router)

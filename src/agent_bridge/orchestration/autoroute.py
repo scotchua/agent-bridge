@@ -37,6 +37,17 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from ..localq.spool import QueueCaps
+
+#: Mirrors ``localfirst.MIN_LOCAL_IDLE_RATIO``/``QueueCaps.min_cpu_idle_ratio``:
+#: a directly measured CPU idle fraction at or above this rescues the load
+#: check below, for the same reason it rescues queue admission and
+#: ``readiness()`` (load-average-per-core conflates waiting-on-I/O with
+#: genuine CPU contention). Re-derived here rather than imported from
+#: ``localfirst`` because that module already imports this one -- importing
+#: back would cycle -- so both read the same ``QueueCaps`` default instead.
+MIN_LOCAL_IDLE_RATIO = QueueCaps().min_cpu_idle_ratio
+
 #: Every route that exists. A paid API route is not absent by configuration,
 #: it is absent from the vocabulary.
 ROUTES = ("claude", "codex", "local")
@@ -366,7 +377,7 @@ CODES = frozenset({
 
 
 def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
-           load: Load) -> Decision:
+           load: Load, cpu_idle_ratio: float | None = None) -> Decision:
     """Select one route for ``signal``. Pure, total, and fail-closed.
 
     ``fresh_routes`` is the set of routes the stage router currently holds a
@@ -374,9 +385,16 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
     machine nobody has reported capacity for, and it means peers are not
     dispatched to: a capacity observation expires closed by design, and this
     function does not second-guess that.
+
+    ``cpu_idle_ratio`` is an optional, directly measured CPU idle fraction
+    (from the same heartbeat sample the caller already has, not re-probed
+    here) that can rescue an otherwise-high load reading -- see
+    ``MIN_LOCAL_IDLE_RATIO``. Passing ``None`` means no such reading exists;
+    it is recorded honestly rather than treated as any particular value.
     """
     repo_policy = policy.for_repo(signal.repo)
     peer = PEER_FOR_CLIENT[signal.client]
+    idle_known = isinstance(cpu_idle_ratio, (int, float)) and not isinstance(cpu_idle_ratio, bool)
     considered: dict[str, object] = {
         "client": signal.client,
         "peer": peer,
@@ -386,6 +404,7 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
         "mechanical_ok": repo_policy.mechanical_ok,
         "fresh_routes": sorted(fresh_routes),
         "load_per_core": load.busy_at,
+        "cpu_idle_ratio": cpu_idle_ratio if idle_known else None,
         "is_review": signal.is_review,
         "author_route": signal.author_route,
     }
@@ -426,12 +445,15 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
                 "this host exposes no load average, so local capacity is "
                 "unknown and local work defers rather than assuming the "
                 "machine is idle")
-        if load.ratio >= policy.max_local_load_ratio:
+        idle_rescues = idle_known and cpu_idle_ratio >= MIN_LOCAL_IDLE_RATIO
+        if load.ratio >= policy.max_local_load_ratio and not idle_rescues:
+            detail = (f"; measured idle {cpu_idle_ratio:.2f} is below the "
+                      f"{MIN_LOCAL_IDLE_RATIO} rescue threshold" if idle_known else "")
             return retain(
                 "retained_local_load_high",
                 f"load per core is {load.busy_at}, at or above the "
-                f"{policy.max_local_load_ratio} ceiling, so the local model "
-                f"would compete with the user's own machine")
+                f"{policy.max_local_load_ratio} ceiling{detail}, so the local "
+                f"model would compete with the user's own machine")
         if "local" not in fresh_routes:
             return retain(
                 "retained_no_fresh_capacity",

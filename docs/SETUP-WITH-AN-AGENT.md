@@ -14,6 +14,13 @@ can only read the link, open a local agent session with the downloaded repo.
 
 ## For the assistant: complete this sequence
 
+Never copy the author's account permissions, home paths, credentials, model
+names, or live configuration onto the user's machine. "Same connection" means
+the same supported consultation tools and workflow, not identical account
+access or automatic sharing of all conversations. Consultations are not
+arbitrary remote execution. Do not claim live Windows testing from mocked
+platform paths or macOS tests — Windows claims need a real Windows or WSL run.
+
 ### 1. Inspect the computer
 
 Use a durable local checkout, preferably in the user's home directory. Detect

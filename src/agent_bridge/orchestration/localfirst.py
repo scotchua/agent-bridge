@@ -71,6 +71,15 @@ CALIBRATION_RUNS_PER_SIZE = 3
 JSON_ENVELOPE_HEADROOM_BYTES = 1_000
 MAX_WINDOW_BYTES = QueueCaps().max_input_bytes - JSON_ENVELOPE_HEADROOM_BYTES
 
+#: Mirrors ``QueueCaps.min_cpu_idle_ratio``: a directly measured CPU idle
+#: fraction at or above this rescues the load-average check below, for the
+#: same reason it rescues queue admission (load-average-per-core conflates
+#: waiting-on-I/O with genuine CPU contention). Read from the same heartbeat
+#: sample the resource_deferred check above already consulted, not
+#: re-probed, so the two checks can never disagree about the machine's
+#: current state.
+MIN_LOCAL_IDLE_RATIO = QueueCaps().min_cpu_idle_ratio
+
 #: The byte sizes calibration measures at, smallest first. The largest tier
 #: is ``MAX_WINDOW_BYTES`` itself, so calibration never measures a window a
 #: real digest could not also request.
@@ -389,11 +398,17 @@ def readiness(*, policy: "autoroute.Policy", state_root: str, local_queue_root: 
             "load_unknown",
             "this host exposes no load average, so local capacity is unknown",
             considered)
-    if reading.ratio >= policy.max_local_load_ratio:
+    cpu_idle_ratio = resource.get("cpu_idle_ratio")
+    idle_known = isinstance(cpu_idle_ratio, (int, float)) and not isinstance(cpu_idle_ratio, bool)
+    considered["cpu_idle_ratio"] = cpu_idle_ratio if idle_known else None
+    idle_rescues = idle_known and cpu_idle_ratio >= MIN_LOCAL_IDLE_RATIO
+    if reading.ratio >= policy.max_local_load_ratio and not idle_rescues:
+        detail = (f"; measured idle {cpu_idle_ratio:.2f} is below the "
+                  f"{MIN_LOCAL_IDLE_RATIO} rescue threshold" if idle_known else "")
         return _not_ready(
             "load_high",
             f"load per core is {reading.busy_at}, at or above the "
-            f"{policy.max_local_load_ratio} ceiling",
+            f"{policy.max_local_load_ratio} ceiling{detail}",
             considered)
 
     covering_size, covering_median = _covering_calibration(calibration, window)

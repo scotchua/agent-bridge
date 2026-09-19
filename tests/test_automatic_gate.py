@@ -684,6 +684,77 @@ class TheTieBreakIsSymmetricUnlessAskedOtherwise(unittest.TestCase):
         self.assertEqual(decision.code, "routed_peer_review_independence")
 
 
+class MeasuredCpuIdleRatioForAutomaticRouting(unittest.TestCase):
+    """The plumbing ``ensure_decision()`` uses to source the same idle
+    rescue ``readiness()`` applies, read from the same heartbeat file."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.local_queue_root = str(Path(self.temp.name))
+
+    def write_heartbeat(self, resource):
+        path = Path(autodecide.localfirst.heartbeat_path(self.local_queue_root))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"updated_at": time.time(),
+                                    "queue": {"resource": resource}}),
+                        encoding="utf-8")
+
+    def test_no_local_queue_root_reads_nothing(self):
+        self.assertIsNone(autodecide._measured_cpu_idle_ratio(None))
+
+    def test_no_heartbeat_file_reads_nothing(self):
+        self.assertIsNone(autodecide._measured_cpu_idle_ratio(self.local_queue_root))
+
+    def test_a_real_reading_is_returned(self):
+        self.write_heartbeat({"cpu_idle_ratio": 0.42})
+        self.assertEqual(
+            autodecide._measured_cpu_idle_ratio(self.local_queue_root), 0.42)
+
+    def test_a_malformed_heartbeat_reads_nothing_rather_than_raising(self):
+        path = Path(autodecide.localfirst.heartbeat_path(self.local_queue_root))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json", encoding="utf-8")
+        self.assertIsNone(autodecide._measured_cpu_idle_ratio(self.local_queue_root))
+
+
+class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
+    """Mirrors ``localfirst.readiness()``'s rescue: load-average-per-core
+    conflates waiting-on-I/O with genuine CPU contention, so a directly
+    measured idle fraction can still let mechanical local work through."""
+
+    def decide(self, load_ratio, cpu_idle_ratio):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("public", ("local",), mechanical_ok=True)},
+            max_local_load_ratio=0.5)
+        return autoroute.decide(
+            autoroute.Signal(client="claude", repo="/r", task_type="mechanical"),
+            policy, fresh_routes=frozenset({"local"}),
+            load=autoroute.Load(load_ratio, True), cpu_idle_ratio=cpu_idle_ratio)
+
+    def test_high_load_is_retained_without_a_measured_idle_reading(self):
+        decision = self.decide(0.9, None)
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_local_load_high")
+        self.assertIsNone(decision.considered["cpu_idle_ratio"])
+
+    def test_high_load_is_rescued_by_a_high_measured_idle_reading(self):
+        decision = self.decide(0.9, 0.9)
+        self.assertEqual(decision.route, "local")
+        self.assertEqual(decision.code, "routed_local_mechanical")
+        self.assertEqual(decision.considered["cpu_idle_ratio"], 0.9)
+
+    def test_a_low_measured_idle_reading_does_not_rescue_it(self):
+        decision = self.decide(0.9, 0.1)
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_local_load_high")
+
+    def test_low_load_needs_no_rescue_and_still_records_the_reading(self):
+        decision = self.decide(0.1, 0.4)
+        self.assertEqual(decision.route, "local")
+        self.assertEqual(decision.considered["cpu_idle_ratio"], 0.4)
+
+
 class PolicyParsing(unittest.TestCase):
     def test_an_absent_policy_retains_everything(self):
         with tempfile.TemporaryDirectory() as temporary:
