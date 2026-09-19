@@ -43,7 +43,8 @@ class PortableSampler:
     """
 
     def sample(self) -> ResourceSnapshot:
-        return ResourceSnapshot(time.time(), "normal", "normal", True, 600.0, 0.0)
+        return ResourceSnapshot(time.time(), "normal", "normal", True, 600.0, 0.0,
+                                cpu_idle_ratio=0.9)
 
 
 # ------------------------------------------------------------------- globs
@@ -630,7 +631,7 @@ class ReadinessTests(unittest.TestCase):
         store.atomic_write_json(localfirst.calibration_path(str(self.state)), {
             "version": 1, "created_at": created_at, "worker_sha256": sha, "sizes": sizes})
 
-    def _write_heartbeat(self, *, updated_at=None, verdict="admissible"):
+    def _write_heartbeat(self, *, updated_at=None, verdict="admissible", cpu_idle_ratio=None):
         updated_at = updated_at if updated_at is not None else time.time()
         if verdict == "admissible":
             resource = {"verdict": {"interactive": "admissible", "bulk": "deferred"}}
@@ -640,6 +641,8 @@ class ReadinessTests(unittest.TestCase):
             resource = {"verdict": "deferred", "reason": "resource_sample_unavailable"}
         else:
             raise AssertionError(verdict)
+        if cpu_idle_ratio is not None:
+            resource["cpu_idle_ratio"] = cpu_idle_ratio
         store.atomic_write_json(localfirst.heartbeat_path(str(self.local_queue)), {
             "version": 1, "updated_at": updated_at, "queue": {"resource": resource}})
 
@@ -728,6 +731,26 @@ class ReadinessTests(unittest.TestCase):
     def test_load_high(self):
         self._write_calibration()
         self._write_heartbeat()
+        result = self._readiness(self._enabled_policy(max_local_load_ratio=0.5),
+                                 load=autoroute.Load(ratio=0.9, known=True))
+        self.assertEqual(result.code, "load_high")
+
+    def test_load_high_rescued_by_measured_idle(self):
+        """The same rescue LocalQueue admission gets: load-average-per-core
+        conflates waiting-on-I/O with genuine CPU contention, so a directly
+        measured idle fraction from the same heartbeat sample can still let
+        the lane through."""
+        self._write_calibration()
+        self._write_heartbeat(cpu_idle_ratio=0.9)
+        result = self._readiness(self._enabled_policy(max_local_load_ratio=0.5),
+                                 load=autoroute.Load(ratio=0.9, known=True))
+        self.assertTrue(result.ready, result)
+        self.assertEqual(result.code, "ready")
+        self.assertEqual(result.considered["cpu_idle_ratio"], 0.9)
+
+    def test_load_high_not_rescued_by_low_measured_idle(self):
+        self._write_calibration()
+        self._write_heartbeat(cpu_idle_ratio=0.1)
         result = self._readiness(self._enabled_policy(max_local_load_ratio=0.5),
                                  load=autoroute.Load(ratio=0.9, known=True))
         self.assertEqual(result.code, "load_high")
