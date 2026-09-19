@@ -929,9 +929,19 @@ class CalibrateTests(unittest.TestCase):
         """The real MacSampler is what production uses when nothing is
         injected. On any host that is not macOS this documents the honest
         consequence rather than hiding it behind a fake: calibrate refuses
-        rather than measuring blind."""
+        rather than measuring blind.
+
+        The real MacSampler is exercised (nothing injected), but its
+        sample() is forced to fail the way it genuinely does on a host with
+        no macOS probes -- the outcome must not depend on this machine's own
+        ambient CPU load/idle state, which real hardware makes nondeterministic
+        (found by adversarial review: this host's real load average and idle%
+        could otherwise land on either side of admission from one run to the
+        next)."""
         self._start_model()
-        result = delegation_verify.calibrate(str(self.config_path))
+        with mock.patch("agent_bridge.localq.runtime.MacSampler.sample",
+                        side_effect=RuntimeError("no macos probes on this host")):
+            result = delegation_verify.calibrate(str(self.config_path))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "calibration_refused:resource_resource_sample_unavailable")
 
@@ -1017,18 +1027,32 @@ class CalibrateTests(unittest.TestCase):
 
     def test_calibrate_cli_writes_the_record_and_exits_zero(self):
         self._start_model()
+        # No portable sampler is reachable from a real CLI subprocess (unlike
+        # the in-process tests above, there is no seam here to mock the real
+        # MacSampler), so refusal is forced through a config-level trigger
+        # instead of ambient resource state: this host's real load average
+        # and idle% are nondeterministic and, found by adversarial review,
+        # can land on either side of admission from one run to the next.
+        # worker_not_configured is checked before any resource sampling, so
+        # it refuses the same way regardless of host CPU state.
+        store.atomic_write_json(str(self.config_path), {
+            "config_version": "1", "state_root": str(self.state),
+            "local_queue_root": str(self.local_queue),
+            "capacity_db": str(self.state / "capacity.sqlite3"),
+            "worker_executable": str(self.base / "does-not-exist"),
+            "worker_state": str(self.worker_state), "interval_seconds": 1.0})
         env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
         import subprocess
         completed = subprocess.run(
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.delegation_verify",
              "calibrate", "--config", str(self.config_path)],
             capture_output=True, timeout=60, env=env)
-        # No portable sampler is reachable from the CLI, so on this host the
-        # real MacSampler refuses; the CLI's exit code must reflect that
-        # ("ok": false) rather than reporting success.
+        # The CLI's exit code must reflect refusal ("ok": false) rather than
+        # reporting success.
         self.assertEqual(completed.returncode, 1, completed.stdout.decode() + completed.stderr.decode())
         payload = json.loads(completed.stdout.decode())
         self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "calibration_refused:worker_not_configured")
 
 
 # ---------------------------------------------------------- protected launchers

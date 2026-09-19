@@ -83,6 +83,17 @@ class MacSampler:
             raise ValueError("uptime output not recognized")
         return float(match.group(1))
 
+    @staticmethod
+    def _cpu_idle(text: str) -> float | None:
+        """None on no match or on an unparseable captured number, never raises."""
+        match = re.search(r"CPU usage:\s*[\d.]+%\s*user,\s*[\d.]+%\s*sys,\s*([\d.]+)%\s*idle", text, re.I)
+        if not match:
+            return None
+        try:
+            return float(match.group(1)) / 100.0
+        except ValueError:
+            return None
+
     def sample(self) -> ResourceSnapshot:
         memory = self.runner(["/usr/bin/memory_pressure", "-Q"])
         battery = self.runner(["/usr/bin/pmset", "-g", "batt"])
@@ -96,6 +107,19 @@ class MacSampler:
                              "thermal_source": "configured" if self.thermal_probe else "unavailable"}
         if self.last_details["cpu_cores"] <= 0:
             raise ValueError("invalid core count")
+        # Best-effort secondary signal only: unlike the probes above, a failure here
+        # must not fail the whole sample closed. It only ever widens admission (see
+        # QueueCaps.min_cpu_idle_ratio), so losing it just falls back to the
+        # load-ratio check that existed before it. Only the runner call (an
+        # injected boundary with no fixed exception contract) is caught broadly;
+        # _cpu_idle itself is provably exception-free, so a real bug there still
+        # surfaces instead of being silently swallowed here.
+        try:
+            top_text = self.runner(["/usr/bin/top", "-l", "1", "-n", "0"])
+        except Exception:
+            top_text = None
+        cpu_idle = self._cpu_idle(top_text) if top_text is not None else None
         return ResourceSnapshot(self.clock(), self._memory(memory), thermal,
                                 self._ac_power(battery), self._idle_seconds(idle),
-                                self.last_details["load_1"] / self.last_details["cpu_cores"])
+                                self.last_details["load_1"] / self.last_details["cpu_cores"],
+                                cpu_idle)
