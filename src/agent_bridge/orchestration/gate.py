@@ -1538,7 +1538,8 @@ def record_event(state_root: str, client: str, tool_name: str, decision: Decisio
         store.append_ledger(os.path.join(receipt_dir(state_root), EVENT_LEDGER), record)
 
 
-def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:
+def automatic_decider(client: str, state_root: str, capacity_db: str,
+                      local_queue_root: str = "") -> Any:
     """The callable :func:`judge` uses to create a decision that does not exist.
 
     Imported lazily so ``gate`` stays importable without the stage router and
@@ -1548,7 +1549,8 @@ def automatic_decider(client: str, state_root: str, capacity_db: str) -> Any:
         from .autodecide import ensure_decision
 
         return ensure_decision(client=client, repo=repo, state_root=state_root,
-                               capacity_db=capacity_db, task_type=task_type)
+                               capacity_db=capacity_db, task_type=task_type,
+                               local_queue_root=local_queue_root or None)
     return decide
 
 
@@ -2365,7 +2367,8 @@ def main(argv: list[str] | None = None) -> int:
                             protected=protected, local_queue_root=local_queue_root,
                             worker_executable=worker_executable,
                             decide=None if args.no_automatic_routing else
-                            automatic_decider(args.client, state_root, capacity_db))
+                            automatic_decider(args.client, state_root, capacity_db,
+                                              local_queue_root))
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "
