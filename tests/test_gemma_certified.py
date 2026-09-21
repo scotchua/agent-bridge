@@ -22,7 +22,7 @@ from agent_bridge.localq.spool import (FakeBackend, LocalQueue, QueueCaps,
                                        ResourceSnapshot, SubprocessBackend,
                                        UNSUPPORTED_KIND_REASON)
 from agent_bridge.orchestration.config import OrchestrationConfigError, load
-from agent_bridge.orchestration import delegation_verify, localfirst
+from agent_bridge.orchestration import delegation_verify, gate, localfirst
 
 
 FAKES = Path(__file__).resolve().parent / "fakes"
@@ -127,11 +127,44 @@ class ConfigAndSelectionTests(unittest.TestCase):
         service = Service.for_config(cfg, root=str(self.root / "service"), sampler=Sampler())
         self.assertEqual(service.queue.allowed_task_types, frozenset({"summarize"}))
 
+    def test_gate_readiness_uses_the_backend_calibration_target(self):
+        private = config_doc(self.root, self.fx, "private_worker")
+        private_path = self.write(private)
+        self.assertEqual(gate.gate_paths_from_config(str(private_path))[3],
+                         private["worker_executable"])
+
+        gemma = config_doc(self.root, self.fx)
+        gemma_path = self.write(gemma)
+        self.assertEqual(gate.gate_paths_from_config(str(gemma_path))[3],
+                         gemma["gemma_delegate_executable"])
+
+    def test_checkpoint_and_route_measure_the_same_unicode_payload(self):
+        cfg = load(self.write(config_doc(self.root, self.fx)))
+        service = Service.for_config(cfg, root=str(self.root / "unicode"), sampler=Sampler())
+        intake = AutomaticIntake(
+            service.queue, policy=IntakePolicy(min_input_chars=1, min_nonblank_lines=1))
+        samples = ("caf\u00e9\r\n", "cafe\u0301\n", "\ufeff\u4e16\u754c\n", "\U0001f680\n")
+        for index, text in enumerate(samples):
+            with self.subTest(index=index):
+                checkpoint = intake.checkpoint(
+                    task_id=f"unicode-{index}", task_type="summarize",
+                    classification="internal_nonclient", caller="codex",
+                    input_bytes=len(text.encode("utf-8")),
+                    nonblank_lines=sum(1 for line in text.splitlines() if line.strip()))
+                routed = intake.route(
+                    task_type="summarize", input=text, params=None,
+                    priority="interactive", classification="internal_nonclient",
+                    caller="codex", purpose="work",
+                    checkpoint_id=checkpoint["checkpoint_id"])
+                self.assertEqual(routed["decision"], "local")
+
     @unittest.skipUnless(os.name == "posix", "certified Gemma backend requires POSIX process groups")
     def test_gemma_calibration_uses_only_certified_params_and_runs_every_sample(self):
         config_path = self.write(config_doc(self.root, self.fx))
         result = delegation_verify.calibrate(str(config_path), sampler=Sampler())
         self.assertTrue(result["ok"], result)
+        record = localfirst.load_calibration_record(str(self.root / "state"))
+        self.assertEqual(record["backend_id"], "gemma_certified")
         expected = len(localfirst.CALIBRATION_SIZES) * localfirst.CALIBRATION_RUNS_PER_SIZE
         self.assertEqual(int((self.fx["install"] / "calls.txt").read_text()), expected)
         samples = [delegation_verify._synthetic_calibration_input(8000, index)

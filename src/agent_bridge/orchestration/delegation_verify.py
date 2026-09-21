@@ -424,7 +424,8 @@ def calibrate(config_path: str, *, clock: Any = time.time,
                "python_version": platform.python_version()}
         record = localfirst.build_calibration_record(
             worker_executable=str(calibration_target), worker_state=str(cfg.worker_state),
-            sizes=sizes, sampler_snapshot=resource, host=host, clock=clock)
+            sizes=sizes, sampler_snapshot=resource, host=host,
+            backend_id=str(getattr(cfg, "local_backend", "private_worker")), clock=clock)
         localfirst.write_calibration_record(str(cfg.state_root), record)
     finally:
         shutil.rmtree(queue_root, ignore_errors=True)

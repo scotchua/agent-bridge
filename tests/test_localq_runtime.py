@@ -150,6 +150,7 @@ class RuntimeTests(unittest.TestCase):
             restarted = Service(str(root), str(worker), str(state), sampler=Sampler()).once()
             saved = json.loads((root / "runtime-state.json").read_text())
             self.assertEqual(first["version"], 1)
+            self.assertEqual(first["backend_id"], "private_worker")
             self.assertEqual(restarted["queue"]["state"], "local_queue")
             self.assertEqual(saved["sampler"], {"fixture": True})
 

@@ -1685,9 +1685,15 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
     ``<state_root>/local-queue`` when the config omits it, matching
     ``config/orchestration.example.json``, so an existing config written
     before the local-first read gate existed keeps working.
-    ``worker_executable`` defaults to the empty string when absent, the same
-    reasoning: a config predating this feature (or a test's minimal one) has
-    no worker to name, and an empty string is exactly what
+    The returned executable is the productive backend calibration actually
+    measures: ``gemma_delegate_executable`` for ``gemma_certified`` and the
+    existing ``worker_executable`` otherwise. Keeping this selection here is
+    load-bearing: calibration pins the Gemma delegate, so comparing that
+    record with the legacy private-worker path would make every post-activation
+    readiness check report ``calibration_worker_changed`` and silently waive
+    the local-first read gate. ``worker_executable`` defaults to the empty
+    string when absent, the same reasoning: a config predating this feature
+    (or a test's minimal one) has no worker to name, and an empty string is exactly what
     ``localfirst.readiness`` already reads as "no local worker configured"
     (``worker_not_configured``), never a crash.
     """
@@ -1701,11 +1707,14 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
         local_queue_root = os.path.join(loaded["state_root"], "local-queue")
     elif not isinstance(local_queue_root, str):
         raise ValueError("orchestration config local_queue_root must be a string")
-    worker_executable = loaded.get("worker_executable")
+    worker_field = ("gemma_delegate_executable"
+                    if loaded.get("local_backend") == "gemma_certified"
+                    else "worker_executable")
+    worker_executable = loaded.get(worker_field)
     if worker_executable is None:
         worker_executable = ""
     elif not isinstance(worker_executable, str):
-        raise ValueError("orchestration config worker_executable must be a string")
+        raise ValueError(f"orchestration config {worker_field} must be a string")
     return loaded["state_root"], loaded["capacity_db"], local_queue_root, worker_executable
 
 

@@ -33,7 +33,8 @@ def atomic_state(path: Path, value: dict) -> None:
 class Service:
     def __init__(self, root: str, worker: str, worker_state: str, *, sampler: MacSampler | None = None,
                  backend: Backend | None = None, caps: QueueCaps | None = None,
-                 allowed_task_types: "frozenset[str] | None" = None):
+                 allowed_task_types: "frozenset[str] | None" = None,
+                 backend_id: str = "private_worker"):
         """Build the queue for one local backend.
 
         ``worker``/``worker_state`` build the default private-worker
@@ -44,7 +45,10 @@ class Service:
         ``local_backend: "gemma_certified"`` -- without this constructor
         knowing anything about that backend's own contract.
         """
+        if not isinstance(backend_id, str) or not backend_id:
+            raise ValueError("backend_id_invalid")
         self.root = Path(root).absolute()
+        self.backend_id = backend_id
         self.sampler = sampler or MacSampler()
         if backend is None:
             command = [sys.executable, str(Path(worker_child.__file__).resolve()), "--worker", worker, "--state", worker_state,
@@ -70,11 +74,13 @@ class Service:
         queue_root = str(root) if root is not None else str(cfg.local_queue_root)
         backend, caps, allowed = build_backend_and_caps(cfg, queue_root)
         return cls(queue_root, str(cfg.worker_executable), str(cfg.worker_state),
-                  sampler=sampler, backend=backend, caps=caps, allowed_task_types=allowed)
+                  sampler=sampler, backend=backend, caps=caps, allowed_task_types=allowed,
+                  backend_id=str(getattr(cfg, "local_backend", "private_worker")))
 
     def once(self) -> dict:
         result = self.queue.run_once("localq-service")
-        state = {"version": 1, "updated_at": time.time(), "last_result": result,
+        state = {"version": 1, "updated_at": time.time(), "backend_id": self.backend_id,
+                 "last_result": result,
                  "queue": self.queue.state_report(), "sampler": getattr(self.sampler, "last_details", {})}
         atomic_state(self.state_path, state)
         return state

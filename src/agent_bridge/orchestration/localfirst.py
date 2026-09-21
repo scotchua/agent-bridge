@@ -370,6 +370,22 @@ def readiness(*, policy: "autoroute.Policy", state_root: str, local_queue_root: 
             "server's background executor appears to have stopped",
             considered)
 
+    # A server loads its backend once at process start. A fresh heartbeat
+    # from a server that predates a config change is therefore not evidence
+    # that the backend this calibration measured is running. New calibration
+    # records bind a backend id; once bound, an absent id is also a mismatch,
+    # so only a restarted server that loaded the same backend makes the lane
+    # ready. Legacy records have no backend id and retain their old behavior.
+    calibrated_backend = calibration.get("backend_id")
+    if (isinstance(calibrated_backend, str)
+            and heartbeat.get("backend_id") != calibrated_backend):
+        return _not_ready(
+            "executor_not_running",
+            "the local-queue heartbeat belongs to a different backend than "
+            "the current calibration; restart the orchestration server",
+            {**considered, "calibrated_backend": calibrated_backend,
+             "heartbeat_backend": heartbeat.get("backend_id")})
+
     queue_state = heartbeat.get("queue")
     resource = queue_state.get("resource") if isinstance(queue_state, dict) else None
     verdict = resource.get("verdict") if isinstance(resource, dict) else None
@@ -477,13 +493,14 @@ def _covering_calibration(calibration: dict[str, Any],
 def build_calibration_record(*, worker_executable: str, worker_state: str,
                              sizes: dict[str, dict[str, Any]],
                              sampler_snapshot: dict[str, Any], host: dict[str, Any],
+                             backend_id: str | None = None,
                              clock: Callable[[], float] = time.time) -> dict[str, Any]:
     """The durable shape ``delegation_verify calibrate`` writes.
 
     A pure assembler: it does no I/O and makes no provider or model calls,
     so it can be unit-tested without a real local worker.
     """
-    return {
+    record = {
         "version": CALIBRATION_VERSION,
         "created_at": float(clock()),
         "worker_sha256": store.sha256_file(worker_executable),
@@ -492,6 +509,11 @@ def build_calibration_record(*, worker_executable: str, worker_state: str,
         "sampler": sampler_snapshot,
         "host": host,
     }
+    if backend_id is not None:
+        if not isinstance(backend_id, str) or not backend_id:
+            raise ValueError("backend_id_invalid")
+        record["backend_id"] = backend_id
+    return record
 
 
 def write_calibration_record(state_root: str, record: dict[str, Any]) -> None:
