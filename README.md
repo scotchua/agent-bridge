@@ -206,7 +206,10 @@ mint one automatically, and record whether an eligible unit was actually
 dispatched. The optional certified Gemma backend is configuration-selected,
 summarize-only, and pins the model digest plus both security-critical source
 files. Unsupported work refuses before queueing and never substitutes Qwen,
-Apple, or a cloud provider. See
+Apple, or a cloud provider. Calibration and the live executor heartbeat are
+also bound to the selected backend, so an old private-worker process cannot
+satisfy Gemma readiness after a configuration change; restart the connected
+apps after changing the backend. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md#certified-gemma-local-backend).
 
 Saying yes also installs the **delegation-first gate**, which is the part that

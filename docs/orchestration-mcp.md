@@ -101,7 +101,12 @@ Configuration is server-owned. No request can select a backend or model. The
 receipt directory must already exist as a private ordinary directory, and all
 configured files must be absolute, existing, regular and non-symlink paths.
 Run the synthetic calibration after changing the backend and before relying on
-it for production.
+it for production. The calibration record and the executor heartbeat both
+name the selected backend. Readiness refuses a missing or mismatched backend
+identity, which prevents a still-running pre-change private-worker process
+from satisfying a new Gemma configuration. Restart every connected assistant
+after a backend change; until a matching heartbeat appears, local-first reads
+are waived and logged rather than dispatched through the old backend.
 
 Cross-provider implementation is different. The MCP processes only submit jobs
 and read durable status. They never start Claude or Codex. This matters on macOS
