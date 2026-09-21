@@ -60,6 +60,14 @@ def build_intake_tools(intake: AutomaticIntake) -> dict[str, dict[str, Any]]:
         "purpose": {"type": "string", "enum": ["work", "test"]},
         "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
         "idempotency_key": {"type": "string"},
+        # AutomaticIntake.route now requires a checkpoint for every
+        # purpose="work" call (purpose="test" -- internal direct
+        # test/calibration code -- may still omit one). This standalone,
+        # non-caller-bound transport is a lower-level surface than
+        # orchestration's work_route_local, which mints and consumes its
+        # own checkpoint automatically; a caller here supplies one it
+        # already minted (a future local_checkpoint tool, or a test).
+        "checkpoint_id": {"type": "string"},
     }, ["task_type", "input", "priority", "classification", "caller", "purpose"])
     receipt = _schema({"receipt_id": {"type": "string"}}, ["receipt_id"])
 

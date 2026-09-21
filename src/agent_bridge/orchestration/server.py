@@ -157,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = load(args.config)
     cfg.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    service = Service(str(cfg.local_queue_root), str(cfg.worker_executable), str(cfg.worker_state))
+    # The local backend (gemma_certified or the existing private worker) is
+    # chosen exactly once, here, from the operator's own configuration file.
+    # Nothing this server exposes to a caller can change it.
+    service = Service.for_config(cfg)
     router = StageRouter(cfg.capacity_db)
     execution = None
     if cfg.execution_queue_root is not None:

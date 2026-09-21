@@ -106,6 +106,8 @@ jobs:
           python3 -m unittest discover -s tests -p "test_execution_dispatcher.py"
           python3 -m unittest discover -s tests -p "test_localq.py"
           python3 -m unittest discover -s tests -p "test_localq_intake.py"
+          python3 -m unittest discover -s tests -p "test_checkpoint.py"
+          python3 -m unittest discover -s tests -p "test_gemma_certified.py"
           python3 -m unittest discover -s tests -p "test_localq_server.py"
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
           python3 -m unittest discover -s tests -p "test_delegation_gate.py"

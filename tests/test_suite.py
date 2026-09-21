@@ -604,17 +604,21 @@ def test_local_first_declaration() -> None:
         intake = AutomaticIntake(
             queue, policy=IntakePolicy(min_input_chars=10, min_nonblank_lines=1), clock=time.time)
 
+        # purpose="test": this fixture drives AutomaticIntake.route directly
+        # to mint receipts for the local_first declaration checks below, the
+        # internal test/calibration exemption from the checkpoint
+        # requirement that purpose="work" now carries (tests/test_checkpoint.py).
         def local_receipt(idempotency_key, intake_instance=intake):
             return intake_instance.route(
                 task_type="summarize", input="synthetic operating note " * 8,
                 params={"instruction": "Select operating facts."}, priority="interactive",
-                classification="internal_nonclient", caller="codex", purpose="work",
+                classification="internal_nonclient", caller="codex", purpose="test",
                 risk_flags=[], idempotency_key=idempotency_key)
 
         refused_receipt = intake.route(
             task_type="summarize", input="synthetic operating note " * 8, params=None,
             priority="interactive", classification="client_derived", caller="codex",
-            purpose="work", risk_flags=[])
+            purpose="test", risk_flags=[])
         check("LF: fixture receipt actually refused",
               refused_receipt["decision"] == "refused", json.dumps(refused_receipt))
 

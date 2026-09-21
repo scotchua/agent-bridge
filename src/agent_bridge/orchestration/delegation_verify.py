@@ -218,18 +218,50 @@ def _run_direction(executor: Any, _unused_queue_root: Any,
     }
 
 
+#: The one fixed instruction every local-model verification/calibration run
+#: sends. It matches the certified delegate's own certified summarize
+#: prompt (``gemma_child.CERTIFIED_SUMMARIZE_INSTRUCTION``) exactly, so a
+#: run against ``gemma_certified`` sends the certified prompt rather than a
+#: second, separately-invented one.
+_LOCAL_MODEL_INSTRUCTION = "Summarize in one sentence."
+
+
+def _local_model_params(cfg: Any) -> dict[str, Any]:
+    """The params object this check/calibration actually sends, matching
+    whichever backend ``cfg`` configures rather than a hard-coded provider.
+
+    ``gemma_certified`` accepts no "provider" key at all -- nothing here
+    selects Qwen, Apple, or any other route for it -- so it is simply
+    omitted for that backend; the private worker keeps sending the explicit
+    "auto" it always effectively meant, exercising its own automatic
+    Apple/Qwen selection precisely as before.
+    """
+    params: dict[str, Any] = {"instruction": _LOCAL_MODEL_INSTRUCTION}
+    if getattr(cfg, "local_backend", "private_worker") != "gemma_certified":
+        params["provider"] = "auto"
+    return params
+
+
 def _local_model_check(cfg: Any) -> dict[str, Any]:
-    worker = Path(cfg.worker_executable)
-    if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
-        return {"status": "not_configured"}
+    backend = getattr(cfg, "local_backend", "private_worker")
+    if backend != "gemma_certified":
+        worker = Path(cfg.worker_executable)
+        if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
+            return {"status": "not_configured"}
     from ..localq.service import Service  # deferred: only needed on this path
     # Same isolation as the provider directions, for the same reason:
     # ``service.once()`` runs whatever is queued, and the user's own local
     # queue is not this check's to consume.
     queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-verify-localq-"))
     try:
-        return _local_model_check_in(cfg, Service(
-            str(queue_root), str(cfg.worker_executable), str(cfg.worker_state)))
+        # The private-worker branch keeps the exact three-positional-argument
+        # construction this always used, unchanged: existing callers (and
+        # tests that substitute a fake ``Service``) keep working without
+        # having to know about ``for_config``. Only "gemma_certified" needs
+        # that classmethod, to build the certified delegate's own backend.
+        service = (Service.for_config(cfg, root=str(queue_root)) if backend == "gemma_certified"
+                  else Service(str(queue_root), str(cfg.worker_executable), str(cfg.worker_state)))
+        return _local_model_check_in(cfg, service)
     finally:
         shutil.rmtree(queue_root, ignore_errors=True)
 
@@ -237,7 +269,7 @@ def _local_model_check(cfg: Any) -> dict[str, Any]:
 def _local_model_check_in(cfg: Any, service: Any) -> dict[str, Any]:
     submitted = service.queue.submit(
         task_type="summarize", input=LOCAL_MODEL_INPUT,
-        params={"instruction": "Summarize in one sentence.", "provider": "qwen"},
+        params=_local_model_params(cfg),
         priority="interactive", classification="synthetic", caller="codex", purpose="test",
         idempotency_key=f"delegation-verify-local-{int(time.time())}")
     job_id = submitted["job_id"]
@@ -260,9 +292,16 @@ _CALIBRATION_LINE = ("Synthetic calibration line for the agent-bridge "
                     "local-first read gate's digest timing measurement. ")
 
 
-def _synthetic_calibration_input(byte_length: int) -> str:
+def _synthetic_calibration_input(byte_length: int, run_index: int = 0) -> str:
+    if byte_length < 2 or run_index < 0 or run_index > 99:
+        raise ValueError("calibration_input_invalid")
     repeated = _CALIBRATION_LINE * (byte_length // len(_CALIBRATION_LINE) + 1)
-    return repeated[:byte_length]
+    # LocalQueue deduplicates identical payloads even when their idempotency
+    # keys differ. Keep every calibration sample the exact requested byte
+    # size while changing two ASCII bytes per run. This avoids adding a
+    # non-certified parameter to the Gemma delegate contract merely to make
+    # repeated measurements distinct.
+    return repeated[:byte_length - 2] + f"{run_index:02d}"
 
 
 def _production_queue_busy(local_queue_root: Any) -> bool:
@@ -317,16 +356,24 @@ def calibrate(config_path: str, *, clock: Any = time.time,
     if _production_queue_busy(cfg.local_queue_root):
         return {"ok": False, "error": "calibration_refused:executor_busy"}
 
-    worker = Path(cfg.worker_executable)
-    if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
-        return {"ok": False, "error": "calibration_refused:worker_not_configured"}
+    gemma_backend = getattr(cfg, "local_backend", "private_worker") == "gemma_certified"
+    if not gemma_backend:
+        worker = Path(cfg.worker_executable)
+        if worker.name == delegation.NO_WORKER_SENTINEL or not worker.is_file():
+            return {"ok": False, "error": "calibration_refused:worker_not_configured"}
+    # The executable this calibration's own record identifies and hashes:
+    # the configured productive backend's own binary, never a hard-coded
+    # one. For "private_worker" this is unchanged (``cfg.worker_executable``);
+    # for "gemma_certified" it is the certified delegate itself, which
+    # ``orchestration.config.load`` already required to exist.
+    calibration_target = (cfg.gemma_delegate_executable if gemma_backend
+                          else cfg.worker_executable)
 
     from ..localq.service import Service  # deferred: only needed on this path
 
     queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-calibrate-"))
     try:
-        service = Service(str(queue_root), str(cfg.worker_executable), str(cfg.worker_state),
-                          sampler=sampler)
+        service = Service.for_config(cfg, root=str(queue_root), sampler=sampler)
         resource = service.queue.state_report().get("resource", {})
         verdict = resource.get("verdict")
         if isinstance(verdict, dict):
@@ -340,23 +387,13 @@ def calibrate(config_path: str, *, clock: Any = time.time,
 
         sizes: dict[str, Any] = {}
         for size in localfirst.CALIBRATION_SIZES:
-            text = _synthetic_calibration_input(size)
             runs_s: list[float] = []
             outcomes: list[str] = []
             for run_index in range(localfirst.CALIBRATION_RUNS_PER_SIZE):
+                text = _synthetic_calibration_input(size, run_index)
                 submitted = service.queue.submit(
                     task_type="summarize", input=text,
-                    # ``calibration_run`` makes each run's payload distinct.
-                    # LocalQueue.submit deduplicates on a content hash of the
-                    # *whole* payload in addition to the idempotency key
-                    # (``WHERE idem_key=? OR content_key=?``), so three runs
-                    # with identical input and params collapse onto the
-                    # first job regardless of how unique idempotency_key is:
-                    # measured directly, all three runs came back reporting
-                    # the first run's own outcome. This field's only job is
-                    # to make the content differ; nothing reads its value.
-                    params={"instruction": "Summarize in one sentence.", "provider": "qwen",
-                           "calibration_run": run_index},
+                    params=_local_model_params(cfg),
                     priority="interactive", classification="synthetic", caller="codex",
                     purpose="test",
                     idempotency_key=f"calibrate-{size}-{run_index}-{int(clock() * 1000)}")
@@ -386,7 +423,7 @@ def calibrate(config_path: str, *, clock: Any = time.time,
         host = {"platform": platform.system(), "cpu_count": os.cpu_count(),
                "python_version": platform.python_version()}
         record = localfirst.build_calibration_record(
-            worker_executable=str(cfg.worker_executable), worker_state=str(cfg.worker_state),
+            worker_executable=str(calibration_target), worker_state=str(cfg.worker_state),
             sizes=sizes, sampler_snapshot=resource, host=host, clock=clock)
         localfirst.write_calibration_record(str(cfg.state_root), record)
     finally:
@@ -485,10 +522,17 @@ def main(argv: list[str] | None = None) -> int:
     store.atomic_write_json(args.out, results)
     print(f"wrote {args.out}")
     cfg_doc = store.read_json(args.config)
-    worker_path = cfg_doc.get("worker_executable", "")
-    local_required = (isinstance(worker_path, str)
-                      and Path(worker_path).is_file()
-                      and Path(worker_path).name != delegation.NO_WORKER_SENTINEL)
+    if cfg_doc.get("local_backend") == "gemma_certified":
+        # ``orchestration.config.load`` already required every gemma_*
+        # path to exist before this config could load at all, so the local
+        # lane is unconditionally required and there is no
+        # "not_configured" state for it to have.
+        local_required = True
+    else:
+        worker_path = cfg_doc.get("worker_executable", "")
+        local_required = (isinstance(worker_path, str)
+                          and Path(worker_path).is_file()
+                          and Path(worker_path).name != delegation.NO_WORKER_SENTINEL)
     try:
         delegation.validate_evidence(
             results, cfg_doc,

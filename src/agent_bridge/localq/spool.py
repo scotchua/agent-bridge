@@ -25,6 +25,14 @@ from typing import Any, Callable, Protocol
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
 MECHANICAL_TASKS = frozenset({"summarize", "extract", "checklist", "log_triage", "test_draft"})
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+#: Fixed refusal reason for a mechanical task type that is real (it is in
+#: ``MECHANICAL_TASKS``) but not carried by the queue's *currently configured*
+#: backend -- e.g. every kind but ``summarize`` when the backend is
+#: ``gemma_certified``. Kept separate from ``task_type_refused`` (a task type
+#: that is not mechanical at all): one is "this queue never does that kind of
+#: work"; this one is "this backend does not, today". Both refuse before
+#: anything is queued.
+UNSUPPORTED_KIND_REASON = "unsupported_kind"
 
 
 class AdmissionError(ValueError):
@@ -158,7 +166,7 @@ class SubprocessBackend:
         try:
             output, _ = proc.communicate(json.dumps(payload), timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
+            self._terminate_group(proc)
             proc.communicate()
             raise TimeoutError("child exceeded local execution timeout") from exc
         finally:
@@ -174,20 +182,36 @@ class SubprocessBackend:
             raise RuntimeError("child did not return a JSON object")
         return value
 
+    @staticmethod
+    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = signal.SIGKILL) -> None:
+        """Kill the whole isolated process group, not only the immediate child.
+
+        ``start_new_session=True`` above makes this child its own
+        process-group leader, so anything it spawns (a further certified
+        delegate process, in particular) shares that group unless it starts
+        its own new session. A plain ``proc.kill()``/``proc.terminate()``
+        signals only the immediate process by pid; a timed-out or cancelled
+        job could leave a grandchild running past the queue's own deadline.
+        Found by review: the timeout branch here used ``proc.kill()`` alone
+        while ``cancel()`` a few lines down already used ``killpg`` -- the
+        same bug fixed in one place and left live in the other.
+        """
+        if os.name != "posix":  # pragma: no cover - Windows is covered by Popen termination semantics
+            proc.kill()
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+
     def cancel(self, job_id: str) -> bool:
         """Terminate the isolated child process group for an active job."""
         with self._lock:
             proc = self._processes.get(job_id)
         if proc is None or proc.poll() is not None:
             return False
-        try:
-            if os.name == "posix":
-                os.killpg(proc.pid, signal.SIGTERM)
-            else:  # pragma: no cover - Windows is covered by Popen termination semantics
-                proc.terminate()
-            return True
-        except ProcessLookupError:
-            return False
+        self._terminate_group(proc, signal.SIGTERM)
+        return True
 
 
 class LocalQueue:
@@ -195,7 +219,8 @@ class LocalQueue:
 
     def __init__(self, root: str | Path, *, sampler: Sampler,
                  backend: Backend | None = None, caps: QueueCaps = QueueCaps(),
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 allowed_task_types: "frozenset[str] | None" = None):
         self.root = Path(root)
         self.blobs = self.root / "blobs"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -203,6 +228,16 @@ class LocalQueue:
         self.db_path = self.root / "localq.sqlite3"
         self.lock_path = self.root / "executor.lock"
         self.sampler, self.backend, self.caps, self.clock = sampler, backend, caps, clock
+        # The kinds *this* backend actually carries. Defaults to every
+        # mechanical task, unchanged from before this existed. A backend
+        # that supports fewer kinds (``gemma_certified`` supports only
+        # ``summarize`` today) passes a narrower set here so an unsupported
+        # kind is refused at submission, before anything is queued, rather
+        # than discovered only when the executor finally runs it.
+        self.allowed_task_types = (MECHANICAL_TASKS if allowed_task_types is None
+                                  else frozenset(allowed_task_types))
+        if not self.allowed_task_types <= MECHANICAL_TASKS:
+            raise ValueError("allowed_task_types must be a subset of MECHANICAL_TASKS")
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -280,6 +315,8 @@ class LocalQueue:
                idempotency_key: str | None = None) -> dict[str, Any]:
         if task_type not in MECHANICAL_TASKS:
             raise AdmissionError("task_type_refused")
+        if task_type not in self.allowed_task_types:
+            raise AdmissionError(UNSUPPORTED_KIND_REASON)
         if classification not in ALLOWED_CLASSIFICATIONS:
             raise AdmissionError("classification_refused")
         if caller not in {"codex", "claude"} or purpose not in {"work", "test"}:

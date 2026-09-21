@@ -199,6 +199,16 @@ depending on what was actually proven, never more than that. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md) for the manual
 reference path and current platform boundary.
 
+For local mechanical text, the orchestration server now keeps an append-only
+checkpoint ledger. Assistant-facing work calls cannot label production as a
+test: they run as caller-bound `purpose=work`, consume a prior checkpoint or
+mint one automatically, and record whether an eligible unit was actually
+dispatched. The optional certified Gemma backend is configuration-selected,
+summarize-only, and pins the model digest plus both security-critical source
+files. Unsupported work refuses before queueing and never substitutes Qwen,
+Apple, or a cloud provider. See
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md#certified-gemma-local-backend).
+
 Saying yes also installs the **delegation-first gate**, which is the part that
 makes delegation automatic rather than available.
 
@@ -211,8 +221,9 @@ sentence, each of them load-bearing:
    enforced by the host, not requested.
  • **In the two CLIs.** Claude Code and the Codex CLI expose a `PreToolUse`
    hook. Claude Desktop, the Codex desktop app and Codex on the web do not,
-   so nothing local intercepts them. If those are where you work, this
-   changes nothing for you.
+   so nothing local can intercept ordinary conversational production there.
+   Their orchestration work tools still create and audit checkpoints when
+   invoked, but that is tool/instruction enforcement, not a native hook.
  • **Assistant-mediated dispatch.** A tool call names files, not the task, so
    the gate can compel the dispatch and name the route, item, stage and
    owner, but the assistant writes the brief. We are not going to call a

@@ -1,0 +1,18 @@
+{
+  "config_version": "1",
+  "state_root": "/absolute/private/state",
+  "local_queue_root": "/absolute/private/state/local-queue",
+  "capacity_db": "/absolute/private/state/capacity.sqlite3",
+  "worker_executable": "/absolute/path/to/existing/private-worker",
+  "worker_state": "/absolute/private/worker-state",
+  "interval_seconds": 5.0,
+  "local_backend": "gemma_certified",
+  "gemma_delegate_executable": "/absolute/pinned/path/to/delegate.py",
+  "gemma_delegate_sha256": "replace-with-64-lowercase-hex-characters",
+  "gemma_python_executable": "/absolute/path/to/python3",
+  "gemma_receipt_root": "/absolute/private/receipt-directory",
+  "gemma_receipt_validator_executable": "/absolute/pinned/path/to/delegation_receipt.py",
+  "gemma_receipt_validator_sha256": "replace-with-64-lowercase-hex-characters",
+  "gemma_model_digest": "replace-with-64-lowercase-hex-characters",
+  "gemma_timeout_seconds": 600.0
+}

@@ -66,6 +66,43 @@ The local Ollama executor runs in the server's background thread while either
 app is connected. A local result is an untrusted draft until its supervising
 assistant checks it and records `work_feedback`.
 
+### Checkpoints and production provenance
+
+Every `purpose=work` intake requires an append-only checkpoint bound to caller,
+task type, classification, UTF-8 byte count, nonblank-line count and risk
+flags. `work_route_local` consumes a supplied `work_checkpoint` id or creates
+one automatically for the exact unit it already received. Its assistant-facing
+schema does not expose `purpose` or caller identity, so a caller cannot relabel
+production as a calibration test or impersonate the other assistant.
+
+`work_checkpoint_no_eligible_unit` records the honest case where a task has no
+plausible mechanical unit. `work_checkpoint_audit` returns only aggregate
+counts: total, eligible, dispatched, no-unit and refusals by a closed reason
+set. It exposes no document text, task id or content hash. This is auditable
+instruction/tool enforcement for desktop chats; only supported CLI hook
+surfaces can be hard-gated before a read or edit.
+
+### Certified Gemma local backend
+
+The default remains `private_worker` for compatibility. An operator may select
+`local_backend: "gemma_certified"` using the shape in
+`config/orchestration.gemma.example.json` on a POSIX host. Native Windows
+selection currently refuses because verified nested process-tree termination
+is not yet available for this adapter. This route is intentionally narrow:
+
+- only `summarize` is admitted;
+- the model digest, delegate source and receipt-validator source are pinned;
+- the installed delegate's `local-delegate/v2` receipt is validated against
+  the exact invocation, input, output, options and parent queue job;
+- timeout and cancellation terminate the adapter process group on POSIX; and
+- refusal or failure has no Qwen, Apple or cloud fallback.
+
+Configuration is server-owned. No request can select a backend or model. The
+receipt directory must already exist as a private ordinary directory, and all
+configured files must be absolute, existing, regular and non-symlink paths.
+Run the synthetic calibration after changing the backend and before relying on
+it for production.
+
 Cross-provider implementation is different. The MCP processes only submit jobs
 and read durable status. They never start Claude or Codex. This matters on macOS
 because a desktop app's MCP sandbox may be unable to use the logged-in user's

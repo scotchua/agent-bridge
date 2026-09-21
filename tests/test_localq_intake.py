@@ -31,11 +31,16 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def route(self, **changes):
+        # purpose="test": this class drives AutomaticIntake.route directly to
+        # calibrate its classification and idempotency behaviour, which is
+        # exactly the internal test/calibration exemption from the
+        # checkpoint requirement (tests/test_checkpoint.py exercises the
+        # purpose="work" + checkpoint path this file does not).
         args = {
             "task_type": "summarize", "input": "synthetic operating note " * 8,
             "params": {"instruction": "Select operating facts."},
             "priority": "interactive", "classification": "internal_nonclient",
-            "caller": "codex", "purpose": "work", "risk_flags": [],
+            "caller": "codex", "purpose": "test", "risk_flags": [],
         }
         args.update(changes)
         return self.intake.route(**args)
