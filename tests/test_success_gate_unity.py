@@ -80,7 +80,8 @@ class QueuePathTests(unittest.TestCase):
         def executor(request, job_dir):
             return dict(outcome)
 
-        return eq.ExecutionQueue(root / "q", executor, clock=lambda: 1.0)
+        return eq.ExecutionQueue(root / "q", executor, clock=lambda: 1.0,
+                                  model_reserved=eq.reserve_nothing)
 
     def _submit(self, queue, counter=[0]):
         counter[0] += 1

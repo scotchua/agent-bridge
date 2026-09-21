@@ -13,7 +13,7 @@ from typing import Any
 from ..capacity_router import StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.service import Service
-from . import gate
+from . import autoroute, gate
 from .config import load
 from .execution_queue import ExecutionQueue
 from .mcp import build_tools
@@ -165,8 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         # process. Desktop app sandboxes can deny Keychain access.  This
         # surface only admits requests and reads durable status/receipts; the
         # standalone execution worker consumes the same queue.
-        execution = ExecutionQueue(cfg.execution_queue_root, None,
-                                   recover_interrupted=False)
+        execution = ExecutionQueue(
+            cfg.execution_queue_root, None, recover_interrupted=False,
+            model_reserved=autoroute.model_reserved_for(str(cfg.state_root)))
     # The same protected list the delegation-first hook computes, so
     # work_digest_file refuses a target the hook would also refuse to write:
     # the gate's own state, the stage router's database, the local queue's

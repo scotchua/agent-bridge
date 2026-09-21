@@ -58,6 +58,7 @@ import sqlite3
 import stat
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -1107,6 +1108,56 @@ def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
     return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
 
 
+def manual_receipt_overtaken(receipt: dict[str, Any], now: float,
+                             capacity_db: str | None) -> bool:
+    """Whether a hand-made receipt names a stage that no longer exists.
+
+    A manual receipt is deliberately stickier than an automatic one: the
+    operator chose that route, so a policy, capacity or task-type change is
+    not this gate's cue to overrule them. Only one condition retires it.
+
+    The stage going terminal is that condition, and it has to be, because
+    nothing else can clear it. A receipt whose stage is complete, reassigned
+    or lapsed cannot be renewed by anyone, and keeping it denies every edit in
+    the repository permanently: ``routing_decide`` needs an owned stage,
+    ``stage_claim`` needs a route with fresh capacity, and the only writer of
+    this client's own freshness is the auto-decide branch that a surviving
+    receipt skips. The receipt prevents the write that would replace it.
+    Discarding it here is what lets that branch run and the deadlock clear
+    itself, which is the same reason the automatic case is handled.
+    """
+    if capacity_db is None:
+        return False
+    return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
+
+
+def receipt_overtaken(receipt: dict[str, Any], now: float,
+                      capacity_db: str | None, task_type: str,
+                      policy_fingerprint: Callable[[], str | None] | None = None,
+                      capacity_fingerprint: Callable[[], str | None] | None = None,
+                      ) -> bool:
+    """Whether any receipt should be replaced by a fresh decision.
+
+    Dispatches on how the receipt was made, because the two kinds retire for
+    different reasons: an automatic one whenever the decision stops describing
+    the call, a manual one only when its stage is gone.
+
+    The two fingerprints arrive as zero-argument callables rather than values
+    because only the automatic branch reads them, and each costs a real read:
+    the operator's policy file, and a scan of the capacity table. Taking them
+    as values makes every manual receipt pay for both, which is what the
+    guard this replaced avoided for free: ``and`` does not evaluate a call's
+    arguments until it reaches the call. Neither read can raise (see their
+    own docstrings), so this is cost, not correctness. Deferring restores it.
+    """
+    if not receipt.get("automatic"):
+        return manual_receipt_overtaken(receipt, now, capacity_db)
+    return automatic_receipt_overtaken(
+        receipt, now, capacity_db, task_type,
+        None if policy_fingerprint is None else policy_fingerprint(),
+        None if capacity_fingerprint is None else capacity_fingerprint())
+
+
 # ------------------------------------------------------------- read judgment
 
 
@@ -1349,12 +1400,11 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                             f"delegation-first gate: routing state could not be read "
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
         task_type = infer_task_type(paths)
-        if (receipt is not None and decide is not None and receipt.get("automatic")
-                and automatic_receipt_overtaken(
-                    receipt, now, capacity_db, task_type,
-                    autoroute.policy_fingerprint(state_root),
-                    None if capacity_db is None
-                    else capacity_digest(capacity_db, now))):
+        if receipt is not None and decide is not None and receipt_overtaken(
+                receipt, now, capacity_db, task_type,
+                lambda: autoroute.policy_fingerprint(state_root),
+                None if capacity_db is None
+                else lambda: capacity_digest(capacity_db, now)):
             receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and

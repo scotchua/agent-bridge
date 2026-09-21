@@ -260,6 +260,7 @@ class QueuePrivacyAtCreationTests(unittest.TestCase):
         self.brief.write_text("do the thing\n", encoding="utf-8")
 
     def _queue(self, **kwargs):
+        kwargs.setdefault("model_reserved", eq.reserve_nothing)
         return eq.ExecutionQueue(self.root, None, recover_interrupted=False,
                                  **kwargs)
 

@@ -332,6 +332,20 @@ def require_private_queue(path: Path, *, platform: Any = None,
         raise ExecutionAdmissionError(f"queue_{exc.reason}") from exc
 
 
+def reserve_nothing(model: str) -> str | None:
+    """A matcher that reserves no model at all.
+
+    Exists so that a queue enforcing nothing has to say so. ``model_reserved``
+    is a required argument rather than one defaulting to None, because the
+    default was the failure: a queue built without it enforced nothing and
+    said nothing, and the only thing standing between that and production was
+    a test grepping the source for a literal. A cross-provider review called
+    that what it was. Now the constructor refuses, and every caller that
+    genuinely wants no restriction names this function.
+    """
+    return None
+
+
 class ExecutionQueue:
     """Filesystem queue whose request and terminal receipts survive restarts."""
 
@@ -339,7 +353,18 @@ class ExecutionQueue:
                  executor: Callable[[dict[str, Any], Path], dict[str, Any]] | None,
                  *, clock: Callable[[], float] = time.time,
                  recover_interrupted: bool = True,
-                 platform: Any = None):
+                 platform: Any = None,
+                 model_reserved: Callable[[str], str | None]):
+        # A matcher, not a list, and resolved per call rather than captured
+        # here. Not a list because the one implementation of what counts as a
+        # reserved name lives in ``autoroute``, and two layers enforcing the
+        # same rule through two copies of the matching is how they come to
+        # disagree. Not captured because a worker process outlives an
+        # operator's edit to their policy, and a reservation that only takes
+        # effect on the next restart is not one.
+        #
+        # Required, with no default. See ``reserve_nothing`` for why.
+        self._model_reserved = model_reserved
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -376,6 +401,40 @@ class ExecutionQueue:
                 or any(c in value for c in "\0\r\n")):
             raise ExecutionAdmissionError(f"{label}_invalid")
         return value
+
+    def _refuse_reserved_model(self, model: Any) -> None:
+        """Refuse a model the operator has reserved, or pass.
+
+        Called twice per job on purpose, at admission and again immediately
+        before the harness is spawned, because the two calls defend against
+        different things. Admission is where a caller gets a useful answer.
+        The spawn is where the reservation actually has to hold: ``run_once``
+        reads ``request.json`` back off disk, and between the two moments the
+        operator may have added a reservation that the queued job predates,
+        or something may have written a job directory directly -- the queue
+        root is JSON files, not an authenticated store. The same reasoning
+        already produced ``brief_changed_after_admission`` one line above the
+        second call; this is that check's twin for the model.
+
+        Hence the shape validation, which ``submit`` has already done by the
+        time it calls this. At spawn the value came from a file, so it is not
+        known to be a string at all, and a reservation that a non-string slips
+        past is not one.
+
+        A matcher that raises refuses. It reads the operator's policy, and
+        every reason that read can fail -- absent mount, wrong state_root,
+        malformed file, a defect in the matcher itself -- is a reason to
+        refuse rather than to admit, which is why the catch is broad and the
+        cause is chained rather than discarded.
+        """
+        if not isinstance(model, str) or not model:
+            raise ExecutionAdmissionError("model_invalid")
+        try:
+            reserved = self._model_reserved(model)
+        except Exception as exc:  # noqa: BLE001  any failure is a refusal
+            raise ExecutionAdmissionError("reservation_policy_check_failed") from exc
+        if reserved is not None:
+            raise ExecutionAdmissionError(f"model_reserved_to_operator:{reserved}")
 
     def submit(self, *, caller: str, provider: str, repo: str, brief: str,
                base: str, classification: str, model: str, effort: str,
@@ -422,6 +481,13 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("brief_not_utf8") from exc
         base = self._clean_text(base, "base")
         model = self._clean_text(model, "model")
+        # Models the operator keeps for themselves, refused where the job is
+        # created rather than only where it is requested. The MCP handler
+        # checks this too and is the better place to be told about it -- it
+        # can name the reservation in an error the agent reads -- but it is
+        # one caller of this method, and a rule that holds only at one caller
+        # is a convention. Checked again at spawn: see run_once.
+        self._refuse_reserved_model(model)
         effort = self._clean_text(effort, "effort")
         item_id = self._clean_text(item_id, "item_id")
         stage = self._clean_text(stage, "stage")
@@ -529,6 +595,13 @@ class ExecutionQueue:
             current = Path(request["brief"]).read_bytes()
             if hashlib.sha256(current).hexdigest() != request["brief_sha256"]:
                 raise ExecutionAdmissionError("brief_changed_after_admission")
+            # The authoritative one. Admission checked the caller's argument;
+            # this checks the value that is about to become ``--model`` on the
+            # harness command line, read back from a file that a queued job
+            # predating the reservation, or anything able to write the queue
+            # root, could have supplied. A cross-provider review found this
+            # gap: the worker was handed the matcher and never called it.
+            self._refuse_reserved_model(request.get("model"))
             outcome = self.executor(request, selected)
             validate_outcome(outcome)
             receipt.update(

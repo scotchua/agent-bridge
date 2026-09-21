@@ -288,7 +288,7 @@ class DispatchIntent(AutoCase):
 
 
 class DefectsFoundWhileBuildingThis(AutoCase):
-    """Both were live failures, not hypotheticals. See the module docstring."""
+    """All were live failures, not hypotheticals. See the module docstring."""
 
     def test_a_completed_stage_does_not_brick_the_repository(self):
         self.assertAllowed(self.hook("claude", self.repo))
@@ -303,6 +303,60 @@ class DefectsFoundWhileBuildingThis(AutoCase):
         second = self.receipt_for(self.repo)
         self.assertNotEqual(second["stage"], first["stage"])
         self.assertEqual(second["stage"], "implementation#2")
+
+    def test_a_manual_receipt_outliving_its_stage_does_not_brick_the_repository(self):
+        """The same brick one layer down, and the one nothing could clear.
+
+        A hand-made receipt is deliberately not re-decided when policy,
+        capacity or task type change. That left the terminal-stage case with
+        no way out at all: editing needs a receipt, ``routing_decide`` needs
+        an owned stage, ``stage_claim`` needs a route with fresh capacity, and
+        the only writer of this client's own freshness is the auto-decide
+        branch that a surviving receipt skips. The receipt prevented the write
+        that would have replaced it. Observed live with three unrelated stages
+        stuck at once, and unrecoverable without editing the gate, which the
+        gate itself was denying.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        router = StageRouter(str(self.db))
+        current = router.get(first["item_id"], first["stage"])
+        router.complete(first["item_id"], first["stage"],
+                        owner_id=current["owner_id"],
+                        expected_revision=current["revision"])
+        from agent_bridge import store
+        store.atomic_write_json(gate.receipt_path(str(self.state), str(self.repo)),
+                                {**first, "automatic": False})
+        self.assertTrue(gate.manual_receipt_overtaken(
+            {**first, "automatic": False}, time.time(), str(self.db)))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertNotEqual(self.receipt_for(self.repo)["stage"], first["stage"])
+
+    def test_a_manual_receipt_survives_an_ordinary_change(self):
+        """Only a gone stage retires a manual receipt. Nothing else.
+
+        The operator chose that route by hand, so re-deciding it whenever
+        policy or capacity moved would quietly overrule them. This is the
+        guard against fixing the deadlock by widening the exception until the
+        distinction between the two kinds of receipt stops meaning anything.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        from agent_bridge import store
+        manual = {**first, "automatic": False,
+                  "policy_fingerprint": "no-longer-current",
+                  "capacity_fingerprint": "no-longer-current"}
+        store.atomic_write_json(
+            gate.receipt_path(str(self.state), str(self.repo)), manual)
+        self.assertFalse(gate.manual_receipt_overtaken(
+            manual, time.time(), str(self.db)))
+        # The same receipt marked automatic would be re-decided on either
+        # fingerprint, which is what makes this a real distinction.
+        self.assertTrue(gate.automatic_receipt_overtaken(
+            {**manual, "automatic": True}, time.time(), str(self.db),
+            "implementation", "some-other-policy"))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["stage"], first["stage"])
 
     def test_generations_are_bounded_rather_than_searched_for_ever(self):
         self.assertLessEqual(autodecide.MAX_STAGE_GENERATIONS, 10_000)
@@ -795,6 +849,41 @@ class PolicyParsing(unittest.TestCase):
                 "/tmp": {"allowed_routes": ["anthropic_api"]}}})
         self.assertEqual(autoroute.ROUTES, ("claude", "codex", "local"))
 
+    def test_reserved_models_is_empty_by_default(self):
+        """A policy written before the field existed reserves nothing."""
+        self.assertEqual(autoroute.parse_policy(
+            {"version": 1, "repos": {}}).reserved_models, ())
+
+    def test_reserved_models_is_normalised_and_deduplicated(self):
+        policy = autoroute.parse_policy({
+            "version": 1, "repos": {},
+            "reserved_models": ["Astra", " astra ", "FABLE"]})
+        self.assertEqual(policy.reserved_models, ("astra", "fable"))
+
+    def test_reserved_models_rejects_a_bad_shape(self):
+        for bad in ("astra", [""], ["   "], [None], [1]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(autoroute.PolicyError):
+                    autoroute.parse_policy({"version": 1, "repos": {},
+                                            "reserved_models": bad})
+
+    def test_reserved_model_match_names_the_token_it_hit(self):
+        """Named, not just refused, so an operator can see which reservation
+        fired without reading the policy file to guess."""
+        reserved = ("astra", "fable")
+        self.assertEqual(autoroute.reserved_model_match("gpt-6-astra", reserved), "astra")
+        self.assertEqual(autoroute.reserved_model_match("claude-fable-5-1", reserved), "fable")
+        self.assertIsNone(autoroute.reserved_model_match("gpt-5.6-terra", reserved))
+        self.assertIsNone(autoroute.reserved_model_match("gpt-6-astra", ()))
+
+    def test_reserved_model_match_leaves_shape_errors_to_the_validator(self):
+        """A non-string or blank model is a shape fault the dispatch validator
+        already refuses. Answering it here too would give one fault two
+        different messages."""
+        for value in (None, "", "   ", 5, ["astra"]):
+            with self.subTest(value=value):
+                self.assertIsNone(autoroute.reserved_model_match(value, ("astra",)))
+
     def test_route_classifications_is_absent_by_default(self):
         policy = autoroute.parse_policy({"version": 1, "repos": {}})
         self.assertEqual(policy.route_classifications, {})
@@ -1166,6 +1255,109 @@ class AStageSomebodyElseOwnsIsNotAdopted(AutoCase):
         self.assertNotEqual(receipt["stage"], "implementation")
         self.assertEqual(router.get(item, "implementation")["owner_id"],
                          "some-agents-own-owner")
+
+
+class ReviewFindingsFromTheOtherProvider(AutoCase):
+    """Raised by codex reviewing the receipt fix. One was real; two were not.
+
+    Kept together because the two that were not are the more useful half: each
+    describes a plausible failure this design is claimed to be free of, and a
+    claim nothing checks is the kind that stops being true quietly.
+    """
+
+    def test_a_manual_receipt_does_not_compute_the_automatic_fingerprints(self):
+        """The real one, and a regression introduced by the fix itself.
+
+        The guard it replaced was ``receipt.get("automatic") and
+        automatic_receipt_overtaken(...)``, and Python does not evaluate a
+        call's arguments until the ``and`` reaches it, so a manual receipt
+        never read the policy file or scanned the capacity table. Passing
+        those two reads as arguments made every receipt pay for both: a
+        sha256 of the policy file and a ``SELECT * FROM capacity`` on every
+        gated write, for two values the manual branch then ignores.
+
+        Only the cost is real. The reviewer who raised this expected the
+        eager reads to be able to raise past ``stage_binding``'s fail-closed
+        handling, but neither can: ``policy_fingerprint`` documents that it
+        never raises and ``capacity_digest`` returns None on an unreadable
+        table. Checked rather than assumed, and recorded here so the next
+        reader does not re-derive it.
+        """
+        def boom():
+            raise AssertionError("the manual path must not compute this")
+
+        manual = {"item_id": "i", "stage": "implementation", "owner_id": "o",
+                  "owner_route": "claude", "valid_until": time.time() + 3600,
+                  "automatic": False}
+        self.assertFalse(gate.receipt_overtaken(
+            manual, time.time(), None, "implementation", boom, boom))
+
+        # The automatic path still reads both, which is what makes the
+        # difference above a deferral rather than a removal.
+        seen = []
+        gate.receipt_overtaken({**manual, "automatic": True}, time.time(), None,
+                               "implementation",
+                               lambda: seen.append("policy") or "p",
+                               lambda: seen.append("capacity") or "c")
+        self.assertEqual(seen, ["policy", "capacity"])
+
+    def test_an_expired_manual_receipt_over_a_live_stage_is_not_a_wedge(self):
+        """Not a defect: the stage is still owned, so it is still renewable.
+
+        The worry was a second deadlock of the same shape -- an expired
+        receipt stays non-None, so it skips the re-decision and is then denied
+        as ``routing_receipt_expired`` for ever. It is not, and the difference
+        is what the deny message tells the operator to do. The deadlock this
+        fix addressed was unrecoverable because the stage was terminal, so
+        nothing could renew it. An expired receipt over a live stage leaves
+        that stage owned by this owner, and ``stage_renew`` on it works.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        from agent_bridge import store
+        store.atomic_write_json(
+            gate.receipt_path(str(self.state), str(self.repo)),
+            {**receipt, "automatic": False, "valid_until": time.time() - 1})
+        self.assertDenied(self.hook("claude", self.repo), "routing_receipt_expired")
+        # The way out the deny message names, taken here to prove it exists.
+        router = StageRouter(str(self.db))
+        current = router.get(receipt["item_id"], receipt["stage"])
+        self.assertEqual(current["state"], "owned")
+        renewed = router.renew(receipt["item_id"], receipt["stage"],
+                               owner_id=current["owner_id"], lease_seconds=3600,
+                               expected_revision=current["revision"])
+        self.assertEqual(renewed["state"], "owned")
+
+    def test_a_stage_owned_by_another_owner_is_skipped_rather_than_taken(self):
+        """Not a defect: discarding a receipt cannot hand its stage to anyone.
+
+        The worry was that clearing a ``stage_reassigned`` receipt and calling
+        the decider immediately afterwards could overturn a deliberate
+        reassignment. It cannot. ``stage_name`` picks the first generation
+        this owner can own and ``_own_stage`` reports a stage somebody else
+        holds rather than claiming it, so the decision lands on a new
+        generation and the reassigned one is left exactly as it was.
+
+        The larger reading -- that reassigning a stage revokes a client's
+        right to edit the repository -- was never true here either: a
+        repository with no receipt at all gets a fresh generation by the same
+        path. Stages are units of work, not access.
+        """
+        repo = git_repo(self.base / "other")
+        item = autodecide.item_id_for(str(repo))
+        self.observe("claude")
+        router = StageRouter(str(self.db))
+        router.register(item, "implementation", allowed_routes=("claude",),
+                        preferred_routes=("claude",))
+        before = router.get(item, "implementation")
+        router.assign(item, "implementation", owner_id="somebody-else",
+                      lease_seconds=3600, expected_revision=before["revision"])
+
+        self.assertAllowed(self.hook("claude", repo))
+        self.assertEqual(self.receipt_for(repo)["stage"], "implementation#2")
+        untouched = router.get(item, "implementation")
+        self.assertEqual(untouched["owner_id"], "somebody-else")
+        self.assertEqual(untouched["state"], "owned")
 
 
 if __name__ == "__main__":

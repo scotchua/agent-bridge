@@ -16,7 +16,9 @@ from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration import autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
-    _harness_summary, outcome_is_success)
+    _harness_summary, outcome_is_success,
+    reserve_nothing,
+)
 from agent_bridge.orchestration.server import Server
 
 
@@ -66,7 +68,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
-        self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0)
+        self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0,
+                                    model_reserved=reserve_nothing)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -183,7 +186,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         def explode(request, selected):
             raise RuntimeError("token=do-not-record")
 
-        queue = ExecutionQueue(self.root / "queue", explode, clock=lambda: 100.0)
+        queue = ExecutionQueue(self.root / "queue", explode, clock=lambda: 100.0,
+                               model_reserved=reserve_nothing)
         queue.run_once("worker-1")
         result = queue.result(job["job_id"])
         self.assertEqual(result["state"], "failed")
@@ -197,7 +201,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(queued["job_id"], duplicate["job_id"])
         with self.assertRaisesRegex(ExecutionAdmissionError, "idempotency_conflict"):
             self.submit(idempotency_key="same-task", base="other")
-        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 101.0)
+        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 101.0,
+                                 model_reserved=reserve_nothing)
         self.assertEqual(restarted.status(queued["job_id"])["state"], "queued")
         self.assertEqual(restarted.run_once("worker-1")["state"], "complete")
         result = restarted.result(queued["job_id"])
@@ -220,7 +225,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         receipt = json.loads((directory / "receipt.json").read_text())
         receipt["state"] = "running"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
-        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 102.0)
+        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 102.0,
+                                 model_reserved=reserve_nothing)
         self.assertEqual(restarted.status(job["job_id"])["state"], "blocked")
         self.assertIsNone(restarted.run_once("worker-2"))
         self.assertEqual(self.fake.requests, [])
@@ -281,7 +287,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
         status_only = ExecutionQueue(self.root / "queue", None,
                                      clock=lambda: 102.0,
-                                     recover_interrupted=False)
+                                     recover_interrupted=False,
+                                     model_reserved=reserve_nothing)
         self.assertEqual(status_only.status(job["job_id"])["state"], "running")
         with self.assertRaisesRegex(ExecutionAdmissionError, "worker_not_configured"):
             status_only.run_once("mcp-process")
@@ -290,7 +297,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         job = self.submit()
         directory = self.root / "queue" / job["job_id"]
         (directory / "claim.lock").write_text("", encoding="utf-8")
-        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 103.0)
+        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 103.0,
+                                 model_reserved=reserve_nothing)
         result = restarted.result(job["job_id"])
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["error"], "interrupted_requires_reconciliation")
@@ -412,7 +420,8 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
-        self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0)
+        self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0,
+                                    model_reserved=reserve_nothing)
         self.state_root = self.root / "state"
 
     def tearDown(self):
@@ -424,7 +433,7 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         path.write_text(json.dumps({"version": 1, "repos": {}, **document}), encoding="utf-8")
 
     def dispatch(self, *, caller="claude", provider="codex", classification="synthetic",
-                item_id="item-1", owner_id="owner-1"):
+                item_id="item-1", owner_id="owner-1", model="sonnet"):
         router = StageRouter(self.root / "capacity.sqlite3", clock=lambda: 100.0)
         router.observe_capacity(CapacityObservation(
             route=provider, observed_at=100.0, fresh_until=200.0, available=True,
@@ -437,7 +446,7 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
                         state_root=str(self.state_root))
         return server.tools["execution_dispatch"]["handler"]({
             "provider": provider, "repo": str(self.repo), "brief": str(self.brief),
-            "base": "HEAD", "classification": classification, "model": "sonnet",
+            "base": "HEAD", "classification": classification, "model": model,
             "effort": "medium", "verify_argv": [["pytest", "-q"]], "item_id": item_id,
             "stage": "implement", "owner_id": owner_id, "stage_revision": owned["revision"]})
 
@@ -468,6 +477,50 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         result = self.dispatch(provider="codex", classification="public")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "execution_dispatch_refused:classification_not_eligible_for_route")
+
+    def test_a_model_the_operator_reserved_is_refused_at_dispatch(self):
+        """Reserved models are the operator's to spend, not an agent's to pick."""
+        self.write_policy(
+            repos={str(self.repo): {"classification": "synthetic",
+                                    "allowed_routes": ["claude", "codex"]}},
+            reserved_models=["astra", "fable"])
+        result = self.dispatch(model="gpt-6-astra")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"],
+                         "execution_dispatch_refused:model_reserved_to_operator:astra")
+
+    def test_reserving_a_token_covers_every_spelling_of_that_model(self):
+        """The point of a token, not an exact name: a new snapshot or a
+        provider's long-form id must not walk straight through a list written
+        against last month's shorthand."""
+        self.write_policy(
+            repos={str(self.repo): {"classification": "synthetic",
+                                    "allowed_routes": ["claude", "codex"]}},
+            reserved_models=["astra"])
+        spellings = ("astra", "gpt-6-astra", "GPT-6-ASTRA", "gpt-6-astra-2026-09-01")
+        for index, spelling in enumerate(spellings):
+            with self.subTest(spelling=spelling):
+                # A fresh stage each time: registering one twice is stage_exists,
+                # which would fail the test for a reason unrelated to the model.
+                result = self.dispatch(model=spelling, item_id=f"item-spelling-{index}")
+                self.assertFalse(result["ok"], spelling)
+                self.assertIn("model_reserved_to_operator", result["error"])
+
+    def test_an_unreserved_model_still_dispatches(self):
+        """The guard must refuse the reserved name and nothing else."""
+        self.write_policy(
+            repos={str(self.repo): {"classification": "synthetic",
+                                    "allowed_routes": ["claude", "codex"]}},
+            reserved_models=["astra", "fable"])
+        result = self.dispatch(model="gpt-5.6-terra")
+        self.assertTrue(result["ok"], result)
+
+    def test_no_reservations_means_no_refusals(self):
+        """An existing policy file with no reserved_models keeps behaving
+        exactly as it did before the field existed."""
+        self.write_policy(repos={str(self.repo): {
+            "classification": "synthetic", "allowed_routes": ["claude", "codex"]}})
+        self.assertTrue(self.dispatch(model="gpt-6-astra")["ok"])
 
     def test_route_classifications_is_enforced_live_at_dispatch_too(self):
         # Not just at the earlier routing decision: dispatch re-derives and

@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from ..platform import platform as host_platform
+from . import autoroute
 from .config import load
 from .execution_queue import (
     ExecutionAdmissionError,
@@ -169,8 +170,9 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     cfg = load(config_path)
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
-    return ExecutionQueue(cfg.execution_queue_root, select_executor(cfg),
-                          recover_interrupted=True)
+    return ExecutionQueue(
+        cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
+        model_reserved=autoroute.model_reserved_for(str(cfg.state_root)))
 
 
 def run(config_path: str, *, once: bool, interval: float,

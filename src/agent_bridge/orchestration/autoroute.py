@@ -35,6 +35,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any, Mapping
 
 from ..localq.spool import QueueCaps
@@ -270,6 +271,32 @@ class Policy:
     #: existing policy file with no ``local_first`` block keeps behaving
     #: exactly as it does today.
     local_first: LocalFirstConfig = field(default_factory=LocalFirstConfig)
+    #: Model name fragments the operator reserves to themselves. A dispatch
+    #: naming a model that contains one of these is refused unless the request
+    #: carries the operator's own authorization.
+    #:
+    #: Matched as a case-folded substring rather than an exact name on purpose.
+    #: The same model is spelled several ways across a provider's shorthand,
+    #: its full identifier and its dated snapshots, and an exact-match list is
+    #: one new snapshot away from being silently empty. Reserving the token
+    #: ``astra`` covers ``gpt-6-astra`` and anything later carrying the name;
+    #: an exact list reserving ``gpt-6-astra`` would not.
+    #:
+    #: This lives in the operator's policy file rather than the bridge config
+    #: so that the list can be protected from the assistant the list restrains.
+    #: Be precise about what protects it. ``gate.protected_paths`` covers the
+    #: policy file, but the gate matches paths it can read in a tool call, so a
+    #: script that assembles the path at runtime goes straight past it -- this
+    #: was demonstrated, not assumed. The property this field needs therefore
+    #: comes from the filesystem, not from the gate: the operator sets the
+    #: macOS system-immutable flag (``sudo chflags schg``) on the policy file
+    #: and on the config naming ``state_root``, after which write, truncate,
+    #: unlink, rename and clearing the flag all require root.
+    #:
+    #: Without that flag this field is a convention, not a control. Anyone
+    #: relying on it should check the flag is set rather than trusting the
+    #: file's location.
+    reserved_models: tuple[str, ...] = ()
 
     def for_repo(self, repo: str) -> RepoPolicy:
         """The entry for ``repo``, matched on the real path, else the default."""
@@ -646,17 +673,66 @@ def parse_policy(document: object) -> Policy:
                    if not key.startswith("_")} - {"version", "repos",
                                                   "max_local_load_ratio", "prefer",
                                                   "declared_available", "local_first",
-                                                  "route_classifications"}
+                                                  "route_classifications",
+                                                  "reserved_models"}
     if unknown_top:
         raise PolicyError("routing policy has unknown keys: "
                           + ", ".join(sorted(unknown_top)))
+    reserved = document.get("reserved_models", [])
+    if (not isinstance(reserved, list)
+            or any(not isinstance(m, str) or not m.strip() for m in reserved)):
+        raise PolicyError("reserved_models must be a list of non-empty strings")
     local_first = _parse_local_first(document.get("local_first", {}))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
                   peer_classifications=PEER_CLASSIFICATIONS,
                   route_classifications=route_classifications,
                   max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
                   declared_routes=tuple(dict.fromkeys(declared)),
-                  local_first=local_first)
+                  local_first=local_first,
+                  reserved_models=tuple(dict.fromkeys(
+                      m.strip().casefold() for m in reserved)))
+
+
+def reserved_model_match(model: object, reserved: tuple[str, ...]) -> str | None:
+    """The reserved token ``model`` contains, or None if it is not reserved.
+
+    Returns the token rather than a bool so the refusal can name which
+    reservation was hit, which is the difference between an operator seeing
+    "astra is reserved" and seeing "refused".
+
+    A non-string or empty model is not reserved here. That is not leniency:
+    those are shape errors the dispatch validator already refuses on its own,
+    and duplicating the check would give two different messages for one fault.
+    Callers must keep running their own shape validation, not lean on this.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    folded = model.casefold()
+    for token in reserved:
+        if token in folded:
+            return token
+    return None
+
+
+def model_reserved_for(state_root: str) -> Callable[[str], str | None]:
+    """The operator's reservation, read fresh from their policy on each call.
+
+    Handed to the execution queue so that the layer which actually creates a
+    job can refuse a reserved model without importing this module's policy
+    handling, and so that both layers match names through the one
+    implementation in :func:`reserved_model_match` rather than two copies.
+
+    Reads the file on every call on purpose. Submits are rare, and a list
+    captured when a worker started would leave that worker enforcing whatever
+    the policy said at boot, which for a long-running process means an
+    operator's edit does nothing until they notice and restart it.
+    ``load_policy`` raises on an unreadable or malformed file; the queue turns
+    that into a refusal, which is the only direction a reservation can fail.
+    """
+    def matcher(model: str) -> str | None:
+        return reserved_model_match(model, load_policy(state_root).reserved_models)
+
+    return matcher
 
 
 def load_policy(state_root: str) -> Policy:

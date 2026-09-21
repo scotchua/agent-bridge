@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import delegation_verify as dv
-from agent_bridge.orchestration.execution_queue import ExecutionQueue
+from agent_bridge.orchestration.execution_queue import ExecutionQueue, reserve_nothing
 
 
 def _git_available() -> bool:
@@ -67,7 +67,8 @@ class VerificationQueueIsolationTests(unittest.TestCase):
 
     def _queue_unrelated_job(self) -> str:
         queue = ExecutionQueue(self.production, self.executor,
-                               recover_interrupted=False)
+                               recover_interrupted=False,
+                               model_reserved=reserve_nothing)
         submitted = queue.submit(
             caller="codex", provider="claude", repo=str(self.user_repo),
             brief=str(self.user_brief), base="HEAD", classification="synthetic",
@@ -82,7 +83,8 @@ class VerificationQueueIsolationTests(unittest.TestCase):
         dv._run_direction(self.executor, self.production,
                           caller="codex", provider="claude")
         queue = ExecutionQueue(self.production, self.executor,
-                               recover_interrupted=False)
+                               recover_interrupted=False,
+                               model_reserved=reserve_nothing)
         self.assertEqual(queue.status(job_id)["state"], "queued")
         self.assertNotIn(str(self.user_repo), self.executor.repos)
         self.assertNotIn(str(self.user_brief), self.executor.briefs)

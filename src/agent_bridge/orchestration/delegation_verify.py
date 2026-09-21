@@ -44,6 +44,7 @@ from .execution_queue import (
     ExecutionQueue,
     Harnesses,
     SubprocessHarnessExecutor,
+    reserve_nothing,
 )
 
 SYNTHETIC_BRIEF = (
@@ -171,7 +172,12 @@ def _run_direction(executor: Any, _unused_queue_root: Any,
     verify_argv = [["git", "status"]]
     queue_root = _verification_queue_root()
     try:
-        queue = ExecutionQueue(queue_root, executor, recover_interrupted=False)
+        # reserve_nothing, deliberately: this queue is created and destroyed
+        # here, drains exactly one fixed synthetic job with model="default",
+        # and is not a surface anything can steer a model choice through. It
+        # also has no cfg to read a policy from.
+        queue = ExecutionQueue(queue_root, executor, recover_interrupted=False,
+                               model_reserved=reserve_nothing)
         submitted = queue.submit(
             caller=caller, provider=provider, repo=str(repo), brief=str(brief),
             base="HEAD", classification="synthetic", model="default", effort="low",

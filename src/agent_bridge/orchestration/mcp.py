@@ -443,6 +443,32 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                         or repo_policy.classification not in peer_classifications):
                     return {"ok": False,
                             "error": "execution_dispatch_refused:classification_not_eligible_for_route"}
+                # Models the operator keeps for themselves. Deliberately no
+                # bypass argument: a flag an assistant can set is not a
+                # reservation, it is a spelling of the same choice. The only
+                # way through is the operator editing their own policy file,
+                # and that edit IS the operator's request -- the semantics
+                # asked for is recommend it freely, never select it alone.
+                #
+                # What makes that edit the operator's alone is the immutable
+                # flag on the policy file, not this module and not the gate;
+                # see Policy.reserved_models. Unflagged, this check still
+                # refuses the obvious path but does not survive an assistant
+                # that decides to edit the list first.
+                #
+                # This is the early refusal, not the boundary. It exists here
+                # because this is where an agent can be told which
+                # reservation it hit, in words it reads. The rule itself is
+                # enforced again in ExecutionQueue.submit, which is where a
+                # job is actually created and which every caller goes
+                # through, not just this one. A cross-provider review made
+                # that point and it was right: a check at one caller is a
+                # convention.
+                reserved = autoroute.reserved_model_match(
+                    args.get("model"), policy.reserved_models)
+                if reserved is not None:
+                    return {"ok": False, "error":
+                            f"execution_dispatch_refused:model_reserved_to_operator:{reserved}"}
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
