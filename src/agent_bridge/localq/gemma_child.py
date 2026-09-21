@@ -5,6 +5,15 @@ the exact document as UTF-8 stdin, writes the draft as plain stdout bytes,
 and writes a ``local-delegate/v2`` receipt. This bridges those contracts
 without selecting another provider, retrying another model, or creating a
 second quarantine mechanism. Only ``summarize`` is certified here.
+
+Repository tests exercise this adapter against contract fakes; they do not
+prove compatibility with the installed delegate and validator. Before an
+operator selects this backend in live configuration, a synthetic smoke test
+must exercise the exact hash-pinned installed files. Those hashes are
+compatibility assertions against accidental drift, not an integrity boundary
+against a same-user process that can rewrite the files or configuration. The
+model digest is attested by the delegate's validated receipt; this adapter does
+not independently measure the model artifact.
 """
 
 from __future__ import annotations

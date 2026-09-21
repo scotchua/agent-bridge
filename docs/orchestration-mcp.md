@@ -100,8 +100,18 @@ is not yet available for this adapter. This route is intentionally narrow:
 Configuration is server-owned. No request can select a backend or model. The
 receipt directory must already exist as a private ordinary directory, and all
 configured files must be absolute, existing, regular and non-symlink paths.
-Run the synthetic calibration after changing the backend and before relying on
-it for production. The calibration record and the executor heartbeat both
+Repository tests use contract fakes and do not prove compatibility with the
+installed delegate and validator. Before selecting this backend in a live
+configuration, run a synthetic smoke test against the exact hash-pinned
+installed files. The installed delegate documents that raw
+`--parent-task-id` values are stored only as SHA-256 bindings, matching the
+adapter's receipt validation. File hashes are compatibility assertions against
+accidental drift rather than an integrity boundary against another same-user
+process, and the model digest is attested by the validated delegate receipt
+rather than independently measured by the adapter.
+
+Run the synthetic calibration after changing the backend and before relying
+on it for production. The calibration record and the executor heartbeat both
 name the selected backend. Readiness refuses a missing or mismatched backend
 identity, which prevents a still-running pre-change private-worker process
 from satisfying a new Gemma configuration. Restart every connected assistant
