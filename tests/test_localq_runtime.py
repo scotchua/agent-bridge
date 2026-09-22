@@ -10,13 +10,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_bridge.localq.runtime import MacSampler, foundation_thermal_state
+from agent_bridge.localq.runtime import (MIN_MEMORY_FREE_PERCENT, MacSampler,
+                                         foundation_thermal_state)
 from agent_bridge.localq.service import Service
 from agent_bridge.localq.spool import ResourceSnapshot
 from agent_bridge.localq import worker_child
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_memory_threshold_is_the_aggressive_local_first_floor(self):
+        self.assertEqual(MIN_MEMORY_FREE_PERCENT, 10.0)
+        self.assertEqual(MacSampler._memory("System-wide memory free percentage: 10%"),
+                         "normal")
+        self.assertEqual(MacSampler._memory("System-wide memory free percentage: 9.9%"),
+                         "high")
+
     def test_foundation_thermal_probe_returns_supported_state(self):
         self.assertIn(foundation_thermal_state(), {"normal", "high", "unknown"})
 

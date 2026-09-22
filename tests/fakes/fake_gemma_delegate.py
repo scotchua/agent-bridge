@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
             "think": False, "schema": False, "second_pass": False,
             "repair_retries": 0, "map_scope": "run", "roster_sha256": None,
         },
+        # Mirror the installed delegate's documented CLI contract: callers
+        # pass a raw identity and the delegate stores only its SHA-256 binding.
         "parent_task_id": hashlib.sha256(args.parent_task_id.encode("utf-8")).hexdigest(),
         "attempt_id": None,
         "output_sha256": hashlib.sha256(output).hexdigest(),

@@ -13,6 +13,12 @@ from .spool import ResourceSnapshot
 
 CommandRunner = Callable[[list[str]], str]
 
+# Scott's operating preference is intentionally aggressive: use the local
+# machine first and tighten admission only after measured user-visible impact.
+# Ten percent still leaves a hard memory-pressure stop, but does not reserve
+# one fifth of unified memory before the worker may start.
+MIN_MEMORY_FREE_PERCENT = 10.0
+
 
 def system_runner(argv: list[str]) -> str:
     return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL, timeout=2)
@@ -63,7 +69,8 @@ class MacSampler:
         match = re.search(r"memory\s+free\s+percentage:\s*(\d+(?:\.\d+)?)%", text, re.I)
         if not match:
             raise ValueError("memory_pressure output not recognized")
-        return "normal" if float(match.group(1)) >= 20.0 else "high"
+        return ("normal" if float(match.group(1)) >= MIN_MEMORY_FREE_PERCENT
+                else "high")
 
     @staticmethod
     def _ac_power(text: str) -> bool:

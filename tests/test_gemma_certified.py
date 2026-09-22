@@ -171,6 +171,10 @@ class ConfigAndSelectionTests(unittest.TestCase):
                    for index in range(localfirst.CALIBRATION_RUNS_PER_SIZE)]
         self.assertEqual({len(sample.encode("utf-8")) for sample in samples}, {8000})
         self.assertEqual(len(set(samples)), localfirst.CALIBRATION_RUNS_PER_SIZE)
+        self.assertTrue(all(sample.count(". ") == 15 and sample.endswith(".")
+                            for sample in samples))
+        self.assertTrue(all(max(len(sentence) + 1 for sentence in sample.split(". "))
+                            < len(sample) // 10 for sample in samples))
 
 
 class GemmaInvokeTests(unittest.TestCase):

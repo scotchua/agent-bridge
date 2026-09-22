@@ -145,6 +145,11 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
     invocation_id = uuid.uuid4().hex
     input_bytes = text.encode("utf-8")
     input_sha256 = hashlib.sha256(input_bytes).hexdigest()
+    # The installed delegate owns this transformation: its documented CLI
+    # accepts the raw parent identity and stores only sha256(raw). Pass job_id
+    # below, but give the validator the binding the receipt must contain.
+    # A real installed-file synthetic smoke remains the compatibility proof;
+    # the repository fake only mirrors this documented boundary.
     parent_task_id = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
     argv = [str(python_path), str(delegate_path), "--task", "summarize",
             "--invocation-id", invocation_id, "--parent-task-id", job_id,

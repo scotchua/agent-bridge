@@ -96,14 +96,17 @@ exist today stay as the definition of "spare capacity":
 
 • one executor, one job at a time (`LocalQueue.run_once`, flock plus lease);
 
-• one-minute load average at or below 0.75 per core (`max_local_load_ratio`);
+• one-minute load average at or below 1.25 per core (`max_local_load_ratio`),
+  or at least 10 percent directly measured CPU idle time;
 
-• memory pressure and thermal state both `normal`, from a fresh sample no
-older than 10 seconds;
+• at least 10 percent memory reported free and thermal state `normal`, from a
+fresh sample no older than 10 seconds;
 
-• bulk work additionally needs AC power and 60 seconds of user idle time.
+• bulk work additionally needs AC power, but does not require the user to be
+idle.
 
-Nothing in this design raises those ceilings. A busy machine waives.
+These defaults deliberately favor local execution. Actual pressure or heat
+still waives; observed user-visible slowdown is the reason to tighten them.
 
 ### The quality model
 
@@ -602,7 +605,7 @@ keys still fail closed through `parse_policy` exactly as today.
 {"version": 1,
  "prefer": [],
  "declared_available": ["local"],
- "max_local_load_ratio": 0.75,
+ "max_local_load_ratio": 1.25,
  "local_first": {
    "enabled": true,
    "latency_budget_seconds": 30,

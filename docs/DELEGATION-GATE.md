@@ -112,8 +112,9 @@ and the order is the point:
 2. **Task type.** Implementation work goes to a provider or stays. It is
    never sent to a local model, for the reason under "What it cannot do".
 3. **Hardware load.** One-minute load average per core, against a ceiling
-   (`max_local_load_ratio`, default 0.75). A host that exposes no load
-   average defers rather than assuming the machine is idle.
+   (`max_local_load_ratio`, default 1.25), with a direct CPU-idle reading able
+   to admit work when the lagging load average still looks high. A host that
+   exposes neither usable signal defers rather than assuming capacity.
 4. **Capacity.** A peer route needs a fresh, available observation in the
    stage router. A stale observation never makes a route eligible, so a
    machine nobody has reported capacity for retains everything.
@@ -132,7 +133,7 @@ covered tool by the same rule that protects the receipts:
 ```json
 {"version": 1,
  "prefer": ["codex", "claude", "local"],
- "max_local_load_ratio": 0.75,
+ "max_local_load_ratio": 1.25,
  "repos": {
    "/abs/path/to/repo": {"classification": "internal_nonclient",
                          "allowed_routes": ["claude", "codex"],

@@ -60,6 +60,8 @@ LOCAL_MODEL_INPUT = "\n".join(
 ) + "\n"
 TERMINAL_STATES = frozenset({"complete", "failed", "blocked"})
 MAX_DRAIN_ATTEMPTS = 50
+CALIBRATION_RESOURCE_WAIT_ATTEMPTS = 120
+CALIBRATION_RESOURCE_POLL_SECONDS = 5.0
 
 
 def _empty_row(reason: str) -> dict[str, Any]:
@@ -285,23 +287,37 @@ def _local_model_check_in(cfg: Any, service: Any) -> dict[str, Any]:
 
 #: A fixed, deterministic ASCII line so the synthetic input is exactly the
 #: requested byte length: every character is one UTF-8 byte, so slicing the
-#: repeated string to ``length`` characters is slicing it to ``length``
-#: bytes. No real or invented user content, matching every other synthetic
-#: fixture in this module.
-_CALIBRATION_LINE = ("Synthetic calibration line for the agent-bridge "
-                    "local-first read gate's digest timing measurement. ")
+#: ASCII-only sentence stems keep byte and character lengths identical. Sixteen
+#: long, distinct sentences exercise the real summarize selector without the
+#: hundreds of near-duplicate sentence IDs created by the original repeated
+#: line. Sixteen also keeps every sentence below the delegate's ten-percent
+#: summary-output budget at all calibrated sizes. No real or invented user
+#: narrative is present.
+_CALIBRATION_STEMS = tuple(
+    f"Synthetic workload record {index} measures an invented queue with no client data and notes that "
+    for index in range(1, 17)
+)
 
 
 def _synthetic_calibration_input(byte_length: int, run_index: int = 0) -> str:
-    if byte_length < 2 or run_index < 0 or run_index > 99:
+    if byte_length < 1024 or run_index < 0 or run_index > 99:
         raise ValueError("calibration_input_invalid")
-    repeated = _CALIBRATION_LINE * (byte_length // len(_CALIBRATION_LINE) + 1)
-    # LocalQueue deduplicates identical payloads even when their idempotency
-    # keys differ. Keep every calibration sample the exact requested byte
-    # size while changing two ASCII bytes per run. This avoids adding a
-    # non-certified parameter to the Gemma delegate contract merely to make
-    # repeated measurements distinct.
-    return repeated[:byte_length - 2] + f"{run_index:02d}"
+    sentence_bytes = byte_length - (len(_CALIBRATION_STEMS) - 1)
+    base, extra = divmod(sentence_bytes, len(_CALIBRATION_STEMS))
+    sentences = []
+    for index, stem in enumerate(_CALIBRATION_STEMS):
+        target = base + (1 if index < extra else 0)
+        prefix = f"{stem}run {run_index:02d} position {index + 1} contains "
+        filler_length = target - len(prefix) - 1
+        if filler_length < 1:
+            raise ValueError("calibration_input_invalid")
+        filler_unit = f"neutral measured detail {index + 1} remains stable "
+        filler = (filler_unit * (filler_length // len(filler_unit) + 1))[:filler_length]
+        sentences.append(prefix + filler + ".")
+    result = " ".join(sentences)
+    if len(result.encode("ascii")) != byte_length:
+        raise AssertionError("calibration_input_size_mismatch")
+    return result
 
 
 def _production_queue_busy(local_queue_root: Any) -> bool:
@@ -333,7 +349,8 @@ def _production_queue_busy(local_queue_root: Any) -> bool:
 
 
 def calibrate(config_path: str, *, clock: Any = time.time,
-              sampler: Any = None) -> dict[str, Any]:
+              sampler: Any = None, monotonic: Any = time.monotonic,
+              sleeper: Any = time.sleep) -> dict[str, Any]:
     """Measure the configured local model's latency at three window sizes.
 
     Refuses rather than measuring, in order: the production queue showing a
@@ -388,8 +405,32 @@ def calibrate(config_path: str, *, clock: Any = time.time,
         sizes: dict[str, Any] = {}
         for size in localfirst.CALIBRATION_SIZES:
             runs_s: list[float] = []
+            resource_waits_s: list[float] = []
             outcomes: list[str] = []
             for run_index in range(localfirst.CALIBRATION_RUNS_PER_SIZE):
+                # Back-to-back model calls can legitimately make the normal
+                # resource guard defer the next job while the Mac cools. Wait
+                # for that guard *before* starting the latency clock instead
+                # of hammering run_once until a fixed attempt count expires
+                # and misreporting a never-started job as a model failure.
+                wait_started = monotonic()
+                admitted = False
+                for wait_index in range(CALIBRATION_RESOURCE_WAIT_ATTEMPTS):
+                    current_resource = service.queue.state_report().get("resource", {})
+                    current_verdict = (current_resource.get("verdict", {})
+                                       if isinstance(current_resource, dict) else {})
+                    if (isinstance(current_verdict, dict)
+                            and current_verdict.get("interactive") == "admissible"):
+                        admitted = True
+                        break
+                    if wait_index + 1 < CALIBRATION_RESOURCE_WAIT_ATTEMPTS:
+                        sleeper(CALIBRATION_RESOURCE_POLL_SECONDS)
+                resource_waits_s.append(monotonic() - wait_started)
+                if not admitted:
+                    outcomes.append("failed")
+                    runs_s.append(0.0)
+                    continue
+
                 text = _synthetic_calibration_input(size, run_index)
                 submitted = service.queue.submit(
                     task_type="summarize", input=text,
@@ -399,10 +440,13 @@ def calibrate(config_path: str, *, clock: Any = time.time,
                     idempotency_key=f"calibrate-{size}-{run_index}-{int(clock() * 1000)}")
                 job_id = submitted["job_id"]
                 started = clock()
-                for _ in range(MAX_DRAIN_ATTEMPTS):
+                drain_deadline = monotonic() + float(service.queue.caps.timeout_seconds) + 60.0
+                while monotonic() < drain_deadline:
                     if service.queue.status(job_id)["status"] in ("complete", "failed"):
                         break
-                    service.once()
+                    service.queue.run_once("localq-calibration")
+                    if service.queue.status(job_id)["status"] == "queued":
+                        sleeper(CALIBRATION_RESOURCE_POLL_SECONDS)
                 elapsed = clock() - started
                 outcome = service.queue.result(job_id)
                 status = outcome.get("status", "failed")
@@ -416,6 +460,7 @@ def calibrate(config_path: str, *, clock: Any = time.time,
             # measured runs actually finished (see ``_covering_calibration``).
             sizes[str(size)] = {
                 "runs_s": runs_s, "outcomes": outcomes,
+                "resource_waits_s": resource_waits_s,
                 "median_s": statistics.median(eligible) if len(eligible) == len(runs_s) else None,
                 "max_s": max(eligible) if len(eligible) == len(runs_s) else None,
             }
@@ -436,8 +481,15 @@ def calibrate(config_path: str, *, clock: Any = time.time,
         budget = autoroute.LocalFirstConfig().latency_budget_seconds
     fits_budget = {size: (entry["median_s"] is not None and entry["median_s"] <= budget)
                   for size, entry in sizes.items()}
-    return {"ok": True, "record": record, "latency_budget_seconds": budget,
-            "fits_budget": fits_budget}
+    ready = bool(fits_budget) and all(fits_budget.values())
+    result = {"ok": ready, "record": record, "latency_budget_seconds": budget,
+              "fits_budget": fits_budget}
+    if not ready:
+        # The durable record remains useful diagnostic evidence, but a CLI
+        # caller (especially the activation launcher) must not confuse
+        # "measurement finished" with "the configured route is ready".
+        result["error"] = "calibration_failed:incomplete_or_over_budget"
+    return result
 
 
 def run(config_path: str, *, callers: tuple[str, ...]) -> dict[str, Any]:

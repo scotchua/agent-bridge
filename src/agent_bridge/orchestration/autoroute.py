@@ -76,7 +76,11 @@ TASK_TYPES = ("implementation", "mechanical", "review", "unknown")
 #: queue already applies ``QueueCaps.max_load_per_core`` when it runs a job;
 #: this is the routing-time equivalent, so work is not sent to a lane that
 #: will immediately defer it.
-DEFAULT_MAX_LOCAL_LOAD = 0.75
+# Deliberately aggressive local-first policy. A load average can remain high
+# after useful work ends, and Scott prefers starting locally then dialing back
+# only after measured user-visible impact. The queue still independently stops
+# for memory pressure, thermal pressure, or near-saturated CPU.
+DEFAULT_MAX_LOCAL_LOAD = 1.25
 
 
 class PolicyError(ValueError):

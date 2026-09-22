@@ -33,6 +33,12 @@ class Sampler:
 
 
 class LocalQueueTests(unittest.TestCase):
+    def test_default_resource_policy_is_intentionally_aggressive(self):
+        caps = QueueCaps()
+        self.assertEqual(caps.bulk_min_idle_seconds, 0.0)
+        self.assertEqual(caps.max_load_per_core, 1.25)
+        self.assertEqual(caps.min_cpu_idle_ratio, 0.10)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.clock = Clock()
@@ -211,14 +217,14 @@ class LocalQueueTests(unittest.TestCase):
 
     def test_high_per_core_load_defers_execution(self):
         job = self.submit(input="wait for lower load")
-        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 0.90)
+        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 1.50)
         deferred = self.queue.run_once("runner")
         self.assertEqual(deferred["status"], "queued")
         self.assertIn("resource_cpu_load", self.queue.status(job["job_id"])["error"])
 
     def test_high_load_ratio_with_healthy_measured_idle_is_admitted(self):
         job = self.submit(input="load average lags a genuinely idle cpu")
-        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 0.90, 0.40)
+        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 1.50, 0.40)
         terminal = self.queue.run_once("runner")
         self.assertEqual(terminal["job_id"], job["job_id"])
         self.assertEqual(terminal["disposition"]["outcome"], "complete")
@@ -227,7 +233,7 @@ class LocalQueueTests(unittest.TestCase):
 
     def test_high_load_ratio_with_unmeasured_idle_still_defers(self):
         job = self.submit(input="load average high, no idle probe available")
-        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 0.90, None)
+        self.sampler.snapshot = ResourceSnapshot(self.clock(), "normal", "normal", True, 120, 1.50, None)
         deferred = self.queue.run_once("runner")
         self.assertEqual(deferred["status"], "queued")
         self.assertIn("resource_cpu_load", self.queue.status(job["job_id"])["error"])

@@ -74,14 +74,16 @@ class QueueCaps:
     max_input_bytes: int = 24_000
     bulk_ttl_seconds: float = 3600.0
     sample_max_age_seconds: float = 10.0
-    bulk_min_idle_seconds: float = 60.0
+    # Aggressive local-first defaults. Bulk work may start while the operator
+    # is active; actual pressure and heat remain hard stops below.
+    bulk_min_idle_seconds: float = 0.0
     lease_seconds: float = 120.0
     timeout_seconds: float = 60.0
-    max_load_per_core: float = 0.75
+    max_load_per_core: float = 1.25
     #: Alternate admission threshold: a directly measured CPU idle fraction
     #: at or above this rescues admission when cpu_load_ratio alone would
     #: refuse it. See ResourceSnapshot.cpu_idle_ratio.
-    min_cpu_idle_ratio: float = 0.25
+    min_cpu_idle_ratio: float = 0.10
 
 
 #: Longest failure text the ``error`` column records.

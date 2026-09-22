@@ -799,7 +799,7 @@ class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
         self.assertEqual(decision.considered["cpu_idle_ratio"], 0.9)
 
     def test_a_low_measured_idle_reading_does_not_rescue_it(self):
-        decision = self.decide(0.9, 0.1)
+        decision = self.decide(0.9, autoroute.MIN_LOCAL_IDLE_RATIO / 2)
         self.assertEqual(decision.route, autoroute.RETAIN)
         self.assertEqual(decision.code, "retained_local_load_high")
 
