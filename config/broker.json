@@ -5,6 +5,9 @@
   "schema_path": "schema/peer_response.v2.json",
   "limits": {
     "prompt_max_chars": 100000,
+    "prompt_start_max_chars": 32000,
+    "prompt_continue_max_chars": 16000,
+    "prompt_corrective_max_chars": 12000,
     "label_max_chars": 200,
     "peer_stdout_max_bytes": 4000000,
     "peer_stderr_capture_max_bytes": 200000,

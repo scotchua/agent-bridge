@@ -59,7 +59,8 @@ def load_conversation(cfg: Config, conversation_id: str) -> dict[str, Any]:
 
 
 def claim_conversation_slot(
-    cfg: Config, conversation_id: str, caller: str, job_id: str, max_turns: int
+    cfg: Config, conversation_id: str, caller: str, job_id: str, max_turns: int,
+    *, timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Admit one continuation, atomically.
 
@@ -73,7 +74,7 @@ def claim_conversation_slot(
     # is "busy", not the global admission gate timing out. Reporting GATE_TIMEOUT
     # would name the right genus and the wrong species.
     try:
-        lock = store.file_lock(path + ".lock")
+        lock = store.file_lock(path + ".lock", timeout=timeout)
     except TimeoutError as exc:
         raise BrokerError(ErrorCategory.CONVERSATION_BUSY) from exc
     with lock:
@@ -669,7 +670,7 @@ def count_active(cfg: Config) -> int:
 
 
 @contextlib.contextmanager
-def admission_gate(cfg: Config) -> Any:
+def admission_gate(cfg: Config, *, timeout: float = 30.0) -> Any:
     """Serialise global admission across every broker process.
 
     Counting then launching is a check-then-act, so two MCP server processes
@@ -679,7 +680,7 @@ def admission_gate(cfg: Config) -> Any:
     write, which is a directory scan and one file, not a peer call.
     """
     store.secure_mkdir(cfg.state_root)
-    with store.file_lock(cfg.state("admission.lock"), timeout=30.0):
+    with store.file_lock(cfg.state("admission.lock"), timeout=timeout):
         yield
 
 

@@ -8,6 +8,7 @@ hard-codes them.
 from __future__ import annotations
 
 import json
+import math
 import os
 import uuid
 from typing import Any
@@ -89,6 +90,19 @@ class Config:
 
     def retention_days(self, name: str) -> int:
         return int(self.raw["retention"][name])
+
+    def prompt_budget(self, operation: str) -> int:
+        defaults = {"start": 32000, "continue": 16000, "corrective": 12000}
+        value = self.raw["limits"].get(f"prompt_{operation}_max_chars", defaults[operation])
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"prompt budget for {operation} must be a positive integer")
+        return max(0, min(value, self.limit("prompt_max_chars") - 1))
+
+    def request_timeout(self, peer: str) -> float:
+        value = float(self.peer(peer).get("timeout_seconds", 300 if peer == "claude" else 420))
+        if not math.isfinite(value):
+            raise ValueError(f"peers.{peer}.timeout_seconds must be finite")
+        return max(0.0, value)
 
     @property
     def allowed_classifications(self) -> tuple[str, ...]:

@@ -21,6 +21,7 @@ class PeerOutcome:
     argv: list[str] = field(default_factory=list)
     returncode: int | None = None
     duration_seconds: float = 0.0
+    elapsed_stages: list[dict[str, Any]] = field(default_factory=list)
     timed_out: bool = False
     group_kill: dict[str, Any] = field(default_factory=dict)
     extraction_path: str | None = None     # which documented channel produced payload

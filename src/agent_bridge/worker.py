@@ -7,7 +7,7 @@ restart without losing the job.
 
 Retry rules enforced here:
   deterministic  -> no retry, ever
-  transient      -> at most one retry, same prompt
+  transient      -> at most one retry, same prompt, within the shared deadline
   malformed or
   schema-invalid -> at most one corrective retry, whose prompt is generated
                     only from a closed error code plus schema metadata
@@ -22,10 +22,11 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
 from typing import Any
 
-from . import envelope, preflight, provenance, registry, runner, schema_validate, store
+from . import broker, envelope, preflight, provenance, receipts, registry, runner, schema_validate, store
 from .backends import claude_backend, codex_backend
 from .backends.base import PeerOutcome, argv_shape
 from .config import Config, load as load_config
@@ -57,28 +58,74 @@ def _run_peer(
     cfg: Config,
     peer: str,
     *,
-    prompt: str,
+    prompt: str | bytes,
     schema: dict[str, Any],
     schema_file: str,
     peer_session_id: str | None,
     resume: bool,
     workspace: str,
     attempt_dir: str,
+    deadline: float,
 ) -> PeerOutcome:
+    # Backends accept text; their pipe writers encode UTF-8 without translation.
+    if isinstance(prompt, bytes):
+        prompt = prompt.decode("utf-8")
     if peer == "claude":
         session_id = peer_session_id or claude_backend.new_session_id()
         return claude_backend.run_consultation(
             cfg, prompt=prompt, schema=schema, session_id=session_id,
             resume=resume, workspace=workspace, attempt_dir=attempt_dir,
+            deadline=deadline,
         )
     return codex_backend.run_consultation(
         cfg, prompt=prompt, schema_file=schema_file,
         thread_id=peer_session_id if resume else None,
         workspace=workspace, attempt_dir=attempt_dir,
+        deadline=deadline,
     )
 
 
+def _cleared_prompt(
+    cfg: Config, request: dict[str, Any], pinned: dict[str, Any] | None,
+    prompt: str, schema: dict[str, Any], schema_file: str,
+    peer_session_id: str | None, resume: bool,
+) -> bytes:
+    """Validate the bytes about to be invoked, including on an identical retry."""
+    try:
+        if request.get("redaction_handoff") != pinned or pinned is None:
+            raise ValueError("handoff pin changed")
+        if store.read_json_atomic(os.path.join(cfg.job_dir(request["job_id"]), "request.json")) != request:
+            raise ValueError("request changed")
+        conversation = registry.load_conversation(cfg, request["conversation_id"])
+        if (conversation.get("peer") != request["peer"]
+                or conversation.get("caller") != request["caller"]
+                or broker.PEER_OF[request["caller"]] != request["peer"]
+                or conversation.get("peer_session_id") != peer_session_id
+                or resume != request["resume"]):
+            raise ValueError("conversation changed")
+        current_schema, _ = cfg.load_schema()
+        with open(schema_file, "rb") as handle:
+            snapshot = handle.read()
+        if (current_schema != schema
+                or snapshot != json.dumps(schema, indent=2, sort_keys=True).encode("utf-8")):
+            raise ValueError("contract changed")
+        args = {key: request[key] for key in broker.START_FIELDS if key in request}
+        if resume:
+            args["conversation_id"] = request["conversation_id"]
+        prompt_bytes = prompt.encode("utf-8")
+        checked = broker.validate_handoff(
+            cfg, args, request["peer"], request["conversation_id"], peer_session_id,
+            resume=resume, prompt_bytes=prompt_bytes,
+        )
+        if checked != pinned:
+            raise ValueError("preparation changed")
+        return prompt_bytes
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID) from exc
+
+
 def execute(job_dir: str) -> int:
+    worker_started = time.monotonic()
     store.set_umask()
     request = store.read_json_atomic(os.path.join(job_dir, "request.json"))
     cfg = load_config(request.get("config_path") or None)
@@ -87,6 +134,11 @@ def execute(job_dir: str) -> int:
     peer = request["peer"]
     caller = request["caller"]
     resume = bool(request["resume"])
+    budget_started = request.get("budget_started_monotonic", worker_started)
+    deadline = request.get("deadline_monotonic", budget_started + cfg.request_timeout(peer))
+    stages = [{"stage": "admission_and_queue", "elapsed_seconds": round(
+        max(0.0, worker_started - budget_started), 3)}]
+    stage_started = worker_started
 
     # The `running` write is load-bearing, so its success must be checked
     # rather than assumed. Terminal documents are immutable, so if this job was
@@ -95,9 +147,20 @@ def execute(job_dir: str) -> int:
     # still pass, a rival would see a terminal job and steal the claim, and two
     # workers would reach the same peer session: exactly the gap the handshake
     # exists to close, reopened by the immutability rule it depends on.
+    try:
+        admitted = registry.read_status(cfg, job_id)
+    except BrokerError as exc:
+        # Legacy jobs may initialize their status here; handoffs require a pin.
+        if (exc.category is not ErrorCategory.JOB_NOT_FOUND
+                or os.path.lexists(os.path.join(job_dir, "status.json"))
+                or broker.HANDOFF_FIELDS & set(request) or "redaction_handoff" in request):
+            raise
+        admitted = {}
     published = registry.write_status(
         cfg, job_id, "running", worker_pid=os.getpid(), started_at=store.utc_now(),
         conversation_id=conversation_id, peer=peer, caller=caller, attempts=0,
+        **({"redaction_handoff": admitted["redaction_handoff"]}
+           if "redaction_handoff" in admitted else {}),
     )
     if published.get("status") != "running" or published.get("worker_pid") != os.getpid():
         store.atomic_write_json(os.path.join(job_dir, "abandoned.json"), {
@@ -138,7 +201,7 @@ def execute(job_dir: str) -> int:
 
     try:
         schema, schema_sha = cfg.load_schema()
-        peer_info = preflight.check_peer(cfg, peer)
+        peer_info = preflight.check_peer(cfg, peer, deadline=deadline)
         workspace = store.secure_mkdir(cfg.workspace(peer, conversation_id))
         preflight.assert_workspace_clean(
             workspace, record_to=cfg.state("last-contamination.json"))
@@ -164,14 +227,43 @@ def execute(job_dir: str) -> int:
             if resume
             else envelope.build_initial(request["prompt"], schema, cfg.contract_version)
         )
+        operation = "continue" if resume else "start"
+        if len(request["prompt"]) > cfg.prompt_budget(operation):
+            raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+        stages.append({"stage": "preparation", "elapsed_seconds": round(
+            time.monotonic() - stage_started, 3)})
+        stage_started = time.monotonic()
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            if time.monotonic() >= deadline:
+                category = ErrorCategory.PEER_TIMEOUT
+                break
+            if len(prompt_text) > cfg.limit("prompt_max_chars") or (
+                operation == "corrective" and len(prompt_text) > cfg.prompt_budget(operation)
+            ):
+                # A corrective message that cannot fit exhausts structured output
+                # recovery; retain its substantive error instead of launching it.
+                if operation == "corrective":
+                    retries_exhausted = True
+                else:
+                    category = ErrorCategory.INPUT_TOO_LARGE
+                break
             attempt_dir = store.secure_mkdir(os.path.join(job_dir, "attempts", str(attempt)))
+            send_prompt = prompt_text
+            if (broker.HANDOFF_FIELDS & set(request) or "redaction_handoff" in request
+                    or "redaction_handoff" in published):
+                send_prompt = _cleared_prompt(
+                    cfg, request, published.get("redaction_handoff"), prompt_text,
+                    schema, schema_file, peer_session_id, resume,
+                )
             outcome = _run_peer(
-                cfg, peer, prompt=prompt_text, schema=schema, schema_file=schema_file,
+                cfg, peer, prompt=send_prompt, schema=schema, schema_file=schema_file,
                 peer_session_id=peer_session_id, resume=resume,
                 workspace=workspace, attempt_dir=attempt_dir,
+                deadline=deadline,
             )
+            stages.extend({**stage, "attempt": attempt} for stage in outcome.elapsed_stages)
+            validation_started = time.monotonic()
             final = outcome
             category = outcome.category
             violations = []
@@ -181,7 +273,9 @@ def execute(job_dir: str) -> int:
                     os.path.join(attempt_dir, "stderr.bin"), outcome.raw_stderr
                 )
 
-            if category is ErrorCategory.OK and isinstance(outcome.payload, dict):
+            if category is ErrorCategory.OK and not isinstance(outcome.payload, dict):
+                category = ErrorCategory.PEER_OUTPUT_MALFORMED
+            if category is ErrorCategory.OK:
                 # Version first: a peer answering a different contract version
                 # will not be fixed by a corrective retry, so it must not spend
                 # one. Only then is the payload validated against the schema.
@@ -193,6 +287,11 @@ def execute(job_dir: str) -> int:
                         category = ErrorCategory.PEER_OUTPUT_SCHEMA_INVALID
                     else:
                         validated = outcome.payload
+            if time.monotonic() >= deadline:
+                category = ErrorCategory.PEER_TIMEOUT
+                validated = None
+            stages.append({"stage": "validation", "attempt": attempt,
+                           "elapsed_seconds": round(time.monotonic() - validation_started, 3)})
 
             attempts_log.append({
                 "attempt": attempt,
@@ -210,6 +309,7 @@ def execute(job_dir: str) -> int:
                 "notes": outcome.notes,
                 "argv_shape": argv_shape(outcome.argv),
             })
+            stage_started = time.monotonic()
 
             if validated is not None:
                 category = ErrorCategory.OK
@@ -234,12 +334,14 @@ def execute(job_dir: str) -> int:
                 # about a conversation the peer has never seen. A schema-valid
                 # but contentless answer could then be committed as the turn.
                 if not outcome.peer_session_id:
+                    retries_exhausted = True
                     break
                 prompt_text = envelope.build_corrective(
                     category.value, violations, schema, cfg.contract_version
                 )
                 peer_session_id = outcome.peer_session_id
                 resume = True
+                operation = "corrective"
                 continue
             if category in TRANSIENT:
                 continue  # one plain retry, same prompt
@@ -261,6 +363,9 @@ def execute(job_dir: str) -> int:
             os.path.join(job_dir, "worker_traceback.txt"),
             traceback.format_exc().encode("utf-8"),
         )
+
+    stages.append({"stage": "finalization", "elapsed_seconds": round(
+        time.monotonic() - stage_started, 3)})
 
     # ---- terminal state -------------------------------------------------
     if category is ErrorCategory.OK:
@@ -328,8 +433,19 @@ def execute(job_dir: str) -> int:
         "peer_cost_usd": final.cost_usd if final else None,
         "attempts": attempts_log,
         "attempt_count": len(attempts_log),
+        "elapsed_stages": stages,
+        "elapsed_seconds": round(time.monotonic() - budget_started, 3),
+        "budget_seconds": cfg.request_timeout(peer),
         "implementation": impl,
     }
+    if published.get("redaction_handoff"):
+        record["redaction_handoff"] = published["redaction_handoff"]
+    receipt = None
+    if category in receipts.CATEGORIES:
+        receipt = receipts.build(cfg, peer, request["prompt"], category,
+                                 attempts_log, stages, time.monotonic() - budget_started)
+        record["receipt"] = receipt
+        store.atomic_write_json(os.path.join(job_dir, "receipt.json"), receipt)
     store.atomic_write_json(os.path.join(job_dir, "provenance.json"), record)
     if validated is not None:
         store.atomic_write_json(os.path.join(job_dir, "result.json"), {
@@ -384,6 +500,7 @@ def execute(job_dir: str) -> int:
         finished_at=finished_at, attempts=len(attempts_log),
         conversation_id=conversation_id, peer=peer, caller=caller,
         worker_pid=None,
+        receipt=receipt,
     )
     return 0 if status == "complete" else 1
 

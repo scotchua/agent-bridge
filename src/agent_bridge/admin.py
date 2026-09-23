@@ -170,6 +170,8 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
         "state_root": cfg.state_root,
         "config": cfg.path,
         "contract_version": cfg.contract_version,
+        "session_validation": "not_checked",
+        "approval_granted": False,
         "contract_schema_sha256": cfg.load_schema()[1],
         "jobs_total": jobs,
         "jobs_by_status": counts,
