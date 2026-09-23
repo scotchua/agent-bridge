@@ -55,7 +55,8 @@ class Service:
                        "--queue-root", str(self.root)]
             backend = SubprocessBackend(command)
         self.queue = LocalQueue(self.root, sampler=self.sampler, backend=backend,
-                                caps=caps or QueueCaps(), allowed_task_types=allowed_task_types)
+                                caps=caps or QueueCaps(), allowed_task_types=allowed_task_types,
+                                backend_id=backend_id)
         self.state_path = self.root / "runtime-state.json"
 
     @classmethod

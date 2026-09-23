@@ -1298,7 +1298,7 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
         f"delegation-first gate: {real_path} is a mechanical artifact ({size:,} bytes, "
         f"matches {matched_glob}) in a repository the operator marked mechanical_ok, and "
         f"the local lane is ready ({readiness.reason}). Call work_digest_file with "
-        f"path={real_path!r}, task_type one of {'|'.join(localfirst.DIGEST_TASK_TYPES)}, then "
+        f"path={real_path!r}, task_type='summarize', then "
         f"work_result on the returned job_id; this read is allowed once the digest completes. "
         f"Exact tools (grep, rg, tail -n) are allowed now.",
         (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob})

@@ -222,7 +222,8 @@ class LocalQueue:
     def __init__(self, root: str | Path, *, sampler: Sampler,
                  backend: Backend | None = None, caps: QueueCaps = QueueCaps(),
                  clock: Callable[[], float] = time.time,
-                 allowed_task_types: "frozenset[str] | None" = None):
+                 allowed_task_types: "frozenset[str] | None" = None,
+                 backend_id: str = "private_worker"):
         self.root = Path(root)
         self.blobs = self.root / "blobs"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -230,6 +231,9 @@ class LocalQueue:
         self.db_path = self.root / "localq.sqlite3"
         self.lock_path = self.root / "executor.lock"
         self.sampler, self.backend, self.caps, self.clock = sampler, backend, caps, clock
+        if not isinstance(backend_id, str) or not backend_id:
+            raise ValueError("backend_id_invalid")
+        self.backend_id = backend_id
         # The kinds *this* backend actually carries. Defaults to every
         # mechanical task, unchanged from before this existed. A backend
         # that supports fewer kinds (``gemma_certified`` supports only

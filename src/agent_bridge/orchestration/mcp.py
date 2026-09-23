@@ -17,8 +17,9 @@ import os
 from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
+from ..localq import gemma_child
 from ..localq.intake import AutomaticIntake
-from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
+from ..localq.spool import AdmissionError, JobNotFound, LocalQueue, UNSUPPORTED_KIND_REASON
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
@@ -218,9 +219,11 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             merged["checkpoint_id"] = checkpoint["checkpoint_id"]
         return call(intake.route, merged)
 
+    digest_task_types = [kind for kind in localfirst.DIGEST_TASK_TYPES
+                         if kind in queue.allowed_task_types]
     digest = _schema({
         "path": {"type": "string", "description": "Absolute path to the file to digest."},
-        "task_type": {"type": "string", "enum": list(localfirst.DIGEST_TASK_TYPES)},
+        "task_type": {"type": "string", "enum": digest_task_types},
         "offset": {"type": "integer", "minimum": 0,
                   "description": "Byte offset to start the window at. Defaults to the tail. "
                                  "The window length is fixed and not the caller's to choose; "
@@ -259,6 +262,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         if (not isinstance(path, str) or not path or not os.path.isabs(path)
                 or task_type not in localfirst.DIGEST_TASK_TYPES):
             return {"ok": False, "error": "digest_path_refused:input_invalid"}
+        if task_type not in queue.allowed_task_types:
+            return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
         if os.path.islink(path):
             return {"ok": False, "error": "digest_path_refused:symlink"}
         try:
@@ -290,6 +295,14 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 task_type, max_chars=policy.local_first.digest_max_output_chars, fields=fields)
         except localfirst.TemplateError as exc:
             return {"ok": False, "error": f"digest_task_refused:{exc}"}
+        # Gemma's certified adapter accepts no arbitrary digest template. An
+        # absent instruction selects its fixed, attested summarize prompt.
+        # Keep the effective prompt in the idempotency binding, but omit the
+        # instruction key on the wire so a template cannot reach the child.
+        params = {"instruction": instruction}
+        if queue.backend_id == "gemma_certified":
+            instruction = gemma_child.CERTIFIED_SUMMARIZE_INSTRUCTION
+            params = {}
         # A single call determines the window from the file's live size and
         # reads exactly that window through the one descriptor it opens --
         # deliberately not a separate os.stat(real_path) followed by
@@ -329,7 +342,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 caller=caller, input_bytes=len(text.encode("utf-8")), nonblank_lines=nonblank_lines,
                 risk_flags=[], idempotency_key=idem)
             intake_result = intake.route(
-                task_type=task_type, input=text, params={"instruction": instruction},
+                task_type=task_type, input=text, params=params,
                 priority=priority, classification=repo_policy.classification, caller=caller,
                 purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
         except (AdmissionError, TypeError, ValueError) as exc:

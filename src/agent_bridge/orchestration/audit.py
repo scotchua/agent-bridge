@@ -482,7 +482,10 @@ def report(state_root: str, *, home: str | None = None,
             capacity_db = loaded.get("capacity_db")
             execution_root = loaded.get("execution_queue_root")
             local_root = loaded.get("local_queue_root")
-            worker_executable = loaded.get("worker_executable")
+            # Match the executable the live gate and calibration actually use.
+            worker_executable = (loaded.get("gemma_delegate_executable")
+                                 if loaded.get("local_backend") == "gemma_certified"
+                                 else loaded.get("worker_executable"))
 
     stages: dict[str, Any] = {"available": False}
     if capacity_db and os.path.exists(capacity_db):

@@ -12,17 +12,20 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.localq import backend_select, gemma_child, worker_child
+from agent_bridge.capacity_router import StageRouter
 from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
 from agent_bridge.localq.service import Service
 from agent_bridge.localq.spool import (FakeBackend, LocalQueue, QueueCaps,
                                        ResourceSnapshot, SubprocessBackend,
                                        UNSUPPORTED_KIND_REASON)
 from agent_bridge.orchestration.config import OrchestrationConfigError, load
-from agent_bridge.orchestration import delegation_verify, gate, localfirst
+from agent_bridge.orchestration import audit, autoroute, delegation_verify, gate, localfirst, mcp
 
 
 FAKES = Path(__file__).resolve().parent / "fakes"
@@ -126,6 +129,58 @@ class ConfigAndSelectionTests(unittest.TestCase):
         self.assertGreater(caps.lease_seconds, caps.timeout_seconds)
         service = Service.for_config(cfg, root=str(self.root / "service"), sampler=Sampler())
         self.assertEqual(service.queue.allowed_task_types, frozenset({"summarize"}))
+        self.assertEqual(service.queue.backend_id, "gemma_certified")
+
+    @unittest.skipUnless(os.name == "posix", "certified Gemma backend requires POSIX process groups")
+    def test_live_digest_uses_certified_gemma_call_shape(self):
+        doc = config_doc(self.root, self.fx)
+        cfg = load(self.write(doc))
+        repo = self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        target = repo / "synthetic.log"
+        target.write_text("Synthetic log entry.\n" * 500, encoding="utf-8")
+        policy_path = Path(autoroute.policy_path(str(self.root / "state")))
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        policy_path.write_text(json.dumps({
+            "version": 1, "declared_available": ["local"],
+            "local_first": {"enabled": True},
+            "repos": {str(repo): {"classification": "internal_nonclient",
+                                  "allowed_routes": ["claude", "codex", "local"],
+                                  "mechanical_ok": True, "mechanical_globs": ["**/*.log"]}},
+        }), encoding="utf-8")
+        service = Service.for_config(cfg, root=str(self.root / "queue"), sampler=Sampler())
+        intake = AutomaticIntake(service.queue, policy=IntakePolicy(min_input_chars=1,
+                                                                      min_nonblank_lines=1))
+        tools = mcp.build_tools("codex", StageRouter(str(self.root / "router.sqlite3")),
+                                service.queue, intake, state_root=str(self.root / "state"))
+        digest = tools["work_digest_file"]
+        self.assertEqual(digest["inputSchema"]["properties"]["task_type"]["enum"],
+                         ["summarize"])
+        refused = digest["handler"]({"path": str(target), "task_type": "log_triage"})
+        self.assertEqual(refused["error"], "digest_task_refused:unsupported_kind")
+        self.assertEqual(service.queue.state_report()["counts"], {})
+        submitted = digest["handler"]({"path": str(target), "task_type": "summarize"})
+        self.assertTrue(submitted["ok"], submitted)
+        self.assertTrue(submitted["job_id"])
+        service.once()
+        result = tools["work_result"]["handler"]({"job_id": submitted["job_id"]})
+        self.assertEqual(result["status"], "complete", result)
+        self.assertEqual(result["result"]["provider"], "gemma_certified")
+
+    def test_audit_selects_gemma_delegate_for_readiness(self):
+        doc = config_doc(self.root, self.fx)
+        config_path = self.write(doc)
+        state = self.root / "state"
+        policy_path = Path(autoroute.policy_path(str(state)))
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        policy_path.write_text(json.dumps({"version": 1, "declared_available": ["local"],
+                                           "local_first": {"enabled": True}, "repos": {}}),
+                               encoding="utf-8")
+        ready = SimpleNamespace(ready=True, code="ready", reason="ready", considered={})
+        with mock.patch.object(audit.localfirst, "readiness", return_value=ready) as check:
+            audit.report(str(state), config_path=str(config_path))
+        self.assertEqual(check.call_args.kwargs["worker_executable"],
+                         str(self.fx["delegate"]))
 
     def test_gate_readiness_uses_the_backend_calibration_target(self):
         private = config_doc(self.root, self.fx, "private_worker")
