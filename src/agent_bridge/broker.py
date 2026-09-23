@@ -8,23 +8,28 @@ is ever placed in a response.
 from __future__ import annotations
 
 import contextlib
+import json
+import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from . import preflight, provenance, registry, store
+from . import envelope, preflight, provenance, receipts, registry, store
 from .config import Config, canonical_uuid
 from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_from_status
 
 CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
-START_FIELDS = {"prompt", "source_classification", "label", "local_first"}
-CONTINUE_FIELDS = {"conversation_id", "prompt", "source_classification", "label", "local_first"}
+HANDOFF_FIELDS = {"preparation_dir", "clearance_sha256"}
+START_FIELDS = {"prompt", "source_classification", "label", "local_first"} | HANDOFF_FIELDS
+CONTINUE_FIELDS = START_FIELDS | {"conversation_id"}
 
 #: local_first.bypass's closed vocabulary (design section 2.8).
 LOCAL_FIRST_BYPASS_REASONS = frozenset({"needs_judgment", "not_mechanical", "local_unavailable"})
@@ -32,7 +37,7 @@ LOCAL_FIRST_BYPASS_REASONS = frozenset({"needs_judgment", "not_mechanical", "loc
 
 # ------------------------------------------------------------------ responses
 def error_response(category: ErrorCategory, **identifiers: Any) -> dict[str, Any]:
-    """Closed-vocabulary error. Typed fields only, constant hint, no free text."""
+    """Closed-vocabulary category and hint, with broker-owned metadata."""
     response: dict[str, Any] = {
         "ok": False,
         "error_category": category.value,
@@ -51,7 +56,7 @@ def ok_response(**fields: Any) -> dict[str, Any]:
 
 # ----------------------------------------------------------------- validation
 def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
-                     peer: str) -> None:
+                     peer: str, operation: str = "start") -> None:
     if not isinstance(args, dict):
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
     unknown = set(args) - allowed
@@ -61,14 +66,16 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
-    if len(prompt) > cfg.limit("prompt_max_chars"):
+    if len(prompt) > cfg.prompt_budget(operation):
         raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
 
     classification = args.get("source_classification")
     if not isinstance(classification, str):
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
     normalized = classification.strip().lower()
-    if normalized in {c.lower() for c in cfg.refused_classifications}:
+    if normalized in {"client-derived", "client_derived"} | {
+        c.lower() for c in cfg.refused_classifications
+    }:
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
     # Checked against what THIS peer may receive, which can be narrower than
     # the global list when one vendor's terms are weaker than the other's.
@@ -82,7 +89,271 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
         if len(label) > cfg.limit("label_max_chars"):
             raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
 
-    _validate_local_first(cfg, prompt, args.get("local_first"))
+    if HANDOFF_FIELDS & set(args):
+        if (not HANDOFF_FIELDS <= set(args)
+                or not isinstance(args["preparation_dir"], str)
+                or not os.path.isabs(args["preparation_dir"])
+                or not _receipt_hash(args["clearance_sha256"])
+                or label is not None):
+            raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+
+
+# Local copy of the local-delegate/v2 receipt validator; no plugin runtime dependency.
+RECEIPT_VERSION = 2
+RECEIPT_CONTRACT = "local-delegate/v2"
+RECEIPT_STATUSES = {
+    "success", "unavailable", "digest_missing", "digest_mismatch", "timeout",
+    "invalid_envelope", "parse_failure", "invalid_result", "incomplete",
+    "review_required", "invalid_input", "internal_error", "interrupted",
+    "receipt_failure",
+}
+RECEIPT_STATES = ("pending", "running", "complete", "failed")
+RECEIPT_HASH_FIELDS = {"model_digest", "prompt_version", "config_version", "input_sha256",
+                       "canonical_input_sha256", "output_sha256", "validator_version",
+                       "parent_task_id", "attempt_id"}
+RECEIPT_FIELDS = RECEIPT_HASH_FIELDS | {"version", "contract", "invocation_id", "task", "chunk_counts",
+                                       "chunks", "passes", "parser_repairs", "triage_repairs",
+                                       "duration_seconds", "result_status", "output_hash_kind",
+                                       "parser_status", "effective_options", "request_options",
+                                       "input_count", "output_count", "human_review_required",
+                                       "semantic_coverage"}
+RECEIPT_OPTION_FIELDS = {"chunk_chars", "job_timeout", "think", "schema", "second_pass",
+                         "repair_retries", "map_scope", "roster_sha256"}
+
+
+def _receipt_count(value):
+    return type(value) is int and value >= 0
+
+
+def _receipt_duration(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def _receipt_hash(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+
+
+def _receipt_chunk_counts(chunks):
+    return {**{state: sum(c["status"] == state for c in chunks) for state in RECEIPT_STATES},
+            "total": len(chunks)}
+
+
+def _receipt_pass_states(chunks):
+    result = []
+    for number in sorted({c["pass"] for c in chunks}):
+        group = [c for c in chunks if c["pass"] == number]
+        states = {c["status"] for c in group}
+        status = ("complete" if states == {"complete"} else "failed" if "failed" in states
+                  else "pending" if states == {"pending"} else "running")
+        result.append({"pass": number, "status": status, "chunk_counts": _receipt_chunk_counts(group)})
+    return result
+
+
+def _validate_delegation_receipt(record):
+    """Closed metadata schema shared by the writer and automated consumers."""
+    if (not isinstance(record, dict) or set(record) != RECEIPT_FIELDS
+            or type(record["version"]) is not int or record["version"] != RECEIPT_VERSION
+            or record["contract"] != RECEIPT_CONTRACT):
+        raise ValueError("invalid delegation receipt fields")
+    if not isinstance(record["invocation_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", record["invocation_id"]):
+        raise ValueError("invalid invocation identity")
+    for key in RECEIPT_HASH_FIELDS:
+        if record[key] is not None and not _receipt_hash(record[key]):
+            raise ValueError("invalid receipt hash")
+    if record["task"] not in (None, "summarize", "triage", "redact", "classify", "extract"):
+        raise ValueError("invalid receipt task")
+    if not isinstance(record["result_status"], str) or record["result_status"] not in RECEIPT_STATUSES:
+        raise ValueError("invalid receipt status")
+    if record["output_hash_kind"] not in ("stdout", "response_bodies"):
+        raise ValueError("invalid output hash kind")
+    if record["parser_status"] not in ("not_run", "complete", "parse_failure", "invalid_result", "incomplete"):
+        raise ValueError("invalid parser status")
+    if record["human_review_required"] is not True or record["semantic_coverage"] != "unproven":
+        raise ValueError("invalid review metadata")
+    for key in ("parser_repairs", "triage_repairs", "input_count", "output_count"):
+        if not _receipt_count(record[key]):
+            raise ValueError("invalid count")
+    if not _receipt_duration(record["duration_seconds"]):
+        raise ValueError("invalid duration")
+    options = record["effective_options"]
+    if options is not None:
+        if (not isinstance(options, dict) or set(options) != RECEIPT_OPTION_FIELDS
+                or not _receipt_count(options["chunk_chars"]) or options["chunk_chars"] < 500
+                or not _receipt_duration(options["job_timeout"]) or options["job_timeout"] == 0
+                or any(type(options[k]) is not bool for k in ("think", "schema", "second_pass"))
+                or type(options["repair_retries"]) is not int or options["repair_retries"] not in (0, 2)
+                or options["map_scope"] not in ("run", "file")
+                or (options["roster_sha256"] is not None and not _receipt_hash(options["roster_sha256"]))):
+            raise ValueError("invalid effective options")
+    requests = record["request_options"]
+    if not isinstance(requests, list):
+        raise ValueError("invalid request options")
+    for request in requests:
+        if (not isinstance(request, dict) or set(request) != {"num_ctx", "think", "schema", "prompt_version"}
+                or not _receipt_count(request["num_ctx"]) or request["num_ctx"] == 0
+                or type(request["think"]) is not bool or type(request["schema"]) is not bool
+                or not _receipt_hash(request["prompt_version"])):
+            raise ValueError("invalid request options")
+    chunks = record["chunks"]
+    if not isinstance(chunks, list):
+        raise ValueError("invalid chunks")
+    for index, chunk in enumerate(chunks, 1):
+        if (not isinstance(chunk, dict) or set(chunk) != {"index", "pass", "status", "parser_status", "duration_seconds"}
+                or type(chunk["index"]) is not int or chunk["index"] != index
+                or type(chunk["pass"]) is not int or chunk["pass"] not in (1, 2)
+                or chunk["status"] not in RECEIPT_STATES
+                or chunk["parser_status"] not in ("not_run", "complete", "parse_failure", "invalid_result", "incomplete")
+                or not _receipt_duration(chunk["duration_seconds"])
+                or (chunk["status"] == "complete" and chunk["parser_status"] != "complete")):
+            raise ValueError("invalid chunk metadata")
+    counts = _receipt_chunk_counts(chunks)
+    if record["chunk_counts"] != counts or record["passes"] != _receipt_pass_states(chunks):
+        raise ValueError("inconsistent completion metadata")
+    if record["result_status"] == "success":
+        required = RECEIPT_HASH_FIELDS - {"parent_task_id", "attempt_id"}
+        if (not chunks or counts["complete"] != counts["total"] or options is None
+                or any(record[k] is None for k in required)
+                or record["task"] is None or record["parser_status"] != "complete"
+                or record["output_hash_kind"] != "stdout" or record["parser_repairs"]
+                or len(requests) != len(chunks) + record["triage_repairs"]
+                or any(r["think"] != options["think"] or r["schema"] != options["schema"] for r in requests)
+                or {c["pass"] for c in chunks} != ({1, 2} if options["second_pass"] else {1})
+                or (record["task"] != "triage" and record["triage_repairs"] != 0)
+                or (record["task"] in ("classify", "triage")
+                    and record["input_count"] != record["output_count"])):
+            raise ValueError("incomplete success receipt")
+    elif record["output_hash_kind"] != "response_bodies":
+        raise ValueError("non-success cannot bind published stdout")
+    return record
+
+
+HANDOFF_CONTRACT = "redaction-handoff/v1"
+PEER_HANDOFF_CONTRACT = "redaction-peer-handoff/v1"
+HANDOFF_ARTIFACTS = {"output.txt", "candidates.txt", "prompt.txt", "receipt.json", "certificate.json"}
+RECEIPT_BINDINGS = {"invocation_id", "input_sha256", "canonical_input_sha256", "effective_options",
+                    "parent_task_id", "attempt_id"}
+
+
+def _handoff_json(raw: bytes) -> Any:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate handoff key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value: str) -> Any:
+        raise ValueError("invalid handoff constant")
+
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid_constant)
+
+
+def _read_clearance(args: dict[str, Any]) -> dict[str, Any]:
+    raw = (Path(args["preparation_dir"]) / "clearance.json").read_bytes()
+    if not _receipt_hash(args["clearance_sha256"]) or store.sha256_bytes(raw) != args["clearance_sha256"]:
+        raise ValueError("clearance changed")
+    clearance = _handoff_json(raw)
+    if (set(clearance) != {"contract", "preparation_sha256", "output_sha256",
+                          "candidate_review_sha256", "prompt_sha256", "human_reviewed", "assembly"}
+            or clearance["contract"] != PEER_HANDOFF_CONTRACT
+            or clearance["human_reviewed"] is not True):
+        raise ValueError("peer clearance required")
+    return clearance
+
+
+def _initial_handoff_identity(args: dict[str, Any]) -> str:
+    """Use the fresh conversation UUID the human reviewed, before creating state."""
+    try:
+        identity = _read_clearance(args)["assembly"]["conversation_id"]
+        if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+            raise ValueError("invalid conversation identity")
+        return identity
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID) from exc
+
+
+def validate_handoff(
+    cfg: Config, args: dict[str, Any], peer: str, conversation_id: str,
+    peer_session_id: str | None, *, resume: bool, prompt_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    """Re-read all pinned snapshots; return only hashes safe to persist."""
+    _validate_common(cfg, args, CONTINUE_FIELDS if resume else START_FIELDS,
+                     peer, "continue" if resume else "start")
+    try:
+        clearance = _read_clearance(args)
+        root = Path(args["preparation_dir"])
+        raw = (root / "preparation.json").read_bytes()
+        record = _handoff_json(raw)
+        if (set(record) != {"contract", "source_classification", "artifacts", "receipt_bindings"}
+                or record["contract"] != HANDOFF_CONTRACT
+                or set(record["artifacts"]) != HANDOFF_ARTIFACTS
+                or set(record["receipt_bindings"]) != RECEIPT_BINDINGS
+                or clearance["preparation_sha256"] != store.sha256_bytes(raw)):
+            raise ValueError("invalid preparation")
+        artifacts = {name: (root / name).read_bytes() for name in HANDOFF_ARTIFACTS}
+        if any(store.sha256_bytes(content) != record["artifacts"][name]
+               for name, content in artifacts.items()):
+            raise ValueError("changed artifact")
+        output = artifacts["output.txt"]
+        labels = re.findall(
+            r"(?im)^Source classification:\s*(internal|synthetic|public|client-derived)\s*$",
+            output.decode("utf-8"),
+        )
+        if (len(labels) != 1 or labels[0].lower() != record["source_classification"]
+                or args["source_classification"] != record["source_classification"]
+                or args["prompt"].encode("utf-8") != output
+                or not artifacts["candidates.txt"].strip()):
+            raise ValueError("payload or classification changed")
+        receipt = _validate_delegation_receipt(_handoff_json(artifacts["receipt.json"]))
+        if (receipt["result_status"] != "success" or receipt["task"] != "redact"
+                or receipt["output_sha256"] != store.sha256_bytes(output)
+                or any(receipt[key] != value for key, value in record["receipt_bindings"].items())):
+            raise ValueError("receipt binding changed")
+        options = receipt["effective_options"]
+        certificate = _handoff_json(artifacts["certificate.json"])
+        route = certificate["binding"]
+        route_key = store.sha256_bytes(json.dumps(
+            route, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        if (not options["second_pass"] or not options["schema"]
+                or certificate["contract"] != "local-delegate-certification/v2"
+                or certificate["route_key"] != route_key
+                or certificate["result"]["eligible"] is not True
+                or certificate["result"]["complete"] is not True
+                or certificate["result"]["failed_metrics"] != []
+                or route["task"] != "redact" or route["contract"] != certificate["contract"]
+                or route["effective_options"] != options
+                or route["digest"] != receipt["model_digest"]
+                or route["prompt_sha256"] != receipt["prompt_version"]
+                or route["validator_sha256"] != receipt["validator_version"]
+                or any(r["prompt_version"] != receipt["prompt_version"] for r in receipt["request_options"])
+                or certificate["evidence_kind"] not in ("fake", "model")
+                or (certificate["evidence_kind"] == "fake" and not (
+                    route["endpoint"] == "http://certification.invalid"
+                    and route["runtime_version"].startswith("synthetic-")))):
+            raise ValueError("invalid redaction route")
+        schema, schema_sha = cfg.load_schema()
+        assembled = (envelope.build_continuation(args["prompt"], cfg.contract_version) if resume
+                     else envelope.build_initial(args["prompt"], schema, cfg.contract_version))
+        actual_bytes = assembled.encode("utf-8") if prompt_bytes is None else prompt_bytes
+        assembly = {
+            "peer": peer, "contract_version": cfg.contract_version,
+            "contract_schema_sha256": schema_sha, "mode": "continuation" if resume else "initial",
+            "conversation_id": conversation_id, "peer_session_id": peer_session_id,
+        }
+        if (clearance["assembly"] != assembly
+                or clearance["output_sha256"] != record["artifacts"]["output.txt"]
+                or clearance["candidate_review_sha256"] != record["artifacts"]["candidates.txt"]
+                or clearance["prompt_sha256"] != record["artifacts"]["prompt.txt"]
+                or store.sha256_bytes(actual_bytes) != clearance["prompt_sha256"]
+                or assembled.encode("utf-8") != artifacts["prompt.txt"]
+                or (prompt_bytes is not None and prompt_bytes != artifacts["prompt.txt"])):
+            raise ValueError("cleared assembly changed")
+        return {"contract": PEER_HANDOFF_CONTRACT,
+                "preparation_sha256": store.sha256_bytes(raw),
+                "clearance_sha256": args["clearance_sha256"], "artifacts": record["artifacts"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID) from exc
 
 
 def _sqlite_uri_path(path: str) -> str:
@@ -314,13 +585,41 @@ def _spawn_worker(cfg: Config, job_dir: str) -> int:
 
 
 # ------------------------------------------------------------------ operations
+def _timeout_response(cfg: Config, peer: str, prompt: str, started: float) -> dict[str, Any]:
+    elapsed = time.monotonic() - started
+    category = ErrorCategory.PEER_TIMEOUT
+    return error_response(category, receipt=receipts.build(
+        cfg, peer, prompt, category, [],
+        [{"stage": "admission", "elapsed_seconds": round(elapsed, 3)}], elapsed))
+
+
+def _request_preflight(cfg: Config, peer: str, prompt: str,
+                       started: float) -> dict[str, Any] | None:
+    try:
+        preflight.check_peer(cfg, peer, deadline=started + cfg.request_timeout(peer))
+    except BrokerError as exc:
+        if exc.category is not ErrorCategory.PEER_TIMEOUT:
+            raise
+        return _timeout_response(cfg, peer, prompt, started)
+    return None
+
+
 def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
+    budget_started = time.monotonic()
     peer = PEER_OF[caller]
     _validate_common(cfg, args, START_FIELDS, peer)
-    preflight.check_peer(cfg, peer)
+    # Consume local-first receipts once at admission, not on handoff rechecks.
+    _validate_local_first(cfg, args["prompt"], args.get("local_first"))
+    handoff = bool(HANDOFF_FIELDS & set(args))
+    conversation_id = _initial_handoff_identity(args) if handoff else str(uuid.uuid4())
+    peer_session_id = conversation_id if handoff and peer == "claude" else None
+    if handoff:
+        validate_handoff(cfg, args, peer, conversation_id, peer_session_id, resume=False)
+    failure = _request_preflight(cfg, peer, args["prompt"], budget_started)
+    if failure is not None:
+        return failure
     cfg.load_schema()
 
-    conversation_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     workspace = store.secure_mkdir(cfg.workspace(peer, conversation_id))
     preflight.assert_workspace_clean(
@@ -330,25 +629,35 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     # The first turn holds a claim too. Making ownership universal is what lets
     # release_conversation_slot require it unconditionally, with no exception
     # for initial jobs that would reopen the hole it closes.
-    with _admission(cfg):
-        if registry.count_active(cfg) >= cfg.limit("max_concurrent_jobs"):
-            raise BrokerError(ErrorCategory.CONCURRENCY_LIMIT)
-        registry.create_conversation(cfg, {
-            "conversation_id": conversation_id,
-            "caller": caller,
-            "peer": peer,
-            "label": args.get("label"),
-            "source_classification": args["source_classification"].strip().lower(),
-            "peer_session_id": None,
-            "workspace": workspace,
-            "turns": 0,
-            "closed": False,
-            "active_job_id": job_id,
-            "active_job_claimed_at": store.utc_now(),
-            "created_at": store.utc_now(),
-            "updated_at": store.utc_now(),
-        })
-        _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=False)
+    deadline = budget_started + cfg.request_timeout(peer)
+    try:
+        with _admission(cfg, deadline):
+            if handoff and os.path.exists(cfg.conversation_path(conversation_id)):
+                raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+            if registry.count_active(cfg) >= cfg.limit("max_concurrent_jobs"):
+                raise BrokerError(ErrorCategory.CONCURRENCY_LIMIT)
+            registry.create_conversation(cfg, {
+                "conversation_id": conversation_id,
+                "caller": caller,
+                "peer": peer,
+                "label": args.get("label"),
+                "source_classification": args["source_classification"].strip().lower(),
+                "peer_session_id": peer_session_id,
+                "workspace": workspace,
+                "turns": 0,
+                "closed": False,
+                "active_job_id": job_id,
+                "active_job_claimed_at": store.utc_now(),
+                "created_at": store.utc_now(),
+                "updated_at": store.utc_now(),
+            })
+            _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=False,
+                         budget_started=budget_started)
+    except BrokerError as exc:
+        _release_quietly(cfg, conversation_id, job_id)
+        if exc.category is ErrorCategory.PEER_TIMEOUT:
+            return _timeout_response(cfg, peer, args["prompt"], budget_started)
+        raise
     try:
         return _dispatch(cfg, peer, conversation_id, job_id)
     except BaseException:
@@ -357,26 +666,42 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
+    budget_started = time.monotonic()
     peer = PEER_OF[caller]
-    _validate_common(cfg, args, CONTINUE_FIELDS, peer)
+    _validate_common(cfg, args, CONTINUE_FIELDS, peer, "continue")
+    _validate_local_first(cfg, args["prompt"], args.get("local_first"))
     conversation_id = canonical_uuid(args.get("conversation_id"))
 
     conversation = registry.load_conversation(cfg, conversation_id)
     if conversation.get("peer") != peer:
         raise BrokerError(ErrorCategory.CONVERSATION_NOT_FOUND)
-    preflight.check_peer(cfg, peer)
+    if HANDOFF_FIELDS & set(args):
+        validate_handoff(cfg, args, peer, conversation_id,
+                         conversation.get("peer_session_id"), resume=True)
+    failure = _request_preflight(cfg, peer, args["prompt"], budget_started)
+    if failure is not None:
+        return failure
 
     # Global admission and the per-conversation claim are separate concerns:
     # the gate serialises the concurrency count across processes, the claim
     # serialises turns within one conversation. Both are needed.
     job_id = str(uuid.uuid4())
-    with _admission(cfg):
-        if registry.count_active(cfg) >= cfg.limit("max_concurrent_jobs"):
-            raise BrokerError(ErrorCategory.CONCURRENCY_LIMIT)
-        registry.claim_conversation_slot(
-            cfg, conversation_id, caller, job_id, cfg.limit("max_turns_per_conversation")
-        )
-        _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=True)
+    deadline = budget_started + cfg.request_timeout(peer)
+    try:
+        with _admission(cfg, deadline):
+            if registry.count_active(cfg) >= cfg.limit("max_concurrent_jobs"):
+                raise BrokerError(ErrorCategory.CONCURRENCY_LIMIT)
+            registry.claim_conversation_slot(
+                cfg, conversation_id, caller, job_id, cfg.limit("max_turns_per_conversation"),
+                timeout=min(10.0, max(0.0, deadline - time.monotonic())),
+            )
+            _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=True,
+                         budget_started=budget_started)
+    except BrokerError as exc:
+        _release_quietly(cfg, conversation_id, job_id)
+        if exc.category is ErrorCategory.PEER_TIMEOUT:
+            return _timeout_response(cfg, peer, args["prompt"], budget_started)
+        raise
     try:
         return _dispatch(cfg, peer, conversation_id, job_id)
     except BaseException:
@@ -385,13 +710,18 @@ def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 @contextlib.contextmanager
-def _admission(cfg: Config) -> Any:
+def _admission(cfg: Config, deadline: float | None = None) -> Any:
     """Admission gate with a diagnosable timeout category."""
     try:
-        with registry.admission_gate(cfg):
+        timeout = 30.0 if deadline is None else min(30.0, max(0.0, deadline - time.monotonic()))
+        with registry.admission_gate(cfg, timeout=timeout):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise BrokerError(ErrorCategory.PEER_TIMEOUT)
             yield
     except TimeoutError as exc:
-        raise BrokerError(ErrorCategory.GATE_TIMEOUT) from exc
+        category = ErrorCategory.PEER_TIMEOUT if deadline is not None and time.monotonic() >= deadline \
+            else ErrorCategory.GATE_TIMEOUT
+        raise BrokerError(category) from exc
 
 
 def _release_quietly(cfg: Config, conversation_id: str, job_id: str) -> None:
@@ -412,9 +742,17 @@ def _release_quietly(cfg: Config, conversation_id: str, job_id: str) -> None:
 def _prepare_job(
     cfg: Config, caller: str, peer: str, conversation_id: str,
     job_id: str, args: dict[str, Any], *, resume: bool,
+    budget_started: float | None = None,
 ) -> str:
     """Write the request and the first status. Runs inside the admission gate."""
+    handoff = None
+    if HANDOFF_FIELDS & set(args):
+        conversation = registry.load_conversation(cfg, conversation_id)
+        handoff = validate_handoff(cfg, args, peer, conversation_id,
+                                   conversation.get("peer_session_id"), resume=resume)
     job_dir = store.secure_mkdir(cfg.job_dir(job_id))
+    if budget_started is None:
+        budget_started = time.monotonic()
 
     # Snapshot the MERGED config the request was admitted under, and point the
     # worker at that file rather than at the path this process was loaded from.
@@ -430,7 +768,7 @@ def _prepare_job(
     snapshot_path = os.path.join(job_dir, "config.snapshot.json")
     store.atomic_write_json(snapshot_path, cfg.raw)
 
-    store.atomic_write_json(os.path.join(job_dir, "request.json"), {
+    request = {
         "job_id": job_id,
         "conversation_id": conversation_id,
         "caller": caller,
@@ -440,12 +778,19 @@ def _prepare_job(
         "label": args.get("label"),
         "local_first": args.get("local_first"),
         "resume": resume,
+        "budget_started_monotonic": budget_started,
+        "deadline_monotonic": budget_started + cfg.request_timeout(peer),
         "config_path": snapshot_path,
         "created_at": store.utc_now(),
-    })
+    }
+    if handoff is not None:
+        request.update({key: args[key] for key in HANDOFF_FIELDS})
+        request["redaction_handoff"] = handoff
+    store.atomic_write_json(os.path.join(job_dir, "request.json"), request)
     registry.write_status(
         cfg, job_id, "queued", conversation_id=conversation_id,
         peer=peer, caller=caller, label=args.get("label"), attempts=0,
+        **({"redaction_handoff": handoff} if handoff is not None else {}),
     )
     return job_dir
 
@@ -483,6 +828,7 @@ def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         "status": status.get("status"),
         "attempts": status.get("attempts"),
         "updated_at": status.get("updated_at"),
+        "status_scope": "Local execution only; no session validation or approval.",
     }
     category = status.get("error_category")
     if status.get("status") in registry.TERMINAL_STATUSES and category and category != "ok":
@@ -491,6 +837,8 @@ def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         payload["error_hint"] = hint(enum_category)
         if status.get("retries_exhausted"):
             payload["retries_exhausted"] = True
+        if status.get("receipt"):
+            payload["receipt"] = status["receipt"]
     return ok_response(**payload)
 
 
@@ -510,6 +858,8 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         )
         if status.get("retries_exhausted"):
             response["retries_exhausted"] = True
+        if status.get("receipt"):
+            response["receipt"] = status["receipt"]
         return response
 
     result = registry.read_result(cfg, job_id)

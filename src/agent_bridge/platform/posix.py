@@ -97,7 +97,7 @@ class PosixPlatform:
                 return report
             except OSError:
                 break
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         try:
             os.killpg(group_id, signal.SIGKILL)
             report["sigkill"] = True
@@ -269,7 +269,8 @@ class PosixPlatform:
                     if time.monotonic() - exited_at > post_exit_drain_seconds:
                         descendant_held_pipes = True
                         break
-                for key, _events in selector.select(timeout=0.05):
+                for key, _events in selector.select(
+                        timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
                     name = key.data
                     stream = key.fileobj
                     if name == "stdin":

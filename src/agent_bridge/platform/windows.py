@@ -679,7 +679,8 @@ class WindowsPlatform:
                         descendant_held_pipes = True
                         break
                 try:
-                    name, chunk = events.get(timeout=0.05)
+                    name, chunk = events.get(
+                        timeout=min(0.05, max(0.0, deadline - time.monotonic())))
                 except queue.Empty:
                     continue
                 if chunk is None:
@@ -712,7 +713,9 @@ class WindowsPlatform:
                         proc.kill()
                     with contextlib.suppress(
                             OSError, ValueError, subprocess.TimeoutExpired):
-                        proc.wait(timeout=PROCESS_CLEANUP_WAIT_SECONDS)
+                        proc.wait(timeout=min(
+                            PROCESS_CLEANUP_WAIT_SECONDS,
+                            max(0.0, deadline - time.monotonic())))
 
             # Do not synchronously close proc.stdin/stdout/stderr here.  Each
             # stream is owned and closed by its writer or reader thread.  A

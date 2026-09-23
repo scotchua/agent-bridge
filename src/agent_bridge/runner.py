@@ -19,6 +19,7 @@ case; it is not a boundary against a process that deliberately escapes.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -31,6 +32,9 @@ from .platform import platform
 #: How long to keep draining after the peer process itself has exited, when a
 #: descendant still holds a pipe open.
 POST_EXIT_DRAIN_SECONDS = 0.5
+
+# Reserved inside the timeout for SIGKILL observation and reaping the leader.
+REAP_SECONDS = 0.1
 
 # Test-only rendezvous used to kill a real worker immediately after a marker
 # transition. It is carried in the fake peer's declared environment, never
@@ -55,6 +59,7 @@ class RunResult:
     group_kill: dict[str, Any] = field(default_factory=dict)
     cap_exceeded: bool = False
     descendant_held_pipes: bool = False
+    elapsed_stages: list[dict[str, Any]] = field(default_factory=list)
 
     def sanitized_argv(self) -> list[str]:
         """argv shape for provenance. Paths kept, no secrets are ever in argv."""
@@ -72,6 +77,7 @@ def run(
     stdout_cap: int,
     stderr_cap: int,
     pgid_file: str | None = None,
+    deadline: float | None = None,
 ) -> RunResult:
     """Run a peer CLI with a fixed argv. Never a shell string.
 
@@ -79,10 +85,29 @@ def run(
     after spawn. If this worker is killed mid-call the peer survives, because
     it lives in its own session by design; the recorded pgid is what lets a
     later reconcile reap it instead of leaving an unbounded orphan.
+
+    timeout includes termination grace and reaping. Grace is capped at half
+    the budget so a short timeout still leaves time to execute the peer. An
+    absolute monotonic deadline shares that budget with earlier invocations.
     """
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         raise TypeError("argv must be a list of strings")
+    if not math.isfinite(timeout) or not math.isfinite(grace):
+        raise ValueError("timeout and grace must be finite")
     started = time.monotonic()
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("deadline must be finite")
+    deadline = min(started + max(0.0, timeout), deadline) if deadline is not None \
+        else started + max(0.0, timeout)
+    timeout = max(0.0, deadline - started)
+    grace = min(max(0.0, grace), max(0.0, timeout) / 2)
+    reap_seconds = min(REAP_SECONDS, max(0.0, timeout) / 4)
+    read_deadline = deadline - grace - reap_seconds
+    if timeout <= 0:
+        return RunResult(
+            argv=argv, returncode=None, stdout=b"", stderr=b"", timed_out=True,
+            duration_seconds=time.monotonic() - started, pgid=None,
+        )
 
     # Write the in-flight marker BEFORE the peer exists. The identity fields are
     # unknown at this point and are filled in immediately after spawn, but the
@@ -104,8 +129,19 @@ def run(
             )
         pause_after_marker_transition(env, "pre_spawn")
 
+    if time.monotonic() >= read_deadline:
+        if pgid_file:
+            try:
+                os.unlink(pgid_file)
+            except OSError:
+                pass
+        return RunResult(
+            argv=argv, returncode=None, stdout=b"", stderr=b"", timed_out=True,
+            duration_seconds=time.monotonic() - started, pgid=None,
+        )
+
     try:
-        if env.get(MARKER_FAULT_PHASE_ENV) == "spawn_failed":
+        if pgid_file and env.get(MARKER_FAULT_PHASE_ENV) == "spawn_failed":
             # This fault mode is exercised from another process.  Keep the
             # pre-spawn marker observable long enough for the crash-injection
             # test to prove it saw the marker before it watches the confirmed
@@ -149,17 +185,21 @@ def run(
         pause_after_marker_transition(env, "spawned")
 
     group_kill: dict[str, Any] = {}
+    execution_started = time.monotonic()
     # Named fields, not positional unpacking: see StreamReadResult for why.
     read = platform.read_streams_with_caps(
-        proc, stdin_data, timeout, stdout_cap, stderr_cap,
+        proc, stdin_data, max(0.0, read_deadline - time.monotonic()),
+        stdout_cap, stderr_cap,
         POST_EXIT_DRAIN_SECONDS)
     stdout, stderr = read.stdout, read.stderr
     timed_out = read.timed_out
     cap_exceeded = read.cap_exceeded
     descendant_held_pipes = read.descendant_held_pipes
+    termination_started = time.monotonic()
     if timed_out or cap_exceeded:
         if pgid is not None:
-            group_kill = platform.terminate_process_tree(pgid, grace)
+            group_kill = platform.terminate_process_tree(
+                pgid, min(grace, max(0.0, deadline - time.monotonic() - reap_seconds)))
         else:
             try:
                 proc.kill()
@@ -171,14 +211,21 @@ def run(
     returncode = proc.poll()
     if returncode is None:
         try:
-            returncode = proc.wait(timeout=5)
+            returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
+            timed_out = True
             if pgid is not None:
-                group_kill = platform.terminate_process_tree(pgid, grace)
+                group_kill = platform.terminate_process_tree(pgid, 0.0)
+            else:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
             returncode = proc.poll()
     if pgid is not None and not group_kill:
         if platform.process_tree_alive(pgid):
-            group_kill = platform.terminate_process_tree(pgid, grace)
+            group_kill = platform.terminate_process_tree(
+                pgid, min(grace, max(0.0, deadline - time.monotonic() - reap_seconds)))
             group_kill["killed_lingering_group"] = True
 
     # The local process is done, but the ATTEMPT is not: the worker has yet to
@@ -212,6 +259,13 @@ def run(
         group_kill=group_kill,
         cap_exceeded=cap_exceeded,
         descendant_held_pipes=descendant_held_pipes,
+        elapsed_stages=[
+            {"stage": "spawn", "elapsed_seconds": round(execution_started - started, 3)},
+            {"stage": "execution", "elapsed_seconds": round(
+                termination_started - execution_started, 3)},
+            {"stage": "termination", "elapsed_seconds": round(
+                time.monotonic() - termination_started, 3)},
+        ],
     )
 
 

@@ -140,6 +140,7 @@ def run_consultation(
     thread_id: str | None,
     workspace: str,
     attempt_dir: str,
+    deadline: float | None = None,
 ) -> PeerOutcome:
     spec = cfg.peer(PEER)
     codex_home = os.path.expanduser(str(spec.get("codex_home")))
@@ -164,6 +165,7 @@ def run_consultation(
         env=env,
         stdin_data=prompt,
         timeout=float(spec.get("timeout_seconds", 420)),
+        deadline=deadline,
         grace=float(spec.get("grace_seconds", 5)),
         stdout_cap=cfg.limit("peer_stdout_max_bytes"),
         stderr_cap=cfg.limit("peer_stderr_capture_max_bytes"),
@@ -174,6 +176,7 @@ def run_consultation(
         argv=argv,
         returncode=result.returncode,
         duration_seconds=result.duration_seconds,
+        elapsed_stages=result.elapsed_stages,
         timed_out=result.timed_out,
         group_kill=result.group_kill,
         raw_stdout=result.stdout,

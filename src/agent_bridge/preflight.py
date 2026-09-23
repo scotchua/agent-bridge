@@ -41,9 +41,22 @@ def observed_version(
     version_argv: list[str],
     timeout: int = 20,
     extra_env: dict[str, str] | None = None,
+    deadline: float | None = None,
 ) -> str:
     try:
         from . import runner
+        if deadline is not None:
+            proc = runner.run(
+                [executable, *version_argv], cwd=os.path.dirname(executable),
+                env=runner.scrubbed_env(extra_env), stdin_data="",
+                timeout=timeout, deadline=deadline, grace=0.1,
+                stdout_cap=10000, stderr_cap=10000)
+            if proc.timed_out:
+                raise BrokerError(ErrorCategory.PEER_TIMEOUT)
+            if proc.spawn_failed or proc.cap_exceeded or proc.descendant_held_pipes:
+                raise BrokerError(ErrorCategory.PREFLIGHT_EXECUTABLE_MISSING)
+            text = (proc.stdout or proc.stderr).decode("utf-8", "replace").strip()
+            return text.splitlines()[0].strip() if text else ""
         proc = subprocess.run(
             [executable, *version_argv],
             capture_output=True, timeout=timeout, check=False, shell=False,
@@ -74,7 +87,7 @@ def discover_executable(peer: str) -> str | None:
     return shutil.which(name) if name else None
 
 
-def check_peer(cfg: Config, peer: str) -> dict[str, Any]:
+def check_peer(cfg: Config, peer: str, *, deadline: float | None = None) -> dict[str, Any]:
     """Verify the peer executable exists and its version is in the allow-list."""
     spec = cfg.peer(peer)
     executable = spec.get("executable") or discover_executable(peer) or ""
@@ -84,6 +97,7 @@ def check_peer(cfg: Config, peer: str) -> dict[str, Any]:
         executable,
         list(spec.get("version_argv") or ["--version"]),
         extra_env=cfg.peer_extra_env(peer),
+        deadline=deadline,
     )
     allowed = list(spec.get("allowed_versions") or [])
     if allowed and version not in allowed:

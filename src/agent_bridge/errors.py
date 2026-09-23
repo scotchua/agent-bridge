@@ -53,11 +53,11 @@ class ErrorCategory(str, enum.Enum):
     PEER_SESSION_ID_MISSING = "peer_session_id_missing"
     PEER_SESSION_MIGRATED = "peer_session_migrated"
     PEER_CONTRACT_VERSION_MISMATCH = "peer_contract_version_mismatch"
+    PEER_TIMEOUT = "peer_timeout"
 
     # Transient.  At most one retry.
     PEER_SPAWN_FAILURE = "peer_spawn_failure"
     PEER_NONZERO_EXIT = "peer_nonzero_exit"
-    PEER_TIMEOUT = "peer_timeout"
     GATE_TIMEOUT = "gate_timeout"
 
     # Terminal bookkeeping.
@@ -93,6 +93,7 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.PEER_HOME_CONFIG_PRESENT,
     ErrorCategory.PEER_AUTH_FAILURE,
     ErrorCategory.PEER_STRUCTURED_OUTPUT_EXHAUSTED,
+    ErrorCategory.PEER_TIMEOUT,
     ErrorCategory.PEER_CONTRACT_VERSION_MISMATCH,
     ErrorCategory.PEER_SESSION_MIGRATED,
     ErrorCategory.PEER_OUTPUT_INCOMPLETE,
@@ -106,7 +107,6 @@ DETERMINISTIC: frozenset[ErrorCategory] = frozenset({
 TRANSIENT: frozenset[ErrorCategory] = frozenset({
     ErrorCategory.PEER_SPAWN_FAILURE,
     ErrorCategory.PEER_NONZERO_EXIT,
-    ErrorCategory.PEER_TIMEOUT,
 })
 
 #: Categories eligible for exactly one *corrective* retry, where the second
@@ -222,7 +222,11 @@ _HINTS: dict[ErrorCategory, str] = {
     ),
     ErrorCategory.PEER_SPAWN_FAILURE: "Peer process could not be started.",
     ErrorCategory.PEER_NONZERO_EXIT: "Peer process exited nonzero.",
-    ErrorCategory.PEER_TIMEOUT: "Peer process exceeded its timeout and its process group was killed.",
+    ErrorCategory.PEER_TIMEOUT: (
+        "Peer time budget exhausted. External process-tree termination was "
+        "requested if the peer started. Shorten or decompose the question "
+        "before submitting another consultation."
+    ),
     ErrorCategory.WORKER_DIED: "Worker process died without recording a terminal state.",
     ErrorCategory.RETRY_EXHAUSTED: "Retry budget exhausted.",
     ErrorCategory.CANCELLED: "Job was cancelled.",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -61,6 +62,7 @@ def spawn_pipe_holder(seconds: int) -> None:
 def main() -> int:
     argv = sys.argv[1:]
     if "--version" in argv:
+        time.sleep(float(os.environ.get("FAKE_CLAUDE_VERSION_DELAY", "0")))
         print(os.environ.get("FAKE_CLAUDE_VERSION", "2.1.229 (Claude Code)"))
         return 0
     mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
@@ -74,6 +76,30 @@ def main() -> int:
     if prompt_log:
         with open(prompt_log, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"prompt": stdin_text}) + "\n")
+
+    if mode in ("slow_transient", "slow_corrective"):
+        marker = os.environ["FAKE_CLAUDE_STATE"]
+        if not os.path.exists(marker):
+            open(marker, "w", encoding="utf-8").close()
+            time.sleep(0.7)
+            mode = "nonzero" if mode == "slow_transient" else "schema_invalid"
+        else:
+            mode = "stubborn_hang"
+    if mode == "stubborn_hang":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        marker = os.environ["FAKE_CLAUDE_PID_LOG"]
+        with open(marker, "a", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()) + "\n")
+        child_script = (
+            "import os,signal,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"with open({marker!r}, 'a', encoding='utf-8') as handle:\n"
+            "    handle.write(str(os.getpid()) + '\\n')\n"
+            "time.sleep(120)\n"
+        )
+        subprocess.Popen([sys.executable, "-c", child_script],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
 
     # Session id: honour --session-id exactly, or echo back --resume.
     session_id = str(uuid.uuid4())
@@ -116,8 +142,9 @@ def main() -> int:
         # A parseable, contract-valid envelope cannot override a failed process
         # status. This is the edge case the backend must reject.
         return emit(base(session_id, valid(summary="success-shaped failure")), 7)
-    if mode == "hang":
-        spawn_pipe_holder(120)
+    if mode in ("hang", "stubborn_hang"):
+        if mode == "hang":
+            spawn_pipe_holder(120)
         time.sleep(120)
         return 0
     if mode == "flood":

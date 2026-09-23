@@ -272,6 +272,142 @@ registration and configuration.
 - **Make agreement proof of correctness.** Peer replies are evidence to assess,
   not instructions to obey or an automatic approval to publish.
 
+## Consultation budgets and outcomes
+
+The peer integrations have no validated native wall-clock limit. The bridge
+therefore terminates them externally: a POSIX process group receives SIGTERM
+and then SIGKILL, and a Windows Job Object is terminated as a unit. On POSIX,
+descendants that deliberately leave the process group remain outside this
+guarantee. External termination also cannot prove that remote model work stopped.
+
+`peers.<name>.timeout_seconds` is one whole-request budget, measured from the
+start or continue call. Admission, queueing, worker preparation, every attempt,
+validation, termination grace and leader reaping consume the same deadline;
+retries do not reset it. The defaults are 300 seconds for Claude and 420 for
+Codex, with `grace_seconds` set to 5. Each external invocation receives only
+the remaining time. Grace is reserved inside it, capped at half the remaining
+time, with up to 0.1 seconds reserved for reaping. A nonpositive or already
+exhausted budget launches no peer. OS scheduling, locks and durable filesystem
+writes can add latency, including receipt publication after cleanup; this is
+not a real-time guarantee.
+
+The caller prompt budgets are 32,000 characters for `start` and 16,000 for
+`continue`. The generated corrective prompt has a 12,000-character budget.
+Configure these with `limits.prompt_start_max_chars`,
+`limits.prompt_continue_max_chars` and `limits.prompt_corrective_max_chars`.
+Each is clamped below `limits.prompt_max_chars`, the 100,000-character hard
+cap. Oversize caller input is refused before preflight or dispatch; the worker
+also checks the framed prompt against the hard cap before a consultation
+launch. A corrective prompt that cannot fit is never launched.
+
+A timeout returns `peer_timeout` and is never automatically retried. Shorten
+or decompose the question before trying again, or route work needing repository
+context to the separate code-task path. A transient failure can repeat the
+same prompt once within the remaining deadline. Authentication failure remains
+`peer_auth_failure` and is never retried automatically. Malformed or schema-invalid
+output gets at most one corrective retry, in the exact same session; recovery
+stops if no session exists or the corrective prompt cannot fit. Only validated
+output received within the deadline can complete a consultation successfully,
+including a shorter follow-up after failure.
+
+Timeout, authentication and structured-output failures expose a `receipt` in
+both poll and read, also saved as
+`receipt.json` and in provenance and the ledger. Receipt version `1` is an
+additive broker envelope field: the peer response contract remains version `2`.
+The distinct receipt outcomes are `timeout`, `auth_failure` and
+`structured_output_exhausted`; the underlying error category remains available.
+Each includes the caller prompt and effective config SHA-256 hashes, attempt
+count and prompt hashes, elapsed stages (including execution and termination),
+elapsed and allowed seconds, and a suggested `next_action`: respectively
+`shorten`, `route_to_code_task` or `decompose`. All three actions are listed in
+`allowed_next_actions`; they are suggestions, not approval or an automatic route.
+Authentication must be restored before another peer call after an auth failure.
+`unresolved_questions` holds the entire caller prompt as one verbatim string,
+including whitespace and embedded questions. Unvalidated peer text stays in
+quarantine and is never copied into a receipt. A preflight timeout returns its
+receipt directly with zero consultation attempts.
+
+Health or status visibility proves neither a valid authenticated session nor
+approval to act on a peer's answer. Admin status explicitly reports session
+validation as `not_checked` and `approval_granted` as false.
+
+### Local redaction handoffs
+
+The broker's closed start and continue argument sets accept the optional pair
+`preparation_dir` (an absolute local directory) and `clearance_sha256` (the
+SHA-256 of the exact `clearance.json` bytes). Existing requests without either
+field retain their behavior. The published MCP `tools/list` input schemas
+advertise this optional pair: both fields must appear together and cannot be
+used with `label`. No response-contract or config-version change is needed for
+the additive arguments.
+
+Keep preparations outside broker state, in a directory with an opaque name.
+Stage `output.txt`, `candidates.txt`, `receipt.json`, `certificate.json` and
+`prompt.txt`, with their exact byte hashes in the `artifacts` object of
+`preparation.json`. The manifest uses `redaction-handoff/v1`, retains the source
+classification and binds the receipt's invocation, input, canonical input,
+effective options, parent and attempt identities in `receipt_bindings`.
+The receipt must be a complete `local-delegate/v2` redaction success, including
+successful schema-constrained passes one and two. The certificate must bind an
+eligible `local-delegate-certification/v2` route to the same model digest,
+prompt, validator and effective options. Validation is copied locally; no
+plugin checkout is imported at runtime.
+
+For peer use, `prompt.txt` must contain the **fully assembled peer envelope**,
+using `envelope.build_initial` or `envelope.build_continuation` with the current
+response contract. A preparation originally assembled for `codex_task` must
+be assembled and reviewed again for the peer. Human review remains mandatory
+for the output, candidate review, preparation and exact assembled prompt.
+After review, record a new `clearance.json` with exactly these fields:
+
+```json
+{
+  "contract": "redaction-peer-handoff/v1",
+  "human_reviewed": true,
+  "preparation_sha256": "<SHA-256 of preparation.json bytes>",
+  "output_sha256": "<SHA-256 of output.txt bytes>",
+  "candidate_review_sha256": "<SHA-256 of candidates.txt bytes>",
+  "prompt_sha256": "<SHA-256 of prompt.txt bytes>",
+  "assembly": {
+    "peer": "claude",
+    "contract_version": "2",
+    "contract_schema_sha256": "<SHA-256 of the configured schema file bytes>",
+    "mode": "initial",
+    "conversation_id": "<fresh canonical UUID chosen before review>",
+    "peer_session_id": "<same UUID for initial Claude; null for initial Codex>"
+  }
+}
+```
+
+For an initial handoff, the broker creates the reviewed conversation UUID and
+refuses reuse of an existing conversation. For a continuation, use mode
+`continuation`, the existing conversation ID and its exact peer session ID,
+with a separate preparation and clearance. Codex assigns its first session ID
+after invocation, so its initial clearance binds the fresh broker conversation
+and a null prior session. A `codex_task` clearance never authorizes a peer call.
+Hashes detect changed bytes; hashes do not authenticate a person, prove that a
+human reviewed them, or prove that redaction is semantically complete.
+
+The request payload and source classification must exactly equal the
+preparation. Client-derived material remains refused in both directions,
+including with complete receipt and clearance; each peer's configured
+allowance and the global refused list also apply. There is no bypass flag.
+Handoff requests cannot include a free-form label. Only the redacted payload,
+local preparation reference and hash bindings enter the request; raw input,
+candidate text, identifier lists and entity maps are not copied into requests,
+failure receipts or telemetry.
+
+The worker re-reads the artifacts and pinned clearance after assembly and
+immediately before every send, checking the actual UTF-8 prompt against the
+cleared bytes. Both backend pipe writers preserve those UTF-8 bytes. A changed
+payload, envelope, contract, candidate review, receipt, certificate, clearance
+or session produces a deterministic `input_schema_invalid` refusal before the
+affected send; classification gates use `source_classification_refused`.
+Identical transient retries recheck the bindings. A different corrective
+prompt cannot inherit clearance: the first cleared attempt may already have
+been sent, but no corrective retry is sent. Review a new preparation and submit
+a newly cleared continuation to recover.
+
 ## Honest limits
 
 - **Filesystem read isolation is incomplete on the Codex peer.** It is instructed
