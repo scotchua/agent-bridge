@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import Callable
 from typing import Any, Mapping
 
@@ -310,7 +310,48 @@ class Policy:
         found = self.repos.get(real)
         if found is None:
             found = self.repos.get(repo)
+        if found is None:
+            main = _main_worktree(real)
+            inherited = self.repos.get(main) if main else None
+            if inherited is not None:
+                # A linked worktree (a landing or review checkout) inherits its
+                # main repository's classification and local routing, but not
+                # its peer routes: automatic hand-offs between assistants stay
+                # limited to the checkouts the operator named.
+                found = replace(inherited, allowed_routes=tuple(
+                    route for route in inherited.allowed_routes if route == "local"))
         return found if found is not None else self.default
+
+
+def _main_worktree(repo: str) -> str | None:
+    """The main checkout of a linked git worktree, or None.
+
+    A linked worktree's ``.git`` is a file reading ``gitdir: <main>/.git/
+    worktrees/<name>``. Anything else (a real ``.git`` directory, an
+    unreadable or malformed file, a gitdir that is not under a main
+    checkout's ``.git/worktrees``) is not a linked worktree, and None keeps
+    the caller on the default entry.
+    """
+    marker = os.path.join(repo, ".git")
+    if not os.path.isfile(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            line = handle.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = line[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(repo, gitdir)
+    gitdir = os.path.realpath(gitdir)
+    worktrees = os.path.dirname(gitdir)
+    dot_git = os.path.dirname(worktrees)
+    if os.path.basename(worktrees) != "worktrees" or os.path.basename(dot_git) != ".git" \
+            or not os.path.isdir(dot_git):
+        return None
+    return os.path.dirname(dot_git)
 
 
 @dataclass(frozen=True)

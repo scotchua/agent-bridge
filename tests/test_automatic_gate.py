@@ -850,6 +850,64 @@ class ClientDerivedWorkGoesOnlyToTheLocalModel(unittest.TestCase):
         self.assertEqual(decision.code, "retained_no_fresh_capacity")
 
 
+class LinkedWorktreesInheritLocalRoutingOnly(unittest.TestCase):
+    """Landing and review checkouts are linked worktrees with their own git
+    root. Measured 2026-09-24: many sessions run there, and a policy keyed on
+    the main checkout missed them all."""
+
+    def setUp(self):
+        import subprocess
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.temp.name))
+        self.main = base / "main"
+        self.main.mkdir()
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        run = lambda *args: subprocess.run(  # noqa: E731
+            ["git", *args], cwd=self.main, env=env, check=True, capture_output=True)
+        run("init", "-q")
+        run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x")
+        self.linked = base / "landing"
+        run("worktree", "add", "-q", str(self.linked))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def policy(self, entry):
+        return autoroute.Policy(repos={str(self.main): entry})
+
+    def test_a_linked_worktree_inherits_classification_and_the_local_route(self):
+        entry = autoroute.RepoPolicy("client_derived", ("claude", "codex", "local"),
+                                     mechanical_ok=True, mechanical_globs=("**/*.log",))
+        inherited = self.policy(entry).for_repo(str(self.linked))
+        self.assertEqual(inherited.classification, "client_derived")
+        self.assertEqual(inherited.allowed_routes, ("local",))
+        self.assertTrue(inherited.mechanical_ok)
+        self.assertEqual(inherited.mechanical_globs, ("**/*.log",))
+
+    def test_peer_routes_are_not_inherited(self):
+        entry = autoroute.RepoPolicy("internal_nonclient", ("claude", "codex"), mechanical_ok=True)
+        self.assertEqual(self.policy(entry).for_repo(str(self.linked)).allowed_routes, ())
+
+    def test_the_main_checkout_keeps_its_own_entry(self):
+        entry = autoroute.RepoPolicy("internal_nonclient", ("claude", "codex", "local"))
+        self.assertIs(self.policy(entry).for_repo(str(self.main)), entry)
+
+    def test_an_explicit_worktree_entry_wins(self):
+        own = autoroute.RepoPolicy("public", ("claude", "codex"))
+        policy = autoroute.Policy(repos={
+            str(self.main): autoroute.RepoPolicy("client_derived", ("local",)),
+            str(self.linked): own})
+        self.assertIs(policy.for_repo(str(self.linked)), own)
+
+    def test_a_malformed_git_file_falls_back_to_the_default(self):
+        fake = Path(self.temp.name) / "fake"
+        fake.mkdir()
+        (fake / ".git").write_text(f"gitdir: {self.main}/.git\n", encoding="utf-8")
+        entry = autoroute.RepoPolicy("internal_nonclient", ("local",))
+        policy = self.policy(entry)
+        self.assertIs(policy.for_repo(str(fake)), policy.default)
+
+
 class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
     """Mirrors ``localfirst.readiness()``'s rescue: load-average-per-core
     conflates waiting-on-I/O with genuine CPU contention, so a directly
