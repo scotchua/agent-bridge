@@ -122,11 +122,16 @@ def _eligible(row: dict[str, Any]) -> bool:
     if not isinstance(considered, dict):
         return str(row.get("code", "")).startswith(ROUTED_PREFIX)
     classification = considered.get("classification")
-    if classification in (None, "unclassified", "client_derived"):
+    if classification in (None, "unclassified"):
         return False
     allowed = considered.get("allowed_routes")
     if not isinstance(allowed, list) or not allowed:
         return False
+    if classification == "client_derived":
+        # Local is the one route client-derived work may take, and only
+        # mechanical work goes there (the same predicate autoroute.decide uses).
+        return ("local" in allowed and considered.get("mechanical_ok") is True
+                and considered.get("task_type") == "mechanical")
     caller = considered.get("client")
     return any(route != caller for route in allowed)
 
@@ -482,7 +487,10 @@ def report(state_root: str, *, home: str | None = None,
             capacity_db = loaded.get("capacity_db")
             execution_root = loaded.get("execution_queue_root")
             local_root = loaded.get("local_queue_root")
-            worker_executable = loaded.get("worker_executable")
+            # Match the executable the live gate and calibration actually use.
+            worker_executable = (loaded.get("gemma_delegate_executable")
+                                 if loaded.get("local_backend") == "gemma_certified"
+                                 else loaded.get("worker_executable"))
 
     stages: dict[str, Any] = {"available": False}
     if capacity_db and os.path.exists(capacity_db):

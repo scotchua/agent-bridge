@@ -58,11 +58,14 @@ import sqlite3
 import stat
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .. import store
-from ..capacity_router import RoutingError, capacity_fingerprint
+from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
+                              capacity_fingerprint, upsert_observation,
+                              validate_observation)
 from . import autoroute, localfirst
 
 CLIENTS = ("claude", "codex")
@@ -1107,6 +1110,56 @@ def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
     return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
 
 
+def manual_receipt_overtaken(receipt: dict[str, Any], now: float,
+                             capacity_db: str | None) -> bool:
+    """Whether a hand-made receipt names a stage that no longer exists.
+
+    A manual receipt is deliberately stickier than an automatic one: the
+    operator chose that route, so a policy, capacity or task-type change is
+    not this gate's cue to overrule them. Only one condition retires it.
+
+    The stage going terminal is that condition, and it has to be, because
+    nothing else can clear it. A receipt whose stage is complete, reassigned
+    or lapsed cannot be renewed by anyone, and keeping it denies every edit in
+    the repository permanently: ``routing_decide`` needs an owned stage,
+    ``stage_claim`` needs a route with fresh capacity, and the only writer of
+    this client's own freshness is the auto-decide branch that a surviving
+    receipt skips. The receipt prevents the write that would replace it.
+    Discarding it here is what lets that branch run and the deadlock clear
+    itself, which is the same reason the automatic case is handled.
+    """
+    if capacity_db is None:
+        return False
+    return stage_binding(capacity_db, receipt, now) in _OVERTAKEN
+
+
+def receipt_overtaken(receipt: dict[str, Any], now: float,
+                      capacity_db: str | None, task_type: str,
+                      policy_fingerprint: Callable[[], str | None] | None = None,
+                      capacity_fingerprint: Callable[[], str | None] | None = None,
+                      ) -> bool:
+    """Whether any receipt should be replaced by a fresh decision.
+
+    Dispatches on how the receipt was made, because the two kinds retire for
+    different reasons: an automatic one whenever the decision stops describing
+    the call, a manual one only when its stage is gone.
+
+    The two fingerprints arrive as zero-argument callables rather than values
+    because only the automatic branch reads them, and each costs a real read:
+    the operator's policy file, and a scan of the capacity table. Taking them
+    as values makes every manual receipt pay for both, which is what the
+    guard this replaced avoided for free: ``and`` does not evaluate a call's
+    arguments until it reaches the call. Neither read can raise (see their
+    own docstrings), so this is cost, not correctness. Deferring restores it.
+    """
+    if not receipt.get("automatic"):
+        return manual_receipt_overtaken(receipt, now, capacity_db)
+    return automatic_receipt_overtaken(
+        receipt, now, capacity_db, task_type,
+        None if policy_fingerprint is None else policy_fingerprint(),
+        None if capacity_fingerprint is None else capacity_fingerprint())
+
+
 # ------------------------------------------------------------- read judgment
 
 
@@ -1247,7 +1300,7 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
         f"delegation-first gate: {real_path} is a mechanical artifact ({size:,} bytes, "
         f"matches {matched_glob}) in a repository the operator marked mechanical_ok, and "
         f"the local lane is ready ({readiness.reason}). Call work_digest_file with "
-        f"path={real_path!r}, task_type one of {'|'.join(localfirst.DIGEST_TASK_TYPES)}, then "
+        f"path={real_path!r}, task_type='summarize', then "
         f"work_result on the returned job_id; this read is allowed once the digest completes. "
         f"Exact tools (grep, rg, tail -n) are allowed now.",
         (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob})
@@ -1349,12 +1402,11 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                             f"delegation-first gate: routing state could not be read "
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
         task_type = infer_task_type(paths)
-        if (receipt is not None and decide is not None and receipt.get("automatic")
-                and automatic_receipt_overtaken(
-                    receipt, now, capacity_db, task_type,
-                    autoroute.policy_fingerprint(state_root),
-                    None if capacity_db is None
-                    else capacity_digest(capacity_db, now))):
+        if receipt is not None and decide is not None and receipt_overtaken(
+                receipt, now, capacity_db, task_type,
+                lambda: autoroute.policy_fingerprint(state_root),
+                None if capacity_db is None
+                else lambda: capacity_digest(capacity_db, now)):
             receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and
@@ -1562,6 +1614,94 @@ def automatic_decider(client: str, state_root: str, capacity_db: str,
 #: skipping rows it was never written to expect.
 INLINE_LEDGER = "inline-measurement.jsonl"
 
+#: Failed presence writes, kept out of ``EVENT_LEDGER`` for the same reason
+#: as ``INLINE_LEDGER``: they are not permission decisions. A persistent
+#: failure here is exactly the stale-presence lock-out this write exists to
+#: prevent, so it has to be visible rather than swallowed.
+PRESENCE_FAILURE_LEDGER = "presence-failures.jsonl"
+
+#: At most one failure line per client per this many seconds, so a database
+#: that stays unwritable cannot grow the ledger on every hook call.
+PRESENCE_FAILURE_INTERVAL_SECONDS = 60.0
+
+
+def observe_presence_best_effort(client: str, state_root: str, capacity_db: str,
+                                 clock: Any = time.time) -> bool:
+    """Record this client's presence; on failure, log the class and carry on.
+
+    Best effort on purpose: presence is a liveness observation, and a failed
+    write leaves it as stale as it was before this existed. It is not
+    fail-closed either: a valid receipt can still allow the call. The cost of
+    a failure is the lock-out this write fixes, which is why it is logged.
+    """
+    try:
+        _write_presence(client, capacity_db, float(clock()))
+        return True
+    except Exception as exc:  # noqa: BLE001  never turns a judgment into an error
+        try:
+            path = os.path.join(receipt_dir(state_root), PRESENCE_FAILURE_LEDGER)
+            now = float(clock())
+            if now - _last_presence_failure(path, client) >= PRESENCE_FAILURE_INTERVAL_SECONDS:
+                store.append_ledger(path, {"at": now, "client": client,
+                                           "error": type(exc).__name__})
+        except Exception:  # noqa: BLE001  the judgment proceeds either way
+            pass
+        return False
+
+
+#: Short on purpose: presence is best effort and runs on every PreToolUse
+#: call, so a contended router must not hold the hook for the router's own
+#: five-second decision-time wait.
+PRESENCE_WRITE_TIMEOUT_SECONDS = 0.25
+
+
+def _write_presence(client: str, capacity_db: str, now: float) -> None:
+    """Upsert this client's presence row into an existing, initialized router.
+
+    Never creates anything. ``mode=rw`` refuses a missing file (including one
+    deleted after any earlier check), and no schema is created, so an empty
+    file fails on the missing table. Both matter: a missing or empty router
+    must stay a state the judgment sees and denies (``stage_db_unavailable``),
+    not one the automatic decider proceeds on as "no stages".
+    """
+    from .autodecide import CLIENT_PRESENCE_SECONDS
+
+    if client not in autoroute.PEER_FOR_CLIENT:
+        raise RoutingError("client_invalid")
+    observation = CapacityObservation(
+        route=client, observed_at=now, fresh_until=now + CLIENT_PRESENCE_SECONDS,
+        available=True, source=PRESENCE_SOURCE)
+    validate_observation(observation, now)
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=rw"
+    db = sqlite3.connect(uri, uri=True, timeout=PRESENCE_WRITE_TIMEOUT_SECONDS,
+                         isolation_level=None)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        upsert_observation(db, observation, trusted=True)
+        db.execute("COMMIT")
+    finally:
+        db.close()
+
+
+def _last_presence_failure(path: str, client: str) -> float:
+    """When this client's last failure line was written, or 0 if none.
+    Reads only the tail: the ledger is rate-limited, so it stays small."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 8192))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return 0.0
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("client") == client:
+            return float(row.get("at", 0.0))
+    return 0.0
+
 
 def _response_byte_length(tool_response: Any) -> int:
     """Bytes of a Bash call's ``stdout``/``stderr`` combined -- both reach the
@@ -1635,9 +1775,15 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
     ``<state_root>/local-queue`` when the config omits it, matching
     ``config/orchestration.example.json``, so an existing config written
     before the local-first read gate existed keeps working.
-    ``worker_executable`` defaults to the empty string when absent, the same
-    reasoning: a config predating this feature (or a test's minimal one) has
-    no worker to name, and an empty string is exactly what
+    The returned executable is the productive backend calibration actually
+    measures: ``gemma_delegate_executable`` for ``gemma_certified`` and the
+    existing ``worker_executable`` otherwise. Keeping this selection here is
+    load-bearing: calibration pins the Gemma delegate, so comparing that
+    record with the legacy private-worker path would make every post-activation
+    readiness check report ``calibration_worker_changed`` and silently waive
+    the local-first read gate. ``worker_executable`` defaults to the empty
+    string when absent, the same reasoning: a config predating this feature
+    (or a test's minimal one) has no worker to name, and an empty string is exactly what
     ``localfirst.readiness`` already reads as "no local worker configured"
     (``worker_not_configured``), never a crash.
     """
@@ -1651,11 +1797,14 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
         local_queue_root = os.path.join(loaded["state_root"], "local-queue")
     elif not isinstance(local_queue_root, str):
         raise ValueError("orchestration config local_queue_root must be a string")
-    worker_executable = loaded.get("worker_executable")
+    worker_field = ("gemma_delegate_executable"
+                    if loaded.get("local_backend") == "gemma_certified"
+                    else "worker_executable")
+    worker_executable = loaded.get(worker_field)
     if worker_executable is None:
         worker_executable = ""
     elif not isinstance(worker_executable, str):
-        raise ValueError("orchestration config worker_executable must be a string")
+        raise ValueError(f"orchestration config {worker_field} must be a string")
     return loaded["state_root"], loaded["capacity_db"], local_queue_root, worker_executable
 
 
@@ -2363,6 +2512,11 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
+        if not args.no_automatic_routing and capacity_db:
+            # Before judging, so a receipt held by the other client is compared
+            # against capacity that includes this one. See the helper for why
+            # a failure is logged rather than denied.
+            observe_presence_best_effort(args.client, state_root, capacity_db)
         decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
                             protected=protected, local_queue_root=local_queue_root,
                             worker_executable=worker_executable,

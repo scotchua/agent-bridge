@@ -60,7 +60,8 @@ class VerificationQueueIsolationTests(unittest.TestCase):
             configured = Path(temporary) / "production"
             observed = {}
             class FakeQueue:
-                def __init__(self, root, executor, recover_interrupted=False): observed["root"] = Path(root)
+                def __init__(self, root, executor, recover_interrupted=False,
+                             model_reserved=None): observed["root"] = Path(root)
                 def submit(self, **kwargs): return {"job_id": "synthetic"}
                 def status(self, job_id): return {"state": "complete"}
                 def result(self, job_id): return {"state": "complete", "classification": "synthetic", "harness": {"returncode": 0}}

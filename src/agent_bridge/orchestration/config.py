@@ -37,6 +37,20 @@ class OrchestrationConfig:
     windows_wsl_rootfs_path: str | None = None
     windows_wsl_manifest_path: str | None = None
     windows_wsl_sidecar_path: str | None = None
+    # Which local backend the queue's own Service dispatches mechanical work
+    # to. Chosen once, here, by the operator; nothing an assistant-facing
+    # request supplies can change it. "private_worker" (the existing
+    # Apple/Qwen-fallback worker) is the default so an existing config keeps
+    # its current behavior unchanged.
+    local_backend: str = "private_worker"
+    gemma_delegate_executable: Path | None = None
+    gemma_python_executable: Path | None = None
+    gemma_receipt_root: Path | None = None
+    gemma_receipt_validator_executable: Path | None = None
+    gemma_delegate_sha256: str | None = None
+    gemma_receipt_validator_sha256: str | None = None
+    gemma_model_digest: str | None = None
+    gemma_timeout_seconds: float = 600.0
 
 
 _KEYS = frozenset({
@@ -45,7 +59,20 @@ _KEYS = frozenset({
     "execution_queue_root", "codex_task_executable", "claude_task_executable",
     "python_executable", "claude_config_dir", "windows_wsl_runtime_root", "windows_wsl_rootfs_path",
     "windows_wsl_manifest_path", "windows_wsl_sidecar_path",
+    "local_backend", "gemma_delegate_executable", "gemma_python_executable",
+    "gemma_receipt_root", "gemma_receipt_validator_executable", "gemma_timeout_seconds",
+    "gemma_delegate_sha256", "gemma_receipt_validator_sha256", "gemma_model_digest",
 })
+
+#: The certified delegate's own current budget. Config may only widen this,
+#: never quietly narrow it: see the ``gemma_timeout_seconds`` check in
+#: ``load``.
+GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS = 600.0
+
+_GEMMA_REQUIRED_FIELDS = ("gemma_delegate_executable", "gemma_python_executable",
+                         "gemma_receipt_root", "gemma_receipt_validator_executable",
+                         "gemma_delegate_sha256", "gemma_receipt_validator_sha256",
+                         "gemma_model_digest")
 
 #: The three paths Windows delegation cannot run without. All or none: a
 #: half-configured runtime would be discovered at dispatch time, when the
@@ -85,6 +112,73 @@ def _absolute_path(value: Any, field: str) -> Path:
     return path
 
 
+def _existing_file(value: Any, field: str) -> Path:
+    """Like ``_absolute_path``, but the certified delegate's own paths must
+    already exist and be an ordinary file, checked at config-load time
+    rather than discovered only when the queue tries to dispatch to it.
+    Never a symlink: a config pointing at a name is a config pointing at
+    whatever that name resolves to at run time, which this adapter's own
+    "explicit configured installed path, never ... a versioned cache path
+    discovered at runtime" requirement rules out.
+    """
+    path = _absolute_path(value, field)
+    if path.is_symlink() or not path.is_file():
+        raise OrchestrationConfigError(f"{field}_must_be_an_existing_regular_file")
+    return path
+
+
+def _existing_dir(value: Any, field: str) -> Path:
+    path = _absolute_path(value, field)
+    if path.is_symlink() or not path.is_dir():
+        raise OrchestrationConfigError(f"{field}_must_be_an_existing_directory")
+    return path
+
+
+def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
+    local_backend = raw.get("local_backend", "private_worker")
+    if not isinstance(local_backend, str) or local_backend not in ("private_worker", "gemma_certified"):
+        raise OrchestrationConfigError("local_backend_unsupported")
+    supplied = [raw.get(name) for name in _GEMMA_REQUIRED_FIELDS]
+    if local_backend != "gemma_certified":
+        # Never partially configured for a backend that is not selected:
+        # a stray gemma_* path left in a private_worker config is exactly
+        # the kind of ambiguity "validate strictly and fail closed" rules
+        # out, rather than silently ignoring it.
+        if any(value is not None for value in supplied) or "gemma_timeout_seconds" in raw:
+            raise OrchestrationConfigError("gemma_certified_configuration_must_be_absent")
+        return {"local_backend": local_backend, "gemma_delegate_executable": None,
+               "gemma_python_executable": None, "gemma_receipt_root": None,
+               "gemma_receipt_validator_executable": None,
+               "gemma_delegate_sha256": None, "gemma_receipt_validator_sha256": None,
+               "gemma_model_digest": None,
+               "gemma_timeout_seconds": GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS}
+    if any(value is None for value in supplied):
+        raise OrchestrationConfigError("gemma_certified_configuration_incomplete")
+    delegate = _existing_file(raw.get("gemma_delegate_executable"), "gemma_delegate_executable")
+    python_executable = _existing_file(raw.get("gemma_python_executable"), "gemma_python_executable")
+    receipt_root = _existing_dir(raw.get("gemma_receipt_root"), "gemma_receipt_root")
+    validator = _existing_file(raw.get("gemma_receipt_validator_executable"),
+                               "gemma_receipt_validator_executable")
+    digests = {
+        "gemma_delegate_sha256": raw.get("gemma_delegate_sha256"),
+        "gemma_receipt_validator_sha256": raw.get("gemma_receipt_validator_sha256"),
+        "gemma_model_digest": raw.get("gemma_model_digest"),
+    }
+    for field, digest in digests.items():
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            raise OrchestrationConfigError(f"{field}_invalid")
+    timeout = raw.get("gemma_timeout_seconds", GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS)
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or float(timeout) < GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS):
+        # Never silently shorten the delegate's own certified budget.
+        raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget")
+    return {"local_backend": local_backend, "gemma_delegate_executable": delegate,
+           "gemma_python_executable": python_executable, "gemma_receipt_root": receipt_root,
+           "gemma_receipt_validator_executable": validator,
+           **digests, "gemma_timeout_seconds": float(timeout)}
+
+
 def load(path: str | Path) -> OrchestrationConfig:
     config_path = Path(path).expanduser()
     try:
@@ -115,6 +209,7 @@ def load(path: str | Path) -> OrchestrationConfig:
     claude_config_dir = (None if raw_config_dir is None
                          else _absolute_path(raw_config_dir, "claude_config_dir"))
     windows_paths = _windows_paths(raw)
+    gemma_paths = _gemma_paths(raw)
     if capacity_db == local_root or capacity_db == state_root:
         raise OrchestrationConfigError("capacity_db_must_be_file")
     return OrchestrationConfig(
@@ -125,4 +220,5 @@ def load(path: str | Path) -> OrchestrationConfig:
         claude_task_executable=execution_paths[2], python_executable=execution_paths[3],
         claude_config_dir=claude_config_dir,
         **windows_paths,
+        **gemma_paths,
     )

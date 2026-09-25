@@ -13,6 +13,12 @@ from .spool import ResourceSnapshot
 
 CommandRunner = Callable[[list[str]], str]
 
+# Scott's operating preference is intentionally aggressive: use the local
+# machine first and tighten admission only after measured user-visible impact.
+# Ten percent still leaves a hard memory-pressure stop, but does not reserve
+# one fifth of unified memory before the worker may start.
+MIN_MEMORY_FREE_PERCENT = 10.0
+
 
 def system_runner(argv: list[str]) -> str:
     return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL, timeout=2)
@@ -33,10 +39,20 @@ def foundation_thermal_state() -> str:
     if not process:
         raise RuntimeError("NSProcessInfo unavailable")
     send.restype = ctypes.c_long
-    value = send(process, objc.sel_registerName(b"thermalState"))
-    if value == 0:
+    return thermal_level_name(send(process, objc.sel_registerName(b"thermalState")))
+
+
+def thermal_level_name(value: int) -> str:
+    """Map NSProcessInfoThermalState to the admission vocabulary.
+
+    Nominal (0) and fair (1) are both ``normal``: Apple defines fair as
+    slightly elevated with no action needed, and a Mac doing ordinary work
+    sits there for hours. Deferring on fair kept the local model idle while
+    the machine was perfectly usable. Serious (2) and critical (3) defer.
+    """
+    if value in {0, 1}:
         return "normal"
-    if value in {1, 2, 3}:
+    if value in {2, 3}:
         return "high"
     return "unknown"
 
@@ -63,7 +79,8 @@ class MacSampler:
         match = re.search(r"memory\s+free\s+percentage:\s*(\d+(?:\.\d+)?)%", text, re.I)
         if not match:
             raise ValueError("memory_pressure output not recognized")
-        return "normal" if float(match.group(1)) >= 20.0 else "high"
+        return ("normal" if float(match.group(1)) >= MIN_MEMORY_FREE_PERCENT
+                else "high")
 
     @staticmethod
     def _ac_power(text: str) -> bool:

@@ -31,11 +31,16 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def route(self, **changes):
+        # purpose="test": this class drives AutomaticIntake.route directly to
+        # calibrate its classification and idempotency behaviour, which is
+        # exactly the internal test/calibration exemption from the
+        # checkpoint requirement (tests/test_checkpoint.py exercises the
+        # purpose="work" + checkpoint path this file does not).
         args = {
             "task_type": "summarize", "input": "synthetic operating note " * 8,
             "params": {"instruction": "Select operating facts."},
             "priority": "interactive", "classification": "internal_nonclient",
-            "caller": "codex", "purpose": "work", "risk_flags": [],
+            "caller": "codex", "purpose": "test", "risk_flags": [],
         }
         args.update(changes)
         return self.intake.route(**args)
@@ -50,6 +55,43 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(receipt["classification"], "internal_nonclient")
         self.assertEqual(receipt["input_sha256"], routed["input_sha256"])
 
+    def test_client_derived_mechanical_work_is_queued_locally(self):
+        # Scott, 2026-09-24: the on-device model is the safest processor of
+        # client data. The flag is recognized, not refused.
+        routed = self.route(classification="client_derived", risk_flags=["client_derived"])
+        self.assertEqual(routed["decision"], "local")
+        self.assertEqual(routed["fallback"], "none")
+        self.assertEqual(self.queue.status(routed["job_id"])["classification"], "client_derived")
+        self.assertEqual(self.intake.receipt(routed["receipt_id"])["classification"], "client_derived")
+
+    def test_client_derived_classification_needs_no_flag(self):
+        routed = self.route(classification="client_derived")
+        self.assertEqual(routed["decision"], "local")
+
+    def test_a_client_derived_flag_cannot_contradict_the_classification(self):
+        for classification in ("synthetic", "public", "internal_nonclient"):
+            with self.subTest(classification=classification):
+                routed = self.route(classification=classification, risk_flags=["client_derived"],
+                                    input=("contradictory label text " * 8) + classification)
+                self.assertEqual(routed["decision"], "refused")
+                self.assertEqual(routed["reason"], "risk_flags_invalid")
+                self.assertIsNone(routed["job_id"])
+
+    def test_client_derived_checkpoints_are_recorded_like_any_other(self):
+        closed = self.intake.checkpoint(task_id="cd-none", task_type="summarize",
+                                        classification="client_derived", caller="claude",
+                                        input_bytes=0, nonblank_lines=0, no_eligible_unit=True)
+        self.assertEqual(closed["status"], "no_eligible_unit")
+        eligible = self.intake.checkpoint(task_id="cd-unit", task_type="summarize",
+                                          classification="client_derived", caller="claude",
+                                          input_bytes=5000, nonblank_lines=80)
+        self.assertEqual(eligible["status"], "eligible")
+
+    def test_an_idempotency_key_cannot_relabel_client_derived_work(self):
+        self.route(idempotency_key="cd", classification="client_derived")
+        with self.assertRaisesRegex(Exception, "idempotency_key_conflict"):
+            self.route(idempotency_key="cd", classification="internal_nonclient")
+
     def test_small_work_is_refused_without_queue_or_fallback(self):
         routed = self.route(input="tiny note")
         self.assertEqual(routed["decision"], "refused")
@@ -63,8 +105,8 @@ class AutomaticIntakeTests(unittest.TestCase):
             {"task_type": "tax_position"},
             {"classification": "client"},
             {"risk_flags": ["professional_judgment"]},
-            {"risk_flags": ["client_derived"]},
             {"risk_flags": ["exact_sensitive_identifiers"]},
+            {"risk_flags": ["client_derived", "licensed_review"]},
         ]
         for index, changes in enumerate(cases):
             with self.subTest(changes=changes):

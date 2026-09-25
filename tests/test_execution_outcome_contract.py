@@ -151,7 +151,8 @@ class WindowsQueueIntegrationTests(unittest.TestCase):
 
     def _run(self, response, **overrides):
         queue = eq.ExecutionQueue(self.queue_root, self._executor(response, **overrides),
-                                  recover_interrupted=False)
+                                  recover_interrupted=False,
+                                  model_reserved=eq.reserve_nothing)
         submitted = queue.submit(
             caller="codex", provider="claude", repo=str(self.repo),
             brief=str(self.brief), base="HEAD", classification="synthetic",

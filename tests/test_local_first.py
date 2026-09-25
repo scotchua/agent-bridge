@@ -618,9 +618,10 @@ class ReadinessTests(unittest.TestCase):
                       "digest_grace_seconds", "executor_liveness_seconds", "default_globs")})
         return autoroute.Policy(local_first=lf,
                                 declared_routes=overrides.get("declared_routes", ("local",)),
-                                max_local_load_ratio=overrides.get("max_local_load_ratio", 0.75))
+                                max_local_load_ratio=overrides.get(
+                                    "max_local_load_ratio", autoroute.DEFAULT_MAX_LOCAL_LOAD))
 
-    def _write_calibration(self, *, sha=None, created_at=None, sizes=None):
+    def _write_calibration(self, *, sha=None, created_at=None, sizes=None, backend_id=None):
         sha = sha if sha is not None else store.sha256_file(str(self.worker))
         created_at = created_at if created_at is not None else time.time()
         sizes = sizes if sizes is not None else {
@@ -628,10 +629,14 @@ class ReadinessTests(unittest.TestCase):
             "16000": {"median_s": 6.0, "outcomes": ["complete"] * 3},
             "24000": {"median_s": 9.0, "outcomes": ["complete"] * 3},
         }
-        store.atomic_write_json(localfirst.calibration_path(str(self.state)), {
-            "version": 1, "created_at": created_at, "worker_sha256": sha, "sizes": sizes})
+        record = {"version": 1, "created_at": created_at,
+                  "worker_sha256": sha, "sizes": sizes}
+        if backend_id is not None:
+            record["backend_id"] = backend_id
+        store.atomic_write_json(localfirst.calibration_path(str(self.state)), record)
 
-    def _write_heartbeat(self, *, updated_at=None, verdict="admissible", cpu_idle_ratio=None):
+    def _write_heartbeat(self, *, updated_at=None, verdict="admissible", cpu_idle_ratio=None,
+                         backend_id=None):
         updated_at = updated_at if updated_at is not None else time.time()
         if verdict == "admissible":
             resource = {"verdict": {"interactive": "admissible", "bulk": "deferred"}}
@@ -643,8 +648,11 @@ class ReadinessTests(unittest.TestCase):
             raise AssertionError(verdict)
         if cpu_idle_ratio is not None:
             resource["cpu_idle_ratio"] = cpu_idle_ratio
-        store.atomic_write_json(localfirst.heartbeat_path(str(self.local_queue)), {
-            "version": 1, "updated_at": updated_at, "queue": {"resource": resource}})
+        record = {"version": 1, "updated_at": updated_at,
+                  "queue": {"resource": resource}}
+        if backend_id is not None:
+            record["backend_id"] = backend_id
+        store.atomic_write_json(localfirst.heartbeat_path(str(self.local_queue)), record)
 
     def test_disabled_by_default(self):
         result = self._readiness(autoroute.Policy())
@@ -705,6 +713,19 @@ class ReadinessTests(unittest.TestCase):
         result = self._readiness(self._enabled_policy())
         self.assertEqual(result.code, "executor_not_running")
 
+    def test_executor_not_running_when_heartbeat_is_for_the_previous_backend(self):
+        self._write_calibration(backend_id="gemma_certified")
+        self._write_heartbeat(backend_id="private_worker")
+        result = self._readiness(self._enabled_policy())
+        self.assertEqual(result.code, "executor_not_running")
+        self.assertIn("different backend", result.reason)
+
+    def test_backend_bound_calibration_requires_a_backend_bound_heartbeat(self):
+        self._write_calibration(backend_id="gemma_certified")
+        self._write_heartbeat()
+        result = self._readiness(self._enabled_policy())
+        self.assertEqual(result.code, "executor_not_running")
+
     def test_resource_deferred_dict_shape(self):
         self._write_calibration()
         self._write_heartbeat(verdict="deferred_dict")
@@ -750,7 +771,7 @@ class ReadinessTests(unittest.TestCase):
 
     def test_load_high_not_rescued_by_low_measured_idle(self):
         self._write_calibration()
-        self._write_heartbeat(cpu_idle_ratio=0.1)
+        self._write_heartbeat(cpu_idle_ratio=0.09)
         result = self._readiness(self._enabled_policy(max_local_load_ratio=0.5),
                                  load=autoroute.Load(ratio=0.9, known=True))
         self.assertEqual(result.code, "load_high")
@@ -999,7 +1020,8 @@ class CalibrateTests(unittest.TestCase):
         self._start_model()
         _FlakyModel.fail_once_for_length = 16_000
         result = delegation_verify.calibrate(str(self.config_path), sampler=PortableSampler())
-        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"], "calibration_failed:incomplete_or_over_budget")
         sizes = result["record"]["sizes"]
         largest = str(localfirst.CALIBRATION_SIZES[-1])
         self.assertEqual(set(sizes), {str(size) for size in localfirst.CALIBRATION_SIZES})
@@ -1012,6 +1034,8 @@ class CalibrateTests(unittest.TestCase):
         self.assertEqual(sizes["16000"]["outcomes"].count("failed"), 1)
         self.assertEqual(sizes["16000"]["outcomes"].count("complete"), 2)
         self.assertEqual(len(sizes["8000"]["outcomes"]), 3)
+        self.assertEqual(len(sizes["8000"]["resource_waits_s"]), 3)
+        self.assertTrue(all(wait >= 0 for wait in sizes["8000"]["resource_waits_s"]))
 
         self.assertEqual(result["record"]["version"], localfirst.CALIBRATION_VERSION)
         self.assertEqual(result["record"]["worker_sha256"], store.sha256_file(str(self.worker)))

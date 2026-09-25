@@ -13,7 +13,7 @@ from typing import Any
 from ..capacity_router import StageRouter
 from ..localq.intake import AutomaticIntake
 from ..localq.service import Service
-from . import gate
+from . import autoroute, gate
 from .config import load
 from .execution_queue import ExecutionQueue
 from .mcp import build_tools
@@ -157,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = load(args.config)
     cfg.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    service = Service(str(cfg.local_queue_root), str(cfg.worker_executable), str(cfg.worker_state))
+    # The local backend (gemma_certified or the existing private worker) is
+    # chosen exactly once, here, from the operator's own configuration file.
+    # Nothing this server exposes to a caller can change it.
+    service = Service.for_config(cfg)
     router = StageRouter(cfg.capacity_db)
     execution = None
     if cfg.execution_queue_root is not None:
@@ -165,8 +168,9 @@ def main(argv: list[str] | None = None) -> int:
         # process. Desktop app sandboxes can deny Keychain access.  This
         # surface only admits requests and reads durable status/receipts; the
         # standalone execution worker consumes the same queue.
-        execution = ExecutionQueue(cfg.execution_queue_root, None,
-                                   recover_interrupted=False)
+        execution = ExecutionQueue(
+            cfg.execution_queue_root, None, recover_interrupted=False,
+            model_reserved=autoroute.model_reserved_for(str(cfg.state_root)))
     # The same protected list the delegation-first hook computes, so
     # work_digest_file refuses a target the hook would also refuse to write:
     # the gate's own state, the stage router's database, the local queue's

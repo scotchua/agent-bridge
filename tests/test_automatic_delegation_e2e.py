@@ -57,7 +57,9 @@ from agent_bridge.execution import hostenv  # noqa: E402
 from agent_bridge.localq.spool import ResourceSnapshot  # noqa: E402
 from agent_bridge.orchestration import audit, autodecide, autoroute, gate, localfirst  # noqa: E402
 from agent_bridge.orchestration.execution_queue import (  # noqa: E402
-    ExecutionQueue, Harnesses, SubprocessHarnessExecutor)
+    ExecutionQueue, Harnesses, SubprocessHarnessExecutor,
+    reserve_nothing,
+)
 
 def _verify_python() -> str | None:
     """The interpreter name to verify with, or None if this host has neither.
@@ -345,7 +347,7 @@ class Workflow(unittest.TestCase):
             claude=ROOT / "src/agent_bridge/execution/claude_task.py",
             python=Path(os.path.realpath(sys.executable)),
             claude_config_dir=self.lane_claude_store)),
-            recover_interrupted=False)
+            recover_interrupted=False, model_reserved=reserve_nothing)
 
     def drain_execution(self, expected=1):
         """Run the worker's own loop body against the real harnesses.
@@ -661,9 +663,18 @@ class LocalLane(Workflow):
             self.assertEqual(decision["decision"], "local", decision)
             self.assertEqual(decision["caller"], caller)
 
-    def test_client_derived_material_is_refused_with_no_cloud_fallback(self):
+    def test_client_derived_material_goes_local_with_no_cloud_fallback(self):
+        # Scott, 2026-09-24: the on-device model is the safest processor of
+        # client data, so the local lane takes it like any other mechanical work.
         text = "\n".join(f"line {index}" for index in range(60))
         decision = self.route_local("claude", text, classification="client_derived")
+        self.assertEqual(decision["decision"], "local")
+        self.assertEqual(decision["fallback"], "none")
+        self.assertIsNotNone(decision["job_id"])
+
+    def test_an_unclassified_unit_is_still_refused_with_no_cloud_fallback(self):
+        text = "\n".join(f"line {index}" for index in range(60))
+        decision = self.route_local("claude", text, classification="unclassified")
         self.assertEqual(decision["decision"], "refused")
         self.assertEqual(decision["reason"], "classification_refused")
         self.assertEqual(decision["fallback"], "none")
@@ -1195,7 +1206,8 @@ class RestartRecovery(Workflow):
 
         # Restart: a fresh queue with recovery on, which is what the worker
         # binary constructs after it takes the global lock.
-        recovered = ExecutionQueue(str(self.exec_root), None, recover_interrupted=True)
+        recovered = ExecutionQueue(str(self.exec_root), None, recover_interrupted=True,
+                                   model_reserved=reserve_nothing)
         status = recovered.status(job_id)
         self.assertEqual(status["state"], "blocked")
         final = recovered.result(job_id)
@@ -1208,13 +1220,15 @@ class RestartRecovery(Workflow):
         """The window between taking the claim and publishing running."""
         job_id = self.queued_job()
         (self.exec_root / job_id / "claim.lock").write_bytes(b"")
-        recovered = ExecutionQueue(str(self.exec_root), None, recover_interrupted=True)
+        recovered = ExecutionQueue(str(self.exec_root), None, recover_interrupted=True,
+                                   model_reserved=reserve_nothing)
         self.assertEqual(recovered.status(job_id)["state"], "blocked")
 
     def test_a_queued_job_survives_a_restart_and_still_runs(self):
         """Recovery must not blanket-block work that was never started."""
         job_id = self.queued_job()
-        ExecutionQueue(str(self.exec_root), None, recover_interrupted=True)
+        ExecutionQueue(str(self.exec_root), None, recover_interrupted=True,
+                                   model_reserved=reserve_nothing)
         self.assertEqual(
             json.loads((self.exec_root / job_id / "receipt.json").read_text())["state"],
             "queued")

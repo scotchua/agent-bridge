@@ -191,6 +191,22 @@ class PrivacyIsCheckedBeforeEverythingElse(AutoCase):
         self.assertEqual(receipt["owner_route"], "claude")
         self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
 
+    def test_a_local_only_repository_leaves_each_assistant_its_own_edits(self):
+        # The wider policy lists new repositories with allowed_routes
+        # ["local"]. An assistant's own edit there is retained with it, with
+        # the other assistant fresh, so it is never handed off. (A second
+        # assistant then meets the holder's receipt, exactly as it does in an
+        # unclassified repository today; that is not changed here.)
+        for classification in ("internal_nonclient", "client_derived"):
+            with self.subTest(classification=classification):
+                self.write_policy({str(self.repo): {
+                    "classification": classification,
+                    "allowed_routes": ["local"], "mechanical_ok": True}})
+                for route in ("codex", "claude", "local"):
+                    self.observe(route)
+                self.assertAllowed(self.hook("claude", self.repo))
+                self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+
     def test_capacity_cannot_override_privacy(self):
         """Every route fresh and available still does not move the work."""
         self.write_policy({str(self.repo): {"classification": "client_derived",
@@ -222,6 +238,35 @@ class CapacityEvidenceIsFirstHandOnly(AutoCase):
                          autodecide.CLIENT_PRESENCE_SOURCE)
         self.assertNotIn("codex", capacity)
         self.assertNotIn("local", capacity)
+
+    def test_a_client_turned_away_by_a_receipt_is_still_observed(self):
+        # Measured live 2026-09-24: presence was written only when the hook
+        # made a decision, and a valid receipt naming the other client means
+        # no decision is made. So a client that kept arriving at a repository
+        # the other held was denied without ever being observed, went stale,
+        # and the next decision anywhere had only the holder to choose from.
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+        capacity = StageRouter(str(self.db)).report()["capacity"]
+        self.assertEqual(capacity["codex"]["status"], "available")
+        self.assertEqual(capacity["codex"]["source"], autodecide.CLIENT_PRESENCE_SOURCE)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex",
+                         "the arrival changed eligible capacity, so the receipt is re-made")
+
+    def test_a_client_is_observed_even_outside_any_repository(self):
+        outside = self.base / "not-a-repo"
+        outside.mkdir()
+        StageRouter(str(self.db))       # the router exists; presence never creates it
+        self.hook("codex", outside)
+        capacity = StageRouter(str(self.db)).report()["capacity"]
+        self.assertEqual(capacity["codex"]["status"], "available")
+        self.assertNotIn("claude", capacity)
 
     def test_a_peer_without_a_fresh_observation_keeps_the_work_here(self):
         self.write_policy({str(self.repo): {
@@ -288,7 +333,7 @@ class DispatchIntent(AutoCase):
 
 
 class DefectsFoundWhileBuildingThis(AutoCase):
-    """Both were live failures, not hypotheticals. See the module docstring."""
+    """All were live failures, not hypotheticals. See the module docstring."""
 
     def test_a_completed_stage_does_not_brick_the_repository(self):
         self.assertAllowed(self.hook("claude", self.repo))
@@ -303,6 +348,60 @@ class DefectsFoundWhileBuildingThis(AutoCase):
         second = self.receipt_for(self.repo)
         self.assertNotEqual(second["stage"], first["stage"])
         self.assertEqual(second["stage"], "implementation#2")
+
+    def test_a_manual_receipt_outliving_its_stage_does_not_brick_the_repository(self):
+        """The same brick one layer down, and the one nothing could clear.
+
+        A hand-made receipt is deliberately not re-decided when policy,
+        capacity or task type change. That left the terminal-stage case with
+        no way out at all: editing needs a receipt, ``routing_decide`` needs
+        an owned stage, ``stage_claim`` needs a route with fresh capacity, and
+        the only writer of this client's own freshness is the auto-decide
+        branch that a surviving receipt skips. The receipt prevented the write
+        that would have replaced it. Observed live with three unrelated stages
+        stuck at once, and unrecoverable without editing the gate, which the
+        gate itself was denying.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        router = StageRouter(str(self.db))
+        current = router.get(first["item_id"], first["stage"])
+        router.complete(first["item_id"], first["stage"],
+                        owner_id=current["owner_id"],
+                        expected_revision=current["revision"])
+        from agent_bridge import store
+        store.atomic_write_json(gate.receipt_path(str(self.state), str(self.repo)),
+                                {**first, "automatic": False})
+        self.assertTrue(gate.manual_receipt_overtaken(
+            {**first, "automatic": False}, time.time(), str(self.db)))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertNotEqual(self.receipt_for(self.repo)["stage"], first["stage"])
+
+    def test_a_manual_receipt_survives_an_ordinary_change(self):
+        """Only a gone stage retires a manual receipt. Nothing else.
+
+        The operator chose that route by hand, so re-deciding it whenever
+        policy or capacity moved would quietly overrule them. This is the
+        guard against fixing the deadlock by widening the exception until the
+        distinction between the two kinds of receipt stops meaning anything.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        first = self.receipt_for(self.repo)
+        from agent_bridge import store
+        manual = {**first, "automatic": False,
+                  "policy_fingerprint": "no-longer-current",
+                  "capacity_fingerprint": "no-longer-current"}
+        store.atomic_write_json(
+            gate.receipt_path(str(self.state), str(self.repo)), manual)
+        self.assertFalse(gate.manual_receipt_overtaken(
+            manual, time.time(), str(self.db)))
+        # The same receipt marked automatic would be re-decided on either
+        # fingerprint, which is what makes this a real distinction.
+        self.assertTrue(gate.automatic_receipt_overtaken(
+            {**manual, "automatic": True}, time.time(), str(self.db),
+            "implementation", "some-other-policy"))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["stage"], first["stage"])
 
     def test_generations_are_bounded_rather_than_searched_for_ever(self):
         self.assertLessEqual(autodecide.MAX_STAGE_GENERATIONS, 10_000)
@@ -718,6 +817,147 @@ class MeasuredCpuIdleRatioForAutomaticRouting(unittest.TestCase):
         self.assertIsNone(autodecide._measured_cpu_idle_ratio(self.local_queue_root))
 
 
+class ClientDerivedWorkGoesOnlyToTheLocalModel(unittest.TestCase):
+    """Scott, 2026-09-24: the on-device model is the safest processor of
+    client data. Mechanical client-derived work goes local; nothing
+    client-derived ever goes to a peer."""
+
+    def decide(self, routes, task_type="mechanical", fresh=("local", "codex")):
+        policy = autoroute.Policy(repos={"/r": autoroute.RepoPolicy(
+            "client_derived", tuple(routes), mechanical_ok=True)})
+        return autoroute.decide(
+            autoroute.Signal(client="claude", repo="/r", task_type=task_type),
+            policy, fresh_routes=frozenset(fresh), load=autoroute.Load(0.1, True))
+
+    def test_mechanical_client_derived_work_is_routed_local(self):
+        decision = self.decide(("claude", "codex", "local"))
+        self.assertEqual(decision.route, "local")
+        self.assertEqual(decision.code, "routed_local_mechanical")
+
+    def test_non_mechanical_client_derived_work_never_reaches_a_peer(self):
+        decision = self.decide(("claude", "codex", "local"), task_type="implementation")
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_classification_ineligible")
+
+    def test_client_derived_work_without_the_local_route_stays_put(self):
+        decision = self.decide(("claude", "codex"))
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_classification_ineligible")
+
+    def test_a_policy_that_excludes_client_derived_locally_never_falls_to_a_peer(self):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("client_derived", ("claude", "codex", "local"),
+                                              mechanical_ok=True)},
+            local_classifications=frozenset({"synthetic", "public", "internal_nonclient"}),
+            peer_classifications=frozenset({"synthetic", "public", "internal_nonclient",
+                                            "client_derived"}))
+        for task_type in ("mechanical", "implementation", "review"):
+            with self.subTest(task_type=task_type):
+                decision = autoroute.decide(
+                    autoroute.Signal(client="claude", repo="/r", task_type=task_type),
+                    policy, fresh_routes=frozenset({"local", "codex"}),
+                    load=autoroute.Load(0.1, True))
+                self.assertEqual(decision.route, autoroute.RETAIN)
+                self.assertEqual(decision.code, "retained_classification_ineligible")
+
+    def test_a_stale_local_route_retains_rather_than_falling_to_a_peer(self):
+        decision = self.decide(("claude", "codex", "local"), fresh=("codex",))
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_no_fresh_capacity")
+
+
+class LinkedWorktreesInheritLocalRoutingOnly(unittest.TestCase):
+    """Landing and review checkouts are linked worktrees with their own git
+    root. Measured 2026-09-24: many sessions run there, and a policy keyed on
+    the main checkout missed them all."""
+
+    def setUp(self):
+        import subprocess
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.temp.name))
+        self.main = base / "main"
+        self.main.mkdir()
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        run = lambda *args: subprocess.run(  # noqa: E731
+            ["git", *args], cwd=self.main, env=env, check=True, capture_output=True)
+        run("init", "-q")
+        run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x")
+        self.linked = base / "landing"
+        run("worktree", "add", "-q", str(self.linked))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def policy(self, entry):
+        return autoroute.Policy(repos={str(self.main): entry})
+
+    def test_a_linked_worktree_inherits_classification_and_the_local_route(self):
+        entry = autoroute.RepoPolicy("client_derived", ("claude", "codex", "local"),
+                                     mechanical_ok=True, mechanical_globs=("**/*.log",))
+        inherited = self.policy(entry).for_repo(str(self.linked))
+        self.assertEqual(inherited.classification, "client_derived")
+        self.assertEqual(inherited.allowed_routes, ("local",))
+        self.assertTrue(inherited.mechanical_ok)
+        self.assertEqual(inherited.mechanical_globs, ("**/*.log",))
+
+    def test_peer_routes_are_not_inherited(self):
+        entry = autoroute.RepoPolicy("internal_nonclient", ("claude", "codex"), mechanical_ok=True)
+        self.assertEqual(self.policy(entry).for_repo(str(self.linked)).allowed_routes, ())
+
+    def test_the_main_checkout_keeps_its_own_entry(self):
+        entry = autoroute.RepoPolicy("internal_nonclient", ("claude", "codex", "local"))
+        self.assertIs(self.policy(entry).for_repo(str(self.main)), entry)
+
+    def test_an_explicit_worktree_entry_wins(self):
+        own = autoroute.RepoPolicy("public", ("claude", "codex"))
+        policy = autoroute.Policy(repos={
+            str(self.main): autoroute.RepoPolicy("client_derived", ("local",)),
+            str(self.linked): own})
+        self.assertIs(policy.for_repo(str(self.linked)), own)
+
+    def test_a_forged_git_file_cannot_borrow_a_registered_worktree(self):
+        forged = Path(self.temp.name) / "forged"
+        forged.mkdir()
+        admin = (self.linked / ".git").read_text(encoding="utf-8").strip()
+        (forged / ".git").write_text(admin + "\n", encoding="utf-8")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
+    def test_a_relative_path_worktree_also_inherits(self):
+        import subprocess
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        relative = Path(os.path.realpath(self.temp.name)) / "relative"
+        done = subprocess.run(["git", "worktree", "add", "-q", "--relative-paths", str(relative)],
+                              cwd=self.main, env=env, capture_output=True)
+        if done.returncode != 0:
+            self.skipTest("this git has no --relative-paths")
+        entry = autoroute.RepoPolicy("client_derived", ("claude", "local"), mechanical_ok=True)
+        self.assertEqual(self.policy(entry).for_repo(str(relative)).allowed_routes, ("local",))
+
+    def test_a_symlinked_git_file_cannot_borrow_a_registered_worktree(self):
+        forged = Path(self.temp.name) / "symlinked"
+        forged.mkdir()
+        (forged / ".git").symlink_to(self.linked / ".git")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
+    def test_a_git_file_naming_an_unregistered_worktree_is_refused(self):
+        forged = Path(self.temp.name) / "unregistered"
+        forged.mkdir()
+        (forged / ".git").write_text(f"gitdir: {self.main}/.git/worktrees/nothing\n",
+                                     encoding="utf-8")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
+    def test_a_malformed_git_file_falls_back_to_the_default(self):
+        fake = Path(self.temp.name) / "fake"
+        fake.mkdir()
+        (fake / ".git").write_text(f"gitdir: {self.main}/.git\n", encoding="utf-8")
+        entry = autoroute.RepoPolicy("internal_nonclient", ("local",))
+        policy = self.policy(entry)
+        self.assertIs(policy.for_repo(str(fake)), policy.default)
+
+
 class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
     """Mirrors ``localfirst.readiness()``'s rescue: load-average-per-core
     conflates waiting-on-I/O with genuine CPU contention, so a directly
@@ -745,7 +985,7 @@ class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
         self.assertEqual(decision.considered["cpu_idle_ratio"], 0.9)
 
     def test_a_low_measured_idle_reading_does_not_rescue_it(self):
-        decision = self.decide(0.9, 0.1)
+        decision = self.decide(0.9, autoroute.MIN_LOCAL_IDLE_RATIO / 2)
         self.assertEqual(decision.route, autoroute.RETAIN)
         self.assertEqual(decision.code, "retained_local_load_high")
 
@@ -794,6 +1034,41 @@ class PolicyParsing(unittest.TestCase):
             autoroute.parse_policy({"version": 1, "repos": {
                 "/tmp": {"allowed_routes": ["anthropic_api"]}}})
         self.assertEqual(autoroute.ROUTES, ("claude", "codex", "local"))
+
+    def test_reserved_models_is_empty_by_default(self):
+        """A policy written before the field existed reserves nothing."""
+        self.assertEqual(autoroute.parse_policy(
+            {"version": 1, "repos": {}}).reserved_models, ())
+
+    def test_reserved_models_is_normalised_and_deduplicated(self):
+        policy = autoroute.parse_policy({
+            "version": 1, "repos": {},
+            "reserved_models": ["Astra", " astra ", "FABLE"]})
+        self.assertEqual(policy.reserved_models, ("astra", "fable"))
+
+    def test_reserved_models_rejects_a_bad_shape(self):
+        for bad in ("astra", [""], ["   "], [None], [1]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(autoroute.PolicyError):
+                    autoroute.parse_policy({"version": 1, "repos": {},
+                                            "reserved_models": bad})
+
+    def test_reserved_model_match_names_the_token_it_hit(self):
+        """Named, not just refused, so an operator can see which reservation
+        fired without reading the policy file to guess."""
+        reserved = ("astra", "fable")
+        self.assertEqual(autoroute.reserved_model_match("gpt-6-astra", reserved), "astra")
+        self.assertEqual(autoroute.reserved_model_match("claude-fable-5-1", reserved), "fable")
+        self.assertIsNone(autoroute.reserved_model_match("gpt-5.6-terra", reserved))
+        self.assertIsNone(autoroute.reserved_model_match("gpt-6-astra", ()))
+
+    def test_reserved_model_match_leaves_shape_errors_to_the_validator(self):
+        """A non-string or blank model is a shape fault the dispatch validator
+        already refuses. Answering it here too would give one fault two
+        different messages."""
+        for value in (None, "", "   ", 5, ["astra"]):
+            with self.subTest(value=value):
+                self.assertIsNone(autoroute.reserved_model_match(value, ("astra",)))
 
     def test_route_classifications_is_absent_by_default(self):
         policy = autoroute.parse_policy({"version": 1, "repos": {}})
@@ -1041,6 +1316,109 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
         # And the denials are all the same client, the one routed away.
         self.assertEqual(outcomes, [False, True] * 4)
 
+    def test_presence_alone_does_not_re_decide_while_both_stay_fresh(self):
+        """Presence is now written on every call; its refreshed timestamp must
+        not count as a capacity change. Only arrivals and departures do."""
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.hook("codex", self.repo)                 # the arrival: one re-decision
+        decided = self.decisions()
+        for _ in range(3):
+            self.hook("claude", self.repo)
+            self.hook("codex", self.repo)
+        self.assertEqual(self.decisions(), decided)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex")
+
+    def test_a_client_that_expires_and_returns_re_decides_once_each_way(self):
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.hook("codex", self.repo)
+        now = time.time()                             # codex's presence lapses
+        StageRouter(str(self.db)).observe_capacity(CapacityObservation(
+            route="codex", observed_at=now - 1000, fresh_until=now - 10,
+            available=True, source=autodecide.CLIENT_PRESENCE_SOURCE), trusted=True)
+        before = self.decisions()
+        self.hook("claude", self.repo)                # the departure
+        self.assertEqual(self.decisions(), before + 1)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"], "claude")
+        self.hook("codex", self.repo)                 # the return
+        self.assertEqual(self.decisions(), before + 2)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex")
+
+    def test_no_presence_is_recorded_when_automatic_routing_is_off(self):
+        self.hook("codex", self.repo, "app.py", None, "--no-automatic-routing")
+        self.assertNotIn("codex", StageRouter(str(self.db)).report()["capacity"])
+
+
+class AFailedPresenceWriteIsVisibleAndChangesNothing(AutoCase):
+    """Codex's review of the presence fix: a swallowed failure would leave the
+    lock-out in place with nothing to show for it."""
+
+    def test_the_failure_is_logged_once_per_interval_and_reported(self):
+        unwritable = self.base / "not-a-database.sqlite3"
+        unwritable.write_bytes(b"this is not an sqlite file" * 100)
+        moment = [0.0]
+        for at in (1000.0, 1010.0, 1070.0):
+            moment[0] = at
+            self.assertFalse(gate.observe_presence_best_effort(
+                "codex", str(self.state), str(unwritable), clock=lambda: moment[0]))
+        path = Path(gate.receipt_dir(str(self.state))) / gate.PRESENCE_FAILURE_LEDGER
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["at"] for row in rows], [1000.0, 1070.0],
+                         "the call at 1010 falls inside the interval and is not logged")
+        self.assertTrue(all(row["client"] == "codex" and row["error"] for row in rows))
+
+    def test_a_success_writes_no_failure_line(self):
+        StageRouter(str(self.db))
+        self.assertTrue(gate.observe_presence_best_effort(
+            "claude", str(self.state), str(self.db)))
+        path = Path(gate.receipt_dir(str(self.state))) / gate.PRESENCE_FAILURE_LEDGER
+        self.assertFalse(path.exists())
+
+    def test_a_missing_database_is_never_created_by_presence(self):
+        # Found by the full suite: creating it turned test_delegation_gate's
+        # stage_db_unavailable deny into an automatic decision.
+        missing = self.base / "never-created.sqlite3"
+        self.assertFalse(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(missing)))
+        self.assertFalse(missing.exists())
+
+    def test_an_empty_file_is_never_initialized_by_presence(self):
+        # Codex's delta review: StageRouter creates its schema on open, so an
+        # empty file would have become a valid, empty router.
+        empty = self.base / "empty.sqlite3"
+        empty.write_bytes(b"")
+        self.assertFalse(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(empty)))
+        import sqlite3
+        db = sqlite3.connect(str(empty))
+        try:
+            tables = db.execute("SELECT name FROM sqlite_master").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(tables, [])
+
+    def test_a_contended_router_does_not_hold_the_hook(self):
+        StageRouter(str(self.db))
+        import sqlite3
+        holder = sqlite3.connect(str(self.db), isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            self.assertFalse(gate.observe_presence_best_effort(
+                "codex", str(self.state), str(self.db)))
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertTrue(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(self.db)))
+
+    def test_an_unknown_client_is_refused_and_logged_not_observed(self):
+        self.assertFalse(gate.observe_presence_best_effort(
+            "local", str(self.state), str(self.db)))
+        self.assertNotIn("local", StageRouter(str(self.db)).report()["capacity"])
+
 
 class ReviewIsNeverRoutedBackToItsAuthor(unittest.TestCase):
     """The second half of the independence rule, which was missing.
@@ -1166,6 +1544,109 @@ class AStageSomebodyElseOwnsIsNotAdopted(AutoCase):
         self.assertNotEqual(receipt["stage"], "implementation")
         self.assertEqual(router.get(item, "implementation")["owner_id"],
                          "some-agents-own-owner")
+
+
+class ReviewFindingsFromTheOtherProvider(AutoCase):
+    """Raised by codex reviewing the receipt fix. One was real; two were not.
+
+    Kept together because the two that were not are the more useful half: each
+    describes a plausible failure this design is claimed to be free of, and a
+    claim nothing checks is the kind that stops being true quietly.
+    """
+
+    def test_a_manual_receipt_does_not_compute_the_automatic_fingerprints(self):
+        """The real one, and a regression introduced by the fix itself.
+
+        The guard it replaced was ``receipt.get("automatic") and
+        automatic_receipt_overtaken(...)``, and Python does not evaluate a
+        call's arguments until the ``and`` reaches it, so a manual receipt
+        never read the policy file or scanned the capacity table. Passing
+        those two reads as arguments made every receipt pay for both: a
+        sha256 of the policy file and a ``SELECT * FROM capacity`` on every
+        gated write, for two values the manual branch then ignores.
+
+        Only the cost is real. The reviewer who raised this expected the
+        eager reads to be able to raise past ``stage_binding``'s fail-closed
+        handling, but neither can: ``policy_fingerprint`` documents that it
+        never raises and ``capacity_digest`` returns None on an unreadable
+        table. Checked rather than assumed, and recorded here so the next
+        reader does not re-derive it.
+        """
+        def boom():
+            raise AssertionError("the manual path must not compute this")
+
+        manual = {"item_id": "i", "stage": "implementation", "owner_id": "o",
+                  "owner_route": "claude", "valid_until": time.time() + 3600,
+                  "automatic": False}
+        self.assertFalse(gate.receipt_overtaken(
+            manual, time.time(), None, "implementation", boom, boom))
+
+        # The automatic path still reads both, which is what makes the
+        # difference above a deferral rather than a removal.
+        seen = []
+        gate.receipt_overtaken({**manual, "automatic": True}, time.time(), None,
+                               "implementation",
+                               lambda: seen.append("policy") or "p",
+                               lambda: seen.append("capacity") or "c")
+        self.assertEqual(seen, ["policy", "capacity"])
+
+    def test_an_expired_manual_receipt_over_a_live_stage_is_not_a_wedge(self):
+        """Not a defect: the stage is still owned, so it is still renewable.
+
+        The worry was a second deadlock of the same shape -- an expired
+        receipt stays non-None, so it skips the re-decision and is then denied
+        as ``routing_receipt_expired`` for ever. It is not, and the difference
+        is what the deny message tells the operator to do. The deadlock this
+        fix addressed was unrecoverable because the stage was terminal, so
+        nothing could renew it. An expired receipt over a live stage leaves
+        that stage owned by this owner, and ``stage_renew`` on it works.
+        """
+        self.assertAllowed(self.hook("claude", self.repo))
+        receipt = self.receipt_for(self.repo)
+        from agent_bridge import store
+        store.atomic_write_json(
+            gate.receipt_path(str(self.state), str(self.repo)),
+            {**receipt, "automatic": False, "valid_until": time.time() - 1})
+        self.assertDenied(self.hook("claude", self.repo), "routing_receipt_expired")
+        # The way out the deny message names, taken here to prove it exists.
+        router = StageRouter(str(self.db))
+        current = router.get(receipt["item_id"], receipt["stage"])
+        self.assertEqual(current["state"], "owned")
+        renewed = router.renew(receipt["item_id"], receipt["stage"],
+                               owner_id=current["owner_id"], lease_seconds=3600,
+                               expected_revision=current["revision"])
+        self.assertEqual(renewed["state"], "owned")
+
+    def test_a_stage_owned_by_another_owner_is_skipped_rather_than_taken(self):
+        """Not a defect: discarding a receipt cannot hand its stage to anyone.
+
+        The worry was that clearing a ``stage_reassigned`` receipt and calling
+        the decider immediately afterwards could overturn a deliberate
+        reassignment. It cannot. ``stage_name`` picks the first generation
+        this owner can own and ``_own_stage`` reports a stage somebody else
+        holds rather than claiming it, so the decision lands on a new
+        generation and the reassigned one is left exactly as it was.
+
+        The larger reading -- that reassigning a stage revokes a client's
+        right to edit the repository -- was never true here either: a
+        repository with no receipt at all gets a fresh generation by the same
+        path. Stages are units of work, not access.
+        """
+        repo = git_repo(self.base / "other")
+        item = autodecide.item_id_for(str(repo))
+        self.observe("claude")
+        router = StageRouter(str(self.db))
+        router.register(item, "implementation", allowed_routes=("claude",),
+                        preferred_routes=("claude",))
+        before = router.get(item, "implementation")
+        router.assign(item, "implementation", owner_id="somebody-else",
+                      lease_seconds=3600, expected_revision=before["revision"])
+
+        self.assertAllowed(self.hook("claude", repo))
+        self.assertEqual(self.receipt_for(repo)["stage"], "implementation#2")
+        untouched = router.get(item, "implementation")
+        self.assertEqual(untouched["owner_id"], "somebody-else")
+        self.assertEqual(untouched["state"], "owned")
 
 
 if __name__ == "__main__":

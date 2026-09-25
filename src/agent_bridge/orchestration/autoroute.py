@@ -34,7 +34,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from collections.abc import Callable
 from typing import Any, Mapping
 
 from ..localq.spool import QueueCaps
@@ -62,9 +63,11 @@ CLASSIFICATIONS = ("synthetic", "public", "internal_nonclient",
                    "client_derived", "unclassified")
 #: What the two provider lanes accept, matching ``execution_queue`` exactly.
 PEER_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
-#: What the local worker accepts, matching ``localq.spool`` exactly. Narrower
-#: than the peers' set only if the operator says so; identical by default.
-LOCAL_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+#: What the local worker accepts, matching ``localq.spool`` exactly. Wider
+#: than the peers' set: the local model runs on this machine, so client-derived
+#: text sent to it never leaves the host, and a local digest keeps it out of a
+#: provider's context rather than adding to it (Scott, 2026-09-24).
+LOCAL_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 
 #: Work shapes the gate can tell apart from a tool call. Deliberately coarse:
 #: a PreToolUse payload names files and commands, not intent, and inventing a
@@ -75,7 +78,11 @@ TASK_TYPES = ("implementation", "mechanical", "review", "unknown")
 #: queue already applies ``QueueCaps.max_load_per_core`` when it runs a job;
 #: this is the routing-time equivalent, so work is not sent to a lane that
 #: will immediately defer it.
-DEFAULT_MAX_LOCAL_LOAD = 0.75
+# Deliberately aggressive local-first policy. A load average can remain high
+# after useful work ends, and Scott prefers starting locally then dialing back
+# only after measured user-visible impact. The queue still independently stops
+# for memory pressure, thermal pressure, or near-saturated CPU.
+DEFAULT_MAX_LOCAL_LOAD = 1.25
 
 
 class PolicyError(ValueError):
@@ -270,6 +277,32 @@ class Policy:
     #: existing policy file with no ``local_first`` block keeps behaving
     #: exactly as it does today.
     local_first: LocalFirstConfig = field(default_factory=LocalFirstConfig)
+    #: Model name fragments the operator reserves to themselves. A dispatch
+    #: naming a model that contains one of these is refused unless the request
+    #: carries the operator's own authorization.
+    #:
+    #: Matched as a case-folded substring rather than an exact name on purpose.
+    #: The same model is spelled several ways across a provider's shorthand,
+    #: its full identifier and its dated snapshots, and an exact-match list is
+    #: one new snapshot away from being silently empty. Reserving the token
+    #: ``astra`` covers ``gpt-6-astra`` and anything later carrying the name;
+    #: an exact list reserving ``gpt-6-astra`` would not.
+    #:
+    #: This lives in the operator's policy file rather than the bridge config
+    #: so that the list can be protected from the assistant the list restrains.
+    #: Be precise about what protects it. ``gate.protected_paths`` covers the
+    #: policy file, but the gate matches paths it can read in a tool call, so a
+    #: script that assembles the path at runtime goes straight past it -- this
+    #: was demonstrated, not assumed. The property this field needs therefore
+    #: comes from the filesystem, not from the gate: the operator sets the
+    #: macOS system-immutable flag (``sudo chflags schg``) on the policy file
+    #: and on the config naming ``state_root``, after which write, truncate,
+    #: unlink, rename and clearing the flag all require root.
+    #:
+    #: Without that flag this field is a convention, not a control. Anyone
+    #: relying on it should check the flag is set rather than trusting the
+    #: file's location.
+    reserved_models: tuple[str, ...] = ()
 
     def for_repo(self, repo: str) -> RepoPolicy:
         """The entry for ``repo``, matched on the real path, else the default."""
@@ -277,7 +310,69 @@ class Policy:
         found = self.repos.get(real)
         if found is None:
             found = self.repos.get(repo)
+        if found is None:
+            main = _main_worktree(real)
+            inherited = self.repos.get(main) if main else None
+            if inherited is not None:
+                # A linked worktree (a landing or review checkout) inherits its
+                # main repository's classification and local routing, but not
+                # its peer routes: automatic hand-offs between assistants stay
+                # limited to the checkouts the operator named.
+                found = replace(inherited, allowed_routes=tuple(
+                    route for route in inherited.allowed_routes if route == "local"))
         return found if found is not None else self.default
+
+
+def _main_worktree(repo: str) -> str | None:
+    """The main checkout of a linked git worktree, or None.
+
+    A linked worktree's ``.git`` is a file reading ``gitdir: <main>/.git/
+    worktrees/<name>``. Anything else (a real ``.git`` directory, an
+    unreadable or malformed file, a gitdir that is not under a main
+    checkout's ``.git/worktrees``) is not a linked worktree, and None keeps
+    the caller on the default entry.
+    """
+    marker = os.path.join(repo, ".git")
+    # A symlinked ``.git`` could point at a registered worktree's own file and
+    # pass the backlink check below from an unregistered directory.
+    if os.path.islink(marker) or not os.path.isfile(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            line = handle.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = line[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(repo, gitdir)
+    gitdir = os.path.realpath(gitdir)
+    worktrees = os.path.dirname(gitdir)
+    dot_git = os.path.dirname(worktrees)
+    if os.path.basename(worktrees) != "worktrees" or os.path.basename(dot_git) != ".git" \
+            or not os.path.isdir(gitdir):
+        return None
+    # The main checkout must have registered this worktree: its
+    # administrative directory's ``gitdir`` file points back at this very
+    # ``.git`` file. A forged ``.git`` file borrowing another worktree's
+    # administrative directory fails here.
+    try:
+        with open(os.path.join(gitdir, "gitdir"), encoding="utf-8") as handle:
+            backlink = handle.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    # It must name a file called .git directly inside ``repo``. A relative
+    # backlink (``git worktree add --relative-paths``) is relative to the
+    # administrative directory, never to this process's working directory.
+    # Only the directory part is resolved, so a symlinked parent spelling
+    # still matches while the .git file itself is never followed.
+    if backlink and not os.path.isabs(backlink):
+        backlink = os.path.join(gitdir, backlink)
+    if not backlink or os.path.basename(os.path.normpath(backlink)) != ".git" \
+            or os.path.realpath(os.path.dirname(os.path.normpath(backlink))) != os.path.realpath(repo):
+        return None
+    return os.path.dirname(dot_git)
 
 
 @dataclass(frozen=True)
@@ -418,11 +513,14 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
             "retained_repo_unclassified",
             f"{signal.repo} has no operator classification, so no route is "
             f"eligible to receive it and the work stays with {signal.client}")
-    if repo_policy.classification == "client_derived":
+    if repo_policy.classification == "client_derived" and not (
+            "local" in repo_policy.allowed_routes and repo_policy.mechanical_ok
+            and signal.task_type == "mechanical"
+            and "client_derived" in policy.local_classifications):
         return retain(
             "retained_classification_ineligible",
-            "client-derived material is outside this bridge's supported use "
-            "and is never dispatched to a peer or a local model")
+            "client-derived material goes only to the local model, and only as "
+            "mechanical work; it is never dispatched to a peer")
     if not repo_policy.allowed_routes:
         return retain(
             "retained_no_eligible_route",
@@ -463,6 +561,15 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
                         f"mechanical {repo_policy.classification} text work in a "
                         f"repository the operator marked eligible for a local model",
                         considered)
+
+    # Backstop: the local branch above returns for every client-derived unit
+    # the privacy check let through, so this is unreachable today. It stays
+    # so that no later edit can let client-derived work reach a peer.
+    if repo_policy.classification == "client_derived":
+        return retain(
+            "retained_classification_ineligible",
+            "client-derived material goes only to the local model; it is never "
+            "dispatched to a peer")
 
     # 4. Capacity, for the peer route.
     peer_classifications = policy.route_classifications.get(peer, policy.peer_classifications)
@@ -646,17 +753,66 @@ def parse_policy(document: object) -> Policy:
                    if not key.startswith("_")} - {"version", "repos",
                                                   "max_local_load_ratio", "prefer",
                                                   "declared_available", "local_first",
-                                                  "route_classifications"}
+                                                  "route_classifications",
+                                                  "reserved_models"}
     if unknown_top:
         raise PolicyError("routing policy has unknown keys: "
                           + ", ".join(sorted(unknown_top)))
+    reserved = document.get("reserved_models", [])
+    if (not isinstance(reserved, list)
+            or any(not isinstance(m, str) or not m.strip() for m in reserved)):
+        raise PolicyError("reserved_models must be a list of non-empty strings")
     local_first = _parse_local_first(document.get("local_first", {}))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
                   peer_classifications=PEER_CLASSIFICATIONS,
                   route_classifications=route_classifications,
                   max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
                   declared_routes=tuple(dict.fromkeys(declared)),
-                  local_first=local_first)
+                  local_first=local_first,
+                  reserved_models=tuple(dict.fromkeys(
+                      m.strip().casefold() for m in reserved)))
+
+
+def reserved_model_match(model: object, reserved: tuple[str, ...]) -> str | None:
+    """The reserved token ``model`` contains, or None if it is not reserved.
+
+    Returns the token rather than a bool so the refusal can name which
+    reservation was hit, which is the difference between an operator seeing
+    "astra is reserved" and seeing "refused".
+
+    A non-string or empty model is not reserved here. That is not leniency:
+    those are shape errors the dispatch validator already refuses on its own,
+    and duplicating the check would give two different messages for one fault.
+    Callers must keep running their own shape validation, not lean on this.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    folded = model.casefold()
+    for token in reserved:
+        if token in folded:
+            return token
+    return None
+
+
+def model_reserved_for(state_root: str) -> Callable[[str], str | None]:
+    """The operator's reservation, read fresh from their policy on each call.
+
+    Handed to the execution queue so that the layer which actually creates a
+    job can refuse a reserved model without importing this module's policy
+    handling, and so that both layers match names through the one
+    implementation in :func:`reserved_model_match` rather than two copies.
+
+    Reads the file on every call on purpose. Submits are rare, and a list
+    captured when a worker started would leave that worker enforcing whatever
+    the policy said at boot, which for a long-running process means an
+    operator's edit does nothing until they notice and restart it.
+    ``load_policy`` raises on an unreadable or malformed file; the queue turns
+    that into a refusal, which is the only direction a reservation can fail.
+    """
+    def matcher(model: str) -> str | None:
+        return reserved_model_match(model, load_policy(state_root).reserved_models)
+
+    return matcher
 
 
 def load_policy(state_root: str) -> Policy:

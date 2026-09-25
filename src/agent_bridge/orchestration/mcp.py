@@ -17,8 +17,9 @@ import os
 from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
+from ..localq import gemma_child
 from ..localq.intake import AutomaticIntake
-from ..localq.spool import AdmissionError, JobNotFound, LocalQueue
+from ..localq.spool import AdmissionError, JobNotFound, LocalQueue, UNSUPPORTED_KIND_REASON
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
@@ -93,15 +94,45 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "params": {"type": "object"},
         "priority": {"type": "string", "enum": ["interactive", "bulk"]},
         "classification": {"type": "string"},
-        "purpose": {"type": "string", "enum": ["work", "test"]},
+        # Deliberately no "purpose" property (finding: an assistant-facing
+        # schema that accepted it let a caller label real work "test" and
+        # skip the checkpoint requirement). The handler always routes as
+        # purpose="work" and mints its own checkpoint; there is no caller
+        # provenance field either, for the same reason work_digest_file's
+        # own docstring already gives for classification: the server-bound
+        # caller is the only truth this tool ever forwards.
         "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
         "idempotency_key": {"type": "string", "maxLength": 256},
-    }, ["task_type", "input", "priority", "classification", "purpose"])
+        "checkpoint_id": {"type": "string", "minLength": 1,
+                          "description": "Optional prior work_checkpoint result for this exact unit."},
+    }, ["task_type", "input", "priority", "classification"])
     job = _schema({"job_id": {"type": "string"}}, ["job_id"])
     feedback = _schema({
         "job_id": {"type": "string"},
         "outcome": {"type": "string", "enum": ["used", "reworked", "discarded"]},
     }, ["job_id", "outcome"])
+    # Content-free by construction: bounded task id, task type,
+    # classification, a UTF-8 byte count and a nonblank-line count, risk
+    # flags, and an optional idempotency key. No "input", no "purpose", no
+    # "caller", and nothing shaped like a content hash -- a caller who
+    # already holds the content (work_route_local, work_digest_file) mints
+    # its checkpoint internally instead of round-tripping a digest through
+    # this tool.
+    checkpoint_schema = _schema({
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "task_type": {"type": "string"},
+        "classification": {"type": "string"},
+        "input_bytes": {"type": "integer", "minimum": 0},
+        "nonblank_lines": {"type": "integer", "minimum": 0},
+        "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        "idempotency_key": {"type": "string", "maxLength": 256},
+    }, ["task_id", "task_type", "classification", "input_bytes", "nonblank_lines"])
+    no_eligible_unit_schema = _schema({
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "task_type": {"type": "string"},
+        "classification": {"type": "string"},
+        "idempotency_key": {"type": "string", "maxLength": 256},
+    }, ["task_id", "task_type", "classification"])
     identity = {
         "item_id": {"type": "string"}, "stage": {"type": "string"},
     }
@@ -134,11 +165,65 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         # ``implementation`` from every tool call, because a local worker does
         # not edit files, so no local intent is ever written. Anyone adding
         # one has to add the stage identity to this schema first.
-        return call(intake.route, {"params": None, "risk_flags": [], **args, "caller": caller})
+        #
+        # "purpose" and "caller" are stripped from the schema above; forcing
+        # them here too (after **args, so they win regardless of what a
+        # caller's raw JSON-RPC payload happened to contain) is the second,
+        # independent enforcement -- this handler never trusts the schema
+        # alone to have stopped an assistant from labelling real work "test".
+        #
+        # Every purpose="work" call requires a checkpoint now
+        # (AutomaticIntake.route refuses otherwise). This tool already
+        # receives the content in the same call, so it mints and consumes
+        # one internally with a deterministic identity derived from the
+        # already-supplied text: the same call, twice with identical
+        # arguments, mints (or dedupes onto) the same checkpoint and the
+        # same receipt, and never exposes the derived identity as a second
+        # content channel to the caller.
+        merged = {"params": None, "risk_flags": [], **args, "caller": caller, "purpose": "work"}
+        # A caller-supplied idempotency_key names the checkpoint's own dedup
+        # key, not route's: route's request key is always derived solely
+        # from the checkpoint id (requirement: a consumed checkpoint's route
+        # request key comes from the checkpoint id alone), so this is popped
+        # rather than forwarded -- forwarding it unchanged would compare it
+        # against the server-derived "checkpoint:<id>" key and refuse every
+        # call that supplied one.
+        caller_idempotency_key = merged.pop("idempotency_key", None)
+        supplied_checkpoint_id = merged.pop("checkpoint_id", None)
+        task_input = merged.get("input")
+        if not isinstance(task_input, str):
+            return {"ok": False, "error": "input_invalid"}
+        flags = sorted(set(merged.get("risk_flags") or []))
+        input_bytes = len(task_input.encode("utf-8"))
+        nonblank = sum(1 for line in task_input.splitlines() if line.strip())
+        task_id = "route_local:" + hashlib.sha256(
+            AutomaticIntake._normalized({
+                "caller": caller, "task_type": merged.get("task_type"),
+                "classification": merged.get("classification"), "risk_flags": flags,
+                "priority": merged.get("priority"),
+                "input_sha256": hashlib.sha256(task_input.encode("utf-8")).hexdigest(),
+            }).encode("utf-8")).hexdigest()
+        if supplied_checkpoint_id is not None:
+            if caller_idempotency_key is not None:
+                return {"ok": False, "error": "checkpoint_idempotency_conflict"}
+            merged["checkpoint_id"] = supplied_checkpoint_id
+        else:
+            try:
+                checkpoint = intake.checkpoint(
+                    task_id=task_id, task_type=merged.get("task_type"),
+                    classification=merged.get("classification"), caller=caller,
+                    input_bytes=input_bytes, nonblank_lines=nonblank, risk_flags=flags,
+                    idempotency_key=caller_idempotency_key or task_id)
+            except (AdmissionError, TypeError, ValueError) as exc:
+                return {"ok": False, "error": str(exc) or type(exc).__name__}
+            merged["checkpoint_id"] = checkpoint["checkpoint_id"]
+        return call(intake.route, merged)
 
+    digest_task_types = [kind for kind in localfirst.DIGEST_TASK_TYPES
+                         if kind in queue.allowed_task_types]
     digest = _schema({
         "path": {"type": "string", "description": "Absolute path to the file to digest."},
-        "task_type": {"type": "string", "enum": list(localfirst.DIGEST_TASK_TYPES)},
+        "task_type": {"type": "string", "enum": digest_task_types},
         "offset": {"type": "integer", "minimum": 0,
                   "description": "Byte offset to start the window at. Defaults to the tail. "
                                  "The window length is fixed and not the caller's to choose; "
@@ -177,6 +262,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         if (not isinstance(path, str) or not path or not os.path.isabs(path)
                 or task_type not in localfirst.DIGEST_TASK_TYPES):
             return {"ok": False, "error": "digest_path_refused:input_invalid"}
+        if task_type not in queue.allowed_task_types:
+            return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
         if os.path.islink(path):
             return {"ok": False, "error": "digest_path_refused:symlink"}
         try:
@@ -208,6 +295,14 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 task_type, max_chars=policy.local_first.digest_max_output_chars, fields=fields)
         except localfirst.TemplateError as exc:
             return {"ok": False, "error": f"digest_task_refused:{exc}"}
+        # Gemma's certified adapter accepts no arbitrary digest template. An
+        # absent instruction selects its fixed, attested summarize prompt.
+        # Keep the effective prompt in the idempotency binding, but omit the
+        # instruction key on the wire so a template cannot reach the child.
+        params = {"instruction": instruction}
+        if queue.backend_id == "gemma_certified":
+            instruction = gemma_child.CERTIFIED_SUMMARIZE_INSTRUCTION
+            params = {}
         # A single call determines the window from the file's live size and
         # reads exactly that window through the one descriptor it opens --
         # deliberately not a separate os.stat(real_path) followed by
@@ -233,11 +328,23 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         # adversarial review.
         instruction_sha256 = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
         idem = idempotency_key or f"digest:{caller}:{task_type}:{window_sha256}:{instruction_sha256}"
+        # Every purpose="work" call requires a checkpoint now. This mints
+        # and consumes its own, keyed by the same deterministic identity
+        # (``idem``) already derived above from the window and instruction
+        # this call already read -- the "digest path may mint internally
+        # from the already-read content" case, never a second content
+        # channel: the checkpoint itself carries only the byte/line metrics,
+        # never ``text``.
+        nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
         try:
+            checkpoint = intake.checkpoint(
+                task_id=idem, task_type=task_type, classification=repo_policy.classification,
+                caller=caller, input_bytes=len(text.encode("utf-8")), nonblank_lines=nonblank_lines,
+                risk_flags=[], idempotency_key=idem)
             intake_result = intake.route(
-                task_type=task_type, input=text, params={"instruction": instruction},
+                task_type=task_type, input=text, params=params,
                 priority=priority, classification=repo_policy.classification, caller=caller,
-                purpose="work", idempotency_key=idem)
+                purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
         except (AdmissionError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc) or type(exc).__name__}
         if intake_result.get("decision") != "local":
@@ -286,8 +393,37 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         return result
 
     tools = {
+        "work_checkpoint": {
+            "description": ("Record a content-free checkpoint: bounded task id, task type, "
+                            "classification, UTF-8 byte count, nonblank-line count and risk "
+                            "flags, plus the deterministic eligibility decision those metrics "
+                            "produce. Carries no document text and no content hash. A later "
+                            "work_route_local or work_digest_file call that already holds the "
+                            "content validates it against this checkpoint's exact metrics."),
+            "inputSchema": checkpoint_schema,
+            "handler": lambda args: call(intake.checkpoint, {
+                "risk_flags": [], "idempotency_key": None, **args, "caller": caller}),
+        },
+        "work_checkpoint_no_eligible_unit": {
+            "description": ("Record, append-only, that a search for local mechanical work found "
+                            "no eligible unit. Distinct from a refusal: no content was declared "
+                            "and none is invented. Counted separately by work_checkpoint_audit."),
+            "inputSchema": no_eligible_unit_schema,
+            "handler": lambda args: call(intake.checkpoint, {
+                "idempotency_key": None, **args, "caller": caller,
+                "input_bytes": 0, "nonblank_lines": 0, "risk_flags": [], "no_eligible_unit": True}),
+        },
+        "work_checkpoint_audit": {
+            "description": ("Content-free aggregate checkpoint counts: total, eligible, "
+                            "dispatched, no_eligible_unit, and refusals grouped by a fixed, "
+                            "closed set of reasons. Exposes no task id and no content hash."),
+            "inputSchema": empty,
+            "handler": lambda args: call(intake.audit, {}),
+        },
         "work_route_local": {
-            "description": "Route substantial declared non-client mechanical work to the local worker or refuse it. Never falls back to cloud.",
+            "description": ("Route substantial declared non-client mechanical work to the local worker or refuse it. "
+                            "Pass a prior work_checkpoint checkpoint_id for the same unit, or omit it and this call "
+                            "creates the checkpoint automatically. Never falls back to cloud."),
             "inputSchema": route, "handler": route_local,
         },
         "work_digest_file": {
@@ -443,6 +579,32 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                         or repo_policy.classification not in peer_classifications):
                     return {"ok": False,
                             "error": "execution_dispatch_refused:classification_not_eligible_for_route"}
+                # Models the operator keeps for themselves. Deliberately no
+                # bypass argument: a flag an assistant can set is not a
+                # reservation, it is a spelling of the same choice. The only
+                # way through is the operator editing their own policy file,
+                # and that edit IS the operator's request -- the semantics
+                # asked for is recommend it freely, never select it alone.
+                #
+                # What makes that edit the operator's alone is the immutable
+                # flag on the policy file, not this module and not the gate;
+                # see Policy.reserved_models. Unflagged, this check still
+                # refuses the obvious path but does not survive an assistant
+                # that decides to edit the list first.
+                #
+                # This is the early refusal, not the boundary. It exists here
+                # because this is where an agent can be told which
+                # reservation it hit, in words it reads. The rule itself is
+                # enforced again in ExecutionQueue.submit, which is where a
+                # job is actually created and which every caller goes
+                # through, not just this one. A cross-provider review made
+                # that point and it was right: a check at one caller is a
+                # convention.
+                reserved = autoroute.reserved_model_match(
+                    args.get("model"), policy.reserved_models)
+                if reserved is not None:
+                    return {"ok": False, "error":
+                            f"execution_dispatch_refused:model_reserved_to_operator:{reserved}"}
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
