@@ -333,7 +333,9 @@ def _main_worktree(repo: str) -> str | None:
     the caller on the default entry.
     """
     marker = os.path.join(repo, ".git")
-    if not os.path.isfile(marker):
+    # A symlinked ``.git`` could point at a registered worktree's own file and
+    # pass the backlink check below from an unregistered directory.
+    if os.path.islink(marker) or not os.path.isfile(marker):
         return None
     try:
         with open(marker, encoding="utf-8") as handle:
@@ -360,7 +362,13 @@ def _main_worktree(repo: str) -> str | None:
             backlink = handle.read(4096).strip()
     except (OSError, UnicodeDecodeError):
         return None
-    if not backlink or os.path.realpath(backlink) != os.path.realpath(marker):
+    # Absolute only (a relative one would resolve against this process's
+    # working directory), naming a file called .git directly inside ``repo``.
+    # Only the directory part is resolved, so a symlinked parent spelling
+    # still matches while the .git file itself is never followed.
+    if not backlink or not os.path.isabs(backlink) \
+            or os.path.basename(os.path.normpath(backlink)) != ".git" \
+            or os.path.realpath(os.path.dirname(os.path.normpath(backlink))) != os.path.realpath(repo):
         return None
     return os.path.dirname(dot_git)
 

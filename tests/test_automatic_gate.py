@@ -923,6 +923,13 @@ class LinkedWorktreesInheritLocalRoutingOnly(unittest.TestCase):
         policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
         self.assertIs(policy.for_repo(str(forged)), policy.default)
 
+    def test_a_symlinked_git_file_cannot_borrow_a_registered_worktree(self):
+        forged = Path(self.temp.name) / "symlinked"
+        forged.mkdir()
+        (forged / ".git").symlink_to(self.linked / ".git")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
     def test_a_git_file_naming_an_unregistered_worktree_is_refused(self):
         forged = Path(self.temp.name) / "unregistered"
         forged.mkdir()
