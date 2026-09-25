@@ -157,25 +157,6 @@ def _observe_client_presence(router: StageRouter, client: str) -> None:
         available=True, source=CLIENT_PRESENCE_SOURCE), trusted=True)
 
 
-def observe_presence(client: str, capacity_db: str, *, clock: Any = time.time) -> None:
-    """Record this client's presence on every hook call, not only on decisions.
-
-    ``ensure_decision`` runs only when a repository has no current receipt,
-    so a client that kept meeting a valid receipt held by the other client
-    was denied without ever being observed. It went stale, and every later
-    decision had only the holder to choose from, which kept the receipt
-    valid: a lock-out that sustained itself. Recording presence first lets
-    the capacity fingerprint see the arrival, so the receipt is re-made
-    under the capacity that is actually there.
-
-    Safe to call on every hook: the fingerprint is over route names only,
-    so a refreshed timestamp never re-decides anything by itself.
-    """
-    if client not in autoroute.PEER_FOR_CLIENT:
-        raise AutoDecisionError("client_invalid")
-    _observe_client_presence(StageRouter(capacity_db, clock=clock), client)
-
-
 def _observe_declared_routes(router: StageRouter, policy: autoroute.Policy,
                              *, client: str) -> None:
     """Replay the operator's standing declaration into the capacity ledger.

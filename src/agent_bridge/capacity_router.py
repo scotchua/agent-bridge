@@ -139,23 +139,10 @@ class StageRouter:
         the observation, so a caller that can only supply an observation
         cannot make itself trusted by naming a convincing ``source``.
         """
-        if observation.route not in ROUTES:
-            raise RoutingError("route_invalid")
-        if (not observation.source or observation.fresh_until <= observation.observed_at
-                or observation.observed_at > self.clock() + 1):
-            raise RoutingError("capacity_observation_invalid")
-        if observation.fresh_until - observation.observed_at > MAX_FRESHNESS_SECONDS:
-            raise RoutingError("capacity_freshness_excessive")
+        validate_observation(observation, self.clock())
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("""INSERT INTO capacity(route,observed_at,fresh_until,available,source,trusted)
-                VALUES(?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET
-                observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,
-                available=excluded.available,source=excluded.source,
-                trusted=excluded.trusted""",
-                       (observation.route, observation.observed_at,
-                        observation.fresh_until, int(observation.available),
-                        observation.source, int(bool(trusted))))
+            upsert_observation(db, observation, trusted=trusted)
             db.execute("COMMIT")
 
     def register(self, item_id: str, stage: str, *, allowed_routes: Iterable[str],
@@ -387,6 +374,31 @@ class StageRouter:
             blocked = [dict(row) for row in db.execute(
                 "SELECT item_id,stage,blocked_reason FROM stages WHERE state='blocked' ORDER BY item_id,stage")]
         return {"states": states, "capacity": capacities, "blocked": blocked}
+
+
+def validate_observation(observation: CapacityObservation, now: float) -> None:
+    """The rules every capacity writer applies, shared so the gate hook's
+    no-create presence write cannot drift from ``observe_capacity``."""
+    if observation.route not in ROUTES:
+        raise RoutingError("route_invalid")
+    if (not observation.source or observation.fresh_until <= observation.observed_at
+            or observation.observed_at > now + 1):
+        raise RoutingError("capacity_observation_invalid")
+    if observation.fresh_until - observation.observed_at > MAX_FRESHNESS_SECONDS:
+        raise RoutingError("capacity_freshness_excessive")
+
+
+def upsert_observation(db: sqlite3.Connection, observation: CapacityObservation, *,
+                       trusted: bool) -> None:
+    """Write one validated observation inside the caller's transaction."""
+    db.execute("""INSERT INTO capacity(route,observed_at,fresh_until,available,source,trusted)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET
+        observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,
+        available=excluded.available,source=excluded.source,
+        trusted=excluded.trusted""",
+               (observation.route, observation.observed_at,
+                observation.fresh_until, int(observation.available),
+                observation.source, int(bool(trusted))))
 
 
 def capacity_fingerprint(rows: Iterable[Mapping], now: float) -> str:

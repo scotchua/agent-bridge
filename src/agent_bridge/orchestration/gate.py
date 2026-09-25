@@ -63,7 +63,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .. import store
-from ..capacity_router import RoutingError, capacity_fingerprint
+from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
+                              capacity_fingerprint, upsert_observation,
+                              validate_observation)
 from . import autoroute, localfirst
 
 CLIENTS = ("claude", "codex")
@@ -1627,21 +1629,13 @@ def observe_presence_best_effort(client: str, state_root: str, capacity_db: str,
                                  clock: Any = time.time) -> bool:
     """Record this client's presence; on failure, log the class and carry on.
 
-    Best effort on purpose: presence only ever adds a route to the eligible
-    set, so a failed write cannot widen anything. It is not fail-closed
-    either: a valid receipt can still allow the call. The cost of a failure
-    is the staleness this write fixes, which is why it is logged.
-
-    Never creates the database. Opening the router creates its schema, and a
-    missing database is a state the judgment must see and deny
-    (``stage_db_unavailable``); an empty one made here would instead be read
-    as "no stages", and the automatic decider would proceed on it.
+    Best effort on purpose: presence is a liveness observation, and a failed
+    write leaves it as stale as it was before this existed. It is not
+    fail-closed either: a valid receipt can still allow the call. The cost of
+    a failure is the lock-out this write fixes, which is why it is logged.
     """
-    if not os.path.isfile(capacity_db):
-        return False
     try:
-        from .autodecide import observe_presence
-        observe_presence(client, capacity_db, clock=clock)
+        _write_presence(client, capacity_db, float(clock()))
         return True
     except Exception as exc:  # noqa: BLE001  never turns a judgment into an error
         try:
@@ -1653,6 +1647,40 @@ def observe_presence_best_effort(client: str, state_root: str, capacity_db: str,
         except Exception:  # noqa: BLE001  the judgment proceeds either way
             pass
         return False
+
+
+#: Short on purpose: presence is best effort and runs on every PreToolUse
+#: call, so a contended router must not hold the hook for the router's own
+#: five-second decision-time wait.
+PRESENCE_WRITE_TIMEOUT_SECONDS = 0.25
+
+
+def _write_presence(client: str, capacity_db: str, now: float) -> None:
+    """Upsert this client's presence row into an existing, initialized router.
+
+    Never creates anything. ``mode=rw`` refuses a missing file (including one
+    deleted after any earlier check), and no schema is created, so an empty
+    file fails on the missing table. Both matter: a missing or empty router
+    must stay a state the judgment sees and denies (``stage_db_unavailable``),
+    not one the automatic decider proceeds on as "no stages".
+    """
+    from .autodecide import CLIENT_PRESENCE_SECONDS
+
+    if client not in autoroute.PEER_FOR_CLIENT:
+        raise RoutingError("client_invalid")
+    observation = CapacityObservation(
+        route=client, observed_at=now, fresh_until=now + CLIENT_PRESENCE_SECONDS,
+        available=True, source=PRESENCE_SOURCE)
+    validate_observation(observation, now)
+    uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=rw"
+    db = sqlite3.connect(uri, uri=True, timeout=PRESENCE_WRITE_TIMEOUT_SECONDS,
+                         isolation_level=None)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        upsert_observation(db, observation, trusted=True)
+        db.execute("COMMIT")
+    finally:
+        db.close()
 
 
 def _last_presence_failure(path: str, client: str) -> float:

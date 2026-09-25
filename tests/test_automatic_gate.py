@@ -1226,6 +1226,37 @@ class AFailedPresenceWriteIsVisibleAndChangesNothing(AutoCase):
             "codex", str(self.state), str(missing)))
         self.assertFalse(missing.exists())
 
+    def test_an_empty_file_is_never_initialized_by_presence(self):
+        # Codex's delta review: StageRouter creates its schema on open, so an
+        # empty file would have become a valid, empty router.
+        empty = self.base / "empty.sqlite3"
+        empty.write_bytes(b"")
+        self.assertFalse(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(empty)))
+        import sqlite3
+        db = sqlite3.connect(str(empty))
+        try:
+            tables = db.execute("SELECT name FROM sqlite_master").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(tables, [])
+
+    def test_a_contended_router_does_not_hold_the_hook(self):
+        StageRouter(str(self.db))
+        import sqlite3
+        holder = sqlite3.connect(str(self.db), isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            self.assertFalse(gate.observe_presence_best_effort(
+                "codex", str(self.state), str(self.db)))
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertTrue(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(self.db)))
+
     def test_an_unknown_client_is_refused_and_logged_not_observed(self):
         self.assertFalse(gate.observe_presence_best_effort(
             "local", str(self.state), str(self.db)))
