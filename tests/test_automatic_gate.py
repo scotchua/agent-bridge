@@ -191,6 +191,22 @@ class PrivacyIsCheckedBeforeEverythingElse(AutoCase):
         self.assertEqual(receipt["owner_route"], "claude")
         self.assertIsNone(autodecide.read_intent(str(self.state), str(self.repo)))
 
+    def test_a_local_only_repository_leaves_each_assistant_its_own_edits(self):
+        # The wider policy lists new repositories with allowed_routes
+        # ["local"]. An assistant's own edit there is retained with it, with
+        # the other assistant fresh, so it is never handed off. (A second
+        # assistant then meets the holder's receipt, exactly as it does in an
+        # unclassified repository today; that is not changed here.)
+        for classification in ("internal_nonclient", "client_derived"):
+            with self.subTest(classification=classification):
+                self.write_policy({str(self.repo): {
+                    "classification": classification,
+                    "allowed_routes": ["local"], "mechanical_ok": True}})
+                for route in ("codex", "claude", "local"):
+                    self.observe(route)
+                self.assertAllowed(self.hook("claude", self.repo))
+                self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+
     def test_capacity_cannot_override_privacy(self):
         """Every route fresh and available still does not move the work."""
         self.write_policy({str(self.repo): {"classification": "client_derived",
