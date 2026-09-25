@@ -1612,6 +1612,68 @@ def automatic_decider(client: str, state_root: str, capacity_db: str,
 #: skipping rows it was never written to expect.
 INLINE_LEDGER = "inline-measurement.jsonl"
 
+#: Failed presence writes, kept out of ``EVENT_LEDGER`` for the same reason
+#: as ``INLINE_LEDGER``: they are not permission decisions. A persistent
+#: failure here is exactly the stale-presence lock-out this write exists to
+#: prevent, so it has to be visible rather than swallowed.
+PRESENCE_FAILURE_LEDGER = "presence-failures.jsonl"
+
+#: At most one failure line per client per this many seconds, so a database
+#: that stays unwritable cannot grow the ledger on every hook call.
+PRESENCE_FAILURE_INTERVAL_SECONDS = 60.0
+
+
+def observe_presence_best_effort(client: str, state_root: str, capacity_db: str,
+                                 clock: Any = time.time) -> bool:
+    """Record this client's presence; on failure, log the class and carry on.
+
+    Best effort on purpose: presence only ever adds a route to the eligible
+    set, so a failed write cannot widen anything. It is not fail-closed
+    either: a valid receipt can still allow the call. The cost of a failure
+    is the staleness this write fixes, which is why it is logged.
+
+    Never creates the database. Opening the router creates its schema, and a
+    missing database is a state the judgment must see and deny
+    (``stage_db_unavailable``); an empty one made here would instead be read
+    as "no stages", and the automatic decider would proceed on it.
+    """
+    if not os.path.isfile(capacity_db):
+        return False
+    try:
+        from .autodecide import observe_presence
+        observe_presence(client, capacity_db, clock=clock)
+        return True
+    except Exception as exc:  # noqa: BLE001  never turns a judgment into an error
+        try:
+            path = os.path.join(receipt_dir(state_root), PRESENCE_FAILURE_LEDGER)
+            now = float(clock())
+            if now - _last_presence_failure(path, client) >= PRESENCE_FAILURE_INTERVAL_SECONDS:
+                store.append_ledger(path, {"at": now, "client": client,
+                                           "error": type(exc).__name__})
+        except Exception:  # noqa: BLE001  the judgment proceeds either way
+            pass
+        return False
+
+
+def _last_presence_failure(path: str, client: str) -> float:
+    """When this client's last failure line was written, or 0 if none.
+    Reads only the tail: the ledger is rate-limited, so it stays small."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 8192))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return 0.0
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("client") == client:
+            return float(row.get("at", 0.0))
+    return 0.0
+
 
 def _response_byte_length(tool_response: Any) -> int:
     """Bytes of a Bash call's ``stdout``/``stderr`` combined -- both reach the
@@ -2422,6 +2484,11 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(_hook_input() or "{}")
         if not isinstance(payload, dict):
             raise ValueError("hook input is not a JSON object")
+        if not args.no_automatic_routing and capacity_db:
+            # Before judging, so a receipt held by the other client is compared
+            # against capacity that includes this one. See the helper for why
+            # a failure is logged rather than denied.
+            observe_presence_best_effort(args.client, state_root, capacity_db)
         decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
                             protected=protected, local_queue_root=local_queue_root,
                             worker_executable=worker_executable,

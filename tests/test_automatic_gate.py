@@ -223,6 +223,35 @@ class CapacityEvidenceIsFirstHandOnly(AutoCase):
         self.assertNotIn("codex", capacity)
         self.assertNotIn("local", capacity)
 
+    def test_a_client_turned_away_by_a_receipt_is_still_observed(self):
+        # Measured live 2026-09-24: presence was written only when the hook
+        # made a decision, and a valid receipt naming the other client means
+        # no decision is made. So a client that kept arriving at a repository
+        # the other held was denied without ever being observed, went stale,
+        # and the next decision anywhere had only the holder to choose from.
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["owner_route"], "claude")
+
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+        capacity = StageRouter(str(self.db)).report()["capacity"]
+        self.assertEqual(capacity["codex"]["status"], "available")
+        self.assertEqual(capacity["codex"]["source"], autodecide.CLIENT_PRESENCE_SOURCE)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex",
+                         "the arrival changed eligible capacity, so the receipt is re-made")
+
+    def test_a_client_is_observed_even_outside_any_repository(self):
+        outside = self.base / "not-a-repo"
+        outside.mkdir()
+        StageRouter(str(self.db))       # the router exists; presence never creates it
+        self.hook("codex", outside)
+        capacity = StageRouter(str(self.db)).report()["capacity"]
+        self.assertEqual(capacity["codex"]["status"], "available")
+        self.assertNotIn("claude", capacity)
+
     def test_a_peer_without_a_fresh_observation_keeps_the_work_here(self):
         self.write_policy({str(self.repo): {
             "classification": "internal_nonclient",
@@ -1129,6 +1158,78 @@ class ACapacityChangeReDecidesAtOnce(AutoCase):
         self.assertTrue(any(outcomes), "both clients were denied on every call")
         # And the denials are all the same client, the one routed away.
         self.assertEqual(outcomes, [False, True] * 4)
+
+    def test_presence_alone_does_not_re_decide_while_both_stay_fresh(self):
+        """Presence is now written on every call; its refreshed timestamp must
+        not count as a capacity change. Only arrivals and departures do."""
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.hook("codex", self.repo)                 # the arrival: one re-decision
+        decided = self.decisions()
+        for _ in range(3):
+            self.hook("claude", self.repo)
+            self.hook("codex", self.repo)
+        self.assertEqual(self.decisions(), decided)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex")
+
+    def test_a_client_that_expires_and_returns_re_decides_once_each_way(self):
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.hook("codex", self.repo)
+        now = time.time()                             # codex's presence lapses
+        StageRouter(str(self.db)).observe_capacity(CapacityObservation(
+            route="codex", observed_at=now - 1000, fresh_until=now - 10,
+            available=True, source=autodecide.CLIENT_PRESENCE_SOURCE), trusted=True)
+        before = self.decisions()
+        self.hook("claude", self.repo)                # the departure
+        self.assertEqual(self.decisions(), before + 1)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"], "claude")
+        self.hook("codex", self.repo)                 # the return
+        self.assertEqual(self.decisions(), before + 2)
+        self.assertEqual(self.receipt_for(self.repo)["capacity_fingerprint"],
+                         "claude,codex")
+
+    def test_no_presence_is_recorded_when_automatic_routing_is_off(self):
+        self.hook("codex", self.repo, "app.py", None, "--no-automatic-routing")
+        self.assertNotIn("codex", StageRouter(str(self.db)).report()["capacity"])
+
+
+class AFailedPresenceWriteIsVisibleAndChangesNothing(AutoCase):
+    """Codex's review of the presence fix: a swallowed failure would leave the
+    lock-out in place with nothing to show for it."""
+
+    def test_the_failure_is_logged_once_per_interval_and_reported(self):
+        unwritable = self.base / "not-a-database.sqlite3"
+        unwritable.write_bytes(b"this is not an sqlite file" * 100)
+        moment = [0.0]
+        for at in (1000.0, 1010.0, 1070.0):
+            moment[0] = at
+            self.assertFalse(gate.observe_presence_best_effort(
+                "codex", str(self.state), str(unwritable), clock=lambda: moment[0]))
+        path = Path(gate.receipt_dir(str(self.state))) / gate.PRESENCE_FAILURE_LEDGER
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["at"] for row in rows], [1000.0, 1070.0],
+                         "the call at 1010 falls inside the interval and is not logged")
+        self.assertTrue(all(row["client"] == "codex" and row["error"] for row in rows))
+
+    def test_a_success_writes_no_failure_line(self):
+        StageRouter(str(self.db))
+        self.assertTrue(gate.observe_presence_best_effort(
+            "claude", str(self.state), str(self.db)))
+        path = Path(gate.receipt_dir(str(self.state))) / gate.PRESENCE_FAILURE_LEDGER
+        self.assertFalse(path.exists())
+
+    def test_a_missing_database_is_never_created_by_presence(self):
+        # Found by the full suite: creating it turned test_delegation_gate's
+        # stage_db_unavailable deny into an automatic decision.
+        missing = self.base / "never-created.sqlite3"
+        self.assertFalse(gate.observe_presence_best_effort(
+            "codex", str(self.state), str(missing)))
+        self.assertFalse(missing.exists())
+
+    def test_an_unknown_client_is_refused_and_logged_not_observed(self):
+        self.assertFalse(gate.observe_presence_best_effort(
+            "local", str(self.state), str(self.db)))
+        self.assertNotIn("local", StageRouter(str(self.db)).report()["capacity"])
 
 
 class ReviewIsNeverRoutedBackToItsAuthor(unittest.TestCase):
