@@ -617,8 +617,8 @@ def test_local_first_declaration() -> None:
 
         refused_receipt = intake.route(
             task_type="summarize", input="synthetic operating note " * 8, params=None,
-            priority="interactive", classification="client_derived", caller="codex",
-            purpose="test", risk_flags=[])
+            priority="interactive", classification="internal_nonclient", caller="codex",
+            purpose="test", risk_flags=["confidential"])
         check("LF: fixture receipt actually refused",
               refused_receipt["decision"] == "refused", json.dumps(refused_receipt))
 

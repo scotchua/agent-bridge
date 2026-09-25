@@ -47,6 +47,22 @@ class PortableSampler:
                                 cpu_idle_ratio=0.9)
 
 
+class _ScriptedSampler(PortableSampler):
+    """Plays a script of bad readings ("raise" or "hot"), then reports spare capacity."""
+
+    def __init__(self, script: list[str]):
+        self.script = list(script)
+
+    def sample(self) -> ResourceSnapshot:
+        step = self.script.pop(0) if self.script else "ok"
+        if step == "raise":
+            raise RuntimeError("transient sampler failure")
+        if step == "hot":
+            return ResourceSnapshot(time.time(), "normal", "high", True, 600.0, 0.0,
+                                    cpu_idle_ratio=0.9)
+        return super().sample()
+
+
 # ------------------------------------------------------------------- globs
 
 
@@ -983,11 +999,39 @@ class CalibrateTests(unittest.TestCase):
         could otherwise land on either side of admission from one run to the
         next)."""
         self._start_model()
+        sleeps: list[float] = []
         with mock.patch("agent_bridge.localq.runtime.MacSampler.sample",
                         side_effect=RuntimeError("no macos probes on this host")):
-            result = delegation_verify.calibrate(str(self.config_path))
+            result = delegation_verify.calibrate(str(self.config_path), sleeper=sleeps.append)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "calibration_refused:resource_resource_sample_unavailable")
+        # A persistent failure is retried for the whole bounded budget, then refused.
+        self.assertEqual(len(sleeps), delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS - 1)
+
+    def test_a_one_off_sampler_failure_is_retried_not_refused(self):
+        self._start_model()
+        sampler = _ScriptedSampler(["raise"])
+        result = delegation_verify.calibrate(str(self.config_path), sampler=sampler,
+                                             sleeper=lambda _seconds: None)
+        self.assertTrue(result["ok"], result)
+
+    def test_admission_on_the_final_probe_still_calibrates(self):
+        self._start_model()
+        attempts = delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS
+        sampler = _ScriptedSampler(["hot"] * (attempts - 1))
+        result = delegation_verify.calibrate(str(self.config_path), sampler=sampler,
+                                             sleeper=lambda _seconds: None)
+        self.assertTrue(result["ok"], result)
+
+    def test_persistent_deferral_refuses_after_the_bounded_wait(self):
+        sleeps: list[float] = []
+        sampler = _ScriptedSampler(["hot"] * 10_000)
+        result = delegation_verify.calibrate(str(self.config_path), sampler=sampler,
+                                             sleeper=sleeps.append)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "calibration_refused:resource_interactive_not_admissible")
+        self.assertEqual(len(sleeps), delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS - 1)
+        self.assertTrue(all(s == delegation_verify.CALIBRATION_RESOURCE_POLL_SECONDS for s in sleeps))
 
     def test_refuses_when_the_production_queue_shows_a_running_job(self):
         database = self.local_queue / "localq.sqlite3"

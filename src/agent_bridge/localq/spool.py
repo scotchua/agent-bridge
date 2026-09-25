@@ -186,7 +186,7 @@ class SubprocessBackend:
         return value
 
     @staticmethod
-    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = signal.SIGKILL) -> None:
+    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = getattr(signal, "SIGKILL", signal.SIGTERM)) -> None:
         """Kill the whole isolated process group, not only the immediate child.
 
         ``start_new_session=True`` above makes this child its own
@@ -291,7 +291,15 @@ class LocalQueue:
                 handle.write(raw)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, target)
+            try:
+                os.replace(temporary, target)
+            except PermissionError:
+                # Windows refuses to replace a file another writer is
+                # replacing or reading. The name is the content's digest, so
+                # an existing target already holds these exact bytes.
+                os.unlink(temporary)
+                if not target.exists():
+                    raise
         return digest
 
     def _read_blob(self, digest: str) -> Any:
