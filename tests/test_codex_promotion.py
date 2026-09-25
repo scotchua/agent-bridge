@@ -3,7 +3,6 @@
 Offline only. Every test builds its own promotion directory and slot under a
 temporary directory; none reads the operator's real ~/.codex-bridge.
 """
-import contextlib
 import hashlib
 import json
 import os
@@ -30,6 +29,7 @@ except ImportError:  # pragma: no cover
 
 
 def build_tree(root: Path, tree):
+    """Create the vector's tree under ``root`` with its (read-only) modes."""
     for e in tree:
         p = root / e["path"]
         if e["type"] == "d":
@@ -45,8 +45,14 @@ def build_tree(root: Path, tree):
 
 
 def make_writable(root: Path):
+    if not root.exists():
+        return
+    os.chmod(root, 0o755)
     for dirpath, dirnames, filenames in os.walk(root):
-        os.chmod(dirpath, 0o755)
+        for n in dirnames:
+            p = os.path.join(dirpath, n)
+            if not os.path.islink(p):
+                os.chmod(p, 0o755)
         for n in filenames:
             p = os.path.join(dirpath, n)
             if not os.path.islink(p):
@@ -58,10 +64,9 @@ def independent_digest(tree) -> str:
     lines = []
     for e in tree:
         if e["type"] == "f":
-            mode = format(int(e["mode"], 8) & 0o7555, "04o")
-            lines.append(("f", e["path"], mode, hashlib.sha256(e["content"].encode()).hexdigest()))
+            lines.append(("f", e["path"], e["mode"], hashlib.sha256(e["content"].encode()).hexdigest()))
         elif e["type"] == "d":
-            lines.append(("d", e["path"], format(int(e["mode"], 8) & 0o7555, "04o")))
+            lines.append(("d", e["path"], e["mode"]))
         else:
             lines.append(("l", e["path"], e["target"]))
     lines.sort(key=lambda x: x[1].encode("utf-8"))
@@ -71,26 +76,33 @@ def independent_digest(tree) -> str:
     return h.hexdigest()
 
 
-class DigestVector(unittest.TestCase):
+class TmpCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def new_slot(self, name="slot", read_only_root=True):
+        slot = self.root / name
+        slot.mkdir(parents=True)
+        build_tree(slot, VECTOR["tree"])
+        if read_only_root:
+            os.chmod(slot, 0o555)
+        self.addCleanup(make_writable, slot)
+        return slot
+
+
+class DigestVector(TmpCase):
     def test_vector_matches_an_independent_restatement_of_the_rule(self):
         self.assertEqual(independent_digest(VECTOR["tree"]), VECTOR["expected_tree_digest"])
 
     def test_filesystem_walk_reproduces_the_vector(self):
-        with tempfile.TemporaryDirectory() as t:
-            slot = Path(t) / "slot"; slot.mkdir(); build_tree(slot, VECTOR["tree"])
-            try:
-                self.assertEqual(cp.tree_digest(slot), VECTOR["expected_tree_digest"])
-            finally:
-                make_writable(slot)
+        self.assertEqual(cp.tree_digest(self.new_slot()), VECTOR["expected_tree_digest"])
 
-    def test_read_only_slot_has_the_same_digest(self):
-        with tempfile.TemporaryDirectory() as t:
-            slot = Path(t) / "slot"; slot.mkdir(); build_tree(slot, VECTOR["tree"])
-            try:
-                subprocess.run(["chmod", "-R", "a-w", str(slot)], check=True)
-                self.assertEqual(cp.tree_digest(slot), VECTOR["expected_tree_digest"])
-            finally:
-                make_writable(slot)
+    def test_adding_a_write_bit_changes_the_digest(self):
+        slot = self.new_slot()
+        os.chmod(slot / "node_modules/@openai/codex/package.json", 0o644)
+        self.assertNotEqual(cp.tree_digest(slot), VECTOR["expected_tree_digest"])
 
     def test_record_id_vector(self):
         self.assertEqual(cp.record_id_of(VECTOR["record"]), VECTOR["expected_record_id"])
@@ -98,10 +110,10 @@ class DigestVector(unittest.TestCase):
         self.assertEqual(cp.record_id_of(with_id), VECTOR["expected_record_id"])
 
 
-class DigestDetects(unittest.TestCase):
+class DigestDetects(TmpCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.slot = Path(self.tmp.name) / "slot"; self.slot.mkdir(); build_tree(self.slot, VECTOR["tree"])
+        super().setUp()
+        self.slot = self.new_slot(read_only_root=False)
         make_writable(self.slot)
         self.base = cp.tree_digest(self.slot)
 
@@ -142,29 +154,37 @@ class DigestDetects(unittest.TestCase):
 
 
 class Fixture:
-    """A promotion directory, a slot, a launcher and a node stand-in, all under tmp."""
+    """A promotion directory, a read-only slot, two managed launchers and a node stand-in."""
 
-    def __init__(self, root: Path):
+    def __init__(self, case: TmpCase):
+        root = case.root
         self.root = root
         self.pdir = root / "promotion"; self.pdir.mkdir(mode=0o700)
         self.lock = self.pdir / "admission.lock"
         fd = os.open(self.lock, os.O_CREAT | os.O_WRONLY, 0o600); os.close(fd)
-        self.slot = root / "slots" / "0.156.1-aaaaaaaaaaaa"; self.slot.mkdir(parents=True)
-        build_tree(self.slot, VECTOR["tree"]); make_writable(self.slot)
+        self.slots = root / "codex-cli"
+        self.slot = case.new_slot("codex-cli/slots/0.156.1-aaaaaaaaaaaa")
         self.target = self.slot / "node_modules/@openai/codex/bin/codex.js"
         self.bin = root / "bin"; self.bin.mkdir()
         self.launcher = self.bin / "codex"; os.symlink(str(self.target), self.launcher)
+        self.nvm = root / "nvm-bin"; self.nvm.mkdir()
+        self.nvm_launcher = self.nvm / "codex"; os.symlink(str(self.target), self.nvm_launcher)
         self.node = root / "node"; self.node.write_text("node stand-in\n")
         self.record = self.make_record()
+        patcher = mock.patch.object(cp, "slots_root", return_value=self.slots)
+        patcher.start(); case.addCleanup(patcher.stop)
+
+    def node_entry(self):
+        return {"path": os.path.realpath(self.node),
+                "sha256": hashlib.sha256(self.node.read_bytes()).hexdigest(), "version": "v24.16.0"}
 
     def make_record(self, **overrides):
         record = {
             "schema_version": 1, "predecessor_id": None, "version": "0.156.1",
             "slot_path": str(self.slot), "slot_tree_digest": cp.tree_digest(self.slot),
-            "launchers": [{"name": "local", "path": str(self.launcher), "target": str(self.target),
-                           "node": {"path": os.path.realpath(self.node),
-                                    "sha256": hashlib.sha256(self.node.read_bytes()).hexdigest(),
-                                    "version": "v24.16.0"}}],
+            "launchers": [
+                {"name": "local", "path": str(self.launcher), "target": str(self.target), "node": self.node_entry()},
+                {"name": "nvm", "path": str(self.nvm_launcher), "target": str(self.target), "node": self.node_entry()}],
             "canary": {"harness_version": "1"}, "promoted_at": "2026-09-24T00:00:00Z",
             "promoted_by": "bootstrap", "transaction_id": "tx-1"}
         record.update(overrides)
@@ -183,38 +203,84 @@ class Fixture:
              "controller_pid": 1}).encode())
         os.chmod(p, 0o600)
 
-    def admit(self, launcher=None):
-        return cp.admit(launcher or self.launcher, promotion_dir=self.pdir, node_bin=str(self.node))
+    def admit(self, launcher=None, node=None):
+        return cp.admit(launcher or self.launcher, promotion_dir=self.pdir, node_bin=str(node or self.node))
 
 
 @unittest.skipIf(fcntl is None, "POSIX file locks required")
-class Admission(unittest.TestCase):
+class Admission(TmpCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.f = Fixture(Path(self.tmp.name))
+        super().setUp()
+        self.f = Fixture(self)
 
-    def refused(self, pattern, launcher=None):
+    def refused(self, pattern, launcher=None, node=None):
         with self.assertRaisesRegex(cp.AdmissionRefused, pattern):
-            with self.f.admit(launcher):
+            with self.f.admit(launcher, node):
                 self.fail("admitted")
 
-    def test_not_installed_admits_unchanged(self):
-        with cp.admit(self.f.launcher, promotion_dir=self.f.root / "absent", node_bin=None) as a:
-            self.assertEqual(a.state, "not_installed")
+    def assert_exclusive_blocked(self):
+        probe = os.open(self.f.lock, os.O_RDONLY)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+
+    # -- transition
+
+    def test_absent_directory_is_created_and_the_lock_is_taken(self):
+        pdir = self.root / "home" / ".codex-bridge" / "promotion"
+        with cp.admit(self.f.launcher, promotion_dir=pdir, node_bin=None) as a:
+            self.assertEqual(a.state, "no_record")
             self.assertEqual(a.exec_path, self.f.launcher)
+            self.assertEqual(oct(os.stat(pdir).st_mode & 0o777), oct(0o700))
+            probe = os.open(pdir / "admission.lock", os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+    def test_task_started_before_bootstrap_blocks_its_drain(self):
+        """Finding 1: admission before the directory exists still holds the lock bootstrap drains."""
+        pdir = self.root / "fresh" / "promotion"
+        entered, release = threading.Event(), threading.Event()
+        def job():
+            with cp.admit(self.f.launcher, promotion_dir=pdir, node_bin=None):
+                entered.set(); release.wait(10)
+        t = threading.Thread(target=job); t.start(); entered.wait(10)
+        # Bootstrap: opens the same lock (never replacing it), writes the gate, drains.
+        fd = os.open(pdir / "admission.lock", os.O_RDONLY | os.O_CREAT, 0o600)
+        try:
+            (pdir / "gate.json").write_text(json.dumps(
+                {"transaction_id": "boot", "state": "opened", "opened_at": "x", "controller_pid": 1}))
+            os.chmod(pdir / "gate.json", 0o600)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release.set(); t.join(10)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def test_missing_lock_is_created_not_refused(self):
+        os.unlink(self.f.lock)
+        with self.f.admit() as a:
+            self.assertEqual(a.state, "no_record")
+        self.assertTrue(self.f.lock.is_file())
+
+    def test_no_environment_override_exists(self):
+        """Finding 2: a worker environment cannot move admission away from the real gate."""
+        with mock.patch.dict(os.environ, {"AGENT_BRIDGE_CODEX_PROMOTION_DIR": str(self.root / "absent")}):
+            self.assertEqual(cp.default_promotion_dir(), Path.home() / ".codex-bridge" / "promotion")
+        self.assertFalse(hasattr(cp, "PROMOTION_DIR_ENV"))
+
+    # -- gate and lock
 
     def test_no_record_admits_but_still_honours_the_gate(self):
         with self.f.admit() as a:
             self.assertEqual(a.state, "no_record")
         self.f.write_gate()
         self.refused(r"maintenance in progress \(transaction tx-9\)")
-
-    def test_promoted_record_admits_and_returns_the_resolved_target(self):
-        self.f.write_record()
-        with self.f.admit() as a:
-            self.assertEqual(a.state, "promoted")
-            self.assertEqual(a.exec_path, Path(os.path.realpath(self.f.target)))
-            self.assertEqual(a.record_id, self.f.record["record_id"])
 
     def test_gate_refuses_even_with_a_valid_record(self):
         self.f.write_record(); self.f.write_gate()
@@ -227,17 +293,13 @@ class Admission(unittest.TestCase):
         self.refused("gate is malformed")
 
     def test_a_symlinked_gate_fails_closed(self):
-        other = self.f.root / "elsewhere.json"; other.write_text("{}")
+        other = self.root / "elsewhere.json"; other.write_text("{}")
         os.symlink(other, self.f.pdir / "gate.json")
         self.refused("gate is unreadable")
 
-    def test_missing_lock_fails_closed(self):
-        os.unlink(self.f.lock)
-        self.refused("admission lock is missing")
-
     def test_symlinked_lock_fails_closed(self):
         os.unlink(self.f.lock)
-        real = self.f.root / "real.lock"; real.write_text("")
+        real = self.root / "real.lock"; real.write_text("")
         os.symlink(real, self.f.lock)
         self.refused("not a regular file")
 
@@ -256,11 +318,10 @@ class Admission(unittest.TestCase):
             os.close(fd)
 
     def test_shared_lock_is_held_for_the_body_and_released_after(self):
+        with self.f.admit():
+            self.assert_exclusive_blocked()
         probe = os.open(self.f.lock, os.O_RDONLY)
         try:
-            with self.f.admit():
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released: succeeds
         finally:
             os.close(probe)
@@ -293,6 +354,16 @@ class Admission(unittest.TestCase):
         finally:
             os.close(fd)
 
+    # -- record
+
+    def test_promoted_record_admits_and_returns_the_resolved_target(self):
+        self.f.write_record()
+        for launcher in (self.f.launcher, self.f.nvm_launcher):
+            with self.f.admit(launcher) as a:
+                self.assertEqual(a.state, "promoted")
+                self.assertEqual(a.exec_path, Path(os.path.realpath(self.f.target)))
+                self.assertEqual(a.record_id, self.f.record["record_id"])
+
     def test_record_with_a_bad_id_is_refused(self):
         self.f.write_record({**self.f.record, "version": "0.157.0"})
         self.refused("record id does not match")
@@ -310,41 +381,70 @@ class Admission(unittest.TestCase):
         self.f.write_record(self.f.make_record(version="0.157.0-alpha.1"))
         self.refused("stable x.y.z")
 
-    def test_launcher_not_in_record_is_refused(self):
+    def test_record_version_must_match_the_slot_package(self):
+        self.f.write_record(self.f.make_record(version="0.156.2"))
+        self.refused("package version differs")
+
+    def test_writable_slot_root_is_refused(self):
         self.f.write_record()
-        other = self.f.bin / "codex2"; os.symlink(str(self.f.target), other)
-        self.refused("not a launcher named", launcher=other)
+        os.chmod(self.f.slot, 0o755)
+        self.refused("slot is writable")
+
+    def test_changed_slot_is_refused(self):
+        self.f.write_record()
+        p = self.f.slot / "node_modules/@openai/codex-darwin-arm64/codex"
+        os.chmod(p, 0o755); p.write_text("swapped\n"); os.chmod(p, 0o555)
+        self.refused("no longer matches its digest")
+
+    def test_mismatched_other_launcher_refuses_this_task(self):
+        """Finding 3: a half-switched pair refuses even a task using the good launcher."""
+        self.f.write_record()
+        os.unlink(self.f.nvm_launcher); os.symlink(str(self.f.node), self.f.nvm_launcher)
+        self.refused("managed launcher nvm does not point at the promoted slot")
+
+    def test_missing_other_launcher_refuses(self):
+        self.f.write_record()
+        os.unlink(self.f.nvm_launcher)
+        self.refused("managed launcher nvm is not a symlink")
 
     def test_launcher_pointing_elsewhere_is_refused(self):
         self.f.write_record()
         os.unlink(self.f.launcher); os.symlink(str(self.f.node), self.f.launcher)
-        self.refused("does not point at the promoted slot")
-
-    def test_changed_slot_is_refused(self):
-        self.f.write_record()
-        (self.f.slot / "node_modules/@openai/codex-darwin-arm64/codex").write_text("swapped\n")
-        self.refused("no longer matches its digest")
+        self.refused("managed launcher local does not point at the promoted slot")
 
     def test_changed_node_is_refused(self):
         self.f.write_record()
         self.f.node.write_text("a different node\n")
-        self.refused("node runtime changed")
+        self.refused("node runtime for launcher local changed")
 
-    def test_other_node_path_is_refused(self):
+    def test_task_path_node_must_be_the_recorded_one(self):
         self.f.write_record()
-        other = self.f.root / "node2"; other.write_bytes(self.f.node.read_bytes())
-        with self.assertRaisesRegex(cp.AdmissionRefused, "differs from the one the canaries ran"):
-            with cp.admit(self.f.launcher, promotion_dir=self.f.pdir, node_bin=str(other)):
-                pass
+        other = self.root / "node2"; other.write_bytes(self.f.node.read_bytes())
+        self.refused("differs from the one the canaries ran", node=other)
+
+    def test_unmanaged_binary_runs_as_given_under_the_gate(self):
+        self.f.write_record()
+        fake = self.root / "fake-codex"; fake.write_text("#!/bin/sh\n"); os.chmod(fake, 0o755)
+        with self.f.admit(fake) as a:
+            self.assertEqual(a.state, "unmanaged")
+            self.assertEqual(a.exec_path, fake)
+            self.assert_exclusive_blocked()
+        self.f.write_gate()
+        self.refused("maintenance in progress", launcher=fake)
+
+    def test_unpromoted_managed_slot_is_refused(self):
+        self.f.write_record()
+        other = self.new_slot("codex-cli/slots/0.157.0-bbbbbbbbbbbb")
+        self.refused("unpromoted managed slot", launcher=other / "node_modules/@openai/codex/bin/codex.js")
 
 
 @unittest.skipIf(fcntl is None, "POSIX file locks required")
-class TaskLaneAdmission(unittest.TestCase):
+class TaskLaneAdmission(TmpCase):
     """run_task refuses before running anything and records admission when it proceeds."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.f = Fixture(Path(self.tmp.name))
+        super().setUp()
+        self.f = Fixture(self)
 
     def test_gate_refusal_happens_before_any_codex_process(self):
         self.f.write_gate()
@@ -354,6 +454,13 @@ class TaskLaneAdmission(unittest.TestCase):
                 codex_task.run_task(codex_bin=self.f.launcher, promotion_dir=self.f.pdir,
                                     brief=Path("/b"), repo=Path("/r"), task_root=Path("/t"),
                                     classification="synthetic")
+
+    def test_default_directory_is_used_when_none_is_given(self):
+        self.f.write_gate()
+        with mock.patch.object(cp, "default_promotion_dir", return_value=self.f.pdir), \
+             mock.patch.object(codex_task, "_run_admitted", side_effect=AssertionError("admitted")):
+            with self.assertRaisesRegex(codex_task.TaskError, "maintenance in progress"):
+                codex_task.run_task(codex_bin=self.f.launcher, classification="synthetic")
 
     def test_admitted_task_runs_the_verified_target_with_the_lock_held(self):
         self.f.write_record()

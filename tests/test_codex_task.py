@@ -43,20 +43,24 @@ def requires_confinement(case):
         case.skipTest("no verification confinement backend on this host: " + exc.code)
 
 _PROMOTION_TMP = None
+_PROMOTION_PATCH = None
 
 
 def setUpModule():
     # codex_task now takes part in codex-bridge's CLI promotion admission
-    # (codex_promotion.py). Point it at a directory that does not exist, so
-    # these tests see "not_installed" and never read the operator's real
+    # (codex_promotion.py), which creates and locks its directory. Point it at
+    # a temporary one so these tests never touch the operator's real
     # ~/.codex-bridge state; admission itself is covered in test_codex_promotion.
-    global _PROMOTION_TMP
+    global _PROMOTION_TMP, _PROMOTION_PATCH
+    from agent_bridge.execution import codex_promotion
     _PROMOTION_TMP = tempfile.TemporaryDirectory()
-    os.environ["AGENT_BRIDGE_CODEX_PROMOTION_DIR"] = os.path.join(_PROMOTION_TMP.name, "absent")
+    _PROMOTION_PATCH = mock.patch.object(codex_promotion, "default_promotion_dir",
+                                         return_value=Path(_PROMOTION_TMP.name) / "promotion")
+    _PROMOTION_PATCH.start()
 
 
 def tearDownModule():
-    os.environ.pop("AGENT_BRIDGE_CODEX_PROMOTION_DIR", None)
+    _PROMOTION_PATCH.stop()
     _PROMOTION_TMP.cleanup()
 
 
@@ -248,7 +252,10 @@ class CodexTaskTests(unittest.TestCase):
              "--codex-bin", str(self.fake), "--codex-home", str(self.codex_home),
              "--classification", "synthetic", "--tasks-dir", str(self.root / "tasks"),
              "--verify-json", json.dumps(["sh", "-c", "touch escaped"])],
-            capture_output=True, text=True)
+            capture_output=True, text=True,
+            # A child process does not inherit this module's promotion-dir
+            # patch, so give it an isolated HOME instead.
+            env={**os.environ, "HOME": str(self.root / "home")})
         self.assertEqual(completed.returncode, 1, completed.stderr)
         failure = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertEqual(failure, {"ok": False, "error": "TaskError",

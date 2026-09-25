@@ -20,18 +20,39 @@ The protocol, from this side:
    ``codex.js`` inside the verified slot. The caller executes that path, not
    the launcher name, so a launcher swapped after the check is not what runs.
 
-Transition, stated plainly: until codex-bridge's bootstrap creates the
-promotion directory there is nothing to take part in, and admission reports
-``not_installed`` and admits exactly as before this module existed. Once the
-directory exists, every missing or malformed piece of it is a refusal. With a
-directory but no record yet (bootstrap in progress or undone), the gate still
-applies and admission reports ``no_record``.
+There is no transition bypass. The lock is taken on every admission, before
+codex-bridge's bootstrap has run too: if the promotion directory or the lock
+file does not exist yet, admission creates it (``mkdir`` 0700, then
+``O_CREAT`` without truncation, the same way the controller does; neither side
+ever unlinks or replaces the lock). So a task that starts just before
+bootstrap already holds the shared lock that bootstrap's drain waits for.
+With no record yet (bootstrap not run, or undone), admission reports
+``no_record`` and runs the launcher it was given, exactly as before.
+
+The promotion directory is ``~/.codex-bridge/promotion`` under ``Path.home()``,
+the same home this lane already derives its task root and ``CODEX_HOME`` from.
+There is deliberately no environment override: a worker started with one
+could point admission at an empty directory and ignore the real gate. Tests
+inject a directory in code (``promotion_dir=`` or by patching
+``default_promotion_dir``), or run with an isolated ``HOME`` as the
+end-to-end tests already do.
+
+A record names every managed launcher. All of them are verified on every
+admission, not only the one this task was given (the spec's mixed-install
+rule). ``codex_bin`` may also be a binary the record does not manage, such as
+a test fake: it is admitted under the same lock and gate, and executed as
+given, unless it resolves into the managed slot tree, where only the promoted
+slot is accepted.
 
 codex-bridge's ``promotion.py`` owns the record schema and writes it. This
 module is an independent reader: it checks the exact top-level key set, the
-``record_id`` over the canonical encoding, the launcher it was given, the
-Node runtime that launcher's shebang will find, and the full slot tree
-digest, recomputed on every admission with no cache (spec v5 N3). Both
+``record_id`` over the canonical encoding, every managed launcher and its
+recorded Node runtime, the Node this task's PATH will find, the slot's
+package version, and the full slot tree digest, recomputed on every
+admission with no cache (spec v5 N3). It does not judge the ``canary``
+field: that a record passed its canaries is what codex-bridge's
+``promote.py`` attests by committing it, and ``record_id`` only binds what
+the record says. Both
 implementations are pinned to the same test vector
 (``tests/fixtures/codex_promotion_vector.json``) so they cannot drift apart
 silently.
@@ -51,10 +72,6 @@ try:
 except ImportError:  # pragma: no cover - Windows has no promotion controller
     fcntl = None
 
-#: Overrides the promotion directory. Tests set it so they never read the
-#: operator's real promotion state; production leaves it unset.
-PROMOTION_DIR_ENV="AGENT_BRIDGE_CODEX_PROMOTION_DIR"
-
 RECORD_KEYS=frozenset({"schema_version","record_id","predecessor_id","version","slot_path",
                        "slot_tree_digest","launchers","canary","promoted_at","promoted_by",
                        "transaction_id"})
@@ -72,7 +89,7 @@ class AdmissionRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class Admission:
-    state:str  # not_installed | no_record | promoted
+    state:str  # no_record | promoted | unmanaged
     exec_path:Path
     record_id:str|None=None
     version:str|None=None
@@ -85,8 +102,11 @@ class Admission:
 
 
 def default_promotion_dir()->Path:
-    override=os.environ.get(PROMOTION_DIR_ENV)
-    return Path(override) if override else Path.home()/".codex-bridge"/"promotion"
+    return Path.home()/".codex-bridge"/"promotion"
+
+def slots_root()->Path:
+    """Where codex-bridge installs CLI slots; nothing under it runs unless promoted."""
+    return Path.home()/".codex-cli"
 
 
 # ---------------------------------------------------------------- digests
@@ -109,10 +129,9 @@ def _reject_floats(value):
         for v in value: _reject_floats(v)
 
 def _digest_mode(st)->str:
-    # Write bits are masked out: the controller makes the slot read-only after
-    # install, and that chmod must not change the digest. Every other mode
-    # change (an execute bit, setuid) still does.
-    return format(stat.S_IMODE(st.st_mode)&0o7555,"04o")
+    # The full mode. The controller makes the slot read-only before it
+    # computes the digest, so a write bit added later changes the digest.
+    return format(stat.S_IMODE(st.st_mode),"04o")
 
 def _file_sha256(path:str,st)->str:
     flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_NONBLOCK",0)
@@ -137,9 +156,10 @@ def tree_digest(slot:Path)->str:
       dir:      ``d``, path, mode
       symlink:  ``l``, path, link text
 
-    Mode is four octal digits with the write bits cleared. The slot root itself
-    is not an entry. A symlink must be relative and resolve inside the slot;
-    any other file type (FIFO, socket, device) is refused.
+    Mode is the full permission mode as four octal digits. The slot root itself
+    is not an entry; admission separately refuses a root with any write bit.
+    A symlink must be relative and resolve inside the slot; any other file
+    type (FIFO, socket, device) is refused.
     """
     root=os.path.realpath(slot)
     entries=[]
@@ -232,36 +252,68 @@ def _verify_record(promotion_dir:Path,codex_bin:Path,node_bin:str|None)->Admissi
     if slot is None or not slot.is_absolute(): raise AdmissionRefused("promotion record slot path is not absolute")
     launchers=record["launchers"]
     if not isinstance(launchers,list) or not launchers: raise AdmissionRefused("promotion record lists no launchers")
-    match=None
     for entry in launchers:
         if not isinstance(entry,dict) or set(entry)!=LAUNCHER_KEYS or not isinstance(entry["node"],dict) \
-                or set(entry["node"])!=NODE_KEYS:
+                or set(entry["node"])!=NODE_KEYS or not all(isinstance(entry[k],str) for k in ("name","path","target")):
             raise AdmissionRefused("promotion record launcher entry has the wrong fields")
-        if entry["path"]==str(codex_bin): match=entry
-    if match is None: raise AdmissionRefused("the Codex executable is not a launcher named in the promotion record")
-    try: link=os.readlink(codex_bin)
-    except OSError as exc: raise AdmissionRefused("the Codex launcher is not a symlink") from exc
-    if link!=match["target"]: raise AdmissionRefused("the Codex launcher does not point at the promoted slot")
-    target=Path(os.path.realpath(codex_bin))
     real_slot=os.path.realpath(slot)
-    if os.path.commonpath([real_slot,str(target)])!=real_slot:
-        raise AdmissionRefused("the Codex launcher resolves outside the promoted slot")
+    root_st=os.lstat(slot) if os.path.lexists(slot) else None
+    if root_st is None or not stat.S_ISDIR(root_st.st_mode): raise AdmissionRefused("the promoted slot is missing")
+    if stat.S_IMODE(root_st.st_mode)&0o222: raise AdmissionRefused("the promoted slot is writable")
     if tree_digest(slot)!=record["slot_tree_digest"]: raise AdmissionRefused("the promoted slot no longer matches its digest")
-    _verify_node(match["node"],node_bin)
-    return Admission(state="promoted",exec_path=target,record_id=record["record_id"],version=version,
+    if _slot_package_version(slot)!=version:
+        raise AdmissionRefused("the promoted slot's package version differs from the record")
+    # Every managed launcher, not just ours: a half-switched pair is exactly
+    # what a crashed maintenance run would leave behind.
+    ours=None
+    for entry in launchers:
+        name=entry["name"][:32]
+        try: link=os.readlink(entry["path"])
+        except OSError as exc: raise AdmissionRefused(f"managed launcher {name} is not a symlink") from exc
+        if link!=entry["target"]: raise AdmissionRefused(f"managed launcher {name} does not point at the promoted slot")
+        resolved=os.path.realpath(entry["path"])
+        if os.path.commonpath([real_slot,resolved])!=real_slot:
+            raise AdmissionRefused(f"managed launcher {name} resolves outside the promoted slot")
+        _verify_node_file(entry["node"],name)
+        if entry["path"]==str(codex_bin): ours=entry
+    if ours is not None:
+        _verify_task_node(ours["node"],node_bin)
+        exec_path=Path(os.path.realpath(codex_bin)); state="promoted"
+    else:
+        resolved=os.path.realpath(codex_bin)
+        managed=os.path.realpath(slots_root())
+        if os.path.commonpath([managed,resolved])==managed and os.path.commonpath([real_slot,resolved])!=real_slot:
+            raise AdmissionRefused("the Codex executable is an unpromoted managed slot")
+        exec_path=codex_bin; state="unmanaged"
+    return Admission(state=state,exec_path=exec_path,record_id=record["record_id"],version=version,
                      slot_tree_digest=record["slot_tree_digest"])
 
 
-def _verify_node(expected:dict,node_bin:str|None):
+def _slot_package_version(slot:Path):
+    p=slot/"node_modules"/"@openai"/"codex"/"package.json"
+    try: st=os.lstat(p)
+    except OSError as exc: raise AdmissionRefused("the promoted slot has no Codex package.json") from exc
+    if not stat.S_ISREG(st.st_mode) or st.st_size>MAX_STATE_FILE_BYTES:
+        raise AdmissionRefused("the promoted slot's package.json is not a regular file")
+    try: return json.loads(p.read_bytes().decode("utf-8")).get("version")
+    except (UnicodeDecodeError,ValueError,AttributeError) as exc:
+        raise AdmissionRefused("the promoted slot's package.json does not parse") from exc
+
+
+def _verify_node_file(expected:dict,name:str):
+    try: st=os.stat(expected["path"])
+    except (OSError,TypeError) as exc: raise AdmissionRefused(f"the node runtime for launcher {name} is missing") from exc
+    if not stat.S_ISREG(st.st_mode) or _file_sha256(os.path.realpath(expected["path"]),st)!=expected["sha256"]:
+        raise AdmissionRefused(f"the node runtime for launcher {name} changed since the canaries ran")
+
+
+def _verify_task_node(expected:dict,node_bin:str|None):
     # codex.js starts with ``#!/usr/bin/env node``, so the runtime is whatever
-    # ``node`` the child's PATH finds. The record names the one the canaries ran.
+    # ``node`` the child's PATH finds. It must be the one recorded for this
+    # launcher's context (its bytes were checked in _verify_node_file).
     if not node_bin: raise AdmissionRefused("no node runtime on the task PATH")
-    real=os.path.realpath(node_bin)
-    if real!=expected["path"]: raise AdmissionRefused("the node runtime differs from the one the canaries ran")
-    try: st=os.stat(real)
-    except OSError as exc: raise AdmissionRefused("the node runtime is unreadable") from exc
-    if _file_sha256(real,st)!=expected["sha256"]:
-        raise AdmissionRefused("the node runtime changed since the canaries ran")
+    if os.path.realpath(node_bin)!=expected["path"]:
+        raise AdmissionRefused("the node runtime differs from the one the canaries ran")
 
 
 @contextlib.contextmanager
@@ -274,21 +326,27 @@ def admit(codex_bin:Path,*,promotion_dir:Path|None=None,node_bin:str|None=None):
     """
     promotion_dir=promotion_dir or default_promotion_dir()
     if not codex_bin.is_absolute(): raise AdmissionRefused("Codex executable path must be absolute")
-    try: dir_st=os.lstat(promotion_dir)
-    except FileNotFoundError:
-        yield Admission(state="not_installed",exec_path=codex_bin); return
+    if fcntl is None: raise AdmissionRefused("promotion admission needs POSIX file locks")
+    try: promotion_dir.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    except OSError as exc: raise AdmissionRefused("promotion directory could not be created") from exc
+    try: os.mkdir(promotion_dir,0o700)
+    except FileExistsError: pass
+    except OSError as exc: raise AdmissionRefused("promotion directory could not be created") from exc
+    dir_st=os.lstat(promotion_dir)
     if not stat.S_ISDIR(dir_st.st_mode): raise AdmissionRefused("promotion directory is not a directory")
     _owned_private(dir_st,"promotion directory",mode_mask=0o077)
-    if fcntl is None: raise AdmissionRefused("promotion admission needs POSIX file locks")
     lock=promotion_dir/"admission.lock"
-    try: lock_st=os.lstat(lock)
-    except FileNotFoundError: raise AdmissionRefused("admission lock is missing, so admission stays closed") from None
-    if not stat.S_ISREG(lock_st.st_mode): raise AdmissionRefused("admission lock is not a regular file")
-    _owned_private(lock_st,"admission lock",mode_mask=0o022)
-    fd=os.open(lock,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    # O_CREAT without O_TRUNC or O_EXCL: whichever side gets here first creates
+    # the one lock file, and nobody ever replaces it, so its inode is stable.
+    try: fd=os.open(lock,os.O_RDONLY|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600)
+    except OSError as exc: raise AdmissionRefused("admission lock is not a regular file") from exc
     try:
         opened=os.fstat(fd)
-        if (opened.st_dev,opened.st_ino)!=(lock_st.st_dev,lock_st.st_ino):
+        if not stat.S_ISREG(opened.st_mode): raise AdmissionRefused("admission lock is not a regular file")
+        _owned_private(opened,"admission lock",mode_mask=0o022)
+        try: now=os.lstat(lock)
+        except FileNotFoundError: raise AdmissionRefused("admission lock was removed while it was opened") from None
+        if (opened.st_dev,opened.st_ino)!=(now.st_dev,now.st_ino):
             raise AdmissionRefused("admission lock was replaced while it was opened")
         try: fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
         except BlockingIOError: raise AdmissionRefused("maintenance in progress (admission lock held)") from None

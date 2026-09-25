@@ -4,49 +4,49 @@
     {
       "type": "d",
       "path": "node_modules",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "d",
       "path": "node_modules/.bin",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "d",
       "path": "node_modules/@openai",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "d",
       "path": "node_modules/@openai/codex",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "d",
       "path": "node_modules/@openai/codex/bin",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "f",
       "path": "node_modules/@openai/codex/bin/codex.js",
-      "mode": "0755",
+      "mode": "0555",
       "content": "#!/usr/bin/env node\nconsole.log('codex-cli 0.156.1')\n"
     },
     {
       "type": "f",
       "path": "node_modules/@openai/codex/package.json",
-      "mode": "0644",
+      "mode": "0444",
       "content": "{\"name\":\"@openai/codex\",\"version\":\"0.156.1\"}\n"
     },
     {
       "type": "d",
       "path": "node_modules/@openai/codex-darwin-arm64",
-      "mode": "0755"
+      "mode": "0555"
     },
     {
       "type": "f",
       "path": "node_modules/@openai/codex-darwin-arm64/codex",
-      "mode": "0755",
+      "mode": "0555",
       "content": "native-binary-stand-in\n"
     },
     {
@@ -90,6 +90,6 @@
     "transaction_id": "tx-example"
   },
   "expected_tree_digest": "05b5413e240c079dcd4eeffe267cf2e9c000ba9188aaec47722dd8839bd6af42",
-  "expected_tree_digest_note": "Write bits are masked, so the same tree made read-only (chmod -R a-w) has the same digest.",
+  "expected_tree_digest_note": "Modes are the full permission bits of a slot already made read-only (chmod -R a-w), as the controller digests it. Adding a write bit changes the digest.",
   "expected_record_id": "81499ae02b2496d73090337c5ab7d12adffd8c99fee1a66bfc0a91c3cb25a602"
 }
