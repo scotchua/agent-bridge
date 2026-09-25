@@ -295,11 +295,23 @@ class LocalQueue:
                 os.replace(temporary, target)
             except PermissionError:
                 # Windows refuses to replace a file another writer is
-                # replacing or reading. The name is the content's digest, so
-                # an existing target already holds these exact bytes.
-                os.unlink(temporary)
-                if not target.exists():
+                # replacing or reading. A pre-existing name alone is not
+                # enough, though: accept that race only when it really is
+                # this content-addressed blob.
+                try:
+                    existing_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                except OSError:
+                    existing_digest = None
+                if existing_digest != digest:
                     raise
+            finally:
+                # A successful replace has already removed this name. On a
+                # Windows sharing failure, clean it after checking the target
+                # so every error path leaves no private staging blob behind.
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
         return digest
 
     def _read_blob(self, digest: str) -> Any:
