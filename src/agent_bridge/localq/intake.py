@@ -213,6 +213,11 @@ class AutomaticIntake:
             return "refused", "risk_flags_invalid"
         if set(flags) & PROHIBITED_FLAGS:
             return "refused", "prohibited_risk_flags"
+        # The flag states provenance, so it may not contradict the
+        # classification. (The classification alone suffices: the gate's own
+        # digest path sends client_derived with no flags.)
+        if "client_derived" in flags and classification != "client_derived":
+            return "refused", "risk_flags_invalid"
         if task_type not in MECHANICAL_TASKS:
             return "refused", "task_requires_cloud_or_human_judgment"
         # A configured backend may intentionally support a strict subset of

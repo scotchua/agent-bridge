@@ -94,6 +94,16 @@ class Counting(AuditCase):
                                       "allowed_routes": ["claude", "codex"]})
         self.assertEqual(self.run_audit()["eligible"]["count"], 0)
 
+    def test_client_derived_work_is_eligible_only_as_local_mechanical_work(self):
+        base = {"client": "claude", "peer": "codex", "classification": "client_derived",
+                "allowed_routes": ["claude", "codex", "local"]}
+        self.decision(considered={**base, "mechanical_ok": True, "task_type": "mechanical"})
+        self.decision(considered={**base, "mechanical_ok": True, "task_type": "implementation"})
+        self.decision(considered={**base, "mechanical_ok": "yes", "task_type": "mechanical"})
+        self.decision(considered={**base, "allowed_routes": ["claude", "codex"],
+                                  "mechanical_ok": True, "task_type": "mechanical"})
+        self.assertEqual(self.run_audit()["eligible"]["count"], 1)
+
     def test_automatic_and_agent_requested_decisions_are_told_apart(self):
         self.decision(automatic=True)
         row = {"event": "routing_decided", "decided_at": self.now,

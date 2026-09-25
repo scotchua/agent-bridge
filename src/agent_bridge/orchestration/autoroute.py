@@ -453,7 +453,8 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
             f"eligible to receive it and the work stays with {signal.client}")
     if repo_policy.classification == "client_derived" and not (
             "local" in repo_policy.allowed_routes and repo_policy.mechanical_ok
-            and signal.task_type == "mechanical"):
+            and signal.task_type == "mechanical"
+            and "client_derived" in policy.local_classifications):
         return retain(
             "retained_classification_ineligible",
             "client-derived material goes only to the local model, and only as "
@@ -498,6 +499,15 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
                         f"mechanical {repo_policy.classification} text work in a "
                         f"repository the operator marked eligible for a local model",
                         considered)
+
+    # Backstop: the local branch above returns for every client-derived unit
+    # the privacy check let through, so this is unreachable today. It stays
+    # so that no later edit can let client-derived work reach a peer.
+    if repo_policy.classification == "client_derived":
+        return retain(
+            "retained_classification_ineligible",
+            "client-derived material goes only to the local model; it is never "
+            "dispatched to a peer")
 
     # 4. Capacity, for the peer route.
     peer_classifications = policy.route_classifications.get(peer, policy.peer_classifications)

@@ -62,6 +62,35 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(routed["decision"], "local")
         self.assertEqual(routed["fallback"], "none")
         self.assertEqual(self.queue.status(routed["job_id"])["classification"], "client_derived")
+        self.assertEqual(self.intake.receipt(routed["receipt_id"])["classification"], "client_derived")
+
+    def test_client_derived_classification_needs_no_flag(self):
+        routed = self.route(classification="client_derived")
+        self.assertEqual(routed["decision"], "local")
+
+    def test_a_client_derived_flag_cannot_contradict_the_classification(self):
+        for classification in ("synthetic", "public", "internal_nonclient"):
+            with self.subTest(classification=classification):
+                routed = self.route(classification=classification, risk_flags=["client_derived"],
+                                    input=("contradictory label text " * 8) + classification)
+                self.assertEqual(routed["decision"], "refused")
+                self.assertEqual(routed["reason"], "risk_flags_invalid")
+                self.assertIsNone(routed["job_id"])
+
+    def test_client_derived_checkpoints_are_recorded_like_any_other(self):
+        closed = self.intake.checkpoint(task_id="cd-none", task_type="summarize",
+                                        classification="client_derived", caller="claude",
+                                        input_bytes=0, nonblank_lines=0, no_eligible_unit=True)
+        self.assertEqual(closed["status"], "no_eligible_unit")
+        eligible = self.intake.checkpoint(task_id="cd-unit", task_type="summarize",
+                                          classification="client_derived", caller="claude",
+                                          input_bytes=5000, nonblank_lines=80)
+        self.assertEqual(eligible["status"], "eligible")
+
+    def test_an_idempotency_key_cannot_relabel_client_derived_work(self):
+        self.route(idempotency_key="cd", classification="client_derived")
+        with self.assertRaisesRegex(Exception, "idempotency_key_conflict"):
+            self.route(idempotency_key="cd", classification="internal_nonclient")
 
     def test_small_work_is_refused_without_queue_or_fallback(self):
         routed = self.route(input="tiny note")

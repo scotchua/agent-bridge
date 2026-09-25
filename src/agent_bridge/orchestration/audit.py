@@ -128,8 +128,10 @@ def _eligible(row: dict[str, Any]) -> bool:
     if not isinstance(allowed, list) or not allowed:
         return False
     if classification == "client_derived":
-        # Local is the one route client-derived work may take.
-        return "local" in allowed and bool(considered.get("mechanical_ok"))
+        # Local is the one route client-derived work may take, and only
+        # mechanical work goes there (the same predicate autoroute.decide uses).
+        return ("local" in allowed and considered.get("mechanical_ok") is True
+                and considered.get("task_type") == "mechanical")
     caller = considered.get("client")
     return any(route != caller for route in allowed)
 

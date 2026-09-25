@@ -828,6 +828,22 @@ class ClientDerivedWorkGoesOnlyToTheLocalModel(unittest.TestCase):
         self.assertEqual(decision.route, autoroute.RETAIN)
         self.assertEqual(decision.code, "retained_classification_ineligible")
 
+    def test_a_policy_that_excludes_client_derived_locally_never_falls_to_a_peer(self):
+        policy = autoroute.Policy(
+            repos={"/r": autoroute.RepoPolicy("client_derived", ("claude", "codex", "local"),
+                                              mechanical_ok=True)},
+            local_classifications=frozenset({"synthetic", "public", "internal_nonclient"}),
+            peer_classifications=frozenset({"synthetic", "public", "internal_nonclient",
+                                            "client_derived"}))
+        for task_type in ("mechanical", "implementation", "review"):
+            with self.subTest(task_type=task_type):
+                decision = autoroute.decide(
+                    autoroute.Signal(client="claude", repo="/r", task_type=task_type),
+                    policy, fresh_routes=frozenset({"local", "codex"}),
+                    load=autoroute.Load(0.1, True))
+                self.assertEqual(decision.route, autoroute.RETAIN)
+                self.assertEqual(decision.code, "retained_classification_ineligible")
+
     def test_a_stale_local_route_retains_rather_than_falling_to_a_peer(self):
         decision = self.decide(("claude", "codex", "local"), fresh=("codex",))
         self.assertEqual(decision.route, autoroute.RETAIN)
