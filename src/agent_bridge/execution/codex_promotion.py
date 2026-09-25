@@ -21,23 +21,26 @@ The protocol, from this side:
    the launcher name, so a launcher swapped after the check is not what runs.
 
 There is no transition bypass. The lock is taken on every admission, before
-codex-bridge's bootstrap has run too: if the promotion directory or the lock
-file does not exist yet, admission creates it (``mkdir`` 0700, then
-``O_CREAT`` without truncation, the same way the controller does; neither side
-ever unlinks or replaces the lock). So a task that starts just before
-bootstrap already holds the shared lock that bootstrap's drain waits for.
-With no record yet (bootstrap not run, or undone), admission reports
-``no_record`` and runs the launcher it was given, exactly as before.
+codex-bridge's bootstrap has run too: if the promotion directory does not
+exist yet, admission creates it (``mkdir`` 0700) and then its lock file
+(``O_CREAT`` without truncation, the same way the controller does). So a task
+that starts just before bootstrap already holds the shared lock that
+bootstrap's drain waits for. The lock is created only together with its
+directory. A directory that exists without its lock refuses and needs repair:
+recreating the lock there could leave a running task holding the old inode
+while the controller drains a new one. With no record yet (bootstrap not run,
+or undone), admission reports ``no_record`` and runs the launcher it was
+given, exactly as before.
 
 The promotion directory and the launcher paths are under ``$HOME``, the same
-home this lane already derives its task root and ``CODEX_HOME`` from, so a
-test with an isolated ``HOME`` sees an isolated world (agent-bridge AGENTS.md).
-A worker whose ``HOME`` differs from the account's home in the password
-database would lock and read an empty directory of its own, so that worker is
-refused outright if the Codex executable it was given lives in the account
-home, where the shared launchers are. There is no environment override for
-the directory either. Tests inject one in code (``promotion_dir=``, or by
-patching ``default_promotion_dir`` or ``managed_home``).
+home this lane already derives its task root and ``CODEX_HOME`` from, and
+admission refuses any process whose ``HOME`` is not the account's home in the
+password database. A worker started with another ``HOME`` would otherwise
+lock and read an empty directory of its own, where no gate is ever written.
+There is no environment override for the directory either. Tests inject one
+in code (``promotion_dir=``, or by patching ``managed_home`` and
+``account_home``); a test that runs the lane as a subprocess under an
+isolated ``HOME`` goes through ``tests/fixtures/codex_task_isolated_home.py``.
 
 Once a record exists, the task's executable must be one of the launchers it
 names, and the record must name exactly the three launchers spec v5 section 1
@@ -132,16 +135,11 @@ def default_promotion_dir()->Path:
     return managed_home()/".codex-bridge"/"promotion"
 
 
-def _check_home(codex_bin:Path):
+def _check_home():
     # A worker started with another HOME would take a lock nobody drains and
-    # read no gate, while the shared launchers it runs switch underneath it.
-    home=os.path.realpath(managed_home()); account=os.path.realpath(account_home())
-    if home==account: return
-    # The launcher itself (its directory resolved, the link not) and its target.
-    given=os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(codex_bin))),os.path.basename(codex_bin))
-    for p in (given,os.path.realpath(codex_bin)):
-        if os.path.commonpath([account,p])==account:
-            raise AdmissionRefused("HOME is not the account home, but the Codex executable is in the account home")
+    # read no gate, whatever executable it was given.
+    if os.path.realpath(managed_home())!=os.path.realpath(account_home()):
+        raise AdmissionRefused("HOME is not the account home, so this process cannot see the promotion state")
 
 
 # ---------------------------------------------------------------- digests
@@ -372,19 +370,23 @@ def admit(codex_bin:Path,*,promotion_dir:Path|None=None,node_bin:str|None=None):
     promotion_dir=promotion_dir or default_promotion_dir()
     if not codex_bin.is_absolute(): raise AdmissionRefused("Codex executable path must be absolute")
     if fcntl is None: raise AdmissionRefused("promotion admission needs POSIX file locks")
-    _check_home(codex_bin)
+    _check_home()
     try: promotion_dir.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     except OSError as exc: raise AdmissionRefused("promotion directory could not be created") from exc
-    try: os.mkdir(promotion_dir,0o700)
-    except FileExistsError: pass
+    try: os.mkdir(promotion_dir,0o700); created=True
+    except FileExistsError: created=False
     except OSError as exc: raise AdmissionRefused("promotion directory could not be created") from exc
     dir_st=os.lstat(promotion_dir)
     if not stat.S_ISDIR(dir_st.st_mode): raise AdmissionRefused("promotion directory is not a directory")
     _owned_private(dir_st,"promotion directory",mode_mask=0o077)
     lock=promotion_dir/"admission.lock"
-    # O_CREAT without O_TRUNC or O_EXCL: whichever side gets here first creates
-    # the one lock file, and nobody ever replaces it, so its inode is stable.
-    try: fd=os.open(lock,os.O_RDONLY|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600)
+    # Only the process that created the directory creates the lock, with
+    # O_CREAT but no O_TRUNC or O_EXCL, so a controller racing it opens the
+    # same inode. Nobody ever replaces the lock, so that inode is permanent.
+    flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|(os.O_CREAT if created else 0)
+    try: fd=os.open(lock,flags,0o600)
+    except FileNotFoundError:
+        raise AdmissionRefused("admission lock is missing, so the promotion directory needs repair") from None
     except OSError as exc: raise AdmissionRefused("admission lock is not a regular file") from exc
     try:
         opened=os.fstat(fd)

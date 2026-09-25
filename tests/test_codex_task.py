@@ -14,6 +14,7 @@ from unittest import mock
 from types import SimpleNamespace
 
 CODEX_TASK = Path(__file__).resolve().parent.parent / "src" / "agent_bridge" / "execution" / "codex_task.py"
+ISOLATED_HOME_LAUNCHER = Path(__file__).resolve().parent / "fixtures" / "codex_task_isolated_home.py"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -248,25 +249,17 @@ class CodexTaskTests(unittest.TestCase):
 
     def test_main_reports_the_refusal_text_not_just_the_class(self):
         # A child process does not inherit this module's promotion-dir patch,
-        # and admission takes the account home from the password database, so
-        # an isolated HOME would not redirect it. Re-apply the patch in the
-        # child, then run the script as __main__ the way the worker does.
-        child = ("import runpy, sys\n"
-                 "from pathlib import Path\n"
-                 "sys.path.insert(0, sys.argv.pop(1))\n"
-                 "from agent_bridge.execution import codex_promotion\n"
-                 "pdir = Path(sys.argv.pop(1))\n"
-                 "codex_promotion.default_promotion_dir = lambda: pdir\n"
-                 "sys.argv = sys.argv[1:]\n"
-                 "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        # and admission refuses a HOME that is not the account home. Run it
+        # through the test-only launcher, which treats the isolated HOME as the
+        # account home.
+        home = self.root / "home"; home.mkdir()
         completed = subprocess.run(
-            [sys.executable, "-c", child, str(CODEX_TASK.parents[2]), str(self.root / "promotion"),
-             str(CODEX_TASK), str(self.brief), "--repo", str(self.repo),
+            [sys.executable, str(ISOLATED_HOME_LAUNCHER), str(self.brief), "--repo", str(self.repo),
              "--codex-bin", str(self.fake), "--codex-home", str(self.codex_home),
              "--classification", "synthetic", "--tasks-dir", str(self.root / "tasks"),
              "--verify-json", json.dumps(["sh", "-c", "touch escaped"])],
-            capture_output=True, text=True)
-        self.assertTrue((self.root / "promotion" / "admission.lock").is_file(), completed.stderr)
+            capture_output=True, text=True, env={**os.environ, "HOME": str(home)})
+        self.assertTrue((home / ".codex-bridge" / "promotion" / "admission.lock").is_file(), completed.stderr)
         self.assertEqual(completed.returncode, 1, completed.stderr)
         failure = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertEqual(failure, {"ok": False, "error": "TaskError",

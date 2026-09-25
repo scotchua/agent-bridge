@@ -31,6 +31,10 @@ try:
 except ImportError:  # pragma: no cover
     pwd = None
 
+#: The real functions, saved before any fixture patches them.
+REAL_ACCOUNT_HOME = cp.account_home
+REAL_MANAGED_HOME = cp.managed_home
+
 
 def build_tree(root: Path, tree):
     """Create the vector's tree under ``root`` with its (read-only) modes."""
@@ -175,8 +179,9 @@ class Fixture:
         self.peer_launcher = self._link(self.home / ".codex-cli/peer/codex")
         self.node = root / "node"; self.node.write_text("node stand-in\n")
         self.record = self.make_record()
-        patcher = mock.patch.object(cp, "managed_home", return_value=self.home)
-        patcher.start(); case.addCleanup(patcher.stop)
+        for name in ("managed_home", "account_home"):
+            patcher = mock.patch.object(cp, name, return_value=self.home)
+            patcher.start(); case.addCleanup(patcher.stop)
 
     def _link(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,11 +277,17 @@ class Admission(TmpCase):
         finally:
             os.close(fd)
 
-    def test_missing_lock_is_created_not_refused(self):
+    def test_missing_lock_in_an_existing_directory_is_refused(self):
         os.unlink(self.f.lock)
-        with self.f.admit() as a:
-            self.assertEqual(a.state, "no_record")
-        self.assertTrue(self.f.lock.is_file())
+        self.refused("admission lock is missing, so the promotion directory needs repair")
+        self.assertFalse(self.f.lock.exists())
+
+    def test_a_removed_lock_is_not_recreated_under_a_running_task(self):
+        """Re-review 2: a second inode would let the drain skip the task holding the first."""
+        with self.f.admit():
+            os.unlink(self.f.lock)
+            self.refused("admission lock is missing")
+            self.assertFalse(self.f.lock.exists())
 
     def test_no_environment_override_exists(self):
         """Finding 2: a worker environment cannot move admission away from the real gate."""
@@ -483,29 +494,20 @@ class Admission(TmpCase):
     @unittest.skipIf(pwd is None, "password database required")
     def test_account_home_comes_from_the_password_database(self):
         with mock.patch.dict(os.environ, {"HOME": str(self.root / "other-home")}):
-            self.assertEqual(cp.account_home(), Path(pwd.getpwuid(os.getuid()).pw_dir))
+            self.assertEqual(REAL_ACCOUNT_HOME(), Path(pwd.getpwuid(os.getuid()).pw_dir))
+            self.assertEqual(REAL_MANAGED_HOME(), self.root / "other-home")
 
-    def test_other_HOME_cannot_run_an_account_home_launcher(self):
-        """Re-review finding 2: a worker with a stray HOME is refused before it takes a private lock."""
-        account = self.root / "account"
-        shared = account / ".local/bin/codex"; shared.parent.mkdir(parents=True)
-        os.symlink(str(self.f.target), shared)
+    def test_a_stray_HOME_is_refused_whatever_the_executable(self):
+        """Re-review 2: a worker with another HOME never gets a private, empty admission state."""
+        fake = self.root / "fake-codex"; fake.write_text("#!/bin/sh\n"); os.chmod(fake, 0o755)
         pdir = self.root / "stray" / "promotion"
-        with mock.patch.object(cp, "account_home", return_value=account):
-            with self.assertRaisesRegex(cp.AdmissionRefused, "HOME is not the account home"):
-                with cp.admit(shared, promotion_dir=pdir, node_bin=None):
-                    self.fail("admitted")
-            # A link outside the account home that resolves into it is refused too.
-            via = self.root / "via-codex"; os.symlink(str(shared), via)
-            os.unlink(shared); shared.write_text("#!/bin/sh\n"); os.chmod(shared, 0o755)
-            with self.assertRaisesRegex(cp.AdmissionRefused, "HOME is not the account home"):
-                with cp.admit(via, promotion_dir=pdir, node_bin=None):
-                    self.fail("admitted")
+        with mock.patch.object(cp, "account_home", return_value=self.root / "account"):
+            for launcher in (fake, self.f.launcher):
+                with self.subTest(launcher=launcher.name):
+                    with self.assertRaisesRegex(cp.AdmissionRefused, "HOME is not the account home"):
+                        with cp.admit(launcher, promotion_dir=pdir, node_bin=None):
+                            self.fail("admitted")
         self.assertFalse(pdir.exists())
-        # Same HOME and account home: no refusal on that ground.
-        with mock.patch.object(cp, "account_home", return_value=self.f.home):
-            with self.f.admit() as a:
-                self.assertEqual(a.state, "no_record")
 
 
 @unittest.skipIf(fcntl is None, "POSIX file locks required")
