@@ -503,11 +503,11 @@ def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,**kwargs):
     node_bin=shutil.which("node",path=_env()["PATH"])
     try:
         with codex_promotion.admit(codex_bin,promotion_dir=promotion_dir,node_bin=node_bin) as admission:
-            return _run_admitted(codex_bin=admission.exec_path,admission=admission.receipt(),**kwargs)
+            return _run_admitted(codex_bin=admission.exec_path,admission=admission,**kwargs)
     except codex_promotion.AdmissionRefused as exc:
         raise TaskError(f"Codex CLI admission refused: {exc}") from exc
 
-def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission:dict,
+def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission:codex_promotion.Admission,
                   codex_home:Path=DEFAULT_CODEX_HOME,
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
                   verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
@@ -530,6 +530,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
     base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(codex_bin),"--version"],cwd=codex_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Codex executable")
+    admission.check_reported_version(version.stdout.decode("utf-8","replace"))
     task_root.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(task_root,0o700)
     # mkdir(mode=) and chmod are no-ops on Windows; without this, task_root and
     # every job directory under it inherit whatever their parent grants there.
@@ -543,7 +544,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
              "reasoning_effort_requested":reasoning_effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(codex_bin.resolve()),
              "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
-             "codex_home":str(codex_home),"host_platform":platform.system(),"cli_admission":admission,
+             "codex_home":str(codex_home),"host_platform":platform.system(),"cli_admission":admission.receipt(),
              "git_executable":str(_git_bin()),"verification_confinement":backend.name,
              "confinement_denies_network":backend.denies_network,
              "confinement_confines_reads":backend.confines_reads,

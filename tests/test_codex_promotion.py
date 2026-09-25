@@ -26,6 +26,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None
 
 
 def build_tree(root: Path, tree):
@@ -154,25 +158,30 @@ class DigestDetects(TmpCase):
 
 
 class Fixture:
-    """A promotion directory, a read-only slot, two managed launchers and a node stand-in."""
+    """An account home with a promotion directory, a read-only slot, the three
+    managed launchers of spec v5 section 1, and a node stand-in."""
 
     def __init__(self, case: TmpCase):
         root = case.root
         self.root = root
-        self.pdir = root / "promotion"; self.pdir.mkdir(mode=0o700)
+        self.home = root / "home"; self.home.mkdir()
+        self.pdir = self.home / ".codex-bridge" / "promotion"; self.pdir.mkdir(mode=0o700, parents=True)
         self.lock = self.pdir / "admission.lock"
         fd = os.open(self.lock, os.O_CREAT | os.O_WRONLY, 0o600); os.close(fd)
-        self.slots = root / "codex-cli"
-        self.slot = case.new_slot("codex-cli/slots/0.156.1-aaaaaaaaaaaa")
+        self.slot = case.new_slot("home/.codex-cli/slots/0.156.1-aaaaaaaaaaaa")
         self.target = self.slot / "node_modules/@openai/codex/bin/codex.js"
-        self.bin = root / "bin"; self.bin.mkdir()
-        self.launcher = self.bin / "codex"; os.symlink(str(self.target), self.launcher)
-        self.nvm = root / "nvm-bin"; self.nvm.mkdir()
-        self.nvm_launcher = self.nvm / "codex"; os.symlink(str(self.target), self.nvm_launcher)
+        self.launcher = self._link(self.home / ".local/bin/codex")
+        self.nvm_launcher = self._link(self.home / ".nvm/versions/node/v24.16.0/bin/codex")
+        self.peer_launcher = self._link(self.home / ".codex-cli/peer/codex")
         self.node = root / "node"; self.node.write_text("node stand-in\n")
         self.record = self.make_record()
-        patcher = mock.patch.object(cp, "slots_root", return_value=self.slots)
+        patcher = mock.patch.object(cp, "managed_home", return_value=self.home)
         patcher.start(); case.addCleanup(patcher.stop)
+
+    def _link(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.target), path)
+        return path
 
     def node_entry(self):
         return {"path": os.path.realpath(self.node),
@@ -183,8 +192,9 @@ class Fixture:
             "schema_version": 1, "predecessor_id": None, "version": "0.156.1",
             "slot_path": str(self.slot), "slot_tree_digest": cp.tree_digest(self.slot),
             "launchers": [
-                {"name": "local", "path": str(self.launcher), "target": str(self.target), "node": self.node_entry()},
-                {"name": "nvm", "path": str(self.nvm_launcher), "target": str(self.target), "node": self.node_entry()}],
+                {"name": name, "path": str(path), "target": str(self.target), "node": self.node_entry()}
+                for name, path in (("local", self.launcher), ("nvm", self.nvm_launcher),
+                                   ("peer", self.peer_launcher))],
             "canary": {"harness_version": "1"}, "promoted_at": "2026-09-24T00:00:00Z",
             "promoted_by": "bootstrap", "transaction_id": "tx-1"}
         record.update(overrides)
@@ -229,7 +239,7 @@ class Admission(TmpCase):
     # -- transition
 
     def test_absent_directory_is_created_and_the_lock_is_taken(self):
-        pdir = self.root / "home" / ".codex-bridge" / "promotion"
+        pdir = self.root / "fresh-home" / ".codex-bridge" / "promotion"
         with cp.admit(self.f.launcher, promotion_dir=pdir, node_bin=None) as a:
             self.assertEqual(a.state, "no_record")
             self.assertEqual(a.exec_path, self.f.launcher)
@@ -271,7 +281,7 @@ class Admission(TmpCase):
     def test_no_environment_override_exists(self):
         """Finding 2: a worker environment cannot move admission away from the real gate."""
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_CODEX_PROMOTION_DIR": str(self.root / "absent")}):
-            self.assertEqual(cp.default_promotion_dir(), Path.home() / ".codex-bridge" / "promotion")
+            self.assertEqual(cp.default_promotion_dir(), self.f.home / ".codex-bridge" / "promotion")
         self.assertFalse(hasattr(cp, "PROMOTION_DIR_ENV"))
 
     # -- gate and lock
@@ -358,7 +368,7 @@ class Admission(TmpCase):
 
     def test_promoted_record_admits_and_returns_the_resolved_target(self):
         self.f.write_record()
-        for launcher in (self.f.launcher, self.f.nvm_launcher):
+        for launcher in (self.f.launcher, self.f.nvm_launcher, self.f.peer_launcher):
             with self.f.admit(launcher) as a:
                 self.assertEqual(a.state, "promoted")
                 self.assertEqual(a.exec_path, Path(os.path.realpath(self.f.target)))
@@ -422,20 +432,80 @@ class Admission(TmpCase):
         other = self.root / "node2"; other.write_bytes(self.f.node.read_bytes())
         self.refused("differs from the one the canaries ran", node=other)
 
-    def test_unmanaged_binary_runs_as_given_under_the_gate(self):
+    def test_unrecorded_binary_is_refused_once_a_record_exists(self):
+        """Re-review finding 1: nothing the record does not name runs on a real task."""
         self.f.write_record()
         fake = self.root / "fake-codex"; fake.write_text("#!/bin/sh\n"); os.chmod(fake, 0o755)
-        with self.f.admit(fake) as a:
-            self.assertEqual(a.state, "unmanaged")
-            self.assertEqual(a.exec_path, fake)
-            self.assert_exclusive_blocked()
-        self.f.write_gate()
-        self.refused("maintenance in progress", launcher=fake)
+        self.refused("not a launcher named in the promotion record", launcher=fake)
+        other = self.new_slot("home/.codex-cli/slots/0.157.0-bbbbbbbbbbbb")
+        self.refused("not a launcher named in the promotion record",
+                     launcher=other / "node_modules/@openai/codex/bin/codex.js")
+        self.refused("not a launcher named in the promotion record", launcher=self.f.target)
 
-    def test_unpromoted_managed_slot_is_refused(self):
+    def test_unrecorded_binary_still_runs_before_any_record(self):
+        fake = self.root / "fake-codex"; fake.write_text("#!/bin/sh\n"); os.chmod(fake, 0o755)
+        with self.f.admit(fake) as a:
+            self.assertEqual((a.state, a.exec_path), ("no_record", fake))
+            self.assert_exclusive_blocked()
+
+    def test_record_omitting_a_launcher_is_refused(self):
+        """Re-review finding 3: a record naming only good launchers cannot hide a bad one."""
+        os.unlink(self.f.nvm_launcher); os.symlink(str(self.f.node), self.f.nvm_launcher)
+        good = [e for e in self.f.record["launchers"] if e["name"] != "nvm"]
+        self.f.write_record(self.f.make_record(launchers=good))
+        self.refused("exactly the local, nvm and peer launchers")
+
+    def test_record_with_a_duplicate_or_unknown_launcher_is_refused(self):
+        ls = self.f.record["launchers"]
+        for launchers in (ls + [ls[0]], ls[:2] + [{**ls[2], "name": "extra"}]):
+            with self.subTest(names=[e["name"] for e in launchers]):
+                self.f.write_record(self.f.make_record(launchers=launchers))
+                self.refused("exactly the local, nvm and peer launchers")
+
+    def test_launchers_must_be_at_their_spec_paths(self):
+        elsewhere = self.root / "elsewhere" / "bin" / "codex"; elsewhere.parent.mkdir(parents=True)
+        os.symlink(str(self.f.target), elsewhere)
+        for name in ("local", "nvm", "peer"):
+            with self.subTest(name=name):
+                launchers = [{**e, "path": str(elsewhere)} if e["name"] == name else e
+                             for e in self.f.record["launchers"]]
+                self.f.write_record(self.f.make_record(launchers=launchers))
+                self.refused(f"{name} launcher path is wrong")
+
+    def test_reported_version_must_match_the_record(self):
         self.f.write_record()
-        other = self.new_slot("codex-cli/slots/0.157.0-bbbbbbbbbbbb")
-        self.refused("unpromoted managed slot", launcher=other / "node_modules/@openai/codex/bin/codex.js")
+        with self.f.admit() as a:
+            a.check_reported_version("codex-cli 0.156.1\n")
+            with self.assertRaisesRegex(cp.AdmissionRefused, "reports a version other than the promoted one"):
+                a.check_reported_version("codex-cli 0.157.0\n")
+        cp.Admission(state="no_record", exec_path=self.f.launcher).check_reported_version("anything")
+
+    @unittest.skipIf(pwd is None, "password database required")
+    def test_account_home_comes_from_the_password_database(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "other-home")}):
+            self.assertEqual(cp.account_home(), Path(pwd.getpwuid(os.getuid()).pw_dir))
+
+    def test_other_HOME_cannot_run_an_account_home_launcher(self):
+        """Re-review finding 2: a worker with a stray HOME is refused before it takes a private lock."""
+        account = self.root / "account"
+        shared = account / ".local/bin/codex"; shared.parent.mkdir(parents=True)
+        os.symlink(str(self.f.target), shared)
+        pdir = self.root / "stray" / "promotion"
+        with mock.patch.object(cp, "account_home", return_value=account):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "HOME is not the account home"):
+                with cp.admit(shared, promotion_dir=pdir, node_bin=None):
+                    self.fail("admitted")
+            # A link outside the account home that resolves into it is refused too.
+            via = self.root / "via-codex"; os.symlink(str(shared), via)
+            os.unlink(shared); shared.write_text("#!/bin/sh\n"); os.chmod(shared, 0o755)
+            with self.assertRaisesRegex(cp.AdmissionRefused, "HOME is not the account home"):
+                with cp.admit(via, promotion_dir=pdir, node_bin=None):
+                    self.fail("admitted")
+        self.assertFalse(pdir.exists())
+        # Same HOME and account home: no refusal on that ground.
+        with mock.patch.object(cp, "account_home", return_value=self.f.home):
+            with self.f.admit() as a:
+                self.assertEqual(a.state, "no_record")
 
 
 @unittest.skipIf(fcntl is None, "POSIX file locks required")
@@ -478,8 +548,17 @@ class TaskLaneAdmission(TmpCase):
              mock.patch.object(codex_task, "_run_admitted", side_effect=fake):
             codex_task.run_task(codex_bin=self.f.launcher, promotion_dir=self.f.pdir, classification="synthetic")
         self.assertEqual(seen["codex_bin"], Path(os.path.realpath(self.f.target)))
-        self.assertEqual(seen["admission"]["state"], "promoted")
-        self.assertEqual(seen["admission"]["record_id"], self.f.record["record_id"])
+        self.assertEqual(seen["admission"].state, "promoted")
+        self.assertEqual(seen["admission"].receipt()["record_id"], self.f.record["record_id"])
+
+    def test_wrong_reported_version_is_an_admission_refusal(self):
+        self.f.write_record()
+        def fake(**kw):
+            kw["admission"].check_reported_version("codex-cli 0.157.0")
+        with mock.patch.object(codex_task.shutil, "which", return_value=str(self.f.node)), \
+             mock.patch.object(codex_task, "_run_admitted", side_effect=fake):
+            with self.assertRaisesRegex(codex_task.TaskError, "admission refused: .*reports a version"):
+                codex_task.run_task(codex_bin=self.f.launcher, promotion_dir=self.f.pdir, classification="synthetic")
 
 
 if __name__ == "__main__":

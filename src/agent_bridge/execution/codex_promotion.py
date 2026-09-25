@@ -29,26 +29,28 @@ bootstrap already holds the shared lock that bootstrap's drain waits for.
 With no record yet (bootstrap not run, or undone), admission reports
 ``no_record`` and runs the launcher it was given, exactly as before.
 
-The promotion directory is ``~/.codex-bridge/promotion`` under ``Path.home()``,
-the same home this lane already derives its task root and ``CODEX_HOME`` from.
-There is deliberately no environment override: a worker started with one
-could point admission at an empty directory and ignore the real gate. Tests
-inject a directory in code (``promotion_dir=`` or by patching
-``default_promotion_dir``), or run with an isolated ``HOME`` as the
-end-to-end tests already do.
+The promotion directory and the launcher paths are under ``$HOME``, the same
+home this lane already derives its task root and ``CODEX_HOME`` from, so a
+test with an isolated ``HOME`` sees an isolated world (agent-bridge AGENTS.md).
+A worker whose ``HOME`` differs from the account's home in the password
+database would lock and read an empty directory of its own, so that worker is
+refused outright if the Codex executable it was given lives in the account
+home, where the shared launchers are. There is no environment override for
+the directory either. Tests inject one in code (``promotion_dir=``, or by
+patching ``default_promotion_dir`` or ``managed_home``).
 
-A record names every managed launcher. All of them are verified on every
-admission, not only the one this task was given (the spec's mixed-install
-rule). ``codex_bin`` may also be a binary the record does not manage, such as
-a test fake: it is admitted under the same lock and gate, and executed as
-given, unless it resolves into the managed slot tree, where only the promoted
-slot is accepted.
+Once a record exists, the task's executable must be one of the launchers it
+names, and the record must name exactly the three launchers spec v5 section 1
+defines: ``local`` (``~/.local/bin/codex``), ``nvm`` (the nvm prefix's
+``bin/codex``) and ``peer`` (``~/.codex-cli/peer/codex``). All three are
+verified on every admission, not only the one this task was given (the spec's
+mixed-install rule). Nothing else runs on a real task while a record exists.
 
 codex-bridge's ``promotion.py`` owns the record schema and writes it. This
 module is an independent reader: it checks the exact top-level key set, the
-``record_id`` over the canonical encoding, every managed launcher and its
-recorded Node runtime, the Node this task's PATH will find, the slot's
-package version, and the full slot tree digest, recomputed on every
+``record_id`` over the canonical encoding, the complete launcher set, every
+launcher's target and recorded Node runtime, the Node this task's PATH will
+find, the slot's package version, and the full slot tree digest, recomputed on every
 admission with no cache (spec v5 N3). It does not judge the ``canary``
 field: that a record passed its canaries is what codex-bridge's
 ``promote.py`` attests by committing it, and ``record_id`` only binds what
@@ -63,7 +65,7 @@ attacker running as the user.
 """
 from __future__ import annotations
 
-import contextlib, hashlib, json, os, stat
+import contextlib, hashlib, json, os, re, stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,6 +73,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows has no promotion controller
     fcntl = None
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None
 
 RECORD_KEYS=frozenset({"schema_version","record_id","predecessor_id","version","slot_path",
                        "slot_tree_digest","launchers","canary","promoted_at","promoted_by",
@@ -78,6 +84,8 @@ RECORD_KEYS=frozenset({"schema_version","record_id","predecessor_id","version","
 LAUNCHER_KEYS=frozenset({"name","path","target","node"})
 NODE_KEYS=frozenset({"path","sha256","version"})
 PROMOTED_BY=frozenset({"auto","supervised","bootstrap","rehearsal","rollback"})
+LAUNCHER_NAMES=frozenset({"local","nvm","peer"})
+_NVM_NODE_VERSION=re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 GATE_KEYS=frozenset({"transaction_id","state","opened_at","controller_pid"})
 MAX_STATE_FILE_BYTES=1<<20
 _READ_CHUNK=1<<20
@@ -89,7 +97,7 @@ class AdmissionRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class Admission:
-    state:str  # no_record | promoted | unmanaged
+    state:str  # no_record | promoted
     exec_path:Path
     record_id:str|None=None
     version:str|None=None
@@ -100,13 +108,40 @@ class Admission:
         return {"state":self.state,"exec_path":str(self.exec_path),"record_id":self.record_id,
                 "version":self.version,"slot_tree_digest":self.slot_tree_digest}
 
+    def check_reported_version(self,output:str):
+        """Refuse unless a promoted executable reports the record's version.
+
+        The caller runs ``--version`` on ``exec_path`` under the held lock and
+        passes its stdout here. Every launcher resolves to the same verified
+        ``codex.js`` under a verified Node, so this is the one that can differ.
+        """
+        if self.state=="promoted" and output.strip()!=f"codex-cli {self.version}":
+            raise AdmissionRefused("the Codex executable reports a version other than the promoted one")
+
+
+def managed_home()->Path:
+    """The home whose promotion directory and launchers admission uses."""
+    return Path.home()
+
+def account_home()->Path:
+    """The account's home from the password database; ``$HOME`` can differ per process."""
+    if pwd is None: return Path.home()  # pragma: no cover - no promotion controller there
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 def default_promotion_dir()->Path:
-    return Path.home()/".codex-bridge"/"promotion"
+    return managed_home()/".codex-bridge"/"promotion"
 
-def slots_root()->Path:
-    """Where codex-bridge installs CLI slots; nothing under it runs unless promoted."""
-    return Path.home()/".codex-cli"
+
+def _check_home(codex_bin:Path):
+    # A worker started with another HOME would take a lock nobody drains and
+    # read no gate, while the shared launchers it runs switch underneath it.
+    home=os.path.realpath(managed_home()); account=os.path.realpath(account_home())
+    if home==account: return
+    # The launcher itself (its directory resolved, the link not) and its target.
+    given=os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(codex_bin))),os.path.basename(codex_bin))
+    for p in (given,os.path.realpath(codex_bin)):
+        if os.path.commonpath([account,p])==account:
+            raise AdmissionRefused("HOME is not the account home, but the Codex executable is in the account home")
 
 
 # ---------------------------------------------------------------- digests
@@ -256,6 +291,7 @@ def _verify_record(promotion_dir:Path,codex_bin:Path,node_bin:str|None)->Admissi
         if not isinstance(entry,dict) or set(entry)!=LAUNCHER_KEYS or not isinstance(entry["node"],dict) \
                 or set(entry["node"])!=NODE_KEYS or not all(isinstance(entry[k],str) for k in ("name","path","target")):
             raise AdmissionRefused("promotion record launcher entry has the wrong fields")
+    _check_launcher_set(launchers)
     real_slot=os.path.realpath(slot)
     root_st=os.lstat(slot) if os.path.lexists(slot) else None
     if root_st is None or not stat.S_ISDIR(root_st.st_mode): raise AdmissionRefused("the promoted slot is missing")
@@ -276,17 +312,26 @@ def _verify_record(promotion_dir:Path,codex_bin:Path,node_bin:str|None)->Admissi
             raise AdmissionRefused(f"managed launcher {name} resolves outside the promoted slot")
         _verify_node_file(entry["node"],name)
         if entry["path"]==str(codex_bin): ours=entry
-    if ours is not None:
-        _verify_task_node(ours["node"],node_bin)
-        exec_path=Path(os.path.realpath(codex_bin)); state="promoted"
-    else:
-        resolved=os.path.realpath(codex_bin)
-        managed=os.path.realpath(slots_root())
-        if os.path.commonpath([managed,resolved])==managed and os.path.commonpath([real_slot,resolved])!=real_slot:
-            raise AdmissionRefused("the Codex executable is an unpromoted managed slot")
-        exec_path=codex_bin; state="unmanaged"
-    return Admission(state=state,exec_path=exec_path,record_id=record["record_id"],version=version,
-                     slot_tree_digest=record["slot_tree_digest"])
+    if ours is None: raise AdmissionRefused("the Codex executable is not a launcher named in the promotion record")
+    _verify_task_node(ours["node"],node_bin)
+    return Admission(state="promoted",exec_path=Path(os.path.realpath(codex_bin)),record_id=record["record_id"],
+                     version=version,slot_tree_digest=record["slot_tree_digest"])
+
+
+def _check_launcher_set(launchers:list):
+    # Exactly the three launchers of spec v5 section 1, each once, at its own
+    # path. A record naming fewer would hide a launcher left on another slot.
+    names=[e["name"] for e in launchers]
+    if len(names)!=len(LAUNCHER_NAMES) or set(names)!=LAUNCHER_NAMES:
+        raise AdmissionRefused("promotion record does not list exactly the local, nvm and peer launchers")
+    by={e["name"]:e["path"] for e in launchers}
+    home=managed_home()
+    if by["local"]!=str(home/".local"/"bin"/"codex"): raise AdmissionRefused("promotion record local launcher path is wrong")
+    if by["peer"]!=str(home/".codex-cli"/"peer"/"codex"): raise AdmissionRefused("promotion record peer launcher path is wrong")
+    nvm=Path(by["nvm"])
+    if nvm.parent.parent.parent!=home/".nvm"/"versions"/"node" or nvm.parent.name!="bin" or nvm.name!="codex" \
+            or not _NVM_NODE_VERSION.fullmatch(nvm.parent.parent.name):
+        raise AdmissionRefused("promotion record nvm launcher path is wrong")
 
 
 def _slot_package_version(slot:Path):
@@ -327,6 +372,7 @@ def admit(codex_bin:Path,*,promotion_dir:Path|None=None,node_bin:str|None=None):
     promotion_dir=promotion_dir or default_promotion_dir()
     if not codex_bin.is_absolute(): raise AdmissionRefused("Codex executable path must be absolute")
     if fcntl is None: raise AdmissionRefused("promotion admission needs POSIX file locks")
+    _check_home(codex_bin)
     try: promotion_dir.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     except OSError as exc: raise AdmissionRefused("promotion directory could not be created") from exc
     try: os.mkdir(promotion_dir,0o700)

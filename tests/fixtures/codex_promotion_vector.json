@@ -77,6 +77,26 @@
           "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
           "version": "v24.16.0"
         }
+      },
+      {
+        "name": "nvm",
+        "path": "/Users/example/.nvm/versions/node/v24.16.0/bin/codex",
+        "target": "/Users/example/.codex-cli/slots/0.156.1-000000000000/node_modules/@openai/codex/bin/codex.js",
+        "node": {
+          "path": "/Users/example/.nvm/versions/node/v24.16.0/bin/node",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "version": "v24.16.0"
+        }
+      },
+      {
+        "name": "peer",
+        "path": "/Users/example/.codex-cli/peer/codex",
+        "target": "/Users/example/.codex-cli/slots/0.156.1-000000000000/node_modules/@openai/codex/bin/codex.js",
+        "node": {
+          "path": "/Users/example/.nvm/versions/node/v24.16.0/bin/node",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "version": "v24.16.0"
+        }
       }
     ],
     "canary": {
@@ -91,5 +111,5 @@
   },
   "expected_tree_digest": "05b5413e240c079dcd4eeffe267cf2e9c000ba9188aaec47722dd8839bd6af42",
   "expected_tree_digest_note": "Modes are the full permission bits of a slot already made read-only (chmod -R a-w), as the controller digests it. Adding a write bit changes the digest.",
-  "expected_record_id": "81499ae02b2496d73090337c5ab7d12adffd8c99fee1a66bfc0a91c3cb25a602"
+  "expected_record_id": "4caf10b8451cd1db4585fbd4b27073682cc6a3169bc68c3af8bed982c1bb71ce"
 }
