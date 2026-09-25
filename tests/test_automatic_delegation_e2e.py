@@ -19,7 +19,9 @@ a user actually gets, in a temporary home, through the real parts:
 
 **What is standing in, stated exactly.** The provider CLIs and the local model
 are stand-in executables (``tests/fakes/fake_exec_*.py``,
-``tests/fakes/fake_local_worker.py``). No Claude, Codex or Ollama account is
+``tests/fakes/fake_local_worker.py``). ``codex_task.py`` runs through
+``tests/fixtures/codex_task_isolated_home.py``, which only lets CLI promotion
+admission treat the temporary home as the account home. No Claude, Codex or Ollama account is
 contacted and no allowance is spent. So this proves the dispatch machinery,
 the enforcement, the receipts and the recovery; it does not prove any
 provider's own login or model behaviour. That needs the same commands run
@@ -44,6 +46,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKES = Path(__file__).resolve().parent / "fakes"
+# codex_task.py itself, run through a test-only launcher that treats the
+# temporary HOME as the account home; admission refuses any other HOME.
+CODEX_TASK_LAUNCHER = Path(__file__).resolve().parent / "fixtures" / "codex_task_isolated_home.py"
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge import store  # noqa: E402
@@ -218,7 +223,7 @@ class Workflow(unittest.TestCase):
             "worker_executable": str(self.bin / "local-worker"),
             "worker_state": str(self.worker_state),
             "execution_queue_root": str(self.exec_root),
-            "codex_task_executable": str(ROOT / "src/agent_bridge/execution/codex_task.py"),
+            "codex_task_executable": str(CODEX_TASK_LAUNCHER),
             "claude_task_executable": str(ROOT / "src/agent_bridge/execution/claude_task.py"),
             "python_executable": os.path.realpath(sys.executable),
             "claude_config_dir": str(self.lane_claude_store),
@@ -336,7 +341,7 @@ class Workflow(unittest.TestCase):
     def execution_queue(self):
         """The real queue with the real harness executor."""
         return ExecutionQueue(str(self.exec_root), SubprocessHarnessExecutor(Harnesses(
-            codex=ROOT / "src/agent_bridge/execution/codex_task.py",
+            codex=CODEX_TASK_LAUNCHER,
             claude=ROOT / "src/agent_bridge/execution/claude_task.py",
             python=Path(os.path.realpath(sys.executable)),
             claude_config_dir=self.lane_claude_store)),
