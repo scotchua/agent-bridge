@@ -39,10 +39,20 @@ def foundation_thermal_state() -> str:
     if not process:
         raise RuntimeError("NSProcessInfo unavailable")
     send.restype = ctypes.c_long
-    value = send(process, objc.sel_registerName(b"thermalState"))
-    if value == 0:
+    return thermal_level_name(send(process, objc.sel_registerName(b"thermalState")))
+
+
+def thermal_level_name(value: int) -> str:
+    """Map NSProcessInfoThermalState to the admission vocabulary.
+
+    Nominal (0) and fair (1) are both ``normal``: Apple defines fair as
+    slightly elevated with no action needed, and a Mac doing ordinary work
+    sits there for hours. Deferring on fair kept the local model idle while
+    the machine was perfectly usable. Serious (2) and critical (3) defer.
+    """
+    if value in {0, 1}:
         return "normal"
-    if value in {1, 2, 3}:
+    if value in {2, 3}:
         return "high"
     return "unknown"
 

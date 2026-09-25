@@ -391,14 +391,21 @@ def calibrate(config_path: str, *, clock: Any = time.time,
     queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-calibrate-"))
     try:
         service = Service.for_config(cfg, root=str(queue_root), sampler=sampler)
-        resource = service.queue.state_report().get("resource", {})
-        verdict = resource.get("verdict")
-        if isinstance(verdict, dict):
-            admissible = verdict.get("interactive") == "admissible"
-            detail = "interactive_not_admissible"
-        else:
-            admissible = False
-            detail = resource.get("reason", "unavailable") if isinstance(resource, dict) else "unavailable"
+        # Wait out a transient deferral (a warm or busy moment) with the same
+        # budget each sample run gets, rather than refusing on one reading.
+        for wait_index in range(CALIBRATION_RESOURCE_WAIT_ATTEMPTS):
+            resource = service.queue.state_report().get("resource", {})
+            verdict = resource.get("verdict") if isinstance(resource, dict) else None
+            if isinstance(verdict, dict):
+                admissible = verdict.get("interactive") == "admissible"
+                detail = "interactive_not_admissible"
+            else:
+                admissible = False
+                detail = resource.get("reason", "unavailable") if isinstance(resource, dict) else "unavailable"
+            if admissible or not isinstance(verdict, dict):
+                break
+            if wait_index + 1 < CALIBRATION_RESOURCE_WAIT_ATTEMPTS:
+                sleeper(CALIBRATION_RESOURCE_POLL_SECONDS)
         if not admissible:
             return {"ok": False, "error": f"calibration_refused:resource_{detail}"}
 

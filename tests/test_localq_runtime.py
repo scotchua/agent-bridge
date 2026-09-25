@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.localq.runtime import (MIN_MEMORY_FREE_PERCENT, MacSampler,
-                                         foundation_thermal_state)
+                                         foundation_thermal_state, thermal_level_name)
 from agent_bridge.localq.service import Service
 from agent_bridge.localq.spool import ResourceSnapshot
 from agent_bridge.localq import worker_child
@@ -27,6 +27,10 @@ class RuntimeTests(unittest.TestCase):
 
     def test_foundation_thermal_probe_returns_supported_state(self):
         self.assertIn(foundation_thermal_state(), {"normal", "high", "unknown"})
+
+    def test_fair_thermal_is_usable_and_serious_defers(self):
+        self.assertEqual([thermal_level_name(v) for v in (0, 1, 2, 3, 7)],
+                         ["normal", "normal", "high", "high", "unknown"])
 
     def test_mac_sampler_parses_safe_fixture_and_unknown_thermal_defers(self):
         fixtures = {
