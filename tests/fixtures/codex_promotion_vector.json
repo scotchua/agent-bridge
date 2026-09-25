@@ -1,0 +1,95 @@
+{
+  "description": "Shared test vector for the Codex CLI promotion tree digest and record_id. codex-bridge's promotion.py and agent-bridge's codex_promotion.py must both reproduce these values. Spec: ~/Claude/team-state/tasks/codex-cli-auto-upgrade/SPEC.md v5.",
+  "tree": [
+    {
+      "type": "d",
+      "path": "node_modules",
+      "mode": "0755"
+    },
+    {
+      "type": "d",
+      "path": "node_modules/.bin",
+      "mode": "0755"
+    },
+    {
+      "type": "d",
+      "path": "node_modules/@openai",
+      "mode": "0755"
+    },
+    {
+      "type": "d",
+      "path": "node_modules/@openai/codex",
+      "mode": "0755"
+    },
+    {
+      "type": "d",
+      "path": "node_modules/@openai/codex/bin",
+      "mode": "0755"
+    },
+    {
+      "type": "f",
+      "path": "node_modules/@openai/codex/bin/codex.js",
+      "mode": "0755",
+      "content": "#!/usr/bin/env node\nconsole.log('codex-cli 0.156.1')\n"
+    },
+    {
+      "type": "f",
+      "path": "node_modules/@openai/codex/package.json",
+      "mode": "0644",
+      "content": "{\"name\":\"@openai/codex\",\"version\":\"0.156.1\"}\n"
+    },
+    {
+      "type": "d",
+      "path": "node_modules/@openai/codex-darwin-arm64",
+      "mode": "0755"
+    },
+    {
+      "type": "f",
+      "path": "node_modules/@openai/codex-darwin-arm64/codex",
+      "mode": "0755",
+      "content": "native-binary-stand-in\n"
+    },
+    {
+      "type": "f",
+      "path": "node_modules/Z-upper-sorts-before-lower.txt",
+      "mode": "0444",
+      "content": "sort order is by UTF-8 bytes\n"
+    },
+    {
+      "type": "l",
+      "path": "node_modules/.bin/codex",
+      "target": "../@openai/codex/bin/codex.js"
+    }
+  ],
+  "record": {
+    "schema_version": 1,
+    "predecessor_id": null,
+    "version": "0.156.1",
+    "slot_path": "/Users/example/.codex-cli/slots/0.156.1-000000000000",
+    "slot_tree_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "launchers": [
+      {
+        "name": "local",
+        "path": "/Users/example/.local/bin/codex",
+        "target": "/Users/example/.codex-cli/slots/0.156.1-000000000000/node_modules/@openai/codex/bin/codex.js",
+        "node": {
+          "path": "/Users/example/.hermes/node/bin/node",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "version": "v24.16.0"
+        }
+      }
+    ],
+    "canary": {
+      "harness_version": "1",
+      "outcomes": {
+        "write_confinement": "pass"
+      }
+    },
+    "promoted_at": "2026-09-24T00:00:00Z",
+    "promoted_by": "bootstrap",
+    "transaction_id": "tx-example"
+  },
+  "expected_tree_digest": "05b5413e240c079dcd4eeffe267cf2e9c000ba9188aaec47722dd8839bd6af42",
+  "expected_tree_digest_note": "Write bits are masked, so the same tree made read-only (chmod -R a-w) has the same digest.",
+  "expected_record_id": "81499ae02b2496d73090337c5ab7d12adffd8c99fee1a66bfc0a91c3cb25a602"
+}

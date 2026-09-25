@@ -57,14 +57,14 @@ try:
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from ..errors import BrokerError
-    from . import hostenv, verify_policy
+    from . import codex_promotion, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.errors import BrokerError
-    from agent_bridge.execution import hostenv, verify_policy
+    from agent_bridge.execution import codex_promotion, hostenv, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -491,9 +491,26 @@ def _assert_no_ancestor_contamination(job:Path):
     except BrokerError as exc:
         raise TaskError(f"ancestor instruction-file check failed: {exc.category.value}") from exc
 
-def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Path=DEFAULT_CODEX_HOME,
-             classification:str,model:str|None=None,reasoning_effort:str|None=None,
-             verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
+def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,**kwargs):
+    """Run one task under codex-bridge's CLI promotion admission.
+
+    Admission comes before everything else, including request validation,
+    because it has to cover every Codex process this task starts, starting with
+    ``codex --version``: the shared lock is held until the task returns. See
+    codex_promotion.py. The task then executes the path admission verified,
+    never the launcher name.
+    """
+    node_bin=shutil.which("node",path=_env()["PATH"])
+    try:
+        with codex_promotion.admit(codex_bin,promotion_dir=promotion_dir,node_bin=node_bin) as admission:
+            return _run_admitted(codex_bin=admission.exec_path,admission=admission.receipt(),**kwargs)
+    except codex_promotion.AdmissionRefused as exc:
+        raise TaskError(f"Codex CLI admission refused: {exc}") from exc
+
+def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission:dict,
+                  codex_home:Path=DEFAULT_CODEX_HOME,
+                  classification:str,model:str|None=None,reasoning_effort:str|None=None,
+                  verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
     if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
@@ -526,7 +543,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,codex_home:Pat
              "reasoning_effort_requested":reasoning_effort,
              "permission_to_land":False,"started_at":time.time(),"executable_realpath":str(codex_bin.resolve()),
              "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
-             "codex_home":str(codex_home),"host_platform":platform.system(),
+             "codex_home":str(codex_home),"host_platform":platform.system(),"cli_admission":admission,
              "git_executable":str(_git_bin()),"verification_confinement":backend.name,
              "confinement_denies_network":backend.denies_network,
              "confinement_confines_reads":backend.confines_reads,

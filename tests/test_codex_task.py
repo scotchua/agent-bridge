@@ -42,6 +42,24 @@ def requires_confinement(case):
     except hostenv.HostCapabilityError as exc:
         case.skipTest("no verification confinement backend on this host: " + exc.code)
 
+_PROMOTION_TMP = None
+
+
+def setUpModule():
+    # codex_task now takes part in codex-bridge's CLI promotion admission
+    # (codex_promotion.py). Point it at a directory that does not exist, so
+    # these tests see "not_installed" and never read the operator's real
+    # ~/.codex-bridge state; admission itself is covered in test_codex_promotion.
+    global _PROMOTION_TMP
+    _PROMOTION_TMP = tempfile.TemporaryDirectory()
+    os.environ["AGENT_BRIDGE_CODEX_PROMOTION_DIR"] = os.path.join(_PROMOTION_TMP.name, "absent")
+
+
+def tearDownModule():
+    os.environ.pop("AGENT_BRIDGE_CODEX_PROMOTION_DIR", None)
+    _PROMOTION_TMP.cleanup()
+
+
 from agent_bridge.execution.codex_task import (
     TaskError, _env, _git, _relevant_paths, _remove, _run, _sandboxed,
     _source_state, _with_error_detail, main, run_task)
