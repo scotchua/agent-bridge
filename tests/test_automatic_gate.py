@@ -923,6 +923,17 @@ class LinkedWorktreesInheritLocalRoutingOnly(unittest.TestCase):
         policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
         self.assertIs(policy.for_repo(str(forged)), policy.default)
 
+    def test_a_relative_path_worktree_also_inherits(self):
+        import subprocess
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        relative = Path(os.path.realpath(self.temp.name)) / "relative"
+        done = subprocess.run(["git", "worktree", "add", "-q", "--relative-paths", str(relative)],
+                              cwd=self.main, env=env, capture_output=True)
+        if done.returncode != 0:
+            self.skipTest("this git has no --relative-paths")
+        entry = autoroute.RepoPolicy("client_derived", ("claude", "local"), mechanical_ok=True)
+        self.assertEqual(self.policy(entry).for_repo(str(relative)).allowed_routes, ("local",))
+
     def test_a_symlinked_git_file_cannot_borrow_a_registered_worktree(self):
         forged = Path(self.temp.name) / "symlinked"
         forged.mkdir()

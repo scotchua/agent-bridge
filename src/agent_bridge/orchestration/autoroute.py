@@ -362,12 +362,14 @@ def _main_worktree(repo: str) -> str | None:
             backlink = handle.read(4096).strip()
     except (OSError, UnicodeDecodeError):
         return None
-    # Absolute only (a relative one would resolve against this process's
-    # working directory), naming a file called .git directly inside ``repo``.
+    # It must name a file called .git directly inside ``repo``. A relative
+    # backlink (``git worktree add --relative-paths``) is relative to the
+    # administrative directory, never to this process's working directory.
     # Only the directory part is resolved, so a symlinked parent spelling
     # still matches while the .git file itself is never followed.
-    if not backlink or not os.path.isabs(backlink) \
-            or os.path.basename(os.path.normpath(backlink)) != ".git" \
+    if backlink and not os.path.isabs(backlink):
+        backlink = os.path.join(gitdir, backlink)
+    if not backlink or os.path.basename(os.path.normpath(backlink)) != ".git" \
             or os.path.realpath(os.path.dirname(os.path.normpath(backlink))) != os.path.realpath(repo):
         return None
     return os.path.dirname(dot_git)
