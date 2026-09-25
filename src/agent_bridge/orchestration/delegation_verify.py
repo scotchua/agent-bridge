@@ -391,8 +391,10 @@ def calibrate(config_path: str, *, clock: Any = time.time,
     queue_root = Path(tempfile.mkdtemp(prefix="agent-bridge-calibrate-"))
     try:
         service = Service.for_config(cfg, root=str(queue_root), sampler=sampler)
-        # Wait out a transient deferral (a warm or busy moment) with the same
-        # budget each sample run gets, rather than refusing on one reading.
+        # Wait out a transient deferral (a warm or busy moment, or a one-off
+        # sampler failure) with the same budget each sample run gets, rather
+        # than refusing on one reading. Total: at most 120 probes and 119
+        # sleeps (about ten minutes) before the per-sample waits begin.
         for wait_index in range(CALIBRATION_RESOURCE_WAIT_ATTEMPTS):
             resource = service.queue.state_report().get("resource", {})
             verdict = resource.get("verdict") if isinstance(resource, dict) else None
@@ -402,7 +404,7 @@ def calibrate(config_path: str, *, clock: Any = time.time,
             else:
                 admissible = False
                 detail = resource.get("reason", "unavailable") if isinstance(resource, dict) else "unavailable"
-            if admissible or not isinstance(verdict, dict):
+            if admissible:
                 break
             if wait_index + 1 < CALIBRATION_RESOURCE_WAIT_ATTEMPTS:
                 sleeper(CALIBRATION_RESOURCE_POLL_SECONDS)
