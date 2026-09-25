@@ -186,7 +186,7 @@ class SubprocessBackend:
         return value
 
     @staticmethod
-    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = signal.SIGKILL) -> None:
+    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = getattr(signal, "SIGKILL", signal.SIGTERM)) -> None:
         """Kill the whole isolated process group, not only the immediate child.
 
         ``start_new_session=True`` above makes this child its own
