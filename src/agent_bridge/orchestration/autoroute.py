@@ -349,7 +349,18 @@ def _main_worktree(repo: str) -> str | None:
     worktrees = os.path.dirname(gitdir)
     dot_git = os.path.dirname(worktrees)
     if os.path.basename(worktrees) != "worktrees" or os.path.basename(dot_git) != ".git" \
-            or not os.path.isdir(dot_git):
+            or not os.path.isdir(gitdir):
+        return None
+    # The main checkout must have registered this worktree: its
+    # administrative directory's ``gitdir`` file points back at this very
+    # ``.git`` file. A forged ``.git`` file borrowing another worktree's
+    # administrative directory fails here.
+    try:
+        with open(os.path.join(gitdir, "gitdir"), encoding="utf-8") as handle:
+            backlink = handle.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not backlink or os.path.realpath(backlink) != os.path.realpath(marker):
         return None
     return os.path.dirname(dot_git)
 

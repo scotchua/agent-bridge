@@ -915,6 +915,22 @@ class LinkedWorktreesInheritLocalRoutingOnly(unittest.TestCase):
             str(self.linked): own})
         self.assertIs(policy.for_repo(str(self.linked)), own)
 
+    def test_a_forged_git_file_cannot_borrow_a_registered_worktree(self):
+        forged = Path(self.temp.name) / "forged"
+        forged.mkdir()
+        admin = (self.linked / ".git").read_text(encoding="utf-8").strip()
+        (forged / ".git").write_text(admin + "\n", encoding="utf-8")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
+    def test_a_git_file_naming_an_unregistered_worktree_is_refused(self):
+        forged = Path(self.temp.name) / "unregistered"
+        forged.mkdir()
+        (forged / ".git").write_text(f"gitdir: {self.main}/.git/worktrees/nothing\n",
+                                     encoding="utf-8")
+        policy = self.policy(autoroute.RepoPolicy("client_derived", ("local",), mechanical_ok=True))
+        self.assertIs(policy.for_repo(str(forged)), policy.default)
+
     def test_a_malformed_git_file_falls_back_to_the_default(self):
         fake = Path(self.temp.name) / "fake"
         fake.mkdir()
