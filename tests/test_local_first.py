@@ -998,15 +998,15 @@ class CalibrateTests(unittest.TestCase):
         (found by adversarial review: this host's real load average and idle%
         could otherwise land on either side of admission from one run to the
         next)."""
-        self._start_model()
         sleeps: list[float] = []
         with mock.patch("agent_bridge.localq.runtime.MacSampler.sample",
                         side_effect=RuntimeError("no macos probes on this host")):
             result = delegation_verify.calibrate(str(self.config_path), sleeper=sleeps.append)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "calibration_refused:resource_resource_sample_unavailable")
-        # A persistent failure is retried for the whole bounded budget, then refused.
-        self.assertEqual(len(sleeps), delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS - 1)
+        # Three consecutive sampler failures indicate a missing platform
+        # probe, not a transient deferral.
+        self.assertEqual(len(sleeps), delegation_verify.CALIBRATION_RESOURCE_UNAVAILABLE_LIMIT - 1)
 
     def test_a_one_off_sampler_failure_is_retried_not_refused(self):
         self._start_model()
@@ -1032,6 +1032,28 @@ class CalibrateTests(unittest.TestCase):
         self.assertEqual(result["error"], "calibration_refused:resource_interactive_not_admissible")
         self.assertEqual(len(sleeps), delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS - 1)
         self.assertTrue(all(s == delegation_verify.CALIBRATION_RESOURCE_POLL_SECONDS for s in sleeps))
+
+    def test_resource_precheck_stops_at_its_monotonic_deadline(self):
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+        class SlowSampler(_ScriptedSampler):
+            def sample(self):
+                clock.now += delegation_verify.CALIBRATION_RESOURCE_WAIT_ATTEMPTS * (
+                    delegation_verify.CALIBRATION_RESOURCE_POLL_SECONDS + 1)
+                return super().sample()
+
+        clock = Clock()
+        sleeps: list[float] = []
+        result = delegation_verify.calibrate(
+            str(self.config_path), sampler=SlowSampler(["hot"]), monotonic=clock.monotonic,
+            sleeper=sleeps.append)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "calibration_refused:resource_deadline_exceeded")
+        self.assertEqual(sleeps, [])
 
     def test_refuses_when_the_production_queue_shows_a_running_job(self):
         database = self.local_queue / "localq.sqlite3"

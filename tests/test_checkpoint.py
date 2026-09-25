@@ -8,12 +8,14 @@ test material; nothing here is client data.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -237,6 +239,48 @@ class CheckpointLedgerTests(unittest.TestCase):
         self.assertEqual(len({result["receipt_id"] for result in results}), 1)
         self.assertEqual(len({result["job_id"] for result in results}), 1)
         self.assertEqual(self.queue.state_report()["counts"], {"queued": 1})
+
+    def test_blob_permission_error_accepts_a_matching_concurrent_writer_blob(self):
+        value = {"input": "concurrent blob"}
+        raw = self.queue._normalized(value).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self.queue.blobs / digest
+
+        def concurrent_writer(_temporary, _target):
+            target.write_bytes(raw)
+            raise PermissionError("sharing")
+
+        with mock.patch("agent_bridge.localq.spool.os.replace", side_effect=concurrent_writer):
+            self.assertEqual(self.queue._blob(value), digest)
+
+        self.assertEqual(list(self.queue.blobs.glob("." + digest + ".*")), [])
+
+    def test_blob_permission_error_rejects_a_corrupt_existing_blob(self):
+        value = {"input": "corrupt blob"}
+        raw = self.queue._normalized(value).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self.queue.blobs / digest
+
+        def corrupt_writer(_temporary, _target):
+            target.write_bytes(b"not this content")
+            raise PermissionError("sharing")
+
+        with mock.patch("agent_bridge.localq.spool.os.replace", side_effect=corrupt_writer):
+            with self.assertRaises(PermissionError):
+                self.queue._blob(value)
+
+        self.assertEqual(list(self.queue.blobs.glob("." + digest + ".*")), [])
+
+    def test_blob_permission_error_rejects_a_missing_blob(self):
+        value = {"input": "missing blob"}
+        raw = self.queue._normalized(value).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+
+        with mock.patch("agent_bridge.localq.spool.os.replace", side_effect=PermissionError("sharing")):
+            with self.assertRaises(PermissionError):
+                self.queue._blob(value)
+
+        self.assertEqual(list(self.queue.blobs.glob("." + digest + ".*")), [])
 
     # -- requirement: refused checkpoint-bound work never queues ---------
 

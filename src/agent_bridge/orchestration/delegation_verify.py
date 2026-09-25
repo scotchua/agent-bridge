@@ -62,6 +62,9 @@ TERMINAL_STATES = frozenset({"complete", "failed", "blocked"})
 MAX_DRAIN_ATTEMPTS = 50
 CALIBRATION_RESOURCE_WAIT_ATTEMPTS = 120
 CALIBRATION_RESOURCE_POLL_SECONDS = 5.0
+# Three consecutive unavailable samples are enough to distinguish a missing
+# platform sampler from the one-off probe failures that calibration tolerates.
+CALIBRATION_RESOURCE_UNAVAILABLE_LIMIT = 3
 
 
 def _empty_row(reason: str) -> dict[str, Any]:
@@ -392,10 +395,19 @@ def calibrate(config_path: str, *, clock: Any = time.time,
     try:
         service = Service.for_config(cfg, root=str(queue_root), sampler=sampler)
         # Wait out a transient deferral (a warm or busy moment, or a one-off
-        # sampler failure) with the same budget each sample run gets, rather
-        # than refusing on one reading. Total: at most 120 probes and 119
-        # sleeps (about ten minutes) before the per-sample waits begin.
+        # sampler failure) with the same budget each sample run gets.  A
+        # repeatedly unavailable sampler is a permanent configuration or
+        # platform problem, however, so refuse after three consecutive
+        # readings rather than consuming the full wait budget. The deadline
+        # bounds the pre-check even if probes themselves are slow.
+        resource_deadline = monotonic() + (
+            CALIBRATION_RESOURCE_WAIT_ATTEMPTS * CALIBRATION_RESOURCE_POLL_SECONDS)
+        unavailable_readings = 0
+        admissible = False
         for wait_index in range(CALIBRATION_RESOURCE_WAIT_ATTEMPTS):
+            if monotonic() >= resource_deadline:
+                detail = "deadline_exceeded"
+                break
             resource = service.queue.state_report().get("resource", {})
             verdict = resource.get("verdict") if isinstance(resource, dict) else None
             if isinstance(verdict, dict):
@@ -406,8 +418,18 @@ def calibrate(config_path: str, *, clock: Any = time.time,
                 detail = resource.get("reason", "unavailable") if isinstance(resource, dict) else "unavailable"
             if admissible:
                 break
+            if detail == "resource_sample_unavailable":
+                unavailable_readings += 1
+                if unavailable_readings >= CALIBRATION_RESOURCE_UNAVAILABLE_LIMIT:
+                    break
+            else:
+                unavailable_readings = 0
             if wait_index + 1 < CALIBRATION_RESOURCE_WAIT_ATTEMPTS:
-                sleeper(CALIBRATION_RESOURCE_POLL_SECONDS)
+                remaining = resource_deadline - monotonic()
+                if remaining <= 0:
+                    detail = "deadline_exceeded"
+                    break
+                sleeper(min(CALIBRATION_RESOURCE_POLL_SECONDS, remaining))
         if not admissible:
             return {"ok": False, "error": f"calibration_refused:resource_{detail}"}
 
