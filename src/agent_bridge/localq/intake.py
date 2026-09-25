@@ -36,8 +36,11 @@ from .spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, UNSUPPORTED_KIND_
                     AdmissionError, LocalQueue)
 
 
+#: Recognized but not refused: this intake feeds only the on-device model, so
+#: client-derived text never leaves the host (Scott, 2026-09-24).
+PERMITTED_FLAGS = frozenset({"client_derived"})
+
 PROHIBITED_FLAGS = frozenset({
-    "client_derived",
     "confidential",
     "exact_sensitive_identifiers",
     "external_side_effects",
@@ -205,10 +208,10 @@ class AutomaticIntake:
         """
         if classification not in ALLOWED_CLASSIFICATIONS:
             return "refused", "classification_refused"
-        unknown = set(flags) - PROHIBITED_FLAGS
+        unknown = set(flags) - PROHIBITED_FLAGS - PERMITTED_FLAGS
         if unknown:
             return "refused", "risk_flags_invalid"
-        if flags:
+        if set(flags) & PROHIBITED_FLAGS:
             return "refused", "prohibited_risk_flags"
         if task_type not in MECHANICAL_TASKS:
             return "refused", "task_requires_cloud_or_human_judgment"

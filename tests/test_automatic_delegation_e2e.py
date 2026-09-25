@@ -658,9 +658,18 @@ class LocalLane(Workflow):
             self.assertEqual(decision["decision"], "local", decision)
             self.assertEqual(decision["caller"], caller)
 
-    def test_client_derived_material_is_refused_with_no_cloud_fallback(self):
+    def test_client_derived_material_goes_local_with_no_cloud_fallback(self):
+        # Scott, 2026-09-24: the on-device model is the safest processor of
+        # client data, so the local lane takes it like any other mechanical work.
         text = "\n".join(f"line {index}" for index in range(60))
         decision = self.route_local("claude", text, classification="client_derived")
+        self.assertEqual(decision["decision"], "local")
+        self.assertEqual(decision["fallback"], "none")
+        self.assertIsNotNone(decision["job_id"])
+
+    def test_an_unclassified_unit_is_still_refused_with_no_cloud_fallback(self):
+        text = "\n".join(f"line {index}" for index in range(60))
+        decision = self.route_local("claude", text, classification="unclassified")
         self.assertEqual(decision["decision"], "refused")
         self.assertEqual(decision["reason"], "classification_refused")
         self.assertEqual(decision["fallback"], "none")

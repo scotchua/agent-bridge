@@ -63,9 +63,11 @@ CLASSIFICATIONS = ("synthetic", "public", "internal_nonclient",
                    "client_derived", "unclassified")
 #: What the two provider lanes accept, matching ``execution_queue`` exactly.
 PEER_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
-#: What the local worker accepts, matching ``localq.spool`` exactly. Narrower
-#: than the peers' set only if the operator says so; identical by default.
-LOCAL_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+#: What the local worker accepts, matching ``localq.spool`` exactly. Wider
+#: than the peers' set: the local model runs on this machine, so client-derived
+#: text sent to it never leaves the host, and a local digest keeps it out of a
+#: provider's context rather than adding to it (Scott, 2026-09-24).
+LOCAL_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 
 #: Work shapes the gate can tell apart from a tool call. Deliberately coarse:
 #: a PreToolUse payload names files and commands, not intent, and inventing a
@@ -449,11 +451,13 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
             "retained_repo_unclassified",
             f"{signal.repo} has no operator classification, so no route is "
             f"eligible to receive it and the work stays with {signal.client}")
-    if repo_policy.classification == "client_derived":
+    if repo_policy.classification == "client_derived" and not (
+            "local" in repo_policy.allowed_routes and repo_policy.mechanical_ok
+            and signal.task_type == "mechanical"):
         return retain(
             "retained_classification_ineligible",
-            "client-derived material is outside this bridge's supported use "
-            "and is never dispatched to a peer or a local model")
+            "client-derived material goes only to the local model, and only as "
+            "mechanical work; it is never dispatched to a peer")
     if not repo_policy.allowed_routes:
         return retain(
             "retained_no_eligible_route",

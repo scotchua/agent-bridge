@@ -122,11 +122,14 @@ def _eligible(row: dict[str, Any]) -> bool:
     if not isinstance(considered, dict):
         return str(row.get("code", "")).startswith(ROUTED_PREFIX)
     classification = considered.get("classification")
-    if classification in (None, "unclassified", "client_derived"):
+    if classification in (None, "unclassified"):
         return False
     allowed = considered.get("allowed_routes")
     if not isinstance(allowed, list) or not allowed:
         return False
+    if classification == "client_derived":
+        # Local is the one route client-derived work may take.
+        return "local" in allowed and bool(considered.get("mechanical_ok"))
     caller = considered.get("client")
     return any(route != caller for route in allowed)
 

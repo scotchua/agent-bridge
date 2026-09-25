@@ -285,7 +285,7 @@ class CheckpointLedgerTests(unittest.TestCase):
         self.route_with_checkpoint(eligible_text, checkpoint_id=checkpoint["checkpoint_id"])
 
         refused = self.intake.checkpoint(task_id="audit-refused-classification", task_type="summarize",
-                                         classification="client_derived", caller="codex",
+                                         classification="unclassified", caller="codex",
                                          input_bytes=1000, nonblank_lines=50)
         self.assertEqual(refused["status"], "refused")
         self.assertEqual(refused["reason"], "classification_refused")

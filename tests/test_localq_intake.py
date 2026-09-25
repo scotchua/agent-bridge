@@ -55,6 +55,14 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(receipt["classification"], "internal_nonclient")
         self.assertEqual(receipt["input_sha256"], routed["input_sha256"])
 
+    def test_client_derived_mechanical_work_is_queued_locally(self):
+        # Scott, 2026-09-24: the on-device model is the safest processor of
+        # client data. The flag is recognized, not refused.
+        routed = self.route(classification="client_derived", risk_flags=["client_derived"])
+        self.assertEqual(routed["decision"], "local")
+        self.assertEqual(routed["fallback"], "none")
+        self.assertEqual(self.queue.status(routed["job_id"])["classification"], "client_derived")
+
     def test_small_work_is_refused_without_queue_or_fallback(self):
         routed = self.route(input="tiny note")
         self.assertEqual(routed["decision"], "refused")
@@ -68,8 +76,8 @@ class AutomaticIntakeTests(unittest.TestCase):
             {"task_type": "tax_position"},
             {"classification": "client"},
             {"risk_flags": ["professional_judgment"]},
-            {"risk_flags": ["client_derived"]},
             {"risk_flags": ["exact_sensitive_identifiers"]},
+            {"risk_flags": ["client_derived", "licensed_review"]},
         ]
         for index, changes in enumerate(cases):
             with self.subTest(changes=changes):

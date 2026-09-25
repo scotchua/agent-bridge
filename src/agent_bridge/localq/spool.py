@@ -24,7 +24,8 @@ from typing import Any, Callable, Protocol
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
 MECHANICAL_TASKS = frozenset({"summarize", "extract", "checklist", "log_triage", "test_draft"})
-ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+#: Includes client_derived: this queue's only worker is the on-device model.
+ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 #: Fixed refusal reason for a mechanical task type that is real (it is in
 #: ``MECHANICAL_TASKS``) but not carried by the queue's *currently configured*
 #: backend -- e.g. every kind but ``summarize`` when the backend is

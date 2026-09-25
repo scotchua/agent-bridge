@@ -801,6 +801,39 @@ class MeasuredCpuIdleRatioForAutomaticRouting(unittest.TestCase):
         self.assertIsNone(autodecide._measured_cpu_idle_ratio(self.local_queue_root))
 
 
+class ClientDerivedWorkGoesOnlyToTheLocalModel(unittest.TestCase):
+    """Scott, 2026-09-24: the on-device model is the safest processor of
+    client data. Mechanical client-derived work goes local; nothing
+    client-derived ever goes to a peer."""
+
+    def decide(self, routes, task_type="mechanical", fresh=("local", "codex")):
+        policy = autoroute.Policy(repos={"/r": autoroute.RepoPolicy(
+            "client_derived", tuple(routes), mechanical_ok=True)})
+        return autoroute.decide(
+            autoroute.Signal(client="claude", repo="/r", task_type=task_type),
+            policy, fresh_routes=frozenset(fresh), load=autoroute.Load(0.1, True))
+
+    def test_mechanical_client_derived_work_is_routed_local(self):
+        decision = self.decide(("claude", "codex", "local"))
+        self.assertEqual(decision.route, "local")
+        self.assertEqual(decision.code, "routed_local_mechanical")
+
+    def test_non_mechanical_client_derived_work_never_reaches_a_peer(self):
+        decision = self.decide(("claude", "codex", "local"), task_type="implementation")
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_classification_ineligible")
+
+    def test_client_derived_work_without_the_local_route_stays_put(self):
+        decision = self.decide(("claude", "codex"))
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_classification_ineligible")
+
+    def test_a_stale_local_route_retains_rather_than_falling_to_a_peer(self):
+        decision = self.decide(("claude", "codex", "local"), fresh=("codex",))
+        self.assertEqual(decision.route, autoroute.RETAIN)
+        self.assertEqual(decision.code, "retained_no_fresh_capacity")
+
+
 class LocalLoadCanBeRescuedByMeasuredIdle(unittest.TestCase):
     """Mirrors ``localfirst.readiness()``'s rescue: load-average-per-core
     conflates waiting-on-I/O with genuine CPU contention, so a directly
