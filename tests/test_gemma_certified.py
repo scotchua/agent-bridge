@@ -193,6 +193,7 @@ class ConfigAndSelectionTests(unittest.TestCase):
         self.assertEqual(gate.gate_paths_from_config(str(gemma_path))[3],
                          gemma["gemma_delegate_executable"])
 
+    @unittest.skipUnless(os.name == "posix", "certified Gemma backend requires POSIX process groups")
     def test_checkpoint_and_route_measure_the_same_unicode_payload(self):
         cfg = load(self.write(config_doc(self.root, self.fx)))
         service = Service.for_config(cfg, root=str(self.root / "unicode"), sampler=Sampler())
