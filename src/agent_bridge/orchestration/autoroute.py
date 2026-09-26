@@ -127,6 +127,7 @@ LOCAL_FIRST_KEYS = frozenset({
     "enabled", "latency_budget_seconds", "read_gate_min_bytes",
     "digest_max_output_chars", "calibration_max_age_days",
     "digest_grace_seconds", "executor_liveness_seconds", "default_globs",
+    "inline_output_router",
 })
 
 
@@ -171,6 +172,11 @@ class LocalFirstConfig:
     #: own. Narrow by design: a repository opts a file shape in, not "every
     #: large file".
     default_globs: tuple[str, ...] = ("**/*.log", "**/logs/**")
+    #: Explicit operator opt-in for pre-context command-output routing.  This
+    #: is separate from the read gate: it changes a Bash invocation before it
+    #: runs, and must never become active merely because a repository permits
+    #: local mechanical work.
+    inline_output_router: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -197,6 +203,8 @@ class LocalFirstConfig:
                 raise PolicyError(f"{name} must be a positive integer")
         if not isinstance(self.enabled, bool):
             raise PolicyError("local_first.enabled must be true or false")
+        if not isinstance(self.inline_output_router, bool):
+            raise PolicyError("local_first.inline_output_router must be true or false")
         if (not isinstance(self.default_globs, tuple)
                 or not self.default_globs
                 or any(not isinstance(glob, str) or not glob for glob in self.default_globs)):

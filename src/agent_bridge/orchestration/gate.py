@@ -1546,15 +1546,66 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     return write_decision
 
 
-def hook_output(decision: Decision) -> dict[str, Any]:
+def hook_output(decision: Decision, updated_input: dict[str, Any] | None = None) -> dict[str, Any]:
     """The PreToolUse wire shape both hosts read (``hookSpecificOutput``)."""
     if decision.allowed:
+        if updated_input is not None:
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "allow",
+                "updatedInput": updated_input,
+            }}
         return {}
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
         "permissionDecisionReason": f"{decision.reason} [{decision.code}]",
     }}
+
+
+def inline_output_update(client: str, payload: dict[str, Any], decision: Decision, *,
+                         state_root: str, config_path: str) -> dict[str, Any] | None:
+    """Return Claude's ``updatedInput`` for one eligible original Bash call.
+
+    This runs after :func:`run_hook`: the write/protected-path gate judges
+    the original command and remains the only authority on allow or deny.
+    The returned mapping changes only the command field.
+    """
+    if client != "claude" or not decision.allowed or payload.get("tool_name") != "Bash":
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    command = _command_text(tool_input)
+    if not command:
+        return None
+    try:
+        from . import output_router
+
+        cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
+        repo = repo_key(cwd)
+        if repo is None or not output_router.is_routable_command(command):
+            return None
+        policy = autoroute.load_policy(state_root)
+        repo_policy = policy.for_repo(repo)
+        if (not policy.local_first.inline_output_router or not repo_policy.mechanical_ok
+                or "local" not in repo_policy.allowed_routes
+                or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS):
+            return None
+        updated = dict(tool_input)
+        key = "command" if "command" in tool_input else "cmd"
+        # The host shell has no agent_bridge on its path: name this checkout's
+        # src explicitly, or the wrapper fails to import and the original
+        # command never runs at all.
+        src_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        updated[key] = (f"/usr/bin/env PYTHONPATH={shlex.quote(src_root)} PYTHONDONTWRITEBYTECODE=1 "
+                        f"{shlex.quote(sys.executable)} -P -m agent_bridge.orchestration.output_router run "
+                        f"--config {shlex.quote(os.path.realpath(config_path))} -- /bin/sh -c "
+                        f"{shlex.quote(command)}")
+        return updated
+    except Exception:
+        # An unreadable policy is not an opportunity to run a wrapper. The
+        # original gate judgment remains untouched.
+        return None
 
 
 #: Fields this function sets itself; a ``Decision.extra`` value under one of
@@ -2496,6 +2547,7 @@ def main(argv: list[str] | None = None) -> int:
     # decision travels in the JSON so the host applies it, and a deny is
     # a deny whatever went wrong on the way to it.
     state_root = None
+    updated_input = None
     try:
         if not args.client:
             raise ValueError("--client is required in hook mode")
@@ -2523,6 +2575,8 @@ def main(argv: list[str] | None = None) -> int:
                             decide=None if args.no_automatic_routing else
                             automatic_decider(args.client, state_root, capacity_db,
                                               local_queue_root))
+        updated_input = inline_output_update(args.client, payload, decision,
+                                             state_root=state_root, config_path=args.config or "")
     except Exception as exc:  # noqa: BLE001  fail closed, name only the class
         decision = Decision("deny", "gate_error",
                             f"delegation-first gate: could not judge this call ({type(exc).__name__}); "
@@ -2532,7 +2586,7 @@ def main(argv: list[str] | None = None) -> int:
                 record_event(state_root, args.client or "unknown", "unknown", decision)
             except Exception:  # noqa: BLE001  the deny stands whether or not it could be logged
                 pass
-    sys.stdout.write(json.dumps(hook_output(decision), sort_keys=True) + "\n")
+    sys.stdout.write(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n")
     return 0
 
 
