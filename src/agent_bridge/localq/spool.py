@@ -298,11 +298,7 @@ class LocalQueue:
                 # replacing or reading. A pre-existing name alone is not
                 # enough, though: accept that race only when it really is
                 # this content-addressed blob.
-                try:
-                    existing_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                except OSError:
-                    existing_digest = None
-                if existing_digest != digest:
+                if self._existing_blob_digest(target) != digest:
                     raise
             finally:
                 # A successful replace has already removed this name. On a
@@ -313,6 +309,21 @@ class LocalQueue:
                 except FileNotFoundError:
                     pass
         return digest
+
+    #: Windows also refuses the *read* while the other writer's replace is
+    #: in flight, so the verifying read retries briefly before concluding.
+    BLOB_VERIFY_ATTEMPTS = 20
+    BLOB_VERIFY_SLEEP_SECONDS = 0.025
+
+    def _existing_blob_digest(self, target: Path) -> str | None:
+        """The digest of an existing blob, or None if it cannot be read."""
+        for attempt in range(self.BLOB_VERIFY_ATTEMPTS):
+            try:
+                return hashlib.sha256(target.read_bytes()).hexdigest()
+            except OSError:
+                if attempt + 1 < self.BLOB_VERIFY_ATTEMPTS:
+                    time.sleep(self.BLOB_VERIFY_SLEEP_SECONDS)
+        return None
 
     def _read_blob(self, digest: str) -> Any:
         return json.loads((self.blobs / digest).read_text(encoding="utf-8"))

@@ -271,6 +271,32 @@ class CheckpointLedgerTests(unittest.TestCase):
 
         self.assertEqual(list(self.queue.blobs.glob("." + digest + ".*")), [])
 
+    def test_blob_verify_read_retries_a_transient_windows_sharing_refusal(self):
+        value = {"input": "read during replace"}
+        raw = self.queue._normalized(value).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self.queue.blobs / digest
+        real_read = type(target).read_bytes
+        refusals = {"left": 2}
+
+        def concurrent_writer(_temporary, _target):
+            target.write_bytes(raw)
+            raise PermissionError("sharing")
+
+        def read_bytes(path):
+            if path == target and refusals["left"]:
+                refusals["left"] -= 1
+                raise PermissionError("in use by the other writer's replace")
+            return real_read(path)
+
+        with mock.patch("agent_bridge.localq.spool.os.replace", side_effect=concurrent_writer), \
+                mock.patch.object(type(target), "read_bytes", read_bytes), \
+                mock.patch("agent_bridge.localq.spool.time.sleep") as sleep:
+            self.assertEqual(self.queue._blob(value), digest)
+        self.assertEqual(refusals["left"], 0)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(list(self.queue.blobs.glob("." + digest + ".*")), [])
+
     def test_blob_permission_error_rejects_a_missing_blob(self):
         value = {"input": "missing blob"}
         raw = self.queue._normalized(value).encode("utf-8")
