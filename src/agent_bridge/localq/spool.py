@@ -348,6 +348,19 @@ class LocalQueue:
             raise AdmissionError("resource_bulk_policy")
         return snapshot
 
+    def admit(self, priority: str) -> ResourceSnapshot:
+        """Check current resource admission without changing queue state.
+
+        Callers that need to decide whether to submit work must not reach
+        into ``_admit``.  This intentionally exposes the identical caps and
+        sampler check used immediately before execution; it does not reserve
+        capacity and it does not weaken the authoritative check in
+        :meth:`_run_once_under_lock`.
+        """
+        if priority not in {"interactive", "bulk"}:
+            raise AdmissionError("priority_invalid")
+        return self._admit(priority)
+
     def submit(self, *, task_type: str, input: str, params: dict[str, Any] | None,
                priority: str, classification: str, caller: str, purpose: str,
                idempotency_key: str | None = None) -> dict[str, Any]:
