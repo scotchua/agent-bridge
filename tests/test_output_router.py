@@ -8,13 +8,16 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
-from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration import autoroute, gate, output_router
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy  # noqa: E402
+from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot  # noqa: E402
+from agent_bridge.orchestration import autoroute, gate, output_router  # noqa: E402
 
 
 class GoodSampler:

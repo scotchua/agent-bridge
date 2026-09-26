@@ -290,7 +290,7 @@ def run_command(command: list[str], *, config_path: str) -> int:
         # One combined pipe preserves command output ordering, unlike two
         # independent pipes concatenated after completion.
         completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   check=False)
+                                   shell=False, check=False)
     except OSError as exc:
         sys.stdout.write(f"[local output routing waived: command_failure:{type(exc).__name__}]\n")
         return 127
