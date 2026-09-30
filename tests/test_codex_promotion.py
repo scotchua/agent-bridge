@@ -289,6 +289,30 @@ class Admission(TmpCase):
             self.refused("admission lock is missing")
             self.assertFalse(self.f.lock.exists())
 
+    def test_the_promotion_dir_follows_the_runner_state_home(self):
+        """The runner renamed its state from ~/.codex-bridge to ~/.codex-job-runner.
+        Same rule as its state_home(environ={}): the old name only while the new
+        one does not exist; with only the new one, never a second empty dir."""
+        home = self.root / "state-home"
+        home.mkdir()
+        with mock.patch.object(cp, "managed_home", return_value=home):
+            (home / ".codex-bridge").mkdir()
+            self.assertEqual(cp.default_promotion_dir(), home / ".codex-bridge" / "promotion")
+            (home / ".codex-job-runner").mkdir()
+            self.assertEqual(cp.default_promotion_dir(), home / ".codex-job-runner" / "promotion")
+            (home / ".codex-bridge").rmdir()
+            self.assertEqual(cp.default_promotion_dir(), home / ".codex-job-runner" / "promotion")
+            self.assertFalse((home / ".codex-bridge").exists())
+            (home / ".codex-job-runner").rmdir()
+            self.assertEqual(cp.default_promotion_dir(), home / ".codex-job-runner" / "promotion")
+
+    def test_after_the_migration_the_symlink_and_the_new_name_agree(self):
+        home = self.root / "migrated-home"
+        (home / ".codex-job-runner").mkdir(parents=True)
+        os.symlink(home / ".codex-job-runner", home / ".codex-bridge")
+        with mock.patch.object(cp, "managed_home", return_value=home):
+            self.assertEqual(cp.default_promotion_dir(), home / ".codex-job-runner" / "promotion")
+
     def test_no_environment_override_exists(self):
         """Finding 2: a worker environment cannot move admission away from the real gate."""
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_CODEX_PROMOTION_DIR": str(self.root / "absent")}):

@@ -131,8 +131,27 @@ def account_home()->Path:
     if pwd is None: return Path.home()  # pragma: no cover - no promotion controller there
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
+#: The job runner's state directory names (firm-claude-plugins,
+#: ``firm-tools/skills/codex-job-runner/state_home.py``). The runner was
+#: renamed from codex-bridge and moves its state with a reversible rename that
+#: leaves a symlink at the old name.
+RUNNER_STATE_NAME=".codex-job-runner"
+LEGACY_RUNNER_STATE_NAME=".codex-bridge"
+
 def default_promotion_dir()->Path:
-    return managed_home()/".codex-bridge"/"promotion"
+    """The promotion directory the runner's controller writes.
+
+    The same rule as the runner's own ``state_home(environ={})``: the legacy
+    ~/.codex-bridge only while ~/.codex-job-runner does not exist and the
+    legacy one does, otherwise ~/.codex-job-runner. A fixed old name would,
+    once the migration's symlink is removed, lock and read a second, empty
+    directory where the controller never writes a gate or a record, and admit
+    in transition mode. Like the runner, no environment variable moves it.
+    """
+    home=managed_home()
+    new,old=home/RUNNER_STATE_NAME,home/LEGACY_RUNNER_STATE_NAME
+    state=old if not new.exists() and old.exists() else new
+    return state/"promotion"
 
 
 def _check_home():
