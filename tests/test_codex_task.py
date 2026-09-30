@@ -259,7 +259,9 @@ class CodexTaskTests(unittest.TestCase):
              "--classification", "synthetic", "--tasks-dir", str(self.root / "tasks"),
              "--verify-json", json.dumps(["sh", "-c", "touch escaped"])],
             capture_output=True, text=True, env={**os.environ, "HOME": str(home)})
-        self.assertTrue((home / ".codex-bridge" / "promotion" / "admission.lock").is_file(), completed.stderr)
+        # A fresh home resolves to the runner's current state name, as the
+        # runner's own state_home does.
+        self.assertTrue((home / ".codex-job-runner" / "promotion" / "admission.lock").is_file(), completed.stderr)
         self.assertEqual(completed.returncode, 1, completed.stderr)
         failure = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertEqual(failure, {"ok": False, "error": "TaskError",
