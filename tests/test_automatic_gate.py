@@ -98,6 +98,12 @@ class AutoCase(unittest.TestCase):
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool,
                    "tool_input": tool_input,
                    "cwd": str(repo)}
+        return self.run_hook(client, payload, *args, timeout_is_host_limit=timeout_is_host_limit)
+
+    def run_hook(self, client: str, payload: dict, *args,
+                 timeout_is_host_limit: bool = True) -> dict:
+        """Run the real hook process once. Every hook call in this file goes
+        through here, so a slow host is reported the same way everywhere."""
         started = time.monotonic()
         completed = subprocess.run(
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
@@ -650,13 +656,7 @@ class TheRoutingEscapeAnAdversarialReviewFound(AutoCase):
     def bash(self, client, command, cwd=None):
         payload = {"tool_name": "Bash", "tool_input": {"command": command},
                    "cwd": str(cwd or self.repo)}
-        completed = subprocess.run(
-            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
-             "--client", client, "--config", str(self.config)],
-            input=json.dumps(payload).encode("utf-8"), capture_output=True,
-            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        return json.loads(completed.stdout)
+        return self.run_hook(client, payload)
 
     def nest(self):
         """A nested repository, as a submodule or a stray git init leaves one."""
