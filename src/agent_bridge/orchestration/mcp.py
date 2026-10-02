@@ -18,8 +18,9 @@ from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
 from ..localq import gemma_child
-from ..localq.intake import AutomaticIntake
-from ..localq.spool import AdmissionError, JobNotFound, LocalQueue, UNSUPPORTED_KIND_REASON
+from ..localq.intake import KNOWN_FLAGS, AutomaticIntake
+from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, AdmissionError, JobNotFound,
+                            LocalQueue, UNSUPPORTED_KIND_REASON)
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
@@ -88,12 +89,23 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 RoutingError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc) or type(exc).__name__}
 
+    # Fixed vocabularies, so a caller sees the accepted values before it
+    # guesses (4 of the first 15 plausible units were refused for a risk
+    # flag the intake does not know). The route tool dispatches work, so its
+    # fields are hard enums. The two checkpoint tools record decisions,
+    # including refusals of unknown values, so they name the values in
+    # descriptions instead of rejecting a call before it is recorded.
+    classifications = sorted(ALLOWED_CLASSIFICATIONS)
+    flags = sorted(KNOWN_FLAGS)
+    mechanical = sorted(MECHANICAL_TASKS)
+    flags_hint = ("Known flags: " + ", ".join(flags) + ". Any other value is refused "
+                  "risk_flags_invalid; client_derived needs classification client_derived.")
     route = _schema({
-        "task_type": {"type": "string"},
+        "task_type": {"type": "string", "enum": mechanical},
         "input": {"type": "string", "maxLength": 24000},
         "params": {"type": "object"},
         "priority": {"type": "string", "enum": ["interactive", "bulk"]},
-        "classification": {"type": "string"},
+        "classification": {"type": "string", "enum": classifications},
         # Deliberately no "purpose" property (finding: an assistant-facing
         # schema that accepted it let a caller label real work "test" and
         # skip the checkpoint requirement). The handler always routes as
@@ -101,7 +113,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         # provenance field either, for the same reason work_digest_file's
         # own docstring already gives for classification: the server-bound
         # caller is the only truth this tool ever forwards.
-        "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        "risk_flags": {"type": "array", "items": {"type": "string", "enum": flags},
+                       "uniqueItems": True},
         "idempotency_key": {"type": "string", "maxLength": 256},
         "checkpoint_id": {"type": "string", "minLength": 1,
                           "description": "Optional prior work_checkpoint result for this exact unit."},
@@ -120,17 +133,19 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
     # this tool.
     checkpoint_schema = _schema({
         "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
-        "task_type": {"type": "string"},
-        "classification": {"type": "string"},
+        "task_type": {"type": "string", "description": "Mechanical kinds: " + ", ".join(mechanical)
+                      + ". Name any other kind truthfully; it is recorded as needing cloud or human judgment."},
+        "classification": {"type": "string", "description": "One of: " + ", ".join(classifications) + "."},
         "input_bytes": {"type": "integer", "minimum": 0},
         "nonblank_lines": {"type": "integer", "minimum": 0},
-        "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        "risk_flags": {"type": "array", "items": {"type": "string"}, "uniqueItems": True,
+                       "description": flags_hint},
         "idempotency_key": {"type": "string", "maxLength": 256},
     }, ["task_id", "task_type", "classification", "input_bytes", "nonblank_lines"])
     no_eligible_unit_schema = _schema({
         "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "task_type": {"type": "string"},
-        "classification": {"type": "string"},
+        "classification": {"type": "string", "description": "One of: " + ", ".join(classifications) + "."},
         "idempotency_key": {"type": "string", "maxLength": 256},
     }, ["task_id", "task_type", "classification"])
     identity = {

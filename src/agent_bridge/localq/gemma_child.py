@@ -102,6 +102,21 @@ def _effective_options(timeout: float) -> dict[str, Any]:
     }
 
 
+def params_refusal(params: dict[str, Any]) -> str | None:
+    """The certified delegate's whole parameter contract, as a fixed reason.
+
+    The queue calls this at submission, so a job the delegate will refuse is
+    refused before it is queued (two of the first nine live jobs failed
+    ``custom_instruction_unsupported`` only after waiting their turn), and
+    ``invoke`` calls it again before running anything.
+    """
+    if set(params) - {"instruction"}:
+        return "params_invalid_for_gemma_certified"
+    if params.get("instruction", "") not in ("", CERTIFIED_SUMMARIZE_INSTRUCTION):
+        return "custom_instruction_unsupported"
+    return None
+
+
 def invoke(payload: dict[str, Any], *, delegate: str, python: str,
            receipt_root: str, receipt_validator: str, model_digest: str,
            delegate_sha256: str, validator_sha256: str,
@@ -116,11 +131,11 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
     params = payload.get("params")
     if not isinstance(params, dict):
         raise ValueError("params_invalid")
-    if set(params) - {"instruction"}:
-        raise ValueError("params_invalid_for_gemma_certified")
-    instruction = params.get("instruction", "")
-    if instruction not in ("", CERTIFIED_SUMMARIZE_INSTRUCTION):
-        raise GemmaRefusal("custom_instruction_unsupported")
+    reason = params_refusal(params)
+    if reason == "custom_instruction_unsupported":
+        raise GemmaRefusal(reason)
+    if reason is not None:
+        raise ValueError(reason)
     job_id = payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("job_id_invalid")
