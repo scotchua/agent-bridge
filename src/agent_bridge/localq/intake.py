@@ -69,6 +69,24 @@ CHECKPOINT_REASONS = frozenset({
 #: fired still appears with a zero count rather than being absent.
 CLOSED_REFUSAL_REASONS = frozenset(CHECKPOINT_REASONS - {"eligible_mechanical_work", "no_eligible_unit"})
 
+#: Every risk flag the intake recognizes. Anything else is risk_flags_invalid.
+KNOWN_FLAGS = frozenset(PROHIBITED_FLAGS | PERMITTED_FLAGS)
+
+
+def accepted_values(reason: str, allowed_task_types: "frozenset[str]") -> dict[str, list[str]]:
+    """The fixed vocabulary a refusal was about, so the caller can correct
+    the request instead of guessing (4 of the first 15 plausible units were
+    refused risk_flags_invalid). Static lists only, never request content."""
+    if reason == "risk_flags_invalid":
+        return {"accepted_risk_flags": sorted(KNOWN_FLAGS)}
+    if reason == "classification_refused":
+        return {"accepted_classifications": sorted(ALLOWED_CLASSIFICATIONS)}
+    if reason == UNSUPPORTED_KIND_REASON:
+        return {"accepted_task_types": sorted(allowed_task_types)}
+    if reason == "task_requires_cloud_or_human_judgment":
+        return {"mechanical_task_types": sorted(MECHANICAL_TASKS)}
+    return {}
+
 #: Sanity bounds on the metrics a checkpoint declares. These are not queue
 #: capacity limits (a checkpoint never submits anything); they exist only so
 #: a malformed or hostile declaration cannot wedge the ledger with a
@@ -327,9 +345,8 @@ class AutomaticIntake:
         if mismatch:
             raise AdmissionError("idempotency_key_conflict")
 
-    @staticmethod
-    def _public_checkpoint(row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
-        return {
+    def _public_checkpoint(self, row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
+        return {**accepted_values(row["reason"], self.queue.allowed_task_types),
             "checkpoint_id": row["checkpoint_id"], "created_at": row["created_at"],
             "policy_version": row["policy_version"], "task_id": row["task_id"],
             "task_type": row["task_type"], "classification": row["classification"],
@@ -525,9 +542,8 @@ class AutomaticIntake:
             raise RuntimeError("routing receipt unavailable")
         return self._public(row, deduplicated=False)
 
-    @staticmethod
-    def _public(row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
-        return {
+    def _public(self, row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
+        return {**accepted_values(row["reason"], self.queue.allowed_task_types),
             "receipt_id": row["receipt_id"], "created_at": row["created_at"],
             "policy_version": row["policy_version"], "classification": row["classification"],
             "decision": row["decision"], "reason": row["reason"],

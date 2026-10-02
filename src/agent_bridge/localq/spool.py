@@ -376,6 +376,11 @@ class LocalQueue:
             raise AdmissionError("priority_invalid")
         if not isinstance(params or {}, dict):
             raise AdmissionError("params_invalid")
+        if self.backend_id == "gemma_certified":
+            from . import gemma_child  # deferred: only the gemma lane needs it
+            reason = gemma_child.params_refusal(params or {})
+            if reason is not None:
+                raise AdmissionError(reason)
         if not isinstance(input, str):
             raise AdmissionError("input_invalid")
         payload = {"task_type": task_type, "input": input, "params": params or {},
