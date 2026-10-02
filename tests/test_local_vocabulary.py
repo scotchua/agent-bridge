@@ -107,20 +107,34 @@ class TheToolSchemasStateTheVocabulary(Fixture):
         router = StageRouter(os.path.join(temp.name, "capacity.sqlite3"))
         return build_tools("claude", router, queue, self.intake(queue))
 
-    def test_routing_work_takes_only_known_values(self):
-        props = self.tools()["work_route_local"]["inputSchema"]["properties"]
-        self.assertEqual(props["task_type"]["enum"], sorted(MECHANICAL_TASKS))
-        self.assertEqual(props["classification"]["enum"], sorted(ALLOWED_CLASSIFICATIONS))
-        self.assertEqual(props["risk_flags"]["items"]["enum"], sorted(KNOWN_FLAGS))
+    def test_every_tool_names_the_values_but_none_rejects_before_recording(self):
+        """An enum a client enforces would stop an unknown value before the
+        call reached the ledger. Every refusal must be recorded."""
+        tools = self.tools()
+        for name in ("work_route_local", "work_checkpoint"):
+            with self.subTest(tool=name):
+                props = tools[name]["inputSchema"]["properties"]
+                self.assertNotIn("enum", props["task_type"])
+                self.assertNotIn("enum", props["classification"])
+                self.assertNotIn("enum", props["risk_flags"]["items"])
+                for kind in sorted(MECHANICAL_TASKS):
+                    self.assertIn(kind, props["task_type"]["description"])
+                for value in sorted(ALLOWED_CLASSIFICATIONS):
+                    self.assertIn(value, props["classification"]["description"])
+                for flag in sorted(KNOWN_FLAGS):
+                    self.assertIn(flag, props["risk_flags"]["description"])
+                self.assertIn("always refuses", props["risk_flags"]["description"])
 
-    def test_a_checkpoint_names_the_values_but_still_records_any(self):
-        props = self.tools()["work_checkpoint"]["inputSchema"]["properties"]
-        self.assertNotIn("enum", props["classification"])
-        self.assertNotIn("enum", props["risk_flags"]["items"])
-        for value in sorted(ALLOWED_CLASSIFICATIONS):
-            self.assertIn(value, props["classification"]["description"])
-        for flag in sorted(KNOWN_FLAGS):
-            self.assertIn(flag, props["risk_flags"]["description"])
+    def test_a_route_refusal_names_the_accepted_values_and_is_recorded(self):
+        queue = self.queue()
+        intake = self.intake(queue)
+        result = intake.route(task_type="summarize", input="text\n" * 50, params={},
+                              priority="interactive", classification="synthetic",
+                              caller="claude", purpose="test", risk_flags=["client"])
+        self.assertEqual(result["decision"], "refused")
+        self.assertEqual(result["reason"], "risk_flags_invalid")
+        self.assertEqual(result["accepted_risk_flags"], sorted(KNOWN_FLAGS))
+        self.assertEqual(intake.receipt(result["receipt_id"])["reason"], "risk_flags_invalid")
 
 
 if __name__ == "__main__":

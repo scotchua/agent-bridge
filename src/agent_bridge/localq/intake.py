@@ -542,9 +542,8 @@ class AutomaticIntake:
             raise RuntimeError("routing receipt unavailable")
         return self._public(row, deduplicated=False)
 
-    @staticmethod
-    def _public(row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
-        return {
+    def _public(self, row: sqlite3.Row, *, deduplicated: bool = False) -> dict[str, Any]:
+        return {**accepted_values(row["reason"], self.queue.allowed_task_types),
             "receipt_id": row["receipt_id"], "created_at": row["created_at"],
             "policy_version": row["policy_version"], "classification": row["classification"],
             "decision": row["decision"], "reason": row["reason"],
