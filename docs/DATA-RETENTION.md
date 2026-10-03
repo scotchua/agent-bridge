@@ -47,6 +47,26 @@ never deleted or truncated by this command, regardless of the retention
 settings. Changing the day values in `config/local.json` changes eligibility;
 it still does not schedule cleanup.
 
+## Agent Room, Hermes and Grok
+
+The optional Agent Room keeps its own owner-only state directory (default
+`~/.agent-bridge/chat`): a SQLite file with room messages, jobs, sessions,
+preferences and peer rounds, plus short-lived runtime files holding loopback
+credentials. Round payloads are cleared when a round ends; room history stays
+until you delete the room. See [peer rounds](PEER-ROUNDS.md#context-and-privacy).
+
+Hermes job directories live under the room state and are deleted once the reply
+is read, or after 24 hours if unread. The Grok queue is a separate owner-only
+directory (default `~/.agent-bridge/grok`): a reply is deleted when the room
+reads it, cancelled or stale jobs after 24 hours, and deleting a room cancels
+its queued job. Hermes and Grok may keep their own copies of what they received
+under their providers' terms; nothing here deletes those.
+
+The optional output router keeps each routed command's full output under the
+orchestration state root (`routing/inline-output/`, owner-only) for 30 days,
+and records content-free metadata (bytes, repository, outcome) in
+`routing/inline-output-routing.jsonl`.
+
 ## Uninstall and provider records
 
 The guided uninstaller removes bridge registrations and managed instruction
