@@ -142,6 +142,7 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
                                 raise ValueError('Delete confirmation required')
                             if rounds is not None:
                                 rounds.delete_room(room)
+                            dispatcher.cancel_room(room)
                             result = store.delete_room(room)
                         elif parts[3] == 'preferences':
                             result = store.preferences(room, body['lead'], body['participants'])

@@ -188,7 +188,7 @@ class RoomStore:
             row = db.execute('SELECT * FROM room_preferences WHERE room=?', (room_id,)).fetchone()
             if row:
                 return {'lead': row['lead'], 'participants': [p for p in json.loads(row['participants']) if p in self.participants]}
-            return {'lead': self.participants[0], 'participants': [p for p in self.participants if p != 'hermes']}
+            return {'lead': self.participants[0], 'participants': [p for p in self.participants if p in PARTICIPANTS]}
     def rename_room(self, room_id, title):
         if not isinstance(title,str) or not title.strip() or len(title)>100:
             raise ValueError('Room title must contain 1-100 characters')

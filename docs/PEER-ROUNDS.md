@@ -83,6 +83,10 @@ layout and the private state directory; there is no hand-written
 profile being signed in. Hermes is a third-party provider, so the offline test
 suite never makes a live provider call.
 
+The Grok queue is a separate draft integration in
+[`GROK-ROOM-SETUP.md`](GROK-ROOM-SETUP.md). It is not ready for review until
+Scott approves adding xAI/Grok as a provider.
+
 If the room uses a custom state directory, pass the same directory with
 --state-dir. Do not expose the stdio service publicly.
 

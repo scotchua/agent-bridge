@@ -13,6 +13,7 @@ from .storage import RoomStore
 from .dispatch import Dispatcher
 from .adapters import BridgeAdapter
 from .hermes import HermesAdapter
+from .grok import GrokAdapter
 from .rounds import PeerRounds
 from .policy import RoomPolicy, room_config
 from .server import create_server
@@ -27,7 +28,7 @@ def _local_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
-def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | None = None):
+def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | None = None, grok_state_dir: Path | None = None):
     bridge_store.set_umask()
     root = Path(root).resolve()
     prepare_private_directory(root)
@@ -54,15 +55,26 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
         if adapters['hermes'].status().get('state') == 'ready':
             participants.append('hermes')
+    if grok_state_dir is not None:
+        grok_root = Path(grok_state_dir).resolve()
+        if grok_root == root or grok_root in root.parents or root in grok_root.parents:
+            raise ValueError('Grok queue directory must be separate from the room state directory')
+        adapters['grok'] = GrokAdapter(grok_root, policy)
+        if adapters['grok'].status().get('state') == 'ready':
+            participants.append('grok')
+    elif 'grok' in adapters:
+        del adapters['grok']
     room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=tuple(participants))
     if not room_store.rooms():
         room_store.create_room('My agents')
     room_store.recover_interrupted()
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
-    round_adapters = {p: adapters[p] for p in participants}
+    # Grok communicates only through its local queue helper; it has no MCP peer client.
+    peer_participants = [p for p in participants if p != 'grok']
+    round_adapters = {p: adapters[p] for p in peer_participants}
     rounds = PeerRounds(room_store, round_adapters, policy)
-    rounds_token = {caller: secrets.token_urlsafe(32) for caller in participants}
+    rounds_token = {caller: secrets.token_urlsafe(32) for caller in peer_participants}
     server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
     server.peer_rounds, server.rounds_token = rounds, rounds_token
     return server, room_store, dispatcher, token
@@ -73,6 +85,7 @@ def main(argv=None):
     parser.add_argument('--open', action='store_true')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat')
     parser.add_argument('--hermes-executable', type=Path, help='Optional installed Hermes CLI; always uses its default profile')
+    parser.add_argument('--grok-state-dir', type=Path, help='Opt in to the existing Grok Bot queue at this private state directory')
     args = parser.parse_args(argv)
     root = args.state_dir.resolve()
     prepare_private_directory(root)
@@ -96,7 +109,7 @@ def main(argv=None):
             raise SystemExit('Another room instance is starting or not responding. Retry shortly.')
     server = dispatcher = None
     try:
-        server, _, dispatcher, token = build_app(root, hermes_executable=args.hermes_executable)
+        server, _, dispatcher, token = build_app(root, hermes_executable=args.hermes_executable, grok_state_dir=args.grok_state_dir)
         bridge_store.atomic_write_json(str(runtime_path), {'port': server.server_port, 'token': token})
         bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'tokens': server.rounds_token, 'participants': list(server.peer_rounds.participants)})
         thread = threading.Thread(target=dispatcher.loop, daemon=True)

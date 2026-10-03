@@ -1,4 +1,5 @@
 from test_chat_storage import StorageTests
+import threading
 from agent_bridge.chat.dispatch import Dispatcher
 
 
@@ -88,3 +89,30 @@ class DispatchTests(StorageTests):
         self.assertTrue(d.run_once())
         self.assertTrue(d.run_once())
         self.assertEqual([j['status'] for j in self.store.snapshot(self.room)['jobs']],['completed','completed'])
+
+    def test_cancel_room_uses_the_provider_job_id(self):
+        class BlockingPeer(FakePeer):
+            def __init__(self):
+                self.started, self.release, self.cancelled = threading.Event(), threading.Event(), []
+
+            def start(self, prompt, classification):
+                self.started.set()
+                return {'ok': True, 'job_id': 'provider-job', 'conversation_id': 'c'}
+
+            def poll(self, job_id):
+                self.release.wait(2)
+                return {'ok': True, 'status': 'running'}
+
+            def cancel(self, job_id):
+                self.cancelled.append(job_id)
+
+        peer = BlockingPeer()
+        self.store.submit(self.room, 'r', 'hello', ['claude'], 'public')
+        dispatcher = Dispatcher(self.store, {'claude': peer})
+        worker = threading.Thread(target=dispatcher.run_once)
+        worker.start()
+        self.assertTrue(peer.started.wait(1))
+        dispatcher.cancel_room(self.room)
+        self.assertEqual(peer.cancelled, ['provider-job'])
+        peer.release.set()
+        worker.join(2)

@@ -1,4 +1,6 @@
 from test_chat_storage import StorageTests
+from agent_bridge.chat.storage import RoomStore
+from agent_bridge.chat.dispatch import Dispatcher
 
 class RoomManagementTests(StorageTests):
     def test_rename_preserves_history(self):
@@ -20,3 +22,23 @@ class RoomManagementTests(StorageTests):
             for table in ('messages','requests','jobs','sessions','room_preferences','discussion_jobs'):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0],0)
         self.assertFalse(self.store.is_running(job['id']))
+
+    def test_delete_cancels_active_provider_work_before_removing_room(self):
+        class Peer:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel(self, job_id):
+                self.cancelled.append(job_id)
+
+        peer = Peer()
+        store = RoomStore(self.path, participants=('claude', 'codex', 'grok'))
+        room = store.create_room('Grok room')['id']
+        store.submit(room, 'r', 'topic', ['grok'], 'synthetic')
+        job = store.claim_next()
+        dispatcher = Dispatcher(store, {'grok': peer})
+        dispatcher.cancel_room(room)
+        self.assertEqual(peer.cancelled, [])
+        self.assertEqual(store.snapshot(room)['jobs'][0]['status'], 'cancelled')
+        store.delete_room(room)
+        self.assertNotIn(room, [entry['id'] for entry in store.rooms()])

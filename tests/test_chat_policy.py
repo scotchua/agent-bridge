@@ -32,3 +32,11 @@ class PolicyTests(StorageTests):
     def test_insecure_storage_refuses_room(self):
         with patch('agent_bridge.chat.policy.verify_private_directory', side_effect=ValueError('ACL failed')):
             with self.assertRaises(ValueError): room_config(config.load(), RoomPolicy(False))
+
+    def test_global_classification_policy_applies_to_grok(self):
+        cfg = config.load()
+        cfg.raw = copy.deepcopy(cfg.raw)
+        cfg.raw['allowed_source_classifications'] = ['public', 'synthetic']
+        policy = RoomPolicy(cfg)
+        with self.assertRaises(ValueError):
+            policy.authorize('grok', 'internal')

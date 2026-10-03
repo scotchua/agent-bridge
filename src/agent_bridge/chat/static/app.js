@@ -38,7 +38,7 @@ async function refresh() {
   participantStates=status.participants;
   for(const p of status.participants) {
     const card=node('div',undefined,'participant '+p.state); card.append(node('strong',p.id),node('small',p.state.replaceAll('_',' '))); card.title=p.detail||'';
-    if(['claude','codex','hermes'].includes(p.id)) { const reset=node('button','Fresh consultation'); reset.title='Starts a new agent session with saved room history.'; reset.onclick=async()=>{try {await api('/api/rooms/'+roomId+'/reset',{target:p.id});$('error').textContent='Next request starts fresh with the saved room history.';}catch(e){error(e);}};card.append(reset); }
+    if(['claude','codex','hermes','grok'].includes(p.id)) { const reset=node('button','Fresh consultation'); reset.title='Starts a new agent session with saved room history.'; reset.onclick=async()=>{try {await api('/api/rooms/'+roomId+'/reset',{target:p.id});$('error').textContent='Next request starts fresh with the saved room history.';}catch(e){error(e);}};card.append(reset); }
     $('participants').append(card);
     const label=node('label'); const input=node('input');input.type='checkbox';input.value=p.id;input.disabled=p.state!=='ready'; input.checked=selected.has(p.id);input.onchange=()=>{input.checked?selected.add(p.id):selected.delete(p.id);savePreferences();};label.append(input,document.createTextNode(' '+p.id));$('recipients').append(label);
   }

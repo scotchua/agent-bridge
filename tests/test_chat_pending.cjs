@@ -17,16 +17,17 @@ vm.runInContext(`
 `, context);
 console.log('Pending send retry tests passed');
 vm.runInContext(`
- const statuses = [{id:'codex',state:'verification_required'},{id:'claude',state:'ready'},{id:'hermes',state:'ready'}];
+ const statuses = [{id:'codex',state:'verification_required'},{id:'claude',state:'ready'},{id:'hermes',state:'ready'},{id:'grok',state:'ready'}];
  let rejected=false;
  try { addressedRecipients('@codex are you there?', [], statuses); } catch(e) { rejected=true; }
  if(!rejected) throw new Error('Unavailable mention silently saved as note');
  if(addressedRecipients('@claude hello', [], statuses)[0]!=='claude') throw new Error('Ready mention was not addressed');
  if(addressedRecipients('@hermes hello', [], statuses)[0]!=='hermes') throw new Error('Ready Hermes mention was not addressed');
+ if(addressedRecipients('@grok hello', [], statuses)[0]!=='grok') throw new Error('Ready Grok mention was not addressed');
  if(addressedRecipients('Just a note', [], statuses).length!==0) throw new Error('Plain note dispatched inference');
 `, context);
 vm.runInContext(`
- const ready = ['claude','codex','hermes'].map(id=>({id,state:'ready'}));
+ const ready = ['claude','codex','hermes','grok'].map(id=>({id,state:'ready'}));
  if(conversationRecipients('hello','chat','codex',['claude'],ready).join()!=='codex') throw Error('Lead routing failed');
  if(conversationRecipients('@claude help','chat','codex',[],ready).join()!=='claude') throw Error('Mention should override lead');
  if(conversationRecipients('hello','discuss','codex',['claude'],ready).join()!=='claude,codex') throw Error('Discussion must include lead');

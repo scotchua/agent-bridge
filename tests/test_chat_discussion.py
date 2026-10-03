@@ -45,3 +45,9 @@ class DiscussionTests(StorageTests):
         self.assertEqual([j['status'] for j in self.store.snapshot(self.room)['jobs']],['failed','completed','completed'])
     def test_new_room_discussion_includes_registered_providers(self):
         self.assertEqual(set(self.store.preferences(self.room)['participants']), {'claude','codex'})
+
+    def test_new_room_defaults_exclude_optional_providers(self):
+        from agent_bridge.chat.storage import RoomStore
+        store = RoomStore(self.path, participants=('claude', 'codex', 'hermes', 'grok'))
+        room = store.create_room('Optional providers are manual')['id']
+        self.assertEqual(store.preferences(room), {'lead': 'claude', 'participants': ['claude', 'codex']})

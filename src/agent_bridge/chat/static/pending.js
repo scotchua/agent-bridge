@@ -1,7 +1,7 @@
 'use strict';
 function addressedRecipients(text, selected, statuses) {
   const recipients = new Set(selected);
-  for (const match of text.matchAll(/@(claude|codex|hermes)\b/gi)) {
+  for (const match of text.matchAll(/@(claude|codex|hermes|grok)\b/gi)) {
     const id = match[1].toLowerCase();
     const status = statuses.find(p => p.id === id);
     if (!status || status.state !== 'ready') throw new Error(id + ' is not connected yet. Your draft has been kept; it was not sent or saved as a note.');

@@ -19,7 +19,7 @@ class RoomPolicy:
     def _allowed(self, target: str) -> tuple[str, ...]:
         if self.cfg is None:
             return LABELS
-        if target == 'hermes':
+        if target in ('hermes', 'grok'):
             return self.cfg.allowed_classifications
         return tuple(self.cfg.peer_allowed_classifications(target))
 
@@ -30,12 +30,12 @@ class RoomPolicy:
 
     def authorize(self, target: str, classification: str) -> None:
         if self.cfg is not None:
-            if target != 'hermes':
+            if target not in ('hermes', 'grok'):
                 try:
                     self.cfg.peer(target)
                 except (KeyError, ValueError):
                     raise ValueError('Unknown peer') from None
-        elif target not in ('claude', 'codex', 'hermes'):
+        elif target not in ('claude', 'codex', 'hermes', 'grok'):
             raise ValueError('Unknown peer')
         if classification not in LABELS or classification not in self._allowed(target):
             raise ValueError('Room policy refuses this classification')
