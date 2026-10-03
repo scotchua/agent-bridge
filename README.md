@@ -26,12 +26,14 @@ CLIs without automatically applying their patches.
 The bridge runs on your computer. Claude and Codex consultations still go to
 their providers through your own accounts.
 
-An optional experimental [peer-round extension](docs/PEER-ROUNDS.md) adds
-human-approved, selected-context consultations with the other Claude or Codex
-peer, plus a local Agent Room for review and recording. It reuses the existing
-Claude/Codex bridge and is off unless separately started and configured.
-Replies never trigger
-another round automatically.
+An optional experimental **Agent Room** ([peer rounds](docs/PEER-ROUNDS.md))
+adds a local, human-approved place to put a selected question to several
+assistants at once and keep their replies side by side. It reuses the existing
+Claude/Codex bridge and is off unless you start it. Two optional third-party
+providers can join the room if you opt in: **Hermes**, through its installed
+CLI, and **Grok**, through a manually approved local queue that the Grok Bot
+desktop app works ([setup](docs/GROK-ROOM-SETUP.md)). Neither is ever selected
+by default, and replies never trigger another round automatically.
 
 ## Why you might want this
 
@@ -103,6 +105,9 @@ portable guided commands, see [SETUP-WITH-AN-AGENT.md](docs/SETUP-WITH-AN-AGENT.
 | Optional local worker | Bounded summarization, extraction, classification, checklists and log triage through an existing Ollama model. |
 | Advanced orchestration | Durable stage ownership, capacity the operator declares or the hook observes first-hand, automatic admission for eligible mechanical work sent to a local model, and bounded cross-provider implementation jobs. |
 | Delegation-first gate | The routing decision is made automatically before implementation, from your own policy, and no edit happens without a receipt naming the route. Includes an audit of what was eligible, routed, retained and bypassed. |
+| Agent Room (optional) | A local, loopback-only room where you approve one selected question to several assistants and read their replies together. |
+| Optional third-party providers | Hermes (installed CLI, default profile) and Grok (a local queue a Grok Bot works through two approved commands). Off unless you opt in at launch; never pre-selected in a room. |
+| Output router (optional) | Large read-only command output (logs, test runs, `git log`/`diff`) summarized by your local model before it reaches the cloud assistant; the full output stays on disk. Off by default. |
 | Exchange records | Prompts, replies, job status and available model/version/effort provenance. |
 | Guided installation and removal | Staged settings, verification, backups, conflict checks and an uninstall preview. |
 
@@ -176,7 +181,17 @@ more than consultation. It can:
   marks `mechanical_ok` -- off by default, and never for text an assistant
   never captured to a file; and
 - **make the routing decision automatically, and refuse implementation
-  without one.**
+  without one**; and
+- **route large read-only command output to the local model before it
+  enters the assistant's context** (the output router). It is off by default
+  and switched on by `local_first.inline_output_router` in the operator's
+  routing policy, for Claude Code only. The command still runs exactly as
+  asked; its full output is kept on disk and the assistant receives a local
+  digest with the path to the full text. Any refusal, timeout or failure falls
+  back to the original output with a one-line note saying why. A digest adds
+  local-model latency (about 25 seconds in its first measured run) and, on
+  the certified Gemma backend, is short; the assistant may still need to open
+  the full output.
 
 Cross-provider implementation runs in disposable Git worktrees and returns an
 unapplied patch. It never grants permission to apply, commit, push or merge.
@@ -216,7 +231,10 @@ files. Unsupported work refuses before queueing and never substitutes Qwen,
 Apple, or a cloud provider. Calibration and the live executor heartbeat are
 also bound to the selected backend, so an old private-worker process cannot
 satisfy Gemma readiness after a configuration change; restart the connected
-apps after changing the backend. See
+apps after changing the backend. The Gemma certificate is bound to the exact
+Ollama runtime version: when Ollama updates itself, the delegate refuses
+(`matching_certificate_missing`) until an automatic recertification on the new
+runtime passes. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md#certified-gemma-local-backend).
 
 Saying yes also installs the **delegation-first gate**, which is the part that
@@ -478,7 +496,30 @@ a newly cleared continuation to recover.
   harness (a restricted tool allowlist, no shell), Codex retains its own shell
   tool inside that sandbox. Confinement is exactly what Codex documents for
   `workspace-write`, no more, and read confinement is not claimed for either
-  harness. A bundled harness proves the lane can be constructed and its
+  harness. On macOS the Claude harness now also runs generation inside a
+  `sandbox-exec` **write fence**: network and reads stay open, and writes are
+  limited to the job's worktree, a private temp directory, the lane's own
+  login store and the CLI's lock files; the login keychain is writable only
+  by the system `security` program. A worktree containing a hard-linked file
+  is refused, because the fence judges writes by path. Linux generation is
+  unfenced, and its receipt says so.
+- **Execution jobs check their verification programs first.** The worker
+  refuses a job, before any model run, when a verify program is not on its own
+  `PATH` (`verify_not_runnable`). It looks names up and runs nothing, so it
+  does not catch an interpreter that exists but lacks a test package.
+- **Claude implementation jobs may come back empty.** In three synthetic runs
+  with Claude Code CLI 2.1.277, the non-interactive CLI declined its own Write
+  tool under `--permission-mode auto`, so no file changed. Treat Claude
+  execution-lane output as unverified until a real job writes a patch.
+- **Hermes and Grok are third-party providers.** What you send them is
+  processed under their own terms: Hermes through its default profile and
+  login, Grok through the Grok Bot app and your xAI account. Labels are policy
+  metadata, not content scanning. The Grok queue relies on the person running
+  the Bot approving each of its two commands; this repository cannot see or
+  limit the Bot's other capabilities. Grok joins a room only if its Bot checked
+  in within 90 seconds before the room started, and it takes no part in peer
+  rounds. Both have only offline tests here; no live provider call is made in
+  CI. A bundled harness proves the lane can be constructed and its
   offline contract tested; it is not a substitute for the live synthetic
   verification this machine's signed-in CLIs still have to pass.
 - **The read gate's two clients are not equally strong, and it does not
@@ -532,6 +573,10 @@ configuration are retained separately.
 | `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
 | `docs/orchestration-mcp.md` | Manual advanced orchestration, local routing and external execution-worker setup. |
 | `docs/DELEGATION-GATE.md` | Host-enforced delegation-first gate, automatic routing, the audit report, and their stated limits. |
+| `docs/PEER-ROUNDS.md` | Agent Room, human-approved peer rounds, and the optional Hermes provider. |
+| `docs/GROK-ROOM-SETUP.md` | The optional Grok Bot local queue and its two-command boundary. |
+| `start_chat.py` / `grok_room.py` | Agent Room launcher; the Grok Bot's queue helper. |
+| `src/agent_bridge/chat/` | Agent Room server, storage, peer rounds and the Hermes and Grok adapters. |
 | `docs/audits/automatic-delegation-2026-09-15.md` | What the automatic component was live-tested against, and what remains unproven. |
 | `setup_bridge.py` | Portable launcher for onboarding and bridge commands. |
 | `examples/onboarding-answers.json` | Example setup-answer schema, not preapproved choices. |
@@ -554,6 +599,13 @@ install the current implementation.
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report
 security issues through the private path in [SECURITY.md](SECURITY.md), not in a
 public issue.
+
+## Acknowledgements
+
+Thanks to **Brooks** ([@Bsoutherland233](https://github.com/Bsoutherland233))
+for the Agent Room's provider-neutral peer rounds and the Hermes and Grok
+adapters (pull requests #17 to #20), for working through several review rounds
+on them, and for testing them in a Windows environment.
 
 ## Licence
 

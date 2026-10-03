@@ -27,9 +27,10 @@ port; they are deleted on a normal launcher shutdown (a crash may leave stale
 runtime files for the next launch to reject or replace). The state directory is
 owner-only and must stay inside the dedicated room directory.
 
-Pending rounds expire after one hour. Expiry and explicit rejection clear the
-selected payload immediately while keeping the status and payload hash for
-review. Expired or rejected metadata is deleted after 30 days. Deleting a room
+Pending rounds expire after one hour. Expiry, rejection, cancellation,
+completion, and a round interrupted by a restart all clear the selected payload
+immediately while keeping the status and payload hash for review; terminal
+round metadata is deleted after 30 days. Deleting a room
 also deletes its messages, jobs, sessions, requests, preferences, and peer
 round record. Completed replies remain in the room history until the room is
 deleted; this feature does not run an automatic room-history cleanup job.
@@ -37,7 +38,9 @@ deleted; this feature does not run an automatic room-history cleanup job.
 The threat model covers accidental cross-room/history sharing, a peer treating
 another peer's reply as instructions, and a network client reaching the local
 HTTP service. The service therefore binds to loopback, requires an exact Host
-and Origin on API requests, uses per-caller round tokens, disables proxies and
+on every request and the exact local Origin on every write (a read with no
+Origin is accepted, since browsers omit it on same-origin reads, but a foreign
+Origin is always refused), uses per-caller round tokens, disables proxies and
 redirects, caps request/response sizes, and has a socket read timeout. It does
 not protect against a person or process that already has the same Windows user
 account's shell or file access: that actor can read the private state directory
@@ -83,9 +86,13 @@ layout and the private state directory; there is no hand-written
 profile being signed in. Hermes is a third-party provider, so the offline test
 suite never makes a live provider call.
 
-The Grok queue is a separate draft integration in
-[`GROK-ROOM-SETUP.md`](GROK-ROOM-SETUP.md). It is not ready for review until
-Scott approves adding xAI/Grok as a provider.
+Grok is a second optional provider, reached through a local queue that a
+Grok Bot works; see [`GROK-ROOM-SETUP.md`](GROK-ROOM-SETUP.md). Grok takes part
+in room chat and discussion only, never in peer rounds, and receives no round
+token.
+
+Optional providers are never selected by default: a new room selects only
+Claude and Codex, and you tick Hermes or Grok yourself.
 
 If the room uses a custom state directory, pass the same directory with
 --state-dir. Do not expose the stdio service publicly.
@@ -103,7 +110,11 @@ Offline tests use fake adapters only. Run them from the repository root:
 
     $env:PYTHONPATH='tests;src'
     python -B -m unittest discover -s tests -p 'test_chat_*.py'
-    python -B -m unittest test_peer_rounds test_peer_http test_peer_mcp
+    python -B -m unittest test_peer_rounds test_peer_http test_peer_mcp test_peer_hermes
     node tests/test_chat_pending.cjs
 
 No live provider tests are run by this contribution.
+
+Peer rounds and the Hermes and Grok adapters were contributed by Brooks
+([@Bsoutherland233](https://github.com/Bsoutherland233)), who also tested them
+on Windows.
