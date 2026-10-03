@@ -297,11 +297,15 @@ def run_command(command: list[str], *, config_path: str) -> int:
     output = completed.stdout
     try:
         from .config import load
+        from .gate import repo_key
         from ..localq.service import Service
 
         cfg = load(config_path)
         state_root = str(cfg.state_root)
-        repo = autoroute.repo_key(os.getcwd())
+        # repo_key lives in gate. The router called autoroute.repo_key, which
+        # does not exist, so every live run waived setup_failure:AttributeError
+        # and no output was ever routed (first live run, 2026-10-02).
+        repo = repo_key(os.getcwd())
         policy = autoroute.load_policy(state_root)
         repo_policy = policy.for_repo(repo or os.getcwd())
         service = Service.for_config(cfg)
