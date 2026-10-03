@@ -124,6 +124,41 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(code, 7)
         self.assertTrue(captured.getvalue().endswith("child"))
 
+    def test_the_wrapper_reaches_routing_with_a_working_setup(self):
+        """Every other run_command test uses an unusable config, so the setup
+        itself was never exercised and a call to a function that does not
+        exist shipped unseen. This one stubs only the backend."""
+        from unittest import mock
+        from agent_bridge.localq import service as service_module
+
+        queue, _intake = self.queue()
+        stub = mock.Mock(queue=queue)
+        cfg = mock.Mock(state_root=self.state)
+        calls = []
+        real_route = output_router.route_output
+
+        def spy(output, **kwargs):
+            calls.append(kwargs)
+            return real_route(output, **kwargs)
+
+        previous = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch("agent_bridge.orchestration.config.load", return_value=cfg), \
+                    mock.patch.object(service_module.Service, "for_config", return_value=stub), \
+                    mock.patch.object(output_router, "route_output", side_effect=spy):
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured):
+                    code = output_router.run_command(["/bin/sh", "-c", "printf small; exit 4"],
+                                                     config_path=str(self.base / "config.json"))
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 4)
+        self.assertNotIn("setup_failure", captured.getvalue())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["repo"], os.path.realpath(self.repo))
+        self.assertEqual(calls[0]["classification"], "internal_nonclient")
+
     def test_routed_output_has_header_digest_failure_tail_and_private_capture(self):
         queue, intake = self.queue()
         source = (b"ordinary line\n" * 400) + b"FAILED important assertion\n"
