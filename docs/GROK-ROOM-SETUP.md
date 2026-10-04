@@ -59,8 +59,9 @@ room chat or discussion prompt contains the room transcript. Grok takes no
 part in peer rounds. The Bot may keep its own memories
 and provider-side data under its existing account terms; this adapter does not
 change those terms. The queue is owner-only. Completed replies are deleted
-when the room reads them; cancelled and stale queue files are deleted after
-24 hours. Deleting a room cancels its queued Grok job. Malformed or foreign
+when the room reads them; a job cancelled by the room is deleted at once, and
+other stale queue files are deleted after 24 hours. Deleting a room cancels
+its queued Grok job. Malformed or foreign
 JSON is moved into the owner-only `quarantine` directory and is ignored.
 
 ## Receive and reply
