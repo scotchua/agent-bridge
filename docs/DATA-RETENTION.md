@@ -56,7 +56,8 @@ credentials. Round payloads are cleared when a round ends; room history stays
 until you delete the room. See [peer rounds](PEER-ROUNDS.md#context-and-privacy).
 
 Hermes job directories live under the room state and are deleted once the reply
-is read, or after 24 hours if unread. The Grok queue is a separate owner-only
+is read; unread directories older than 24 hours are removed at the next Agent
+Room launch, not while it runs. The Grok queue is a separate owner-only
 directory (default `~/.agent-bridge/grok`): a reply is deleted when the room
 reads it, cancelled or stale jobs after 24 hours, and deleting a room cancels
 its queued job. Hermes and Grok may keep their own copies of what they received

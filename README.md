@@ -185,7 +185,9 @@ more than consultation. It can:
 - **route large read-only command output to the local model before it
   enters the assistant's context** (the output router). It is off by default
   and switched on by `local_first.inline_output_router` in the operator's
-  routing policy, for Claude Code only. The command still runs exactly as
+  routing policy, for Claude Code only; it also applies only in a repository
+  whose policy marks `mechanical_ok`, allows the `local` route and carries a
+  local-eligible classification. The command still runs exactly as
   asked; its full output is kept on disk and the assistant receives a local
   digest with the path to the full text. Any refusal, timeout or failure falls
   back to the original output with a one-line note saying why. A digest adds
@@ -231,10 +233,11 @@ files. Unsupported work refuses before queueing and never substitutes Qwen,
 Apple, or a cloud provider. Calibration and the live executor heartbeat are
 also bound to the selected backend, so an old private-worker process cannot
 satisfy Gemma readiness after a configuration change; restart the connected
-apps after changing the backend. The Gemma certificate is bound to the exact
-Ollama runtime version: when Ollama updates itself, the delegate refuses
-(`matching_certificate_missing`) until an automatic recertification on the new
-runtime passes. See
+apps after changing the backend. The installed certified delegate (not this
+repository) binds its certificate to the exact Ollama runtime version: when
+Ollama updates itself, the delegate refuses with its own reason until its
+recertification on the new runtime passes; this repository only reports that
+refusal. See
 [Orchestration and local-worker MCP](docs/orchestration-mcp.md#certified-gemma-local-backend).
 
 Saying yes also installs the **delegation-first gate**, which is the part that
@@ -516,8 +519,9 @@ a newly cleared continuation to recover.
   login, Grok through the Grok Bot app and your xAI account. Labels are policy
   metadata, not content scanning. The Grok queue relies on the person running
   the Bot approving each of its two commands; this repository cannot see or
-  limit the Bot's other capabilities. Grok joins a room only if its Bot checked
-  in within 90 seconds before the room started, and it takes no part in peer
+  limit the Bot's other capabilities. Grok is added to the participant list
+  only if its Bot checked in within the 90 seconds before Agent Room was
+  launched (a later check-in needs a relaunch), and it takes no part in peer
   rounds. Both have only offline tests here; no live provider call is made in
   CI. A bundled harness proves the lane can be constructed and its
   offline contract tested; it is not a substitute for the live synthetic
@@ -604,8 +608,9 @@ public issue.
 
 Thanks to **Brooks** ([@Bsoutherland233](https://github.com/Bsoutherland233))
 for the Agent Room's provider-neutral peer rounds and the Hermes and Grok
-adapters (pull requests #17 to #20), for working through several review rounds
-on them, and for testing them in a Windows environment.
+adapters (pull requests #18 to #20), for working through several review rounds
+on them, and for testing them in a Windows environment (including the Windows
+ACL test change in #17).
 
 ## Licence
 
