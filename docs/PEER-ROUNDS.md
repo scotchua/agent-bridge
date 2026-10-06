@@ -38,9 +38,10 @@ deleted; this feature does not run an automatic room-history cleanup job.
 The threat model covers accidental cross-room/history sharing, a peer treating
 another peer's reply as instructions, and a network client reaching the local
 HTTP service. The service therefore binds to loopback, requires an exact Host
-on every request and the exact local Origin on every write (a read with no
-Origin is accepted, since browsers omit it on same-origin reads, but a foreign
-Origin is always refused), uses per-caller round tokens, disables proxies and
+on every request and the exact local Origin on every write (an API read with
+no Origin is accepted, since browsers omit it on same-origin reads, but a
+foreign Origin on an API read is refused; static asset reads are not
+Origin-checked), uses per-caller round tokens, disables proxies and
 redirects, caps request/response sizes, and has a socket read timeout. It does
 not protect against a person or process that already has the same Windows user
 account's shell or file access: that actor can read the private state directory
@@ -110,7 +111,7 @@ Offline tests use fake adapters only. Run them from the repository root:
 
     $env:PYTHONPATH='tests;src'
     python -B -m unittest discover -s tests -p 'test_chat_*.py'
-    python -B -m unittest test_peer_rounds test_peer_http test_peer_mcp test_peer_hermes
+    python -B -m unittest test_peer_rounds test_peer_http test_peer_mcp test_peer_hermes test_chat_grok
     node tests/test_chat_pending.cjs
 
 No live provider tests are run by this contribution.
