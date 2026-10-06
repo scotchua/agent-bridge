@@ -564,12 +564,20 @@ blocks it can still identify as its own. Edited entries are preserved and
 reported. Consultation history, provider logins, shared instructions and bridge
 configuration are retained separately.
 
+## Upgrading from an earlier version
+
+From the repository, get the current files with `git pull`, then run
+`python setup_bridge.py upgrade`. The wizard checks what is already present,
+explains one optional feature at a time, and makes no change until its final
+confirmation.
+
 ## Repository guide
 
 | Path | Purpose |
 | --- | --- |
 | `AGENTS.md` / `CLAUDE.md` | Entry point for an assistant working with this repo. |
 | `docs/SETUP-WITH-AN-AGENT.md` | Guided installation, verification and removal. |
+| `setup_bridge.py upgrade` | Repeatable, opt-in upgrade guide for earlier installations. |
 | `docs/DATA-RETENTION.md` | Local storage, cleanup and provider-history boundaries. |
 | `docs/orchestration-mcp.md` | Manual advanced orchestration, local routing and external execution-worker setup. |
 | `docs/DELEGATION-GATE.md` | Host-enforced delegation-first gate, automatic routing, the audit report, and their stated limits. |
