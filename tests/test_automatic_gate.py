@@ -2100,7 +2100,10 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         """Measured on the previous design: five nested repositories, first
         decision, routed-away innermost, 10.3 s -- past the 10 s hook timeout,
         with no contention at all. Under the lock a missing receipt is read
-        without the store's one-second retry window."""
+        without the store's one-second retry window. A fixed 3 s bound failed
+        on windows-latest on 2026-10-06: 3.2 s on Python 3.13 (PR #31) and
+        8.1 s on Python 3.11 (docs-only PR #32), versus about 0.14 s on macOS.
+        Calibrate on this runner so host speed gets proportional headroom."""
         deepest = self.repo
         for depth in range(4):
             deepest = git_repo(deepest / f"n{depth}")
@@ -2114,10 +2117,26 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
                                    "routed_elsewhere")
         elapsed = time.monotonic() - started
         self.assertIn("routed to claude", reason)
-        # Measured 0.14 s here; one retry window per missing receipt would be
-        # about 5 s. The bound leaves room for a slow CI host's interpreter
-        # start-up and still catches that regression.
-        self.assertLess(elapsed, 3.0, f"a routed-away deny took {elapsed:.1f} s")
+        # The receipt now exists, so the same hook pays interpreter start-up,
+        # imports, git discovery and a gate decision without missing-receipt
+        # retries under the decision lock. Take the faster of two warm calls
+        # to reduce the effect of transient host load on the baseline.
+        warm_times = []
+        for _ in range(2):
+            started = time.monotonic()
+            self.assertDenied(self.hook("codex", deepest, "mod.py", timeout_is_host_limit=False),
+                              "routed_elsewhere")
+            warm_times.append(time.monotonic() - started)
+        baseline = min(warm_times)
+        if baseline > 2.0:
+            self.skipTest(f"this host's warm hook baseline is {baseline:.2f} s; "
+                          "above 2 s the timing bound cannot distinguish retry sleeps")
+        # At a 0.14 s baseline the bound is 3.28 s. With baseline <= 2 s,
+        # baseline + 5 s of retry sleeps is >= 3 + 2 * baseline and fails.
+        limit = 3.0 + 2 * baseline
+        self.assertLess(elapsed, limit,
+                        f"a routed-away deny took {elapsed:.2f} s; "
+                        f"warm baseline {baseline:.2f} s, bound {limit:.2f} s")
 
     def test_routing_decide_takes_the_same_lock(self):
         """The hand-made writer is serialised with the gate too."""
