@@ -980,6 +980,21 @@ class TheHookPayloadIsUtf8WhateverTheLocaleSays(unittest.TestCase):
                             "allowed_routes": ["claude", "codex"]}}}, ensure_ascii=False),
             encoding="utf-8")
 
+    def run_gate(self, payload: bytes, environment: dict[str, str]):
+        """Run the child once, retrying only an apparent interpreter crash."""
+        command = [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+                   "--client", "claude", "--config", str(self.config)]
+        completed = subprocess.run(command, input=payload, capture_output=True,
+                                   timeout=120, env=environment)
+        if completed.returncode < 0:
+            sys.stderr.write(
+                f"retrying gate child after signal {-completed.returncode} "
+                f"(encoding={environment.get('PYTHONIOENCODING', 'default')})\n")
+            completed = subprocess.run(command, input=payload, capture_output=True,
+                                       timeout=120, env=environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed
+
     def judge_with(self, encoding: str) -> dict:
         """Drive the gate as a subprocess with its stdio encoding forced.
 
@@ -994,11 +1009,7 @@ class TheHookPayloadIsUtf8WhateverTheLocaleSays(unittest.TestCase):
         environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"),
                        "PYTHONIOENCODING": encoding}
         environment.pop("PYTHONUTF8", None)
-        completed = subprocess.run(
-            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
-             "--client", "claude", "--config", str(self.config)],
-            input=payload, capture_output=True, timeout=120, env=environment)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        completed = self.run_gate(payload, environment)
         return json.loads(completed.stdout)
 
     def code(self, payload: dict) -> str:
@@ -1030,21 +1041,40 @@ class TheHookPayloadIsUtf8WhateverTheLocaleSays(unittest.TestCase):
             {"hook_event_name": "PreToolUse", "tool_name": "Edit",
              "tool_input": {"file_path": str(self.repo / "app.py")},
              "cwd": str(self.repo)}).encode("utf-8")
-        completed = subprocess.run(
-            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
-             "--client", "claude", "--config", str(self.config)],
-            input=payload, capture_output=True, timeout=120,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+        completed = self.run_gate(
+            payload, {**os.environ, "PYTHONPATH": str(ROOT / "src")})
         self.assertEqual(self.code(json.loads(completed.stdout)), "routed_elsewhere")
 
     def test_bytes_that_are_not_utf8_are_a_deny_rather_than_a_guess(self):
-        completed = subprocess.run(
-            [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
-             "--client", "claude", "--config", str(self.config)],
-            input=b"\xff\xfe{not even close}", capture_output=True, timeout=120,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
-        self.assertEqual(completed.returncode, 0)
+        completed = self.run_gate(
+            b"\xff\xfe{not even close}",
+            {**os.environ, "PYTHONPATH": str(ROOT / "src")})
         self.assertEqual(self.code(json.loads(completed.stdout)), "gate_error")
+
+    def test_a_signal_death_is_retried_once(self):
+        second = subprocess.CompletedProcess([], 0, stdout=b"{}", stderr=b"")
+        with mock.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], -11, stdout=b"", stderr=b""), second,
+        ]) as run:
+            result = self.judge_with("latin-1")
+        self.assertEqual(result, {})
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_second_signal_death_still_fails(self):
+        with mock.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], -11, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess([], -11, stdout=b"", stderr=b""),
+        ]) as run:
+            with self.assertRaisesRegex(AssertionError, "-11"):
+                self.judge_with("latin-1")
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_positive_failure_is_not_retried(self):
+        with mock.patch("subprocess.run", return_value=
+                        subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"failed")) as run:
+            with self.assertRaisesRegex(AssertionError, "failed"):
+                self.judge_with("latin-1")
+        self.assertEqual(run.call_count, 1)
 
 
 class TheLauncherNeverFailsOpen(unittest.TestCase):
