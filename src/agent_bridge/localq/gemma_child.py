@@ -19,13 +19,16 @@ not independently measure the model artifact.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import sysconfig
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -71,8 +74,9 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_validator(path: Path) -> Any:
-    """Load only the explicitly configured installed validator file."""
+@contextmanager
+def _load_validator(path: Path):
+    """Load the configured validator using its installation and stdlib paths."""
     name = "_agent_bridge_delegate_receipt_" + hashlib.sha256(
         str(path).encode("utf-8")).hexdigest()[:16]
     spec = importlib.util.spec_from_file_location(name, path)
@@ -80,12 +84,44 @@ def _load_validator(path: Path) -> Any:
         raise GemmaReceiptError("receipt_validator_unloadable")
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imports = {alias.name.partition(".")[0]
+                   for node in ast.walk(tree)
+                   if isinstance(node, ast.Import) for alias in node.names}
+        imports.update(node.module.partition(".")[0]
+                       for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom) and node.level == 0
+                       and node.module)
+    except (OSError, SyntaxError, UnicodeError) as exc:
         raise GemmaReceiptError("receipt_validator_unloadable") from exc
-    if not callable(getattr(module, "read_success", None)):
-        raise GemmaReceiptError("receipt_validator_contract_missing")
-    return module
+    # Cached third-party or cwd modules must not satisfy an installed sibling
+    # import. The configured directory is first, followed only by stdlib paths.
+    shadowed = {key: sys.modules.pop(key) for key in imports
+                if key not in sys.stdlib_module_names and key in sys.modules}
+    original_path = sys.path[:]
+    stdlib_paths = {Path(sysconfig.get_path(name)).resolve()
+                    for name in ("stdlib", "platstdlib")}
+    stdlib_paths.update(path / "lib-dynload" for path in tuple(stdlib_paths))
+    sys.path[:] = [str(path.parent)] + [entry for entry in original_path
+                                      if entry and Path(entry).resolve() in stdlib_paths]
+    prior_modules = set(sys.modules)
+    try:
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            raise GemmaReceiptError("receipt_validator_unloadable") from exc
+        if not callable(getattr(module, "read_success", None)):
+            raise GemmaReceiptError("receipt_validator_contract_missing")
+        yield module
+    finally:
+        for key in set(sys.modules) - prior_modules:
+            loaded = sys.modules[key]
+            location = getattr(loaded, "__file__", None)
+            if location and Path(location).parent.resolve() == path.parent.resolve():
+                sys.modules.pop(key, None)
+        sys.modules.update(shadowed)
+        sys.path[:] = original_path
 
 
 def _effective_options(timeout: float) -> dict[str, Any]:
@@ -157,6 +193,17 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
         raise GemmaRefusal("receipt_validator_source_changed")
     timeout = float(timeout)
 
+    with _load_validator(validator_path) as validator:
+        return _invoke_validated(
+            text, job_id, delegate_path, python_path, receipt_root_path,
+            model_digest, timeout, validator)
+
+
+def _invoke_validated(text: str, job_id: str, delegate_path: Path,
+                      python_path: Path, receipt_root_path: Path,
+                      model_digest: str, timeout: float, validator: Any) -> dict[str, Any]:
+    """Run one delegate call after validator preflight succeeds."""
+
     invocation_id = uuid.uuid4().hex
     input_bytes = text.encode("utf-8")
     input_sha256 = hashlib.sha256(input_bytes).hexdigest()
@@ -193,7 +240,6 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
     except OSError as exc:
         raise GemmaReceiptError("receipt_unreadable") from exc
 
-    validator = _load_validator(validator_path)
     try:
         record = validator.read_success(
             receipt_path, output,

@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -268,6 +269,64 @@ class GemmaInvokeTests(unittest.TestCase):
         self.assertEqual(result["input_sha256"], hashlib.sha256(text.encode()).hexdigest())
         exact = self.fx["receipts"] / f"local-delegate-{result['invocation_id']}.json"
         self.assertTrue(exact.is_file())
+
+    def test_installed_sibling_import_succeeds_without_import_pollution(self):
+        sibling = self.fx["install"] / "state_home.py"
+        sibling.write_text("MARKER = 'configured-install'\n", encoding="utf-8")
+        validator = self.fx["validator"]
+        validator.write_text(
+            validator.read_text(encoding="utf-8") +
+            "\nimport state_home\n"
+            "if state_home.MARKER != 'configured-install':\n"
+            "    raise ValueError('wrong sibling')\n", encoding="utf-8")
+        prior_path = sys.path[:]
+        prior = sys.modules.get("state_home")
+        unrelated = types.ModuleType("state_home")
+        unrelated.MARKER = "unrelated"
+        sys.modules["state_home"] = unrelated
+        try:
+            result = self.invoke()
+            self.assertEqual(result["provider"], "gemma_certified")
+            self.assertIs(sys.modules["state_home"], unrelated)
+            self.assertEqual(sys.path, prior_path)
+        finally:
+            if prior is None:
+                sys.modules.pop("state_home", None)
+            else:
+                sys.modules["state_home"] = prior
+
+    def test_missing_sibling_refuses_before_delegate_even_if_cached(self):
+        validator = self.fx["validator"]
+        validator.write_text(validator.read_text(encoding="utf-8") +
+                             "\nimport missing_installed_dependency\n", encoding="utf-8")
+        decoy = self.root / "unrelated"
+        decoy.mkdir()
+        (decoy / "missing_installed_dependency.py").write_text(
+            "MARKER = 'wrong path'\n", encoding="utf-8")
+        prior_path = sys.path[:]
+        cached = types.ModuleType("missing_installed_dependency")
+        sys.modules["missing_installed_dependency"] = cached
+        sys.path.insert(0, str(decoy))
+        try:
+            with self.assertRaisesRegex(gemma_child.GemmaReceiptError,
+                                        "receipt_validator_unloadable"):
+                self.invoke()
+            self.assertFalse((self.fx["install"] / "calls.txt").exists())
+            self.assertIs(sys.modules["missing_installed_dependency"], cached)
+            self.assertEqual(sys.path, [str(decoy)] + prior_path)
+        finally:
+            sys.modules.pop("missing_installed_dependency", None)
+            sys.path[:] = prior_path
+
+    def test_malformed_receipt_rejected_with_sibling_validator(self):
+        (self.fx["install"] / "state_home.py").write_text("MARKER = True\n", encoding="utf-8")
+        validator = self.fx["validator"]
+        validator.write_text(validator.read_text(encoding="utf-8") +
+                             "\nimport state_home\n", encoding="utf-8")
+        self.mode("malformed")
+        with self.assertRaisesRegex(gemma_child.GemmaReceiptError, "receipt_invalid"):
+            self.invoke()
+        self.assertNotIn("state_home", sys.modules)
 
     def test_unsupported_kind_custom_instruction_and_provider_refuse_before_spawn(self):
         with self.assertRaisesRegex(ValueError, UNSUPPORTED_KIND_REASON):
