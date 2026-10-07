@@ -122,6 +122,23 @@ class ClaudeTaskTests(unittest.TestCase):
         self.assertFalse((Path(result["job_dir"]) / "generation-worktree").exists())
         self.assertFalse((Path(result["job_dir"]) / "verification-worktree").exists())
 
+    def test_receipt_records_usage_from_the_claude_envelope(self):
+        requires_confinement(self)
+        self.fake.write_text(
+            "#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf "
+            "'{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; "
+            "--version) echo fake; exit;; esac\nprintf 'after\\n' > value.txt\n"
+            "printf '{\"result\":\"done\",\"is_error\":false,\"modelUsage\":{\"claude-fake\":{\"inputTokens\":10,\"outputTokens\":20,\"cacheCreationInputTokens\":3,\"cacheReadInputTokens\":4}}}\\n'\n")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IXUSR)
+        result = run_task(brief=self.brief, repo=self.repo,
+                          task_root=self.root / "tasks", claude_bin=self.fake,
+                          claude_config_dir=self.store, classification="synthetic",
+                          model="fake", effort="low",
+                          verify_argv=[["git", "diff", "--check"]])
+        usage = result["response_metadata"]["token_usage"]
+        self.assertTrue(usage["usage_present"])
+        self.assertEqual(usage["usage"]["models"][0]["usage"]["total_reported"], 37)
+
     def test_a_bom_prefixed_brief_is_not_rejected(self):
         # A Windows editor or PowerShell's default encoding can prepend a
         # UTF-8 BOM to a brief file this project never wrote itself.
@@ -792,6 +809,17 @@ class ClaudeTaskErrorDetailTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception),
                          "Claude exited with status 1: Failed to authenticate: OAuth session expired "
                          "and could not be refreshed")
+
+    def test_a_nonzero_exit_still_records_envelope_usage(self):
+        requires_confinement(self)
+        fake = self._fake(
+            "printf '{\"result\":\"failed\",\"is_error\":true,\"modelUsage\":{\"claude-fake\":{\"inputTokens\":10,\"outputTokens\":20,\"cacheCreationInputTokens\":3,\"cacheReadInputTokens\":4}}}\\n'\nexit 1\n")
+        with self.assertRaises(TaskError):
+            self._run(fake)
+        receipt_path = next((self.root / "tasks").glob("*/receipt.json"))
+        receipt = json.loads(receipt_path.read_text())
+        self.assertTrue(receipt["response_metadata"]["token_usage"]["usage_present"])
+        self.assertEqual(receipt["response_metadata"]["token_usage"]["usage"]["models"][0]["usage"]["total_reported"], 37)
 
     def test_a_nonzero_exit_with_no_parseable_reason_keeps_the_bare_message(self):
         requires_confinement(self)

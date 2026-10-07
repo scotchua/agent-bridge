@@ -202,7 +202,12 @@ def main() -> int:
     if last_message_path:
         with open(last_message_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
-    event({"type": "turn.completed"})
+    completed = {"type": "turn.completed"}
+    if mode == "token_usage":
+        completed["usage"] = {"input_tokens": 10,
+                              "cached_input_tokens": 4,
+                              "output_tokens": 3}
+    event(completed)
     return 0
 
 

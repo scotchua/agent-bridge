@@ -139,7 +139,12 @@ if MODE != "nomessage" and last_message:
     with open(last_message, "w", encoding="utf-8") as handle:
         handle.write("codex done\\n")
 
-event({{"type": "turn.completed"}})
+usage = ({{"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3}}
+         if MODE == "usage" else None)
+completed = {{"type": "turn.completed"}}
+if usage is not None:
+    completed["usage"] = usage
+event(completed)
 sys.exit(0)
 '''
 
@@ -201,6 +206,17 @@ class CodexTaskTests(unittest.TestCase):
         self.assertFalse((Path(result["job_dir"]) / "generation-worktree").exists())
         self.assertFalse((Path(result["job_dir"]) / "verification-worktree").exists())
         self.assertEqual(receipt["auth"]["auth_method"], "chatgpt")
+
+    def test_receipt_records_usage_from_the_codex_jsonl_stream(self):
+        requires_confinement(self)
+        self._write_fake(mode="usage")
+        result = self.run_default(verify_argv=[["git", "diff", "--check"]])
+        usage = result["response_metadata"]["token_usage"]
+        self.assertTrue(usage["usage_present"])
+        turn = usage["turns"][0]
+        self.assertEqual(turn["usage"]["input_tokens"], 10)
+        self.assertFalse(turn["resumed"])
+        self.assertEqual(turn["cli_version"], "codex-cli 0.147.0")
 
     def test_refuses_client_material_before_dispatch(self):
         with self.assertRaises(TaskError):
