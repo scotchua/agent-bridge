@@ -135,6 +135,18 @@ class ClientDerivedParityTests(unittest.TestCase):
                     fresh_routes=frozenset({peer}), load=autoroute.Load(0.1, True))
                 self.assertEqual(peer_result.route, peer)
 
+    def test_room_policy_follows_the_peer_opt_in_symmetrically(self):
+        from agent_bridge.chat.policy import RoomPolicy
+        off = RoomPolicy(self.bridge_config())
+        on = RoomPolicy(self.bridge_config(("peer",)))
+        self.assertFalse(off.allow_client)
+        self.assertTrue(on.allow_client)
+        for target in ("claude", "codex"):
+            with self.subTest(target=target):
+                with self.assertRaises(ValueError):
+                    off.authorize(target, "client-derived")
+                on.authorize(target, "client-derived")
+
     def test_secret_and_credential_labels_remain_refused(self):
         cfg = self.bridge_config(("peer", "execution"))
         for caller, peer in broker.PEER_OF.items():
