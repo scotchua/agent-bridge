@@ -813,8 +813,6 @@ class ClaudeTaskErrorDetailTests(unittest.TestCase):
                          "expired and could not be refreshed")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class GenerationFenceTests(unittest.TestCase):
@@ -902,3 +900,7 @@ class GenerationFenceTests(unittest.TestCase):
             ["x"], Path("/j"), Path("/g"), None, {}, hostenv.LINUX_USERNS)
         self.assertIsNone(fence)
         self.assertEqual(command, ["x"])
+
+
+if __name__ == "__main__":
+    unittest.main()
