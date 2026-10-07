@@ -2850,6 +2850,11 @@ def main(argv: list[str] | None = None) -> int:
                 pass
     if out.emit(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n"):
         watchdog.cancel()
+        # Let the cancelled timer thread finish before the interpreter shuts
+        # down. A daemon thread still alive during finalization is a known
+        # source of crashes, and macOS CI runners have shown the gate child
+        # exiting on SIGSEGV after a correct decision.
+        watchdog.join(timeout=1.0)
     return 0
 
 

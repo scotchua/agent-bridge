@@ -24,6 +24,11 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
+    env:
+      # A child interpreter that dies on a fatal signal (seen as SIGSEGV on
+      # macOS runners) prints its Python stack to stderr, which the tests
+      # include in their failure message.
+      PYTHONFAULTHANDLER: "1"
     # bash everywhere, on purpose. GitHub's default shell on Windows is pwsh,
     # and a native command that exits nonzero does not stop a pwsh step: only
     # the LAST command's exit status is reported for a multi-line step, so
