@@ -23,7 +23,7 @@ import os
 import uuid
 from typing import Any
 
-from .. import runner
+from .. import runner, token_usage
 from ..config import Config
 from ..errors import ErrorCategory
 from .base import PeerOutcome, auth_failure_reason, parse_single_object
@@ -198,6 +198,7 @@ def run_consultation(
         # into a distinguishable "the CLI did not report it" rather than an
         # ambiguous null that could equally mean the bridge failed to read it.
         "model_usage_present": isinstance(usage_models, dict) and bool(usage_models),
+        "token_usage": token_usage.claude_model_usage(usage_models),
         "total_cost_present": envelope.get("total_cost_usd") is not None,
         "requested_model": requested_model,
         "requested_reasoning_effort": cfg.peer_reasoning_effort(PEER),

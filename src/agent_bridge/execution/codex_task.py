@@ -53,14 +53,14 @@ from __future__ import annotations
 import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
-    from .. import runner, preflight, store
+    from .. import runner, preflight, store, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from ..errors import BrokerError
     from . import codex_promotion, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from agent_bridge import runner, preflight, store
+    from agent_bridge import runner, preflight, store, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.errors import BrokerError
@@ -646,7 +646,10 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         failed=r.returncode not in (0,None) or any(e.get("type")=="turn.failed" for e in events)
         receipt["response_metadata"]={"thread_id":thread_id,"event_count":len(events),
                                       "event_types":sorted({str(e.get("type")) for e in events})[:20],
-                                      "error_event_count":len(error_messages)}
+                                      "error_event_count":len(error_messages),
+                                      "token_usage":token_usage.codex_turn_usage(
+                                          events, cli_version=receipt["executable_version"],
+                                          resumed=False)}
         if failed: raise TaskError(_with_error_detail(f"Codex exited with status {r.returncode}",error_messages))
         if not thread_id: raise TaskError("Codex did not report a thread id")
         last_message=last_message_file.read_bytes() if last_message_file.is_file() else b""

@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
-    from .. import runner
+    from .. import runner, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from . import claude_config, hostenv, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from agent_bridge import runner
+    from agent_bridge import runner, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.execution import claude_config, hostenv, verify_policy
@@ -636,13 +636,18 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         for n,data in (("claude.stdout",r.stdout),("claude.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
             receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
+        # A nonzero process can still have emitted a result envelope. Capture
+        # its provider usage before the normal failure path records the receipt.
+        try: response=_json(r.stdout,"Claude output")
+        except TaskError: response=None
+        usage_models=response.get("modelUsage") if response else None
+        receipt["response_metadata"]={"session_id":response.get("session_id") if response else None,"subtype":response.get("subtype") if response else None,
+                                      "terminal_reason":response.get("terminal_reason") if response else None,"stop_reason":response.get("stop_reason") if response else None,
+                                      "num_turns":response.get("num_turns") if response else None,"observed_models":sorted(usage_models) if isinstance(usage_models,dict) else [],
+                                      "token_usage":token_usage.claude_model_usage(usage_models)}
         if r.returncode:
             raise TaskError(_with_result_detail(f"Claude exited with status {r.returncode}",r.stdout))
-        response=_json(r.stdout,"Claude output")
-        usage_models=response.get("modelUsage")
-        receipt["response_metadata"]={"session_id":response.get("session_id"),"subtype":response.get("subtype"),
-                                      "terminal_reason":response.get("terminal_reason"),"stop_reason":response.get("stop_reason"),
-                                      "num_turns":response.get("num_turns"),"observed_models":sorted(usage_models) if isinstance(usage_models,dict) else []}
+        if response is None: response=_json(r.stdout,"Claude output")
         if response.get("is_error") is not False or not isinstance(response.get("result"),str):
             raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")

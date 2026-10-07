@@ -1324,6 +1324,22 @@ def test_provenance_completeness() -> None:
         sb.cleanup()
 
 
+def test_token_usage_provenance() -> None:
+    print("\n[token usage provenance]")
+    sb = Sandbox()
+    try:
+        sb.env(FAKE_CODEX_MODE="token_usage")
+        started, _, _ = sb.run_to_completion("claude")
+        usage = sb.provenance(started["job_id"]).get("token_usage")
+        check("Codex provenance includes reported token usage and CLI version",
+              isinstance(usage, dict)
+              and usage.get("cli_version") == "codex-cli 0.147.0"
+              and usage.get("turns", [{}])[0].get("usage", {}).get("input_tokens") == 10,
+              json.dumps(usage))
+    finally:
+        sb.cleanup()
+
+
 def test_concurrency_and_busy() -> None:
     print("\n[concurrency and conversation locking]")
     sb = Sandbox(limits={"max_concurrent_jobs": 1},
@@ -4731,6 +4747,7 @@ def main() -> int:
     test_prompt_contains_only_caller_text()
     test_permissions()
     test_provenance_completeness()
+    test_token_usage_provenance()
     test_concurrency_and_busy()
     test_workspace_isolation()
     test_codex_home_recursion_vector()

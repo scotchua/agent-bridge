@@ -28,7 +28,7 @@ import json
 import os
 from typing import Any
 
-from .. import preflight, runner, store
+from .. import preflight, runner, store, token_usage
 from ..config import Config
 from ..errors import ErrorCategory
 from .base import PeerOutcome, auth_failure_reason, parse_single_object
@@ -203,6 +203,8 @@ def run_consultation(
         "peer_home": home_inventory,
         "event_count": len(events),
         "event_types": sorted({str(e.get("type")) for e in events})[:20],
+        "token_usage": token_usage.codex_turn_usage(
+            events, cli_version=None, resumed=bool(thread_id)),
         "error_event_count": len(error_messages),
         "resumed": bool(thread_id),
         "requested_thread_id": thread_id,

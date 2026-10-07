@@ -431,6 +431,13 @@ def execute(job_dir: str) -> int:
             (final.notes or {}).get("requested_alias_in_observed_model")
             if final else None),
         "peer_cost_usd": final.cost_usd if final else None,
+        # Usage is provider-reported metadata, and its producing CLI version
+        # is retained in the same block as well as in peer_observed_version.
+        "token_usage": (
+            {**(final.notes or {}).get("token_usage", {}),
+             "cli_version": peer_info.get("observed_version")}
+            if final and isinstance((final.notes or {}).get("token_usage"), dict) else None
+        ),
         "attempts": attempts_log,
         "attempt_count": len(attempts_log),
         "elapsed_stages": stages,
