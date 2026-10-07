@@ -224,7 +224,7 @@ class LocalQueue:
                  backend: Backend | None = None, caps: QueueCaps = QueueCaps(),
                  clock: Callable[[], float] = time.time,
                  allowed_task_types: "frozenset[str] | None" = None,
-                 backend_id: str = "private_worker"):
+                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None):
         self.root = Path(root)
         self.blobs = self.root / "blobs"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -235,6 +235,7 @@ class LocalQueue:
         if not isinstance(backend_id, str) or not backend_id:
             raise ValueError("backend_id_invalid")
         self.backend_id = backend_id
+        self.client_data_health_gate = client_data_health_gate
         # The kinds *this* backend actually carries. Defaults to every
         # mechanical task, unchanged from before this existed. A backend
         # that supports fewer kinds (``gemma_certified`` supports only
@@ -370,6 +371,10 @@ class LocalQueue:
             raise AdmissionError(UNSUPPORTED_KIND_REASON)
         if classification not in ALLOWED_CLASSIFICATIONS:
             raise AdmissionError("classification_refused")
+        if classification == "client_derived":
+            reason = self._client_data_health_refusal()
+            if reason is not None:
+                raise AdmissionError(reason)
         if caller not in {"codex", "claude"} or purpose not in {"work", "test"}:
             raise AdmissionError("provenance_invalid")
         if priority not in {"interactive", "bulk"}:
@@ -423,6 +428,27 @@ class LocalQueue:
                 return self._public(existing, deduplicated=True)
             raise
         return {"job_id": job_id, "status": "queued", "deduplicated": False}
+
+    def _client_data_health_refusal(self) -> str | None:
+        """Check the backend-specific client-data admission invariant.
+
+        The health gate is intentionally consulted only after confirming the
+        active backend can be bound to its delegate.  A bad/missing gate is a
+        conservative health refusal, never an implicit admission.
+        """
+        if self.backend_id != "gemma_certified":
+            return "client_data_backend_unsupported"
+        gate = self.client_data_health_gate
+        if gate is None:
+            return "client_data_health_unverified"
+        try:
+            reason = gate.check()
+        except Exception:
+            return "client_data_health_unverified"
+        if reason in {None, "client_data_health_unverified", "client_data_health_failed",
+                      "client_data_health_binding_mismatch"}:
+            return reason
+        return "client_data_health_unverified"
 
     def _get(self, db: sqlite3.Connection, job_id: str) -> sqlite3.Row:
         row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -553,6 +579,18 @@ class LocalQueue:
             db.execute("UPDATE jobs SET status='running',lease_owner=?,lease_until=?,updated_at=? WHERE job_id=?",
                        (owner, now + self.caps.lease_seconds, now, row["job_id"]))
             db.execute("COMMIT")
+        if row["classification"] == "client_derived":
+            reason = self._client_data_health_refusal()
+            if reason is not None:
+                now = self.clock()
+                with self._db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("""UPDATE jobs SET status='failed',updated_at=?,lease_owner=NULL,lease_until=NULL,
+                        error=?,disposition_json=? WHERE job_id=?""",
+                               (now, reason, self._normalized({"outcome": "failed", "reason": reason}),
+                                row["job_id"]))
+                    db.execute("COMMIT")
+                return self.result(row["job_id"])
         payload = {"task_type": row["task_type"], "input": self._read_blob(row["input_blob"]),
                    "params": json.loads(row["params_json"]), "job_id": row["job_id"]}
         outcome, result, error = "complete", None, None

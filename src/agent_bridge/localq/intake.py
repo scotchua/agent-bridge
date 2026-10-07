@@ -94,6 +94,10 @@ def accepted_values(reason: str, allowed_task_types: "frozenset[str]") -> dict[s
 MAX_DECLARED_BYTES = 50_000_000
 MAX_DECLARED_LINES = 5_000_000
 MAX_TASK_ID_LEN = 256
+HEALTH_REFUSAL_REASONS = frozenset({
+    "client_data_health_unverified", "client_data_health_failed",
+    "client_data_health_binding_mismatch", "client_data_backend_unsupported",
+})
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,15 @@ class AutomaticIntake:
             db.execute("""CREATE TRIGGER IF NOT EXISTS checkpoints_no_delete
                 BEFORE DELETE ON checkpoints BEGIN
                 SELECT RAISE(ABORT, 'checkpoints are append-only'); END""")
+            db.execute("""CREATE TABLE IF NOT EXISTS health_refusals (
+                refusal_id TEXT PRIMARY KEY, created_at REAL NOT NULL,
+                checkpoint_id TEXT, classification TEXT NOT NULL, reason TEXT NOT NULL)""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS health_refusals_no_update
+                BEFORE UPDATE ON health_refusals BEGIN
+                SELECT RAISE(ABORT, 'health refusals are append-only'); END""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS health_refusals_no_delete
+                BEFORE DELETE ON health_refusals BEGIN
+                SELECT RAISE(ABORT, 'health refusals are append-only'); END""")
 
     @staticmethod
     def _normalized(value: Any) -> str:
@@ -379,12 +392,29 @@ class AutomaticIntake:
                 "WHERE r.checkpoint_id = c.checkpoint_id AND r.job_id IS NOT NULL)").fetchone()[0]
             rows = db.execute(
                 "SELECT reason, COUNT(*) AS n FROM checkpoints WHERE status='refused' GROUP BY reason").fetchall()
+            health_rows = db.execute(
+                "SELECT reason, COUNT(*) AS n FROM health_refusals GROUP BY reason").fetchall()
         refused_by_reason = {reason: 0 for reason in sorted(CLOSED_REFUSAL_REASONS)}
         for row in rows:
             if row["reason"] in CLOSED_REFUSAL_REASONS:
                 refused_by_reason[row["reason"]] = row["n"]
+        health_refusals_by_reason = {reason: 0 for reason in sorted(HEALTH_REFUSAL_REASONS)}
+        for row in health_rows:
+            if row["reason"] in HEALTH_REFUSAL_REASONS:
+                health_refusals_by_reason[row["reason"]] = row["n"]
         return {"total": total, "eligible": eligible, "dispatched": dispatched,
-                "no_eligible_unit": no_eligible_unit, "refused_by_reason": refused_by_reason}
+                "no_eligible_unit": no_eligible_unit, "refused_by_reason": refused_by_reason,
+                "health_refusals_by_reason": health_refusals_by_reason}
+
+    def _record_health_refusal(self, *, checkpoint_id: str | None, classification: str,
+                               reason: str) -> None:
+        """Append a content-free refusal event before exposing the refusal."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT INTO health_refusals(
+                refusal_id,created_at,checkpoint_id,classification,reason) VALUES(?,?,?,?,?)""",
+                       (uuid.uuid4().hex, self.clock(), checkpoint_id, classification, reason))
+            db.execute("COMMIT")
 
     # ---- routing --------------------------------------------------------
 
@@ -501,10 +531,16 @@ class AutomaticIntake:
 
         job_id = None
         if decision == "local":
-            submitted = self.queue.submit(
-                task_type=task_type, input=input, params=params, priority=priority,
-                classification=classification, caller=caller, purpose=purpose,
-                idempotency_key="route:" + request_key)
+            try:
+                submitted = self.queue.submit(
+                    task_type=task_type, input=input, params=params, priority=priority,
+                    classification=classification, caller=caller, purpose=purpose,
+                    idempotency_key="route:" + request_key)
+            except AdmissionError as exc:
+                if str(exc) in HEALTH_REFUSAL_REASONS:
+                    self._record_health_refusal(checkpoint_id=checkpoint_id,
+                                                classification=classification, reason=str(exc))
+                raise
             job_id = submitted["job_id"]
 
         values = (
