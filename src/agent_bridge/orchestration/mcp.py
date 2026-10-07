@@ -595,10 +595,14 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                     return {"ok": False, "error":
                             f"execution_dispatch_refused:policy_unreadable:{type(exc).__name__}"}
                 repo_policy = policy.for_repo(args.get("repo"))
-                peer_classifications = policy.route_classifications.get(
-                    provider, policy.peer_classifications)
-                if "execution" in policy.client_derived_routes:
-                    peer_classifications = peer_classifications | {"client_derived"}
+                # Same rule as autoroute.decide: a per-route list is used as
+                # written; only the global set gains client_derived.
+                if provider in policy.route_classifications:
+                    peer_classifications = policy.route_classifications[provider]
+                else:
+                    peer_classifications = policy.peer_classifications
+                    if "execution" in policy.client_derived_routes:
+                        peer_classifications = peer_classifications | {"client_derived"}
                 if (provider not in repo_policy.allowed_routes
                         or repo_policy.classification not in peer_classifications):
                     return {"ok": False,

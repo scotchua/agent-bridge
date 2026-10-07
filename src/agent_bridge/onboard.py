@@ -835,15 +835,30 @@ def _managed_text_update(path: str, name: str, body: str, previous_body: str | N
     return (text + separator + block + newline).encode("utf-8")
 
 
+_IDENTIFIER_RULE = (
+    "Never route secrets, credentials, passwords, API keys or tokens. Exact sensitive identifiers "
+    "(including SSNs, EINs, account or card numbers, email addresses and phone numbers) need the "
+    "operator's explicit approval and a separately logged, scope-matched exception.")
+
+
+def _client_instruction(routes: list[str]) -> str:
+    """One line describing exactly which routes accept client-derived work."""
+    peer, execution = "peer" in routes, "execution" in routes
+    if not peer and not execution:
+        return ("Never route client-derived, confidential, secret, credential, or identifying "
+                "material through the bridge.")
+    where = ("consultations and execution jobs" if peer and execution else
+             "consultations only; execution jobs refuse it" if peer else
+             "execution jobs only; consultations refuse it")
+    return ("Client-derived work, labeled client_derived, is accepted for " + where +
+            ", with the same access for Claude and Codex (operator configuration). " + _IDENTIFIER_RULE)
+
+
 def _shared_instructions(answers: dict[str, Any]) -> str:
     allowed = privacy_overlay(answers)["allowed_source_classifications"]
     text = ["# agent-bridge shared instructions", "", "Use the bridge only for consultation.",
             "Allowed source labels: " + ", ".join(allowed) + ".",
-            ("Client-derived work, labeled client_derived, may go to Claude and Codex through this consultation bridge, "
-             "with the same access for both (operator configuration). Never route secrets or credentials, and never "
-             "route exact sensitive identifiers (SSNs, EINs, account or card numbers) without the operator's explicit approval."
-             if "peer" in answers.get("client_derived_routes", []) else
-             "Never route client-derived, confidential, secret, credential, or identifying material through the bridge."),
+            _client_instruction(answers.get("client_derived_routes", [])),
             "Use start, poll, read, and continue deliberately. Share only the selected context needed for the question.",
             "Claude and Codex are peers. A consultation is evidence, not approval; do not duplicate approvals or create recursive bridge calls.",
             "Exact tools first: grep, rg, head, tail, and bounded reads. They beat any model at finding a string.",

@@ -160,11 +160,31 @@ class ClientDerivedParityTests(unittest.TestCase):
         from agent_bridge import onboard
         base = {"privacy": {"mode": "baseline", "peers": {}}, "local_ollama": {"enabled": False},
                 "automatic_delegation": {"enabled": False}}
+        none = onboard._shared_instructions({**base, "client_derived_routes": []})
+        self.assertIn("Never route client-derived", none)
         execution_only = onboard._shared_instructions({**base, "client_derived_routes": ["execution"]})
-        self.assertIn("Never route client-derived", execution_only)
+        self.assertIn("execution jobs only; consultations refuse it", execution_only)
         peer = onboard._shared_instructions({**base, "client_derived_routes": ["peer"]})
-        self.assertIn("same access for both", peer)
-        self.assertIn("exact sensitive identifiers", peer)
+        self.assertIn("consultations only; execution jobs refuse it", peer)
+        for text in (execution_only, peer):
+            self.assertIn("same access for Claude and Codex", text)
+            self.assertIn("email addresses and phone numbers", text)
+            self.assertIn("separately logged, scope-matched exception", text)
+
+    def test_per_route_limit_beats_the_global_execution_opt_in(self):
+        policy = autoroute.Policy(
+            repos={"/repo": autoroute.RepoPolicy("client_derived", ("claude", "codex"))},
+            client_derived_routes=frozenset({"execution"}),
+            peer_classifications=autoroute.PEER_CLASSIFICATIONS | {"client_derived"},
+            route_classifications={"codex": frozenset({"public"})})
+        restricted = autoroute.decide(
+            autoroute.Signal(client="claude", repo="/repo", task_type="implementation"), policy,
+            fresh_routes=frozenset({"codex"}), load=autoroute.Load(0.1, True))
+        self.assertNotEqual(restricted.route, "codex")
+        unrestricted = autoroute.decide(
+            autoroute.Signal(client="codex", repo="/repo", task_type="implementation"), policy,
+            fresh_routes=frozenset({"claude"}), load=autoroute.Load(0.1, True))
+        self.assertEqual(unrestricted.route, "claude")
 
     def test_secret_and_credential_labels_remain_refused(self):
         cfg = self.bridge_config(("peer", "execution"))

@@ -596,9 +596,15 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
             "dispatched to a peer")
 
     # 4. Capacity, for the peer route.
-    peer_classifications = policy.route_classifications.get(peer, policy.peer_classifications)
-    if client_peer_enabled:
-        peer_classifications = peer_classifications | {"client_derived"}
+    # A per-route list is the operator's narrower choice for that provider and
+    # is used as written. Only the global set gains client_derived from the
+    # execution opt-in, so restricting one provider still restricts it.
+    if peer in policy.route_classifications:
+        peer_classifications = policy.route_classifications[peer]
+    else:
+        peer_classifications = policy.peer_classifications
+        if client_peer_enabled:
+            peer_classifications = peer_classifications | {"client_derived"}
     peer_allowed = (peer in repo_policy.allowed_routes
                     and repo_policy.classification in peer_classifications)
     if signal.is_review and signal.author_route == peer:
