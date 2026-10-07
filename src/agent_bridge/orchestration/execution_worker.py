@@ -163,7 +163,8 @@ def select_executor(cfg, *, os_name: str | None = None):
     return SubprocessHarnessExecutor(Harnesses(
         codex=cfg.codex_task_executable, claude=cfg.claude_task_executable,
         python=cfg.python_executable,
-        claude_config_dir=cfg.claude_config_dir))
+        claude_config_dir=cfg.claude_config_dir),
+        client_derived_routes=cfg.client_derived_routes)
 
 
 def _configured_queue(config_path: str) -> ExecutionQueue:
@@ -172,7 +173,8 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
         raise ExecutionAdmissionError("execution_configuration_missing")
     return ExecutionQueue(
         cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
-        model_reserved=autoroute.model_reserved_for(str(cfg.state_root)))
+        model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
+        client_derived_routes=cfg.client_derived_routes)
 
 
 def run(config_path: str, *, once: bool, interval: float,

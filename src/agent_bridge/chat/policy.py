@@ -11,10 +11,10 @@ class RoomPolicy:
         # running room to enforce the bridge's per-peer classification policy.
         if isinstance(cfg, bool) and allow_client is False:
             allow_client, cfg = cfg, None
-        if allow_client:
-            raise ValueError('Client-derived material is not supported')
         self.cfg = cfg
-        self.allow_client = False
+        self.allow_client = bool(cfg is not None and "peer" in cfg.client_derived_routes)
+        if allow_client and not self.allow_client:
+            raise ValueError('Client-derived material is not enabled')
 
     def _allowed(self, target: str) -> tuple[str, ...]:
         if self.cfg is None:
@@ -26,6 +26,10 @@ class RoomPolicy:
     def effective_classification(self, labels: list[str]) -> str:
         if any(label not in LABELS for label in labels):
             raise ValueError('Client material, credentials and secrets cannot be shared')
+        if 'client-derived' in labels:
+            if not self.allow_client:
+                raise ValueError('Room policy refuses this classification')
+            return 'client-derived'
         return next((label for label in ('internal', 'synthetic') if label in labels), 'public')
 
     def authorize(self, target: str, classification: str) -> None:
@@ -37,7 +41,10 @@ class RoomPolicy:
                     raise ValueError('Unknown peer') from None
         elif target not in ('claude', 'codex', 'hermes', 'grok'):
             raise ValueError('Unknown peer')
-        if classification not in LABELS or classification not in self._allowed(target):
+        normalized = 'client_derived' if classification == 'client-derived' else classification
+        if (classification not in LABELS
+                or normalized not in self._allowed(target)
+                or (classification == 'client-derived' and not self.allow_client)):
             raise ValueError('Room policy refuses this classification')
 
 

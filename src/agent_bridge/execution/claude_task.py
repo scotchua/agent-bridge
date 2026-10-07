@@ -584,9 +584,11 @@ def _fenced_generation(command:list[str],job:Path,gen:Path,config_dir:Path|None,
             {**env,"TMPDIR":str(tmp)},hostenv.MACOS_SANDBOX_EXEC)
 
 def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
-             classification:str,model:str,effort:str,
+             classification:str,model:str,effort:str,client_derived_routes: tuple[str, ...] = (),
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
+    if classification not in ALLOWED_CLASSIFICATIONS and not (
+            classification == "client_derived" and "execution" in client_derived_routes):
+        raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,claude_bin)): raise TaskError("all paths must be absolute")
     claude_config_dir=_checked_config_dir(claude_config_dir)
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
@@ -717,7 +719,7 @@ def main(argv=None):
     # still checked against the one canonical directory.
     p.add_argument("--claude-config-dir",type=Path,
                    default=Path(os.environ["CLAUDE_CONFIG_DIR"]) if os.environ.get("CLAUDE_CONFIG_DIR") else None)
-    p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS)); p.add_argument("--model",default="sonnet")
+    p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS | {"client_derived"})); p.add_argument("--client-derived-routes",action="append",default=[],choices=["execution"]); p.add_argument("--model",default="sonnet")
     p.add_argument("--effort",default="medium",choices=("low","medium","high","xhigh","max")); p.add_argument("--base",default="HEAD")
     p.add_argument("--timeout",type=int,default=900); p.add_argument("--verify-timeout",type=int,default=300)
     p.add_argument("--verify-json",action="append",required=True)

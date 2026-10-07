@@ -28,6 +28,7 @@ from . import windows_privacy as wpv
 
 
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+CLIENT_DERIVED = "client_derived"
 PROVIDER_FOR_CALLER = {"claude": "codex", "codex": "claude"}
 TERMINAL = frozenset({"complete", "failed", "blocked"})
 
@@ -87,7 +88,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 class SubprocessHarnessExecutor:
     """Invoke only a configured bounded harness, with no shell or fallback."""
 
-    def __init__(self, harnesses: Harnesses):
+    def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset()):
         # Construction stays portable so Windows MCP clients can submit and
         # inspect queue work. Actual execution is rejected in __call__ until a
         # Windows execution worker exists and has been tested.
@@ -104,6 +105,7 @@ class SubprocessHarnessExecutor:
         if directory is not None and not claude_config.is_ready(directory):
             raise ExecutionAdmissionError("claude_config_dir_unavailable")
         self.harnesses = harnesses
+        self.client_derived_routes = client_derived_routes
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
         provider = request["provider"]
@@ -148,6 +150,8 @@ class SubprocessHarnessExecutor:
                      "--model", request["model"], "--effort", request["effort"],
                      "--task-root", str(job_dir / "harness"),
                      "--claude-config-dir", str(directory)]
+        if "execution" in self.client_derived_routes:
+            argv += ["--client-derived-routes", "execution"]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         account = pwd.getpwuid(os.getuid()).pw_name
@@ -363,7 +367,8 @@ class ExecutionQueue:
                  *, clock: Callable[[], float] = time.time,
                  recover_interrupted: bool = True,
                  platform: Any = None,
-                 model_reserved: Callable[[str], str | None]):
+                 model_reserved: Callable[[str], str | None],
+                 client_derived_routes: frozenset[str] = frozenset()):
         # A matcher, not a list, and resolved per call rather than captured
         # here. Not a list because the one implementation of what counts as a
         # reserved name lives in ``autoroute``, and two layers enforcing the
@@ -374,6 +379,7 @@ class ExecutionQueue:
         #
         # Required, with no default. See ``reserve_nothing`` for why.
         self._model_reserved = model_reserved
+        self.client_derived_routes = client_derived_routes
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -455,7 +461,9 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("provider_not_eligible_for_caller")
         if paid_fallback:
             raise ExecutionAdmissionError("paid_fallback_forbidden")
-        if classification not in ALLOWED_CLASSIFICATIONS:
+        if (classification not in ALLOWED_CLASSIFICATIONS
+                and not (classification == CLIENT_DERIVED
+                         and "execution" in self.client_derived_routes)):
             raise ExecutionAdmissionError("classification_not_eligible")
         repo_path, brief_path = Path(repo), Path(brief)
         if not repo_path.is_absolute() or not brief_path.is_absolute():

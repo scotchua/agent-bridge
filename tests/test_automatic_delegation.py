@@ -126,7 +126,7 @@ class ConfigGenerationTests(unittest.TestCase):
             home = os.path.join(tmp, "home")
             cfg = delegation.build_config(home, str(ROOT), local_worker_executable=None)
             for key, value in cfg.items():
-                if key in ("config_version", "interval_seconds"):
+                if key in ("config_version", "interval_seconds", "client_derived_routes"):
                     continue
                 self.assertTrue(os.path.isabs(value), f"{key} must be absolute: {value}")
             self.assertTrue(cfg["state_root"].startswith(os.path.join(os.path.abspath(home), ".agent-bridge")))

@@ -28,8 +28,7 @@ SAFE_CLASSES = ("internal", "public", "synthetic")
 STRICT_CLASSES = ("public", "synthetic")
 CALLERS = {"codex_to_claude": ("codex",), "claude_to_codex": ("claude",),
            "both": ("codex", "claude")}
-BLOCKED_LABELS = {"client-derived", "client_derived", "confidential", "secret",
-                  "credential", "credentials"}
+BLOCKED_LABELS = {"confidential", "secret", "credential", "credentials"}
 BEGIN = "# BEGIN agent-bridge managed {name}"
 END = "# END agent-bridge managed {name}"
 
@@ -57,7 +56,7 @@ def validate_answers(raw: Any) -> dict[str, Any]:
     """Validate the small portable answer document.  No field is guessed."""
     if not isinstance(raw, dict) or raw.get("version") != ANSWERS_VERSION:
         raise ValueError("answers must be a version 1 JSON object")
-    if set(raw) - {"version", "directions", "targets", "privacy", "local_ollama", "automatic_delegation"}:
+    if set(raw) - {"version", "directions", "targets", "privacy", "local_ollama", "automatic_delegation", "client_derived_routes"}:
         raise ValueError("answers contain unknown fields; do not infer unrecognized preferences")
     direction = raw.get("directions")
     if not isinstance(direction, str) or direction not in CALLERS:
@@ -95,6 +94,12 @@ def validate_answers(raw: Any) -> dict[str, Any]:
             if any(x in BLOCKED_LABELS or x not in SAFE_CLASSES for x in labels):
                 raise ValueError("privacy can only restrict internal, public, and synthetic; client and secret labels stay refused")
             peer_lists[peer] = labels
+
+    client_routes = raw.get("client_derived_routes", [])
+    if (not isinstance(client_routes, list)
+            or any(not isinstance(route, str) or route not in {"peer", "execution"}
+                   for route in client_routes)):
+        raise ValueError("client_derived_routes must be a list drawn from peer, execution")
 
     local = raw.get("local_ollama")
     if not isinstance(local, dict) or set(local) - {"enabled", "endpoint", "model", "allow_internal"} or not isinstance(local.get("enabled"), bool):
@@ -161,23 +166,28 @@ def validate_answers(raw: Any) -> dict[str, Any]:
 
     return {"version": ANSWERS_VERSION, "directions": direction, "targets": dict(targets),
             "privacy": {"mode": mode, "peers": peer_lists}, "local_ollama": normal_local,
-            "automatic_delegation": normal_delegation}
+            "automatic_delegation": normal_delegation,
+            "client_derived_routes": list(dict.fromkeys(client_routes))}
 
 
 def privacy_overlay(answers: dict[str, Any]) -> dict[str, Any]:
     privacy = answers["privacy"]
+    routes = list(answers.get("client_derived_routes", []))
     if privacy["mode"] == "baseline":
         return {"allowed_source_classifications": list(SAFE_CLASSES),
                 "peers": {peer: {"allowed_source_classifications": list(SAFE_CLASSES)}
-                          for peer in ("claude", "codex")}}
+                          for peer in ("claude", "codex")},
+                "client_derived_routes": routes}
     if privacy["mode"] == "strict":
         return {"allowed_source_classifications": list(STRICT_CLASSES),
                 "peers": {peer: {"allowed_source_classifications": list(STRICT_CLASSES)}
-                          for peer in ("claude", "codex")}}
+                          for peer in ("claude", "codex")},
+                "client_derived_routes": routes}
     # Global list remains the non-client ceiling. Per-peer lists only reduce it.
     return {"allowed_source_classifications": list(SAFE_CLASSES),
             "peers": {peer: {"allowed_source_classifications": labels}
-                      for peer, labels in privacy["peers"].items()}}
+                      for peer, labels in privacy["peers"].items()},
+            "client_derived_routes": routes}
 
 
 def _choice(prompt: str, allowed: set[str], ask: Callable[[str], str]) -> str:
@@ -241,7 +251,8 @@ def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
     direction = _choice("Directions [both/codex_to_claude/claude_to_codex]: ", set(CALLERS), ask)
     print("Baseline: public, synthetic and your non-client internal work may go to either provider. "
           "Strict: public and synthetic only. Custom: narrower choices per recipient. "
-          "Labels are checked, not content; no option enables client data, secrets or filesystem read confinement.")
+          "Labels are checked, not content; client data is controlled by the next question, "
+          "while secrets and filesystem read confinement are not enabled here.")
     mode = _choice("Privacy [baseline/strict/custom]: ", {"baseline", "strict", "custom"}, ask)
     targets = {name: _choice(f"Configure {name}? [yes/no]: ", {"yes", "no"}, ask) == "yes"
                for name in ("codex", "claude_code", "claude_desktop")}
@@ -257,6 +268,8 @@ def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
                 print("Use only internal, public, synthetic and include synthetic for verification.")
             else:
                 raise ValueError("no valid labels after three attempts; no answers saved")
+    allow_client = _choice("Allow client-derived work to go to Claude and Codex through this bridge (same access for both)? [y/N] ",
+                           {"y", "n", "", "yes", "no"}, ask) in {"y", "yes"}
     enabled = _choice("Use an already-installed local Ollama model? [yes/no]: ", {"yes", "no"}, ask) == "yes"
     local: dict[str, Any] = {"enabled": enabled}
     if enabled:
@@ -289,7 +302,8 @@ def questionnaire(ask: Callable[[str], str] = input) -> dict[str, Any]:
                 "Absolute path to that local-worker executable: ").strip()
     return validate_answers({"version": ANSWERS_VERSION, "directions": direction, "targets": targets,
                              "privacy": {"mode": mode, "peers": peers}, "local_ollama": local,
-                             "automatic_delegation": automatic_delegation})
+                             "automatic_delegation": automatic_delegation,
+                             "client_derived_routes": (["peer", "execution"] if allow_client else [])})
 
 
 def load_answers(path: str) -> dict[str, Any]:
@@ -821,11 +835,32 @@ def _managed_text_update(path: str, name: str, body: str, previous_body: str | N
     return (text + separator + block + newline).encode("utf-8")
 
 
+_IDENTIFIER_RULE = (
+    "Never route secrets, credentials, passwords, API keys or tokens. Exact sensitive identifiers "
+    "(including SSNs, EINs, account or card numbers, email addresses and phone numbers) need the "
+    "operator's explicit approval and a separately logged, scope-matched exception.")
+
+
+def _client_instruction(routes: list[str]) -> str:
+    """One line describing exactly which routes accept client-derived work."""
+    peer, execution = "peer" in routes, "execution" in routes
+    if not peer and not execution:
+        return ("Never route client-derived, confidential, secret, credential, or identifying "
+                "material through the bridge.")
+    where = ("consultations and execution jobs" if peer and execution else
+             "consultations only; execution jobs refuse it" if peer else
+             "execution jobs only; consultations refuse it")
+    return ("Client-derived work, labeled client_derived, is accepted for " + where +
+            ", with the same access for Claude and Codex (operator configuration). " + _IDENTIFIER_RULE)
+
+
 def _shared_instructions(answers: dict[str, Any]) -> str:
     allowed = privacy_overlay(answers)["allowed_source_classifications"]
-    text = ["# agent-bridge shared instructions", "", "Use the bridge only for consultation.",
+    text = ["# agent-bridge shared instructions", "",
+            "Use the consultation bridge only for consultation; implementation jobs go through the "
+            "orchestration execution tools.",
             "Allowed source labels: " + ", ".join(allowed) + ".",
-            "Never route client-derived, confidential, secret, credential, or identifying material through the bridge.",
+            _client_instruction(answers.get("client_derived_routes", [])),
             "Use start, poll, read, and continue deliberately. Share only the selected context needed for the question.",
             "Claude and Codex are peers. A consultation is evidence, not approval; do not duplicate approvals or create recursive bridge calls.",
             "Exact tools first: grep, rg, head, tail, and bounded reads. They beat any model at finding a string.",
@@ -931,7 +966,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     if recorded.get("pins") != expected_pins:
         raise ValueError("candidate pins differ from the staged deployment plan; stage again")
     expected = config.merge(config.load().raw, privacy_overlay(answers))
-    for key in ("allowed_source_classifications", "peers"):
+    for key in ("allowed_source_classifications", "peers", "client_derived_routes"):
         if key == "peers":
             for peer in ("claude", "codex"):
                 expected_peer = privacy_overlay(answers).get("peers", {}).get(peer, {}).get("allowed_source_classifications")
@@ -963,7 +998,9 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
         if blocker:
             raise ValueError(blocker)
         worker_executable = delegation_choice.get("local_worker_executable")
-        delegation_cfg = delegation.build_config(home, root, local_worker_executable=worker_executable)
+        delegation_cfg = delegation.build_config(
+            home, root, local_worker_executable=worker_executable,
+            client_derived_routes=tuple(answers["client_derived_routes"]))
         if not delegation_results:
             raise ValueError("automatic_delegation is enabled but no --delegation-results evidence was supplied")
         if not setup_cmd.is_durable(delegation_results):
@@ -1181,7 +1218,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
 #: dispatched. Installing the automatic component must not begin sending
 #: repositories nobody has spoken about to a provider, so the scaffold is
 #: inert and the operator fills it in.
-def _routing_policy_scaffold() -> bytes:
+def _routing_policy_scaffold(client_derived_routes: tuple[str, ...] = ()) -> bytes:
     document = {
         "version": autoroute.POLICY_VERSION,
         "_comment": [
@@ -1190,9 +1227,8 @@ def _routing_policy_scaffold() -> bytes:
             "A repository with no entry here is RETAINED by whichever "
             "assistant is working, and never dispatched. Add an entry to make "
             "a repository eligible.",
-            "classification: synthetic | public | internal_nonclient. "
-            "client_derived is refused outright, and material that could "
-            "identify a client does not belong in any of them.",
+            "classification: synthetic | public | internal_nonclient | client_derived. "
+            "client_derived is retained unless client_derived_routes includes execution.",
             "allowed_routes: any of claude, codex, local. There is no paid "
             "API route and none can be added here.",
             "prefer: empty means no preference, so when both providers are "
@@ -1210,6 +1246,7 @@ def _routing_policy_scaffold() -> bytes:
             "docs/LOCAL-FIRST-DESIGN.md.",
         ],
         "prefer": [],
+        "client_derived_routes": list(client_derived_routes),
         "declared_available": [],
         "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
         "local_first": {"enabled": False},
@@ -1245,13 +1282,30 @@ def _install_gate(home: str, root: str, config_path: str,
             try:
                 store.secure_mkdir(os.path.dirname(policy_path))
                 if not os.path.exists(policy_path):
-                    store.atomic_write_bytes(policy_path, _routing_policy_scaffold())
+                    routes = delegation_cfg.get("client_derived_routes", [])
+                    store.atomic_write_bytes(policy_path, _routing_policy_scaffold(tuple(routes)))
                     report["policy_created"] = True
                 else:
                     # Never rewritten: it is the operator's document, and an
                     # install that reset it would silently un-classify every
                     # repository they had already decided about.
                     report["policy_created"] = False
+                    # Execution needs the opt-in in BOTH files: the queue reads
+                    # the orchestration config, routing and dispatch read this
+                    # policy. A mismatch fails closed (refuses), so say how to
+                    # finish rather than leave the operator guessing.
+                    wanted = "execution" in delegation_cfg.get("client_derived_routes", [])
+                    try:
+                        existing = store.read_json(policy_path)
+                        has = isinstance(existing, dict) and "execution" in (
+                            existing.get("client_derived_routes") or [])
+                    except (OSError, ValueError):
+                        has = False
+                    if wanted and not has:
+                        report["client_derived_policy_step"] = (
+                            f'Add "client_derived_routes": ["execution"] to {policy_path} '
+                            "(it is your document, so setup does not edit it). Until then "
+                            "client-derived work is refused by routing and dispatch.")
             except OSError as exc:
                 report["policy_error"] = type(exc).__name__
     try:

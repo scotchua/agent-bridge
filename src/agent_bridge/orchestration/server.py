@@ -25,7 +25,8 @@ INSTRUCTIONS = (
     "Durable work orchestration and local mechanical processing. This is separate "
     "from peer consultation. Route mechanical work, client-derived included, through "
     "work_checkpoint and work_route_local with its true classification; the on-device "
-    "lane accepts client_derived. Peer and execution routes refuse client-derived input. "
+    "lane accepts client_derived. Peer and execution routes refuse client-derived input "
+    "unless the operator enables their matching client_derived_routes setting. "
     "Local drafts require review; silent cloud fallback is refused."
 )
 
@@ -172,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
         # standalone execution worker consumes the same queue.
         execution = ExecutionQueue(
             cfg.execution_queue_root, None, recover_interrupted=False,
-            model_reserved=autoroute.model_reserved_for(str(cfg.state_root)))
+            model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
+            client_derived_routes=cfg.client_derived_routes)
     # The same protected list the delegation-first hook computes, so
     # work_digest_file refuses a target the hook would also refuse to write:
     # the gate's own state, the stage router's database, the local queue's

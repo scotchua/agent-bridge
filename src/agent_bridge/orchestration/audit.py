@@ -128,10 +128,21 @@ def _eligible(row: dict[str, Any]) -> bool:
     if not isinstance(allowed, list) or not allowed:
         return False
     if classification == "client_derived":
-        # Local is the one route client-derived work may take, and only
-        # mechanical work goes there (the same predicate autoroute.decide uses).
-        return ("local" in allowed and considered.get("mechanical_ok") is True
-                and considered.get("task_type") == "mechanical")
+        # Without the operator's execution opt-in, local is the one route
+        # client-derived work may take, and only mechanical work goes there
+        # (the same predicate autoroute.decide uses). With it, a peer route is
+        # eligible exactly as for any other classification.
+        local = ("local" in allowed and considered.get("mechanical_ok") is True
+                 and considered.get("task_type") == "mechanical")
+        if considered.get("client_derived_execution") is not True:
+            return local
+        caller = considered.get("client")
+        receiving = considered.get("client_derived_peer_routes")
+        if not isinstance(receiving, list):
+            # A decision recorded before this field existed: only local is
+            # provably eligible.
+            return local
+        return local or any(route != caller and route in receiving for route in allowed)
     caller = considered.get("client")
     return any(route != caller for route in allowed)
 

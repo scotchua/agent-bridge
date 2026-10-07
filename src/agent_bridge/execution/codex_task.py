@@ -37,7 +37,7 @@ Differences from the Claude lane, stated rather than left implicit:
 4. Read confinement is not claimed. `-s workspace-write` restricts writes,
    not reads, identically to the consultation peer's documented limitation
    (see the README's "Honest limits"). The controls that actually apply are
-   the refusal of client-derived classifications, the disposable per-job
+   the operator's client-derived route setting, the disposable per-job
    worktree, and the ancestor instruction-file walk above; none of them is a
    filesystem read boundary, and none is claimed as one here.
 
@@ -581,8 +581,11 @@ def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,**kwargs):
 def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission:codex_promotion.Admission,
                   codex_home:Path=DEFAULT_CODEX_HOME,
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
+                  client_derived_routes: tuple[str, ...] = (),
                   verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
-    if classification not in ALLOWED_CLASSIFICATIONS: raise TaskError("execution lane refuses client-derived material")
+    if classification not in ALLOWED_CLASSIFICATIONS and not (
+            classification == "client_derived" and "execution" in client_derived_routes):
+        raise TaskError("execution lane refuses client-derived material")
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
@@ -718,7 +721,9 @@ def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
     p.add_argument("--codex-bin",type=Path,default=Path(shutil.which("codex") or "codex"),dest="codex_bin")
     p.add_argument("--codex-home",type=Path,default=DEFAULT_CODEX_HOME,dest="codex_home")
-    p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS))
+    p.add_argument("--classification",required=True,
+                   choices=sorted(ALLOWED_CLASSIFICATIONS | {"client_derived"}))
+    p.add_argument("--client-derived-routes", action="append", default=[], choices=["execution"])
     p.add_argument("--model",default=None); p.add_argument("--reasoning-effort",default=None,dest="reasoning_effort")
     p.add_argument("--base",default="HEAD"); p.add_argument("--timeout",type=int,default=900)
     p.add_argument("--verify-timeout",type=int,default=300)

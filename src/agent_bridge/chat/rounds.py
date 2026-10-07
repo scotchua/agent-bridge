@@ -52,7 +52,11 @@ class PeerRounds:
             if not isinstance(value, str) or len(value) > limit or (key != 'context' and not value.strip()):
                 raise ValueError('Invalid selected question or context')
         classification = args['source_classification']
-        if classification not in ('public', 'synthetic', 'internal'):
+        # client-derived needs the operator's peer opt-in, which only a room
+        # policy carries; without one it stays refused, as before the opt-in.
+        client_enabled = bool(self.policy is not None and getattr(self.policy, 'allow_client', False))
+        if (classification not in ('public', 'synthetic', 'internal', 'client-derived')
+                or (classification == 'client-derived' and not client_enabled)):
             raise ValueError('Client material, credentials and secrets are excluded')
         for target in targets:
             if self.policy is not None:

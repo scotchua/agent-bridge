@@ -20,6 +20,11 @@ it can still reveal operational details such as when a consultation ran, which
 peer received it, its classification and its outcome. Never share the state
 directory, config, canary output or backups as troubleshooting attachments.
 
+Client-derived content is refused by default. If the operator enables the
+`peer` or `execution` entry in `client_derived_routes`, the corresponding
+local state can contain client-derived prompts, classifications and receipts;
+the setting does not relax the refusals for secrets or credentials.
+
 ## The 30-day defaults
 
 The default configuration makes job payloads and conversation records eligible
