@@ -137,7 +137,12 @@ def _eligible(row: dict[str, Any]) -> bool:
         if considered.get("client_derived_execution") is not True:
             return local
         caller = considered.get("client")
-        return local or any(route not in (caller, "local") for route in allowed)
+        receiving = considered.get("client_derived_peer_routes")
+        if not isinstance(receiving, list):
+            # A decision recorded before this field existed: only local is
+            # provably eligible.
+            return local
+        return local or any(route != caller and route in receiving for route in allowed)
     caller = considered.get("client")
     return any(route != caller for route in allowed)
 

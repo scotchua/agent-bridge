@@ -856,7 +856,9 @@ def _client_instruction(routes: list[str]) -> str:
 
 def _shared_instructions(answers: dict[str, Any]) -> str:
     allowed = privacy_overlay(answers)["allowed_source_classifications"]
-    text = ["# agent-bridge shared instructions", "", "Use the bridge only for consultation.",
+    text = ["# agent-bridge shared instructions", "",
+            "Use the consultation bridge only for consultation; implementation jobs go through the "
+            "orchestration execution tools.",
             "Allowed source labels: " + ", ".join(allowed) + ".",
             _client_instruction(answers.get("client_derived_routes", [])),
             "Use start, poll, read, and continue deliberately. Share only the selected context needed for the question.",

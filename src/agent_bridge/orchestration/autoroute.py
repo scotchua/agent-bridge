@@ -511,6 +511,14 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
         "allowed_routes": list(repo_policy.allowed_routes),
         "mechanical_ok": repo_policy.mechanical_ok,
         "client_derived_execution": "execution" in policy.client_derived_routes,
+        # Provider routes that may actually receive client_derived work under
+        # this policy: a per-route list is used as written, and only the global
+        # set gains client_derived from the execution opt-in (as in step 4).
+        "client_derived_peer_routes": sorted(
+            route for route in PEER_FOR_CLIENT.values()
+            if ("client_derived" in policy.route_classifications[route]
+                if route in policy.route_classifications
+                else "execution" in policy.client_derived_routes)),
         "fresh_routes": sorted(fresh_routes),
         "load_per_core": load.busy_at,
         "cpu_idle_ratio": cpu_idle_ratio if idle_known else None,

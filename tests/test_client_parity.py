@@ -154,7 +154,22 @@ class ClientDerivedParityTests(unittest.TestCase):
                               "task_type": "implementation"}}
         self.assertFalse(audit._eligible(row))
         row["considered"]["client_derived_execution"] = True
+        row["considered"]["client_derived_peer_routes"] = ["claude", "codex"]
         self.assertTrue(audit._eligible(row))
+
+    def test_audit_agrees_with_routing_when_a_provider_is_restricted(self):
+        from agent_bridge.orchestration import audit
+        policy = autoroute.Policy(
+            repos={"/repo": autoroute.RepoPolicy("client_derived", ("claude", "codex"))},
+            client_derived_routes=frozenset({"execution"}),
+            peer_classifications=autoroute.PEER_CLASSIFICATIONS | {"client_derived"},
+            route_classifications={"codex": frozenset({"public"})})
+        decision = autoroute.decide(
+            autoroute.Signal(client="claude", repo="/repo", task_type="implementation"), policy,
+            fresh_routes=frozenset({"codex"}), load=autoroute.Load(0.1, True))
+        self.assertNotEqual(decision.route, "codex")
+        self.assertEqual(decision.considered["client_derived_peer_routes"], ["claude"])
+        self.assertFalse(audit._eligible({"considered": decision.considered}))
 
     def test_shared_instructions_follow_the_peer_route_and_keep_identifier_rule(self):
         from agent_bridge import onboard
