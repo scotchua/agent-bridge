@@ -839,8 +839,10 @@ def _shared_instructions(answers: dict[str, Any]) -> str:
     allowed = privacy_overlay(answers)["allowed_source_classifications"]
     text = ["# agent-bridge shared instructions", "", "Use the bridge only for consultation.",
             "Allowed source labels: " + ", ".join(allowed) + ".",
-            ("Client-derived work is enabled symmetrically for Claude and Codex by operator configuration."
-             if answers.get("client_derived_routes") else
+            ("Client-derived work, labeled client_derived, may go to Claude and Codex through this consultation bridge, "
+             "with the same access for both (operator configuration). Never route secrets or credentials, and never "
+             "route exact sensitive identifiers (SSNs, EINs, account or card numbers) without the operator's explicit approval."
+             if "peer" in answers.get("client_derived_routes", []) else
              "Never route client-derived, confidential, secret, credential, or identifying material through the bridge."),
             "Use start, poll, read, and continue deliberately. Share only the selected context needed for the question.",
             "Claude and Codex are peers. A consultation is evidence, not approval; do not duplicate approvals or create recursive bridge calls.",
@@ -1271,6 +1273,22 @@ def _install_gate(home: str, root: str, config_path: str,
                     # install that reset it would silently un-classify every
                     # repository they had already decided about.
                     report["policy_created"] = False
+                    # Execution needs the opt-in in BOTH files: the queue reads
+                    # the orchestration config, routing and dispatch read this
+                    # policy. A mismatch fails closed (refuses), so say how to
+                    # finish rather than leave the operator guessing.
+                    wanted = "execution" in delegation_cfg.get("client_derived_routes", [])
+                    try:
+                        existing = store.read_json(policy_path)
+                        has = isinstance(existing, dict) and "execution" in (
+                            existing.get("client_derived_routes") or [])
+                    except (OSError, ValueError):
+                        has = False
+                    if wanted and not has:
+                        report["client_derived_policy_step"] = (
+                            f'Add "client_derived_routes": ["execution"] to {policy_path} '
+                            "(it is your document, so setup does not edit it). Until then "
+                            "client-derived work is refused by routing and dispatch.")
             except OSError as exc:
                 report["policy_error"] = type(exc).__name__
     try:

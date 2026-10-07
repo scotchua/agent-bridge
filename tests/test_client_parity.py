@@ -147,6 +147,25 @@ class ClientDerivedParityTests(unittest.TestCase):
                     off.authorize(target, "client-derived")
                 on.authorize(target, "client-derived")
 
+    def test_audit_counts_opted_in_client_execution_as_eligible(self):
+        from agent_bridge.orchestration import audit
+        row = {"considered": {"classification": "client_derived", "client": "claude",
+                              "allowed_routes": ["claude", "codex"], "mechanical_ok": False,
+                              "task_type": "implementation"}}
+        self.assertFalse(audit._eligible(row))
+        row["considered"]["client_derived_execution"] = True
+        self.assertTrue(audit._eligible(row))
+
+    def test_shared_instructions_follow_the_peer_route_and_keep_identifier_rule(self):
+        from agent_bridge import onboard
+        base = {"privacy": {"mode": "baseline", "peers": {}}, "local_ollama": {"enabled": False},
+                "automatic_delegation": {"enabled": False}}
+        execution_only = onboard._shared_instructions({**base, "client_derived_routes": ["execution"]})
+        self.assertIn("Never route client-derived", execution_only)
+        peer = onboard._shared_instructions({**base, "client_derived_routes": ["peer"]})
+        self.assertIn("same access for both", peer)
+        self.assertIn("exact sensitive identifiers", peer)
+
     def test_secret_and_credential_labels_remain_refused(self):
         cfg = self.bridge_config(("peer", "execution"))
         for caller, peer in broker.PEER_OF.items():
