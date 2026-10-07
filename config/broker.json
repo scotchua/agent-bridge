@@ -29,6 +29,7 @@
     "client-derived",
     "client_derived"
   ],
+  "client_derived_routes": [],
   "peers": {
     "claude": {
       "executable": null,

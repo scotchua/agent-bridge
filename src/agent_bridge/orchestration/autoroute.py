@@ -63,6 +63,7 @@ CLASSIFICATIONS = ("synthetic", "public", "internal_nonclient",
                    "client_derived", "unclassified")
 #: What the two provider lanes accept, matching ``execution_queue`` exactly.
 PEER_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient"})
+CLIENT_DERIVED_ROUTES = frozenset({"peer", "execution"})
 #: What the local worker accepts, matching ``localq.spool`` exactly. Wider
 #: than the peers' set: the local model runs on this machine, so client-derived
 #: text sent to it never leaves the host, and a local digest keeps it out of a
@@ -249,6 +250,10 @@ class Policy:
     default: RepoPolicy = RepoPolicy()
     local_classifications: frozenset[str] = LOCAL_CLASSIFICATIONS
     peer_classifications: frozenset[str] = PEER_CLASSIFICATIONS
+    #: Explicit operator routes for client-derived data.  ``execution`` lets
+    #: automatic routing use a provider execution lane; ``peer`` is retained
+    #: here too so one policy vocabulary describes both bridge surfaces.
+    client_derived_routes: frozenset[str] = frozenset()
     #: Per-route narrowing of ``peer_classifications``. A route absent here
     #: uses the global set unchanged. Exists because the two peers can be
     #: different companies under different accounts, possibly different
@@ -521,14 +526,16 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
             "retained_repo_unclassified",
             f"{signal.repo} has no operator classification, so no route is "
             f"eligible to receive it and the work stays with {signal.client}")
+    client_peer_enabled = "execution" in policy.client_derived_routes
     if repo_policy.classification == "client_derived" and not (
-            "local" in repo_policy.allowed_routes and repo_policy.mechanical_ok
-            and signal.task_type == "mechanical"
-            and "client_derived" in policy.local_classifications):
+            client_peer_enabled or ("local" in repo_policy.allowed_routes
+                                    and repo_policy.mechanical_ok
+                                    and signal.task_type == "mechanical"
+                                    and "client_derived" in policy.local_classifications)):
         return retain(
             "retained_classification_ineligible",
-            "client-derived material goes only to the local model, and only as "
-            "mechanical work; it is never dispatched to a peer")
+            "client-derived material is not enabled for provider execution and "
+            "is not eligible for the local mechanical lane")
     if not repo_policy.allowed_routes:
         return retain(
             "retained_no_eligible_route",
@@ -546,34 +553,42 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
     # 3. Hardware load, but only where it can change the answer.
     if local_eligible:
         if not load.known:
-            return retain(
-                "retained_local_load_unknown",
-                "this host exposes no load average, so local capacity is "
-                "unknown and local work defers rather than assuming the "
-                "machine is idle")
+            if repo_policy.classification == "client_derived" and client_peer_enabled:
+                local_eligible = False
+            else:
+                return retain(
+                    "retained_local_load_unknown",
+                    "this host exposes no load average, so local capacity is "
+                    "unknown and local work defers rather than assuming the "
+                    "machine is idle")
         idle_rescues = idle_known and cpu_idle_ratio >= MIN_LOCAL_IDLE_RATIO
-        if load.ratio >= policy.max_local_load_ratio and not idle_rescues:
+        if local_eligible and load.ratio >= policy.max_local_load_ratio and not idle_rescues:
             detail = (f"; measured idle {cpu_idle_ratio:.2f} is below the "
                       f"{MIN_LOCAL_IDLE_RATIO} rescue threshold" if idle_known else "")
-            return retain(
-                "retained_local_load_high",
-                f"load per core is {load.busy_at}, at or above the "
-                f"{policy.max_local_load_ratio} ceiling{detail}, so the local "
-                f"model would compete with the user's own machine")
-        if "local" not in fresh_routes:
-            return retain(
-                "retained_no_fresh_capacity",
-                "no fresh capacity observation for the local route, and a "
-                "stale observation never makes a route eligible")
-        return Decision("local", "routed_local_mechanical",
-                        f"mechanical {repo_policy.classification} text work in a "
-                        f"repository the operator marked eligible for a local model",
-                        considered)
+            if not (repo_policy.classification == "client_derived" and client_peer_enabled):
+                return retain(
+                    "retained_local_load_high",
+                    f"load per core is {load.busy_at}, at or above the "
+                    f"{policy.max_local_load_ratio} ceiling{detail}, so the local "
+                    "model would compete with the user's own machine")
+            local_eligible = False
+        if local_eligible and "local" not in fresh_routes:
+            if not (repo_policy.classification == "client_derived" and client_peer_enabled):
+                return retain(
+                    "retained_no_fresh_capacity",
+                    "no fresh capacity observation for the local route, and a "
+                    "stale observation never makes a route eligible")
+            local_eligible = False
+        if local_eligible:
+            return Decision("local", "routed_local_mechanical",
+                            f"mechanical {repo_policy.classification} text work in a "
+                            f"repository the operator marked eligible for a local model",
+                            considered)
 
     # Backstop: the local branch above returns for every client-derived unit
     # the privacy check let through, so this is unreachable today. It stays
     # so that no later edit can let client-derived work reach a peer.
-    if repo_policy.classification == "client_derived":
+    if repo_policy.classification == "client_derived" and not client_peer_enabled:
         return retain(
             "retained_classification_ineligible",
             "client-derived material goes only to the local model; it is never "
@@ -581,6 +596,8 @@ def decide(signal: Signal, policy: Policy, *, fresh_routes: frozenset[str],
 
     # 4. Capacity, for the peer route.
     peer_classifications = policy.route_classifications.get(peer, policy.peer_classifications)
+    if client_peer_enabled:
+        peer_classifications = peer_classifications | {"client_derived"}
     peer_allowed = (peer in repo_policy.allowed_routes
                     and repo_policy.classification in peer_classifications)
     if signal.is_review and signal.author_route == peer:
@@ -739,6 +756,13 @@ def parse_policy(document: object) -> Policy:
     declared = document.get("declared_available", [])
     if not isinstance(declared, list) or any(route not in ROUTES for route in declared):
         raise PolicyError("declared_available must be a list of known routes")
+    client_routes = document.get("client_derived_routes", [])
+    if (not isinstance(client_routes, list)
+            or any(not isinstance(route, str) or route not in CLIENT_DERIVED_ROUTES
+                   for route in client_routes)):
+        raise PolicyError("client_derived_routes must be a list drawn from peer, execution")
+    peer_classes = (PEER_CLASSIFICATIONS | {"client_derived"}
+                    if "execution" in client_routes else PEER_CLASSIFICATIONS)
     raw_route_classifications = document.get("route_classifications", {})
     if not isinstance(raw_route_classifications, dict):
         raise PolicyError("route_classifications must be an object")
@@ -747,7 +771,7 @@ def parse_policy(document: object) -> Policy:
         if route not in PEER_FOR_CLIENT:
             raise PolicyError(f"route_classifications key {route!r} must be claude or codex")
         if (not isinstance(classes, list) or not classes
-                or any(not isinstance(c, str) or c not in PEER_CLASSIFICATIONS for c in classes)):
+                or any(not isinstance(c, str) or c not in peer_classes for c in classes)):
             raise PolicyError(
                 f"route_classifications[{route!r}] must be a non-empty list drawn from "
                 + ", ".join(sorted(PEER_CLASSIFICATIONS)))
@@ -762,6 +786,7 @@ def parse_policy(document: object) -> Policy:
                                                   "max_local_load_ratio", "prefer",
                                                   "declared_available", "local_first",
                                                   "route_classifications",
+                                                  "client_derived_routes",
                                                   "reserved_models"}
     if unknown_top:
         raise PolicyError("routing policy has unknown keys: "
@@ -772,7 +797,8 @@ def parse_policy(document: object) -> Policy:
         raise PolicyError("reserved_models must be a list of non-empty strings")
     local_first = _parse_local_first(document.get("local_first", {}))
     return Policy(repos=repos, local_classifications=LOCAL_CLASSIFICATIONS,
-                  peer_classifications=PEER_CLASSIFICATIONS,
+                  peer_classifications=peer_classes,
+                  client_derived_routes=frozenset(client_routes),
                   route_classifications=route_classifications,
                   max_local_load_ratio=float(ceiling), prefer=tuple(prefer),
                   declared_routes=tuple(dict.fromkeys(declared)),

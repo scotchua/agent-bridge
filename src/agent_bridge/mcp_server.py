@@ -37,7 +37,7 @@ _CLASSIFICATION_DESCRIPTION = (
     "Provenance of the material in this prompt. Contract version 1 accepts "
     "'internal' (the firm's own non-client work product), 'synthetic' (invented "
     "or fixture data) and 'public' (third-party published material). "
-    "Client-derived content is refused."
+    "Client-derived content requires the operator's peer-route opt-in."
 )
 
 
@@ -179,6 +179,8 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
     """Tool table for one caller mode. The peer's own name never appears."""
     peer = broker.PEER_OF[caller]
     allowed = cfg.peer_allowed_classifications(peer) if cfg else None
+    if allowed and "client_derived" in allowed:
+        allowed = (*allowed, "client-derived")
     start_schema = _start_schema(peer, allowed)
     continue_schema = _continue_schema(peer, allowed)
     start_schema["properties"]["prompt"]["maxLength"] = cfg.prompt_budget("start") if cfg else 32000

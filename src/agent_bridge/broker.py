@@ -73,13 +73,17 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
     if not isinstance(classification, str):
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
     normalized = classification.strip().lower()
-    if normalized in {"client-derived", "client_derived"} | {
-        c.lower() for c in cfg.refused_classifications
-    }:
+    client_derived = normalized in {"client-derived", "client_derived"}
+    if ((client_derived and "peer" not in cfg.client_derived_routes)
+            or normalized in {
+                c.lower() for c in cfg.refused_classifications
+                if c.lower() not in {"client-derived", "client_derived"}
+            }):
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
     # Checked against what THIS peer may receive, which can be narrower than
     # the global list when one vendor's terms are weaker than the other's.
-    if normalized not in {c.lower() for c in cfg.peer_allowed_classifications(peer)}:
+    accepted = {c.lower() for c in cfg.peer_allowed_classifications(peer)}
+    if normalized not in accepted and not (client_derived and "client_derived" in accepted):
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
 
     label = args.get("label")

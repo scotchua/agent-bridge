@@ -52,7 +52,7 @@ class PeerRounds:
             if not isinstance(value, str) or len(value) > limit or (key != 'context' and not value.strip()):
                 raise ValueError('Invalid selected question or context')
         classification = args['source_classification']
-        if classification not in ('public', 'synthetic', 'internal'):
+        if classification not in ('public', 'synthetic', 'internal', 'client-derived'):
             raise ValueError('Client material, credentials and secrets are excluded')
         for target in targets:
             if self.policy is not None:

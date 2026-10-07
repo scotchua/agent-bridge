@@ -58,6 +58,7 @@ class OrchestrationConfig:
     client_data_health_path: str | None = None
     client_data_health_timeout_seconds: float = 30.0
     client_data_health_record: Path | None = None
+    client_derived_routes: frozenset[str] = frozenset()
 
 
 _KEYS = frozenset({
@@ -71,6 +72,7 @@ _KEYS = frozenset({
     "gemma_delegate_sha256", "gemma_receipt_validator_sha256", "gemma_model_digest",
     "client_data_health_command", "client_data_health_path",
     "client_data_health_timeout_seconds", "client_data_health_record",
+    "client_derived_routes",
 })
 
 #: The certified delegate's own current budget. Config may only widen this,
@@ -226,6 +228,11 @@ def load(path: str | Path) -> OrchestrationConfig:
         raise OrchestrationConfigError("config_shape_invalid")
     if raw.get("config_version") != "1":
         raise OrchestrationConfigError("config_version_unsupported")
+    client_routes = raw.get("client_derived_routes", [])
+    if (not isinstance(client_routes, list)
+            or any(not isinstance(route, str) or route not in {"peer", "execution"}
+                   for route in client_routes)):
+        raise OrchestrationConfigError("client_derived_routes_invalid")
     interval = raw.get("interval_seconds", 5.0)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
         raise OrchestrationConfigError("interval_seconds_invalid")
@@ -257,6 +264,7 @@ def load(path: str | Path) -> OrchestrationConfig:
         execution_queue_root=execution_paths[0], codex_task_executable=execution_paths[1],
         claude_task_executable=execution_paths[2], python_executable=execution_paths[3],
         claude_config_dir=claude_config_dir,
+        client_derived_routes=frozenset(client_routes),
         **windows_paths,
         **gemma_paths,
         **health,

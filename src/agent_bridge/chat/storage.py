@@ -7,7 +7,7 @@ import time
 import uuid
 
 PARTICIPANTS = ('claude', 'codex')
-LABELS = ('public', 'synthetic', 'internal')
+LABELS = ('public', 'synthetic', 'internal', 'client-derived')
 
 
 class RoomStore:

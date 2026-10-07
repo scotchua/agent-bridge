@@ -20,6 +20,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, "config", "broker.json")
 SUPPORTED_CONFIG_VERSIONS = ("1",)
 PEERS = ("claude", "codex")
+CLIENT_DERIVED_ROUTES = frozenset({"peer", "execution"})
 
 #: Env var used to point the broker at a specific config file.
 CONFIG_ENV = "AGENT_BRIDGE_CONFIG"
@@ -65,6 +66,10 @@ class Config:
         for peer in PEERS:
             if peer not in raw["peers"]:
                 raise ValueError(f"config missing peers.{peer}")
+        # Validate the opt-in at load time. A malformed local overlay must not
+        # become permissive merely because a particular process has not yet
+        # asked about classifications.
+        self.client_derived_routes
 
     # ---- scalars -------------------------------------------------------
     @property
@@ -108,6 +113,16 @@ class Config:
     def allowed_classifications(self) -> tuple[str, ...]:
         return tuple(self.raw.get("allowed_source_classifications") or ())
 
+    @property
+    def client_derived_routes(self) -> frozenset[str]:
+        """Operator opt-ins for client-derived data, empty in a fresh clone."""
+        value = self.raw.get("client_derived_routes", [])
+        if not isinstance(value, list) or any(not isinstance(route, str)
+                                              or route not in CLIENT_DERIVED_ROUTES
+                                              for route in value):
+            raise ValueError("client_derived_routes must be a list drawn from peer, execution")
+        return frozenset(value)
+
     #: Effort levels both CLIs accept. Kept identical so one setting means the
     #: same thing on each side.
     EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -142,10 +157,14 @@ class Config:
         """
         override = self.peer(peer).get("allowed_source_classifications")
         if override is None:
-            return self.allowed_classifications
-        if not isinstance(override, list) or not all(isinstance(x, str) for x in override):
-            raise ValueError(f"peers.{peer}.allowed_source_classifications must be a list of strings")
-        return tuple(override)
+            allowed = self.allowed_classifications
+        else:
+            if not isinstance(override, list) or not all(isinstance(x, str) for x in override):
+                raise ValueError(f"peers.{peer}.allowed_source_classifications must be a list of strings")
+            allowed = tuple(override)
+        if "peer" in self.client_derived_routes:
+            return tuple(dict.fromkeys((*allowed, "client_derived")))
+        return allowed
 
     @property
     def refused_classifications(self) -> tuple[str, ...]:

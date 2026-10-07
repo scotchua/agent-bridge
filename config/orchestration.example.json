@@ -10,5 +10,6 @@
   "claude_task_executable": "/absolute/path/to/claude_task.py",
   "python_executable": "/absolute/path/to/python3",
   "claude_config_dir": "/absolute/path/to/home/.agent-bridge/claude-home",
+  "client_derived_routes": [],
   "interval_seconds": 5.0
 }

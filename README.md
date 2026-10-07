@@ -130,9 +130,10 @@ Setup asks what may be sent to each receiving peer:
 | Strict | Public material and invented examples only. |
 | Custom | A narrower list for each peer; synthetic examples remain necessary for full setup verification. |
 
-Client-derived/confidential material and secrets are outside this bridge's
-supported use. Removing names does not automatically make client-derived
-material eligible.
+Client-derived material is refused by default. An operator who wants Claude
+and Codex to have the same client-data access may set
+`client_derived_routes` to include `peer` and/or `execution` in their local
+configuration; secrets, credentials and confidential labels remain refused.
 
 **The bridge checks the supplied classification, not the contents of the text.**
 Disallowed labels are rejected before dispatch, but it does not detect a secret
@@ -431,9 +432,10 @@ Hashes detect changed bytes; hashes do not authenticate a person, prove that a
 human reviewed them, or prove that redaction is semantically complete.
 
 The request payload and source classification must exactly equal the
-preparation. Client-derived material remains refused in both directions,
-including with complete receipt and clearance; each peer's configured
-allowance and the global refused list also apply. There is no bypass flag.
+preparation. Client-derived material remains refused in both directions unless
+the operator has enabled the `peer` route in `client_derived_routes`; each
+peer's configured allowance and the secret and credential refusals still
+apply. There is no bypass flag.
 Handoff requests cannot include a free-form label. Only the redacted payload,
 local preparation reference and hash bindings enter the request; raw input,
 candidate text, identifier lists and entity maps are not copied into requests,

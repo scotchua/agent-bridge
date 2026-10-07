@@ -597,6 +597,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 repo_policy = policy.for_repo(args.get("repo"))
                 peer_classifications = policy.route_classifications.get(
                     provider, policy.peer_classifications)
+                if "execution" in policy.client_derived_routes:
+                    peer_classifications = peer_classifications | {"client_derived"}
                 if (provider not in repo_policy.allowed_routes
                         or repo_policy.classification not in peer_classifications):
                     return {"ok": False,

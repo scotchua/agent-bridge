@@ -89,6 +89,7 @@ def paths_for(home: str, root: str) -> dict[str, str]:
 
 
 def build_config(home: str, root: str, *, local_worker_executable: str | None,
+                 client_derived_routes: tuple[str, ...] = (),
                   interval_seconds: float = 5.0) -> dict[str, Any]:
     """Return the complete private orchestration config document.
 
@@ -113,6 +114,7 @@ def build_config(home: str, root: str, *, local_worker_executable: str | None,
         "claude_config_dir": paths["claude_config_dir"],
         "python_executable": _portable_python(),
         "interval_seconds": float(interval_seconds),
+        "client_derived_routes": list(client_derived_routes),
     }
 
 
