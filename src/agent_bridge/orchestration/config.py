@@ -51,6 +51,13 @@ class OrchestrationConfig:
     gemma_receipt_validator_sha256: str | None = None
     gemma_model_digest: str | None = None
     gemma_timeout_seconds: float = 600.0
+    # The client-data health check is optional as a group.  If absent, the
+    # queue deliberately fails closed for client-derived work; if present,
+    # every value is protected operator configuration.
+    client_data_health_command: tuple[str, ...] | None = None
+    client_data_health_path: str | None = None
+    client_data_health_timeout_seconds: float = 30.0
+    client_data_health_record: Path | None = None
 
 
 _KEYS = frozenset({
@@ -62,6 +69,8 @@ _KEYS = frozenset({
     "local_backend", "gemma_delegate_executable", "gemma_python_executable",
     "gemma_receipt_root", "gemma_receipt_validator_executable", "gemma_timeout_seconds",
     "gemma_delegate_sha256", "gemma_receipt_validator_sha256", "gemma_model_digest",
+    "client_data_health_command", "client_data_health_path",
+    "client_data_health_timeout_seconds", "client_data_health_record",
 })
 
 #: The certified delegate's own current budget. Config may only widen this,
@@ -179,6 +188,34 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
            **digests, "gemma_timeout_seconds": float(timeout)}
 
 
+def _client_data_health(raw: dict[str, Any]) -> dict[str, Any]:
+    """Strictly parse the all-or-nothing server-side health configuration."""
+    fields = ("client_data_health_command", "client_data_health_path",
+              "client_data_health_timeout_seconds", "client_data_health_record")
+    present = [field in raw for field in fields]
+    if not any(present):
+        return {"client_data_health_command": None, "client_data_health_path": None,
+                "client_data_health_timeout_seconds": 30.0,
+                "client_data_health_record": None}
+    if not all(present):
+        raise OrchestrationConfigError("client_data_health_configuration_incomplete")
+    command = raw["client_data_health_command"]
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(part, str) and part for part in command)
+            or not Path(command[0]).is_absolute() or tuple(command[-2:]) != ("status", "--json")):
+        raise OrchestrationConfigError("client_data_health_command_invalid")
+    path = raw["client_data_health_path"]
+    if not isinstance(path, str) or not path:
+        raise OrchestrationConfigError("client_data_health_path_invalid")
+    timeout = raw["client_data_health_timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise OrchestrationConfigError("client_data_health_timeout_seconds_invalid")
+    record = _absolute_path(raw["client_data_health_record"], "client_data_health_record")
+    return {"client_data_health_command": tuple(command), "client_data_health_path": path,
+            "client_data_health_timeout_seconds": float(timeout),
+            "client_data_health_record": record}
+
+
 def load(path: str | Path) -> OrchestrationConfig:
     config_path = Path(path).expanduser()
     try:
@@ -210,6 +247,7 @@ def load(path: str | Path) -> OrchestrationConfig:
                          else _absolute_path(raw_config_dir, "claude_config_dir"))
     windows_paths = _windows_paths(raw)
     gemma_paths = _gemma_paths(raw)
+    health = _client_data_health(raw)
     if capacity_db == local_root or capacity_db == state_root:
         raise OrchestrationConfigError("capacity_db_must_be_file")
     return OrchestrationConfig(
@@ -221,4 +259,5 @@ def load(path: str | Path) -> OrchestrationConfig:
         claude_config_dir=claude_config_dir,
         **windows_paths,
         **gemma_paths,
+        **health,
     )

@@ -8,7 +8,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
-from agent_bridge.localq.spool import FakeBackend, LocalQueue, QueueCaps, ResourceSnapshot
+from agent_bridge.localq.spool import (AdmissionError, FakeBackend, LocalQueue,
+                                       QueueCaps, ResourceSnapshot)
 from agent_bridge.localq import mcp
 
 
@@ -55,18 +56,13 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(receipt["classification"], "internal_nonclient")
         self.assertEqual(receipt["input_sha256"], routed["input_sha256"])
 
-    def test_client_derived_mechanical_work_is_queued_locally(self):
-        # Scott, 2026-09-24: the on-device model is the safest processor of
-        # client data. The flag is recognized, not refused.
-        routed = self.route(classification="client_derived", risk_flags=["client_derived"])
-        self.assertEqual(routed["decision"], "local")
-        self.assertEqual(routed["fallback"], "none")
-        self.assertEqual(self.queue.status(routed["job_id"])["classification"], "client_derived")
-        self.assertEqual(self.intake.receipt(routed["receipt_id"])["classification"], "client_derived")
+    def test_client_derived_private_worker_is_refused(self):
+        with self.assertRaisesRegex(AdmissionError, "client_data_backend_unsupported"):
+            self.route(classification="client_derived", risk_flags=["client_derived"])
 
     def test_client_derived_classification_needs_no_flag(self):
-        routed = self.route(classification="client_derived")
-        self.assertEqual(routed["decision"], "local")
+        with self.assertRaisesRegex(AdmissionError, "client_data_backend_unsupported"):
+            self.route(classification="client_derived")
 
     def test_a_client_derived_flag_cannot_contradict_the_classification(self):
         for classification in ("synthetic", "public", "internal_nonclient"):
@@ -88,9 +84,26 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(eligible["status"], "eligible")
 
     def test_an_idempotency_key_cannot_relabel_client_derived_work(self):
-        self.route(idempotency_key="cd", classification="client_derived")
-        with self.assertRaisesRegex(Exception, "idempotency_key_conflict"):
-            self.route(idempotency_key="cd", classification="internal_nonclient")
+        with self.assertRaisesRegex(AdmissionError, "client_data_backend_unsupported"):
+            self.route(idempotency_key="cd", classification="client_derived")
+        # A refused submission made no receipt, so it cannot consume the key.
+        self.assertEqual(self.route(idempotency_key="cd", classification="internal_nonclient")["decision"], "local")
+
+    def test_client_derived_routes_with_certified_backend_and_passing_gate(self):
+        class PassingGate:
+            def check(self):
+                return None
+        queue = LocalQueue(self.temp.name + "-gemma", sampler=Sampler(), backend=FakeBackend(),
+                           caps=QueueCaps(), clock=lambda: 1000.0, backend_id="gemma_certified",
+                           allowed_task_types=frozenset({"summarize"}),
+                           client_data_health_gate=PassingGate())
+        intake = AutomaticIntake(queue, policy=IntakePolicy(min_input_chars=80, min_nonblank_lines=4),
+                                clock=lambda: 1000.0)
+        routed = intake.route(task_type="summarize", input="client note " * 20, params={},
+                              priority="interactive", classification="client_derived", caller="codex",
+                              purpose="test", risk_flags=[])
+        self.assertEqual(routed["decision"], "local")
+        self.assertEqual(queue.status(routed["job_id"])["classification"], "client_derived")
 
     def test_small_work_is_refused_without_queue_or_fallback(self):
         routed = self.route(input="tiny note")

@@ -34,7 +34,7 @@ class Service:
     def __init__(self, root: str, worker: str, worker_state: str, *, sampler: MacSampler | None = None,
                  backend: Backend | None = None, caps: QueueCaps | None = None,
                  allowed_task_types: "frozenset[str] | None" = None,
-                 backend_id: str = "private_worker"):
+                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None):
         """Build the queue for one local backend.
 
         ``worker``/``worker_state`` build the default private-worker
@@ -56,7 +56,7 @@ class Service:
             backend = SubprocessBackend(command)
         self.queue = LocalQueue(self.root, sampler=self.sampler, backend=backend,
                                 caps=caps or QueueCaps(), allowed_task_types=allowed_task_types,
-                                backend_id=backend_id)
+                                backend_id=backend_id, client_data_health_gate=client_data_health_gate)
         self.state_path = self.root / "runtime-state.json"
 
     @classmethod
@@ -71,12 +71,15 @@ class Service:
         must never touch the operator's real one; production omits it.
         """
         from .backend_select import build_backend_and_caps  # deferred: avoids a light import cycle
+        from .client_data_health import ClientDataHealthGate
 
         queue_root = str(root) if root is not None else str(cfg.local_queue_root)
         backend, caps, allowed = build_backend_and_caps(cfg, queue_root)
+        health_gate = ClientDataHealthGate.from_config(cfg)
         return cls(queue_root, str(cfg.worker_executable), str(cfg.worker_state),
                   sampler=sampler, backend=backend, caps=caps, allowed_task_types=allowed,
-                  backend_id=str(getattr(cfg, "local_backend", "private_worker")))
+                  backend_id=str(getattr(cfg, "local_backend", "private_worker")),
+                  client_data_health_gate=health_gate)
 
     def once(self) -> dict:
         result = self.queue.run_once("localq-service")
