@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
+from pathlib import Path
 from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
@@ -23,6 +25,7 @@ from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, Admission
                             LocalQueue, UNSUPPORTED_KIND_REASON)
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
+from ..execution import codex_review
 
 
 def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -59,6 +62,57 @@ def _under_any(path: str, roots: "tuple[str, ...]") -> bool:
         if real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep):
             return True
     return False
+
+
+def _trailer_author(repo: str, base: str, head: str) -> str | None:
+    """Read a single declared author provider from commits in a review range.
+
+    Commit bodies are untrusted provenance claims, so disagreement is unknown,
+    not a convenient choice.  Stage provenance, when present, takes priority.
+    """
+    try:
+        output = subprocess.run(["git", "-C", repo, "log", "--format=%B", f"{base}..{head}"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                check=True, timeout=30).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    providers = set()
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() in {"co-authored-by", "authored-by"}:
+            # Real Git trailers contain a display name and often an e-mail
+            # address ("Claude Opus 5.5 <...>").  Human co-authors convey no
+            # provider provenance, so ignore them rather than making an
+            # otherwise unambiguous provider look unknown.
+            candidate = value.strip().split(maxsplit=1)[0].casefold() if value.strip() else ""
+            if candidate in {"claude", "codex"}:
+                providers.add(candidate)
+    return next(iter(providers)) if len(providers) == 1 else None
+
+
+def _execution_route_classifications(policy: autoroute.Policy,
+                                     execution: ExecutionQueue) -> frozenset[str]:
+    """Return the operator-authorized peer classifications for execution.
+
+    The server configuration selects whether this operator allows
+    client-derived execution; routing-policy.json independently scopes that
+    permission.  They are deliberately a matched pair.  A lone opt-in is a
+    configuration mistake, not a permissive fallback an MCP caller may use.
+    """
+    configured = "execution" in execution.client_derived_routes
+    policy_enabled = "execution" in policy.client_derived_routes
+    if configured != policy_enabled:
+        raise RoutingError("client_derived_routes_mismatch")
+    return (policy.peer_classifications | ({"client_derived"} if configured else set()))
+
+
+def _commit(repo: str, revision: str) -> str | None:
+    try:
+        return subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{revision}^{{commit}}"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              check=True, timeout=30).stdout.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
+        return None
 
 
 def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
@@ -597,12 +651,11 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 repo_policy = policy.for_repo(args.get("repo"))
                 # Same rule as autoroute.decide: a per-route list is used as
                 # written; only the global set gains client_derived.
+                configured_peer_classifications = _execution_route_classifications(policy, execution)
                 if provider in policy.route_classifications:
                     peer_classifications = policy.route_classifications[provider]
                 else:
-                    peer_classifications = policy.peer_classifications
-                    if "execution" in policy.client_derived_routes:
-                        peer_classifications = peer_classifications | {"client_derived"}
+                    peer_classifications = configured_peer_classifications
                 if (provider not in repo_policy.allowed_routes
                         or repo_policy.classification not in peer_classifications):
                     return {"ok": False,
@@ -636,7 +689,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "paid_fallback": False, "idempotency_key": None,
-                    **args, "classification": repo_policy.classification, "caller": caller})
+                    **args, "classification": repo_policy.classification, "caller": caller,
+                    "client_derived_admitted": repo_policy.classification == "client_derived"})
             except (RoutingError, TypeError, ValueError) as exc:
                 return {"ok": False, "error": str(exc) or type(exc).__name__}
             if result.get("ok") and state_root is not None:
@@ -684,6 +738,111 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 "description": "Read a terminal harness receipt. Returned patches remain unapplied and require review.",
                 "inputSchema": job,
                 "handler": lambda args: call(execution.result, args),
+            },
+        })
+        review_dispatch_schema = _schema({
+            "provider": {"type": "string", "enum": ["codex"]},
+            "repo": {"type": "string"}, "brief": {"type": "string"},
+            "base": {"type": "string"}, "head": {"type": "string"},
+            "model": {"type": "string"}, "effort": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200},
+            "idempotency_key": {"type": "string", "maxLength": 256},
+            "item_id": {"type": "string"}, "stage": {"type": "string"},
+            "owner_id": {"type": "string"}, "stage_revision": {"type": "integer", "minimum": 0},
+        }, ["provider", "repo", "brief", "base", "head", "model", "effort",
+            "item_id", "stage", "owner_id", "stage_revision"])
+
+        def dispatch_review(args: dict[str, Any]) -> dict[str, Any]:
+            if state_root is None:
+                return {"ok": False, "error": "review_dispatch_unavailable:no_state_root"}
+            try:
+                current = router.get(args.get("item_id"), args.get("stage"))
+                provider = args.get("provider")
+                if (current["state"] != "owned" or current["owner_id"] != args.get("owner_id")
+                        or current["owner_route"] != provider
+                        or current["revision"] != args.get("stage_revision")):
+                    raise RoutingError("review_stage_binding_invalid")
+                base_sha, head_sha = _commit(args["repo"], args["base"]), _commit(args["repo"], args["head"])
+                if base_sha is None or head_sha is None:
+                    return {"ok": False, "error": "review_dispatch_refused:range_invalid"}
+                args = {**args, "base": base_sha, "head": head_sha}
+                # Bind the dispatch to resolved commits only after the full
+                # evidence range can be computed.  The harness computes it
+                # again from those immutable SHA values before invoking Codex.
+                try:
+                    codex_review.compute_range(Path(args["repo"]), base_sha, head_sha)
+                except (OSError, ValueError, codex_review.TaskError):
+                    return {"ok": False, "error": "review_dispatch_refused:range_invalid"}
+                author = current.get("author_route") or _trailer_author(
+                    args["repo"], args["base"], args["head"])
+                if author is None:
+                    return {"ok": False, "error": "review_dispatch_refused:author_provider_unknown"}
+                if author == provider:
+                    return {"ok": False, "error": "review_dispatch_refused:author_and_reviewer_same_provider"}
+                try:
+                    policy = autoroute.load_policy(state_root)
+                except (OSError, ValueError, autoroute.PolicyError) as exc:
+                    return {"ok": False, "error": f"review_dispatch_refused:policy_unreadable:{type(exc).__name__}"}
+                repo_policy = policy.for_repo(args["repo"])
+                configured_classifications = _execution_route_classifications(policy, execution)
+                if provider in policy.route_classifications:
+                    allowed = policy.route_classifications[provider]
+                else:
+                    allowed = configured_classifications
+                if provider not in repo_policy.allowed_routes or repo_policy.classification not in allowed:
+                    return {"ok": False, "error": "review_dispatch_refused:classification_not_eligible_for_route"}
+                reserved = autoroute.reserved_model_match(args["model"], policy.reserved_models)
+                if reserved is not None:
+                    return {"ok": False, "error": f"review_dispatch_refused:model_reserved_to_operator:{reserved}"}
+                result = call(execution.submit, {
+                    "caller": caller, "classification": repo_policy.classification,
+                    "verify_argv": [], "paid_fallback": False, "kind": "review",
+                    "author_provider": author,
+                    "client_derived_admitted": repo_policy.classification == "client_derived", **args})
+            except (RoutingError, TypeError, ValueError) as exc:
+                return {"ok": False, "error": str(exc) or type(exc).__name__}
+            return result
+
+        verify_review = _schema({
+            "repo": {"type": "string"}, "base": {"type": "string"}, "head": {"type": "string"},
+            "receipt": {"type": "string"}, "dispositions": {"type": "string"},
+            "job_id": {"type": "string"},
+            "chain": {"type": "array", "items": {"type": "string"}},
+        }, ["repo", "base", "head", "dispositions"])
+
+        def verify_review_result(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                receipt = args.get("receipt")
+                job_id = args.get("job_id")
+                if (receipt is None) == (job_id is None):
+                    return {"ok": False, "error": "provide exactly one receipt or job_id"}
+                task_root = None
+                if job_id is not None:
+                    outer = call(execution.result, {"job_id": job_id})
+                    receipt = outer.get("harness", {}).get("review_receipt_path")
+                    task_root = execution.root
+                    if not isinstance(receipt, str):
+                        return {"ok": False, "error": "review receipt path is unavailable"}
+                return codex_review.review_verify(
+                    repo=Path(args["repo"]), base=args["base"], head=args["head"], receipt=Path(receipt),
+                    dispositions=Path(args["dispositions"]),
+                    chain=[Path(value) for value in args.get("chain", [])] or None,
+                    task_root=task_root or codex_review.DEFAULT_TASK_ROOT)
+            except (OSError, ValueError, codex_review.TaskError) as exc:
+                return {"ok": False, "error": str(exc) or type(exc).__name__}
+
+        tools.update({
+            "review_dispatch": {
+                "description": "Queue a read-only Codex review of an explicit commit range. The author provider must differ from the reviewer and is taken from the stage or commit trailers.",
+                "inputSchema": review_dispatch_schema, "handler": dispatch_review,
+            },
+            "review_result": {
+                "description": "Read a terminal read-only review receipt.", "inputSchema": job,
+                "handler": lambda args: call(execution.result, args),
+            },
+            "review_verify": {
+                "description": "Verify a review receipt, reviewed head, and dispositions before a merge decision.",
+                "inputSchema": verify_review, "handler": verify_review_result,
             },
         })
     return tools

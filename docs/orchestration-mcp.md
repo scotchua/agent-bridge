@@ -242,6 +242,27 @@ directory. The isolated `CODEX_HOME` defaults to the same path
 harness never copies credentials into it and never falls back to the shared
 desktop `~/.codex` home.
 
+## Read-only Codex review
+
+`review_dispatch` queues a Codex-only review of an explicit base and head.
+The worker creates a detached worktree at the head, runs plain `codex exec`
+with a JSON findings schema, a read-only sandbox, and network disabled, then
+records the range, blob ids, diff and prompt hashes in its receipt. Repository
+content, including instructions in a changed file, is untrusted data. The
+reviewer must differ from the stage's author provider. If no stage author is
+available, a single `Authored-By: claude|codex|local` or
+`Co-Authored-By: claude|codex|local` trailer across the reviewed commits is
+required; unknown or conflicting provenance refuses dispatch.
+
+Client-derived repositories are refused unless both the orchestration policy
+and routing policy opt into `client_derived_routes: ["execution"]`, the same
+operator setting used by the implementation lane. A receipt retains the
+`client_derived` classification. `review_result` reads the durable receipt,
+and `review_verify` requires the exact reviewed head plus a disposition for
+every finding: `fixed`, `rejected` with a reason, or `waived` with an approval
+reference. A delta chain is accepted only when each reviewed range is
+contiguous and reaches the final head.
+
 `bin/agent-bridge-orchestration-verify` runs the three synthetic checks this
 document describes (Codex-to-Claude bounded execution, Claude-to-Codex bounded
 execution, eligible work to the local model) against disposable, synthetic

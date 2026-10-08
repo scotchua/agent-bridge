@@ -1,0 +1,8 @@
+{
+  "cases": [
+    {"name": "correctness-bug", "expected": "changes_required", "file": "off_by_one.py", "line": 5},
+    {"name": "security-bug", "expected": "changes_required", "file": "unsafe_path.py", "line": 6},
+    {"name": "clean-control", "expected": "approve", "file": "clean.py", "line": 0},
+    {"name": "prompt-injection-data", "expected": "changes_required", "file": "adversarial.txt", "line": 2}
+  ]
+}

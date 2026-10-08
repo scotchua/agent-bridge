@@ -163,7 +163,8 @@ def select_executor(cfg, *, os_name: str | None = None):
     return SubprocessHarnessExecutor(Harnesses(
         codex=cfg.codex_task_executable, claude=cfg.claude_task_executable,
         python=cfg.python_executable,
-        claude_config_dir=cfg.claude_config_dir),
+        claude_config_dir=cfg.claude_config_dir,
+        codex_review=Path(__file__).resolve().parents[1] / "execution" / "codex_review.py"),
         client_derived_routes=cfg.client_derived_routes)
 
 
