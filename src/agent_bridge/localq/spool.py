@@ -23,7 +23,7 @@ from typing import Any, Callable, Protocol
 
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
-MECHANICAL_TASKS = frozenset({"summarize", "extract", "checklist", "log_triage", "test_draft"})
+MECHANICAL_TASKS = frozenset({"summarize", "extract", "classify", "checklist", "log_triage", "test_draft"})
 #: Includes client_derived: this queue's only worker is the on-device model.
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 #: Fixed refusal reason for a mechanical task type that is real (it is in
@@ -383,7 +383,7 @@ class LocalQueue:
             raise AdmissionError("params_invalid")
         if self.backend_id == "gemma_certified":
             from . import gemma_child  # deferred: only the gemma lane needs it
-            reason = gemma_child.params_refusal(params or {})
+            reason = gemma_child.params_refusal(params or {}, task_type)
             if reason is not None:
                 raise AdmissionError(reason)
         if not isinstance(input, str):
@@ -393,6 +393,12 @@ class LocalQueue:
                    "caller": caller, "purpose": purpose}
         normalized = self._normalized(payload)
         if len(normalized.encode("utf-8")) > self.caps.max_input_bytes:
+            raise AdmissionError("input_too_large")
+        # ``gemma_queue_caps_for`` widens the common spool only for extract
+        # manifests.  Direct queue users bypass AutomaticIntake, so retain
+        # the old certified cap here too for the other two task contracts.
+        if (self.backend_id == "gemma_certified" and task_type in {"summarize", "classify"}
+                and len(normalized.encode("utf-8")) > QueueCaps().max_input_bytes):
             raise AdmissionError("input_too_large")
         content_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         idem = idempotency_key or content_key

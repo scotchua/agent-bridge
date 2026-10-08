@@ -222,6 +222,25 @@ def effective_globs(repo_policy: "autoroute.RepoPolicy",
     return repo_policy.mechanical_globs or local_first.default_globs
 
 
+def file_task_for_path(path: str, repo_root: str, repo_policy: "autoroute.RepoPolicy",
+                       local_first: "autoroute.LocalFirstConfig", *,
+                       allowed_pilot_tasks: frozenset[str] = frozenset()) -> tuple[str, str, tuple[str, ...]] | None:
+    """Return the policy-selected whole-file task, with pilot tasks first.
+
+    Empty extract/classify globs remain off rather than inheriting the legacy
+    digest default. Keeping this selection beside the glob machinery avoids
+    divergent Claude/Codex hook decisions.
+    """
+    for task, call, globs in (("extract", "work_extract_file", repo_policy.extract_globs),
+                              ("classify", "work_classify_file", repo_policy.classify_globs)):
+        if task in allowed_pilot_tasks and matches_any(path, repo_root, globs):
+            return task, call, globs
+    globs = effective_globs(repo_policy, local_first)
+    if matches_any(path, repo_root, globs):
+        return "summarize", "work_digest_file", globs
+    return None
+
+
 # ------------------------------------------------------------ window arithmetic
 
 

@@ -1038,6 +1038,19 @@ it fully would mean deriving repo/glob/protected-path membership from the
 same descriptor rather than from the name beforehand, which is a bigger
 structural change than this phase makes.
 
+## Certified extraction and classification pilot
+
+`extract_globs` and `classify_globs` are per-repository, opt-in policy keys
+and default to empty. Matching reads are routed before the existing summarize
+globs. `extract_document_separator` is optional and must be one exact full
+line; no separator means one file is one document. The durable adapter makes
+one delegate call per named document, preserving zero or multiple candidates
+rather than guessing an association. It records occurrence spans, which show
+where text appears but do not establish semantic correctness. Full-source
+review is therefore still required. The pilot excludes `client_derived` for
+extract and classify. Codex desktop has no hook, so it cannot enforce this
+read gate.
+
 ## 8. Handoff
 
 Give the builder this file's path and this instruction:

@@ -113,7 +113,7 @@ class ConfigAndSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(OrchestrationConfigError, "below_certified_budget"):
             load(self.write(doc))
 
-    def test_selected_backend_is_fixed_and_summarize_only(self):
+    def test_selected_backend_is_fixed_and_summarize_only_by_default(self):
         cfg = load(self.write(config_doc(self.root, self.fx)))
         if os.name != "posix":
             with self.assertRaisesRegex(backend_select.BackendSelectionError,
@@ -167,6 +167,27 @@ class ConfigAndSelectionTests(unittest.TestCase):
         result = tools["work_result"]["handler"]({"job_id": submitted["job_id"]})
         self.assertEqual(result["status"], "complete", result)
         self.assertEqual(result["result"]["provider"], "gemma_certified")
+
+    def test_explicit_pilot_opt_in_selects_only_named_tasks(self):
+        doc = config_doc(self.root, self.fx)
+        doc["gemma_pilot_tasks"] = ["extract"]
+        cfg = load(self.write(doc))
+        if os.name != "posix":
+            return
+        _, _, allowed = backend_select.build_backend_and_caps(cfg, str(self.root / "queue"))
+        self.assertEqual(allowed, frozenset({"summarize", "extract"}))
+
+    def test_pilot_config_rejects_unknown_duplicate_and_private_worker_values(self):
+        for value in (["extract", "extract"], ["summarize"], "extract"):
+            with self.subTest(value=value):
+                doc = config_doc(self.root, self.fx)
+                doc["gemma_pilot_tasks"] = value
+                with self.assertRaisesRegex(OrchestrationConfigError, "gemma_pilot_tasks_invalid"):
+                    load(self.write(doc))
+        doc = config_doc(self.root, self.fx, "private_worker")
+        doc["gemma_pilot_tasks"] = []
+        with self.assertRaisesRegex(OrchestrationConfigError, "configuration_must_be_absent"):
+            load(self.write(doc))
 
     def test_audit_selects_gemma_delegate_for_readiness(self):
         doc = config_doc(self.root, self.fx)
@@ -329,7 +350,7 @@ class GemmaInvokeTests(unittest.TestCase):
         self.assertNotIn("state_home", sys.modules)
 
     def test_unsupported_kind_custom_instruction_and_provider_refuse_before_spawn(self):
-        with self.assertRaisesRegex(ValueError, UNSUPPORTED_KIND_REASON):
+        with self.assertRaisesRegex(ValueError, "params_invalid_for_gemma_certified"):
             self.invoke(task_type="extract")
         with self.assertRaisesRegex(gemma_child.GemmaRefusal, "custom_instruction_unsupported"):
             self.invoke(params={"instruction": "invent facts"})
@@ -340,6 +361,23 @@ class GemmaInvokeTests(unittest.TestCase):
     def test_fixed_certified_instruction_is_accepted(self):
         result = self.invoke(params={"instruction": gemma_child.CERTIFIED_SUMMARIZE_INSTRUCTION})
         self.assertEqual(result["provider"], "gemma_certified")
+
+    def test_extract_is_per_document_and_keeps_record_status(self):
+        documents = [{"id": "one", "text": "Alpha invoice"}]
+        self.fx["install"].joinpath("extract_records.json").write_text(json.dumps([
+            {"party": "Alpha", "date": None, "doc_type": None, "reference": None,
+             "description": None, "amount": None, "terms": None, "due_date": None,
+             "account": None}]), encoding="utf-8")
+        source = json.dumps(documents, separators=(",", ":"))
+        result = self.invoke(source, task_type="extract", params={"documents": documents})
+        output = result["output"]
+        self.assertEqual(output["documents"][0]["record_status"], "ok")
+        self.assertEqual(output["documents"][0]["records"][0]["fields"]["party"]["spans"], [[0, 5]])
+
+    def test_classify_preserves_unsure_and_blank_lines(self):
+        result = self.invoke("a\n\nb", task_type="classify", params={})
+        self.assertEqual([row["label"] for row in result["output"]["lines"]],
+                         ["UNSURE", "UNSURE", "UNSURE"])
 
     def test_changed_delegate_or_validator_source_refuses_before_spawn(self):
         delegate_digest = file_sha256(self.fx["delegate"])
@@ -395,6 +433,41 @@ class GemmaInvokeTests(unittest.TestCase):
                 with self.assertRaises(gemma_child.GemmaReceiptError):
                     self.invoke()
                 (self.fx["install"] / "receipt_override.json").unlink()
+
+
+class ValidatorLoaderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def validator(self, sibling: str) -> Path:
+        path = self.root / "validator.py"
+        path.write_text(
+            f"import {sibling}\n"
+            "def read_success(*args, **kwargs):\n"
+            f"    return {{'source': {sibling}.SOURCE}}\n", encoding="utf-8")
+        return path
+
+    def test_installed_sibling_import_succeeds_without_import_pollution(self):
+        sibling = "gemma_validator_sibling"
+        (self.root / f"{sibling}.py").write_text("SOURCE = 'installed'\n", encoding="utf-8")
+        with gemma_child._load_validator(self.validator(sibling)) as validator:
+            self.assertEqual(validator.read_success()["source"], "installed")
+            self.assertEqual(sys.modules[sibling].SOURCE, "installed")
+        self.assertNotIn(sibling, sys.modules)
+
+    def test_installed_sibling_does_not_replace_a_preexisting_module(self):
+        sibling = "gemma_validator_sibling_saved"
+        (self.root / f"{sibling}.py").write_text("SOURCE = 'installed'\n", encoding="utf-8")
+        prior = types.ModuleType(sibling)
+        prior.SOURCE = "prior"
+        sys.modules[sibling] = prior
+        self.addCleanup(sys.modules.pop, sibling, None)
+        with gemma_child._load_validator(self.validator(sibling)) as validator:
+            self.assertEqual(validator.read_success()["source"], "installed")
+            self.assertIsNot(sys.modules[sibling], prior)
+        self.assertIs(sys.modules[sibling], prior)
 
 
 class QueueIntegrationTests(unittest.TestCase):

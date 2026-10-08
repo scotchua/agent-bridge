@@ -13,6 +13,7 @@ operator edits.  See :mod:`agent_bridge.orchestration.autodecide`.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from typing import Any, Callable
 
@@ -20,7 +21,7 @@ from ..capacity_router import RoutingError, StageRouter
 from ..localq import gemma_child
 from ..localq.intake import KNOWN_FLAGS, AutomaticIntake
 from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, AdmissionError, JobNotFound,
-                            LocalQueue, UNSUPPORTED_KIND_REASON)
+                            LocalQueue, QueueCaps, UNSUPPORTED_KIND_REASON)
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 
@@ -239,7 +240,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         return call(intake.route, merged)
 
     digest_task_types = [kind for kind in localfirst.DIGEST_TASK_TYPES
-                         if kind in queue.allowed_task_types]
+                         if kind in queue.allowed_task_types
+                         and not (queue.backend_id == "gemma_certified" and kind == "extract")]
     digest = _schema({
         "path": {"type": "string", "description": "Absolute path to the file to digest."},
         "task_type": {"type": "string", "enum": digest_task_types},
@@ -252,6 +254,10 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "priority": {"type": "string", "enum": ["interactive", "bulk"]},
         "idempotency_key": {"type": "string", "maxLength": 256},
     }, ["path", "task_type"])
+    certified_file_schema = _schema({
+        "path": {"type": "string", "description": "Absolute operator-policy matched file path."},
+        "priority": {"type": "string", "enum": ["interactive", "bulk"]},
+    }, ["path"])
 
     def digest_file(args: dict[str, Any]) -> dict[str, Any]:
         """Satisfy a digest intent, or run a digest on the assistant's own
@@ -281,6 +287,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         if (not isinstance(path, str) or not path or not os.path.isabs(path)
                 or task_type not in localfirst.DIGEST_TASK_TYPES):
             return {"ok": False, "error": "digest_path_refused:input_invalid"}
+        if queue.backend_id == "gemma_certified" and task_type == "extract":
+            return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
         if task_type not in queue.allowed_task_types:
             return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
         if os.path.islink(path):
@@ -338,13 +346,9 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         except localfirst.WindowReadError as exc:
             return {"ok": False, "error": f"digest_read_refused:{exc}"}
         window_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        # instruction, not just task_type, so two extract calls on the same
-        # window with different field lists get different keys: task_type
-        # alone is "extract" either way, and window_sha256 is the same
-        # file content either way, so without this an operator asking for
-        # different fields the second time would silently get back the
-        # first call's job/receipt instead of a new extraction. Found by an
-        # adversarial review.
+        # The fixed instruction is part of the idempotency binding.  It is
+        # operator-owned, but retaining it here keeps any future digest task
+        # template from silently sharing an unrelated result.
         instruction_sha256 = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
         idem = idempotency_key or f"digest:{caller}:{task_type}:{window_sha256}:{instruction_sha256}"
         # Every purpose="work" call requires a checkpoint now. This mints
@@ -392,6 +396,113 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 "digest_receipt_created_at": receipt["created_at"],
                 "window": {"offset": computed_offset, "bytes": window_bytes, "sha256": window_sha256},
                 "classification": repo_policy.classification, "next_call": "work_result"}
+
+    def certified_file(args: dict[str, Any], task_type: str) -> dict[str, Any]:
+        """Submit an operator-selected certified task, bound to a stable file.
+
+        This intentionally has no caller task, classification, instruction, or
+        extraction field selection.  Extract documents are split before the
+        queue call, and each is subsequently delegated independently by the
+        adapter.
+        """
+        if state_root is None:
+            return {"ok": False, "error": "local_first_unavailable"}
+        path, priority = args.get("path"), args.get("priority", "interactive")
+        if not isinstance(path, str) or not path or not os.path.isabs(path) or os.path.islink(path):
+            return {"ok": False, "error": f"{task_type}_path_refused:input_invalid"}
+        real_path = os.path.realpath(path)
+        if _under_any(real_path, (state_root, str(getattr(queue, "root", "")), *protected)):
+            return {"ok": False, "error": f"{task_type}_path_refused:protected_or_state_path"}
+        repo_root = gate.repo_key(real_path)
+        if repo_root is None:
+            return {"ok": False, "error": f"{task_type}_path_refused:not_in_a_repository"}
+        try:
+            policy = autoroute.load_policy(state_root)
+            with open(real_path, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                task_cap = (queue.caps.max_input_bytes if task_type == "extract"
+                            else QueueCaps().max_input_bytes)
+                if before.st_size > task_cap:
+                    return {"ok": False, "error": f"{task_type}_path_refused:input_too_large"}
+                raw = handle.read()
+                after = os.fstat(handle.fileno())
+        except (OSError, autoroute.PolicyError) as exc:
+            return {"ok": False, "error": f"{task_type}_path_refused:{type(exc).__name__}"}
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return {"ok": False, "error": f"{task_type}_path_refused:file_changed"}
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"ok": False, "error": f"{task_type}_path_refused:not_utf8"}
+        repo_policy = policy.for_repo(repo_root)
+        globs = repo_policy.extract_globs if task_type == "extract" else repo_policy.classify_globs
+        if (not policy.local_first.enabled or not repo_policy.mechanical_ok
+                or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS
+                or "local" not in repo_policy.allowed_routes
+                or not localfirst.matches_any(real_path, repo_root, globs)):
+            return {"ok": False, "error": f"{task_type}_path_refused:policy"}
+        if task_type not in queue.allowed_task_types:
+            return {"ok": False, "error": f"{task_type}_path_refused:{UNSUPPORTED_KIND_REASON}"}
+        preflight_sha = hashlib.sha256(raw).hexdigest()
+        if task_type == "extract":
+            separator = repo_policy.extract_document_separator
+            if separator is None:
+                documents_text = [text]
+            else:
+                documents_text, current = [], []
+                for line in text.splitlines(keepends=True):
+                    if line.rstrip("\r\n") == separator:
+                        documents_text.append("".join(current))
+                        current = []
+                    else:
+                        current.append(line)
+                documents_text.append("".join(current))
+            documents = [{"id": f"{preflight_sha}:{number}", "text": value}
+                         for number, value in enumerate(documents_text)]
+            params: dict[str, Any] = {"documents": documents}
+            task_input = json.dumps(documents, ensure_ascii=True, separators=(",", ":"))
+        else:
+            params, task_input = {}, text
+        nonblank = sum(1 for line in task_input.splitlines() if line.strip())
+        idem = f"{task_type}:{caller}:{preflight_sha}"
+        try:
+            checkpoint = intake.checkpoint(task_id=idem, task_type=task_type,
+                classification=repo_policy.classification, caller=caller,
+                input_bytes=len(task_input.encode()), nonblank_lines=nonblank,
+                risk_flags=[], idempotency_key=idem)
+            routed = intake.route(task_type=task_type, input=task_input, params=params,
+                priority=priority, classification=repo_policy.classification, caller=caller,
+                purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
+            # Detect a replacement after the preflight/read and before this
+            # tool returns a route that claims to represent the file.
+            with open(real_path, "rb") as handle:
+                returned_sha = hashlib.sha256(handle.read()).hexdigest()
+        except (AdmissionError, TypeError, ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc) or type(exc).__name__}
+        if returned_sha != preflight_sha:
+            if routed.get("job_id"):
+                try:
+                    queue.cancel(routed["job_id"])
+                except (JobNotFound, OSError, ValueError):
+                    pass
+            return {"ok": False, "error": f"{task_type}_path_refused:file_changed"}
+        job_id = routed.get("job_id")
+        try:
+            localfirst.write_digest_receipt(
+                state_root, path=real_path, repo=repo_root, size=before.st_size,
+                mtime_ns=before.st_mtime_ns, offset=0, window_bytes=len(raw),
+                window_sha256=preflight_sha, decode_replacements=0, task_type=task_type,
+                classification=repo_policy.classification, caller=caller, job_id=job_id or "",
+                intake_receipt_id=routed.get("receipt_id", ""))
+            if job_id:
+                localfirst.record_digest_job(state_root, job_id,
+                    max_output_chars=policy.local_first.digest_max_output_chars)
+            localfirst.retire_digest_intent(state_root, real_path,
+                binding={"path": real_path, "size": before.st_size, "mtime_ns": before.st_mtime_ns})
+        except OSError:
+            pass
+        return {"ok": True, **routed, "file_sha256": preflight_sha, "next_call": "work_result"}
 
     def work_result(args: dict[str, Any]) -> dict[str, Any]:
         result = call(queue.result, args)
@@ -535,6 +646,20 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                         "same stage binding as execution_dispatch."),
         "inputSchema": decide, "handler": decide_routing,
     }
+    # Do not advertise a pilot task merely because the installed backend can
+    # execute it.  Its presence is the operator's explicit activation.
+    if queue.backend_id == "gemma_certified" and "extract" in queue.allowed_task_types:
+        tools["work_extract_file"] = {
+            "description": "Extract certified records from a policy-matched file. Task and classification come only from operator policy.",
+            "inputSchema": certified_file_schema,
+            "handler": lambda args: certified_file(args, "extract"),
+        }
+    if queue.backend_id == "gemma_certified" and "classify" in queue.allowed_task_types:
+        tools["work_classify_file"] = {
+            "description": "Classify each line of a policy-matched file. Task and classification come only from operator policy.",
+            "inputSchema": certified_file_schema,
+            "handler": lambda args: certified_file(args, "classify"),
+        }
     if execution is not None:
         dispatch = _schema({
             "provider": {"type": "string", "enum": ["claude", "codex"]},

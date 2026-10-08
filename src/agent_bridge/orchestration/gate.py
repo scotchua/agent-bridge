@@ -1360,7 +1360,7 @@ def _same_path(a: str, b: str) -> bool:
 def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
                      state_root: str, local_queue_root: str,
                      worker_executable: str, protected: tuple[str, ...],
-                     clock: Any) -> "Decision | None":
+                     clock: Any, allowed_pilot_tasks: frozenset[str]) -> "Decision | None":
     """One file named by a gated-shape read: the design's steps 1 (repository
     membership already checked by the caller; here from step 3 on) through 9.
     None means the fast path allowed it with nothing logged; a ``Decision``
@@ -1382,9 +1382,12 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
     repo_policy = policy.for_repo(repo_root)
     if not repo_policy.mechanical_ok or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS:
         return None
-    globs = localfirst.effective_globs(repo_policy, policy.local_first)
-    if not localfirst.matches_any(real_path, repo_root, globs):
+    selected = localfirst.file_task_for_path(
+        real_path, repo_root, repo_policy, policy.local_first,
+        allowed_pilot_tasks=allowed_pilot_tasks)
+    if selected is None:
         return None
+    task_type, next_call, globs = selected
     try:
         info = os.stat(real_path)
     except OSError:
@@ -1476,16 +1479,18 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
         "deny", "local_digest_required",
         f"delegation-first gate: {real_path} is a mechanical artifact ({size:,} bytes, "
         f"matches {matched_glob}) in a repository the operator marked mechanical_ok, and "
-        f"the local lane is ready ({readiness.reason}). Call work_digest_file with "
-        f"path={real_path!r}, task_type='summarize', then "
+        f"the local lane is ready ({readiness.reason}). Call {next_call} with "
+        f"path={real_path!r}, then "
         f"work_result on the returned job_id; this read is allowed once the digest completes. "
         f"Exact tools (grep, rg, tail -n) are allowed now.",
-        (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob})
+        (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob,
+                                          "task_type": task_type, "next_call": next_call})
 
 
 def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
               local_queue_root: str, worker_executable: str,
-              protected: tuple[str, ...] = (), clock: Any = time.time) -> Decision:
+              protected: tuple[str, ...] = (), clock: Any = time.time,
+              allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
     """Allow or deny one whole-file read across every path it names.
 
     Each path is judged independently (design section 2.1); the first that
@@ -1531,7 +1536,7 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
         outcome = _judge_read_path(
             path, client, policy=policy, state_root=state_root,
             local_queue_root=local_queue_root, worker_executable=worker_executable,
-            protected=protected, clock=clock)
+            protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks)
         if outcome is not None:
             decisions.append(outcome)
     if not decisions:
@@ -1738,7 +1743,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
           capacity_db: str | None = None,
           local_queue_root: str = "", worker_executable: str = "",
-          decide: Any = None) -> Decision:
+          decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
     with ``capacity_db`` every allow also requires the receipt's stage to be
@@ -1772,7 +1777,8 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
         return judge_read(client, paths, cwd, state_root=state_root,
                           local_queue_root=local_queue_root,
                           worker_executable=worker_executable,
-                          protected=protected, clock=clock)
+                          protected=protected, clock=clock,
+                          allowed_pilot_tasks=allowed_pilot_tasks)
     write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
                                   clock=clock, protected=protected, capacity_db=capacity_db,
                                   decide=decide)
@@ -1793,7 +1799,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
             read_decision = judge_read(
                 client, _shell_read_paths(command, cwd), cwd, state_root=state_root,
                 local_queue_root=local_queue_root, worker_executable=worker_executable,
-                protected=protected, clock=clock)
+                protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks)
             # A deny always wins over the write-side allow. An allow only
             # replaces it when there is something worth logging (a
             # gated-shape outcome): an unlogged fast-path allow (outside any
@@ -2119,6 +2125,28 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
     return loaded["state_root"], loaded["capacity_db"], local_queue_root, worker_executable
 
 
+def gemma_pilot_tasks_from_config(config_path: str) -> frozenset[str]:
+    """Return only explicitly enabled certified pilot tasks.
+
+    The hook deliberately treats an unreadable or malformed activation as no
+    pilot, rather than compelling a file read into a task the operator has
+    not clearly enabled.  ``orchestration.config.load`` remains the strict
+    configuration boundary used to construct the service.
+    """
+    try:
+        loaded = store.read_json(config_path)
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(loaded, dict):
+        return frozenset()
+    tasks = loaded.get("gemma_pilot_tasks", [])
+    if (loaded.get("local_backend") != "gemma_certified" or not isinstance(tasks, list)
+            or any(task not in {"extract", "classify"} for task in tasks)
+            or len(set(tasks)) != len(tasks)):
+        return frozenset()
+    return frozenset(tasks)
+
+
 def _hook_input() -> str:
     r"""The PreToolUse payload, decoded as UTF-8 whatever the locale says.
 
@@ -2158,7 +2186,7 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
              protected: tuple[str, ...] = (),
              local_queue_root: str = "", worker_executable: str = "",
-             decide: Any = None) -> Decision:
+             decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
     tool_name = payload.get("tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     if not isinstance(tool_name, str):
@@ -2168,7 +2196,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
         decision = judge(client, tool_name, payload.get("tool_input"), cwd,
                          state_root=state_root, clock=clock, protected=protected,
                          capacity_db=capacity_db, local_queue_root=local_queue_root,
-                         worker_executable=worker_executable, decide=decide)
+                         worker_executable=worker_executable, decide=decide,
+                         allowed_pilot_tasks=allowed_pilot_tasks)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -2808,6 +2837,7 @@ def main(argv: list[str] | None = None) -> int:
     # a deny whatever went wrong on the way to it.
     state_root = None
     updated_input = None
+    allowed_pilot_tasks = frozenset()
     out = _SingleDecision()
     watchdog = _arm_watchdog(out)
     try:
@@ -2821,6 +2851,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             state_root, capacity_db, local_queue_root, worker_executable = \
                 gate_paths_from_config(args.config or "")
+            allowed_pilot_tasks = gemma_pilot_tasks_from_config(args.config or "")
         protected = protected_paths(state_root, args.config, home, capacity_db,
                                     local_queue_root)
         payload = json.loads(_hook_input() or "{}")
@@ -2834,6 +2865,7 @@ def main(argv: list[str] | None = None) -> int:
         decision = run_hook(args.client, state_root, payload, capacity_db=capacity_db,
                             protected=protected, local_queue_root=local_queue_root,
                             worker_executable=worker_executable,
+                            allowed_pilot_tasks=allowed_pilot_tasks,
                             decide=None if args.no_automatic_routing else
                             automatic_decider(args.client, state_root, capacity_db,
                                               local_queue_root))
