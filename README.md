@@ -158,6 +158,25 @@ The worker accepts bounded inline text tasks. It does not read files, run shell
 commands, download models or provide a cloud fallback. Other local runtimes
 need a separately tested adapter.
 
+## When Claude, Codex or Ollama updates
+
+Run `python setup_bridge.py doctor` after an update. You can also install one
+per-user LaunchAgent with `python setup_bridge.py doctor --install-schedule`.
+It checks at login and each night at 03:30 local time. The nightly run waits
+72 hours after a Codex release before considering it (change this with
+`--quarantine-hours` or `~/.agent-bridge/drift/settings.json`), installs that
+exact version in a private staging prefix, and runs the free flag and model
+checks plus the synthetic checks there. Only then does it switch each writable
+npm-managed Codex installation. A failed post-switch free check restores that
+prefix's recorded version. Claude Code and Ollama are only inspected, never
+updated. If the live firm-tools `codex-job-runner` pins the installed Codex
+version, doctor reports the pin and the nightly run leaves Codex in place
+until that pin is updated. Doctor inventories the configured executables,
+Ollama runtime, certified Gemma files, configured absolute paths, gate hooks,
+hook trust, and the Codex default model. Worker loops hold only work that
+depends on a drifted dependency, show `waiting_on_dependency:<name>`, and keep
+unrelated work queued until doctor resolves the issue.
+
 **Local inference does not make the surrounding conversation private.** Text
 passed by Claude or Codex, and results returned to it, are already visible in
 that cloud assistant's conversation. The worker checks for supported local

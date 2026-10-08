@@ -574,9 +574,33 @@ class ExecutionQueue:
 
     def status(self, job_id: str) -> dict[str, Any]:
         receipt = _read_json(self._directory(job_id) / "receipt.json")
-        return {"job_id": job_id, "state": receipt["state"],
+        answer = {"job_id": job_id, "state": receipt["state"],
                 "caller": receipt["caller"], "provider": receipt["provider"],
                 "classification": receipt["classification"]}
+        if receipt.get("waiting_on_dependency"):
+            answer["waiting_on_dependency"] = "waiting_on_dependency:" + str(receipt["waiting_on_dependency"])
+        return answer
+
+    def hold_dependencies(self, dependencies: dict[str, str]) -> None:
+        """Keep matching queued work queued and make the reason visible.
+
+        This is deliberately an in-place receipt annotation, not an admission
+        error: a provider unrelated to the drift must continue to run.
+        """
+        with self._lock:
+            for directory in self.root.iterdir():
+                path = directory / "receipt.json"
+                if not path.is_file():
+                    continue
+                receipt = _read_json(path)
+                if receipt.get("state") != "queued":
+                    continue
+                dependency = dependencies.get(receipt.get("provider"))
+                if dependency:
+                    receipt["waiting_on_dependency"] = dependency
+                else:
+                    receipt.pop("waiting_on_dependency", None)
+                _atomic_json(path, receipt)
 
     def result(self, job_id: str) -> dict[str, Any]:
         directory = self._directory(job_id)
@@ -593,7 +617,8 @@ class ExecutionQueue:
             selected = None
             for directory in sorted(self.root.iterdir()):
                 receipt_path = directory / "receipt.json"
-                if receipt_path.is_file() and _read_json(receipt_path).get("state") == "queued":
+                receipt = _read_json(receipt_path) if receipt_path.is_file() else {}
+                if receipt.get("state") == "queued" and not receipt.get("waiting_on_dependency"):
                     selected = directory
                     break
             if selected is None:

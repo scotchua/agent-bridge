@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, onboard, store
+from . import config, drift, onboard, store
 from .chat.grok import ALLOWED_COMMANDS, REQUIRED_MANIFEST_KEYS
 from .chat.windows_security import prepare_private_directory
 from .orchestration import autoroute, delegation, gate
@@ -232,6 +232,10 @@ def _yes(answer: str) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
+def _yes_default(answer: str) -> bool:
+    return not answer.strip() or _yes(answer)
+
+
 def _card(out: Callable[[str], None], name: str, lines: tuple[str, str, str, str]) -> None:
     out(name)
     for label, value in zip(("What it does", "Where your text goes", "You need first", "What would change"), lines):
@@ -399,6 +403,8 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
     chosen_hermes: str | None = None
     chosen_grok = False
     create_manifest: bytes | None = None
+    record_baseline = False
+    install_nightly = False
 
     for feature in FEATURES:
         item = states[feature]
@@ -444,6 +450,21 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
                 decisions[feature] = "yes"
         else:
             decisions[feature] = "yes"
+
+    # Doctor cannot make a useful comparison record until an orchestration
+    # config has been installed.  Keep this separate from feature choices so
+    # an operator can accept the one-off baseline but decline the nightly
+    # updater independently.
+    config_path = drift.discover_config(home=home)
+    baseline_missing = config_path is not None and drift._read_baseline(home) is None
+    if baseline_missing:
+        out("Doctor baseline: records this installation's free inventory before future changes are compared.")
+        record_baseline = _yes_default(ask("Run doctor once to record a baseline? [Y/n] "))
+        decisions["doctor_baseline"] = "yes" if record_baseline else "not_now"
+        if platform == "darwin":
+            out("Nightly doctor: checks for a quarantined Codex update each night. It is optional.")
+            install_nightly = _yes(ask("Install the nightly doctor schedule? [y/N] "))
+            decisions["doctor_schedule"] = "yes" if install_nightly else "not_now"
 
     include_hermes = ((shutil.which("hermes") if (existing_hermes or chosen_hermes) else None)
                       or chosen_hermes or existing_hermes)
@@ -497,6 +518,21 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
     out("Changed: " + (", ".join(changed) if changed else "recorded the guidance choices only") + ".")
     if decisions.get("agent_room") == "yes":
         out("Start Agent Room with: " + launcher_path(home, platform))
+    if record_baseline:
+        try:
+            report = drift.scheduled_baseline(config_path, home=home)
+            if report.get("ok"):
+                out("Doctor baseline recorded.")
+            else:
+                out("Doctor baseline could not be recorded: " + "; ".join(report.get("needs_you", [])))
+        except (OSError, ValueError, PermissionError) as exc:
+            out(f"Doctor baseline could not be recorded: {exc}.")
+    if install_nightly:
+        try:
+            drift.install_schedule(config_path, home=home)
+            out("Nightly doctor schedule installed.")
+        except (OSError, ValueError, PermissionError) as exc:
+            out(f"Nightly doctor schedule could not be installed: {exc}.")
     out("To undo files created by this upgrade: python setup_bridge.py upgrade --undo")
     return 0
 

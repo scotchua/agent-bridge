@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
         print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
         return 2
     if not raw or raw[0] in {"-h", "--help"}:
-        print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration} ...")
+        print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor} ...")
         return 0
     command, rest = raw[0], raw[1:]
     if command == "onboard":
@@ -51,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         # not replace or widen serve-peer's consultation-only tool set.
         from agent_bridge.orchestration import server as orchestration_server
         return orchestration_server.main(rest)
+    if command == "doctor":
+        from agent_bridge import drift
+        return drift.main(rest)
     print(f"unknown command: {command}", file=sys.stderr)
     return 2
 
