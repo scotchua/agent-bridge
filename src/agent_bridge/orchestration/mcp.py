@@ -73,7 +73,7 @@ def _trailer_author(repo: str, base: str, head: str) -> str | None:
     try:
         output = subprocess.run(["git", "-C", repo, "log", "--format=%B", f"{base}..{head}"],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                check=True, timeout=30).stdout.decode("utf-8", "replace")
+                                check=True, timeout=30, shell=False).stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):
         return None
     providers = set()
@@ -110,7 +110,7 @@ def _commit(repo: str, revision: str) -> str | None:
     try:
         return subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{revision}^{{commit}}"],
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              check=True, timeout=30).stdout.decode("ascii").strip()
+                              check=True, timeout=30, shell=False).stdout.decode("ascii").strip()
     except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
         return None
 
