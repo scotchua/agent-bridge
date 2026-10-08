@@ -469,6 +469,18 @@ class LocalQueue:
         with self._db() as db:
             return self._public(self._get(db, job_id))
 
+    def hold_dependency(self, dependency: str | None) -> None:
+        """Annotate queued local work without claiming or failing it."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if dependency:
+                db.execute("UPDATE jobs SET error=?,updated_at=? WHERE status='queued'",
+                           ("waiting_on_dependency:" + dependency, self.clock()))
+            else:
+                db.execute("UPDATE jobs SET error=NULL,updated_at=? WHERE status='queued' AND error LIKE 'waiting_on_dependency:%'",
+                           (self.clock(),))
+            db.execute("COMMIT")
+
     def result(self, job_id: str) -> dict[str, Any]:
         with self._db() as db:
             row = self._get(db, job_id)
@@ -565,7 +577,7 @@ class LocalQueue:
             self._recover_locked(db, now)
             db.execute("UPDATE jobs SET status='expired',updated_at=?,disposition_json=? WHERE status='queued' AND expires_at IS NOT NULL AND expires_at < ?",
                        (now, self._normalized({"outcome": "expired"}), now))
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY CASE priority WHEN 'interactive' THEN 0 ELSE 1 END,submitted_at LIMIT 1").fetchone()
+            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND (error IS NULL OR error NOT LIKE 'waiting_on_dependency:%') ORDER BY CASE priority WHEN 'interactive' THEN 0 ELSE 1 END,submitted_at LIMIT 1").fetchone()
             if row is None:
                 db.execute("COMMIT")
                 return None
@@ -619,6 +631,7 @@ class LocalQueue:
         with self._db() as db:
             rows = db.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status").fetchall()
             classes = db.execute("SELECT priority,COUNT(*) AS count FROM jobs WHERE status NOT IN ('complete','failed','cancelled','expired','unknown') GROUP BY priority").fetchall()
+            held = db.execute("SELECT job_id,error FROM jobs WHERE status='queued' AND error LIKE 'waiting_on_dependency:%'").fetchall()
         try:
             snapshot = self.sampler.sample()
             age = self.clock() - snapshot.observed_at
@@ -638,4 +651,5 @@ class LocalQueue:
             sample = {"fresh": False, "verdict": "deferred", "reason": "resource_sample_unavailable"}
         return {"schema": 1, "state": "local_queue", "counts": {row["status"]: row["count"] for row in rows},
                 "queue_depth_by_class": {row["priority"]: row["count"] for row in classes},
+                "waiting_jobs": {row["job_id"]: row["error"] for row in held},
                 "resource": sample, "caps": asdict(self.caps), "executor": "single_flock_lease"}

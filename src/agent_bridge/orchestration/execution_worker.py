@@ -198,13 +198,25 @@ def run(config_path: str, *, once: bool, interval: float,
             # Recovery happens only after this process owns the global lock.
             # Any uncertain prior send becomes blocked and is never repeated.
             queue = _configured_queue(config_path)
+            def run_checked_once() -> dict | None:
+                from .. import drift
+                status = drift.quick_check(config_path)
+                changed = set(status["changed"])
+                drift.report_attention(None, status)
+                holds: dict[str, str] = {}
+                if "codex" in changed:
+                    holds["codex"] = "codex"
+                if "claude" in changed:
+                    holds["claude"] = "claude"
+                queue.hold_dependencies(holds)
+                return queue.run_once(identity)
             if once:
-                result = queue.run_once(identity)
+                result = run_checked_once()
                 if result is not None:
                     print(f"{result['job_id']} {result['state']}")
                 return 0
             while not stop:
-                result = queue.run_once(identity)
+                result = run_checked_once()
                 if result is None:
                     time.sleep(interval)
             return 0

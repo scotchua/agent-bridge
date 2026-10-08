@@ -97,6 +97,35 @@ class UpgradeTests(unittest.TestCase):
             self.assertFalse(os.path.exists(upgrade.launcher_path(home, "linux")))
             self.assertFalse(os.path.exists(upgrade._upgrade_path(home)))
 
+    def test_missing_baseline_offers_doctor_and_nightly_separately(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._receipt(home)
+            config = os.path.join(home, "orchestration.json")
+            Path(config).write_text("{}")
+            prompts: list[str] = []
+            def ask(prompt: str) -> str:
+                prompts.append(prompt)
+                if "baseline" in prompt:
+                    return ""
+                if "nightly" in prompt:
+                    return ""
+                if "Apply" in prompt:
+                    return "y"
+                return "n"
+            with mock.patch.object(upgrade.os, "geteuid", return_value=501, create=True), \
+                 mock.patch.object(upgrade.drift, "discover_config", return_value=config), \
+                 mock.patch.object(upgrade.drift, "_read_baseline", return_value=None), \
+                 mock.patch.object(upgrade.drift, "scheduled_baseline", return_value={"ok": True}) as baseline, \
+                 mock.patch.object(upgrade.drift, "doctor") as doctor, \
+                 mock.patch.object(upgrade.drift, "install_schedule") as schedule:
+                result = upgrade.run(home=home, platform="darwin", ask=ask, out=lambda _message: None)
+            self.assertEqual(result, 0)
+            self.assertIn("Run doctor once to record a baseline? [Y/n] ", prompts)
+            self.assertIn("Install the nightly doctor schedule? [y/N] ", prompts)
+            baseline.assert_called_once_with(config, home=os.path.abspath(home))
+            doctor.assert_not_called()
+            schedule.assert_not_called()
+
     def test_manifest_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as home:
             self._receipt(home)

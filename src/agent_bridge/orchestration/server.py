@@ -35,7 +35,7 @@ class Server:
     def __init__(self, caller: str, service: Service, router: StageRouter, *,
                  execution: ExecutionQueue | None = None, interval: float = 5.0,
                  state_root: str | None = None,
-                 protected: tuple[str, ...] = ()):
+                 protected: tuple[str, ...] = (), dependency_check: object | None = None):
         if caller not in {"claude", "codex"}:
             raise ValueError("caller_invalid")
         if interval <= 0:
@@ -47,6 +47,7 @@ class Server:
                                  state_root=state_root, protected=protected)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._dependency_check = dependency_check
 
     def start(self) -> None:
         if self._thread is None:
@@ -58,6 +59,12 @@ class Server:
     def _executor(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._dependency_check is not None:
+                    held = self._dependency_check()
+                    self.service.queue.hold_dependency(held)
+                    if held:
+                        self._stop.wait(self.interval)
+                        continue
                 self.service.once()
             except Exception:
                 pass
@@ -181,9 +188,18 @@ def main(argv: list[str] | None = None) -> int:
     # own database and heartbeat, and the hook installation files.
     protected = gate.protected_paths(str(cfg.state_root), args.config, os.path.expanduser("~"),
                                      str(cfg.capacity_db), str(cfg.local_queue_root))
+    def dependency_check() -> str | None:
+        from .. import drift
+        status = drift.quick_check(args.config)
+        drift.report_attention(None, status)
+        changed = set(status["changed"])
+        for name in ("ollama", "gemma_delegate", "gemma_validator"):
+            if name in changed:
+                return name
+        return None
     return Server(args.caller, service, router, execution=execution,
                   interval=cfg.interval_seconds, state_root=str(cfg.state_root),
-                  protected=protected).serve()
+                  protected=protected, dependency_check=dependency_check).serve()
 
 
 if __name__ == "__main__":
