@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, UNSUPPORTED_KIND_REASON,
-                    AdmissionError, LocalQueue)
+                    AdmissionError, LocalQueue, QueueCaps)
 
 
 #: Recognized but not refused: this intake feeds only the on-device model, so
@@ -480,6 +480,26 @@ class AutomaticIntake:
             raise AdmissionError("priority_invalid")
         if not isinstance(params or {}, dict):
             raise AdmissionError("params_invalid")
+        # Validate certified task shapes at intake, before a receipt or a
+        # queued blob can be created.  The child validates again as a
+        # defence-in-depth boundary before it invokes the delegate.
+        actual_params = params or {}
+        if self.queue.backend_id == "gemma_certified":
+            from . import gemma_child
+            reason = gemma_child.params_refusal(actual_params, task_type)
+            if reason is not None:
+                raise AdmissionError(reason)
+            if task_type == "extract":
+                try:
+                    gemma_child._document_params(actual_params["documents"])
+                except ValueError as exc:
+                    raise AdmissionError(str(exc)) from exc
+            # The spool has one physical cap.  Keep the certified summarize
+            # and classify contracts at their historical 24 KB limit while
+            # allowing an extract manifest to use the wider spool cap.
+            if (task_type in {"summarize", "classify"}
+                    and len(input.encode("utf-8")) > QueueCaps().max_input_bytes):
+                raise AdmissionError("input_too_large")
         flags = self._validated_flags(risk_flags)
         input_raw = input.encode("utf-8")
         input_bytes = len(input_raw)

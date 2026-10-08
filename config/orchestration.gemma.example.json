@@ -14,5 +14,6 @@
   "gemma_receipt_validator_executable": "/absolute/pinned/path/to/delegation_receipt.py",
   "gemma_receipt_validator_sha256": "replace-with-64-lowercase-hex-characters",
   "gemma_model_digest": "replace-with-64-lowercase-hex-characters",
-  "gemma_timeout_seconds": 600.0
+  "gemma_timeout_seconds": 600.0,
+  "gemma_pilot_tasks": []
 }

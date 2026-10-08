@@ -54,7 +54,10 @@ def gemma_queue_caps_for(cfg: Any) -> QueueCaps:
     defaults.
     """
     timeout = float(getattr(cfg, "gemma_timeout_seconds", GEMMA_CERTIFIED_TIMEOUT_SECONDS))
-    return QueueCaps(timeout_seconds=timeout + GEMMA_QUEUE_MARGIN_SECONDS,
+    # An extract job carries an explicit batch manifest. Each document is
+    # capped independently by the adapter, while the spool must hold the
+    # whole manifest long enough to process that one durable job.
+    return QueueCaps(max_input_bytes=400_000, timeout_seconds=timeout + GEMMA_QUEUE_MARGIN_SECONDS,
                      lease_seconds=timeout + (2 * GEMMA_QUEUE_MARGIN_SECONDS))
 
 
@@ -101,4 +104,11 @@ def build_backend_and_caps(cfg: Any, queue_root: str) -> "tuple[Backend, QueueCa
               "--validator-sha256", str(cfg.gemma_receipt_validator_sha256),
               "--model-digest", str(cfg.gemma_model_digest),
               "--timeout", str(timeout)]
-    return SubprocessBackend(command), gemma_queue_caps_for(cfg), frozenset({"summarize"})
+    pilot_tasks = getattr(cfg, "gemma_pilot_tasks", ())
+    # Config validation owns this vocabulary.  Keep this defensive check so a
+    # hand-built config object cannot activate an unreviewed task type.
+    if (not isinstance(pilot_tasks, (tuple, list))
+            or any(task not in {"extract", "classify"} for task in pilot_tasks)):
+        raise BackendSelectionError("gemma_pilot_tasks_invalid")
+    return (SubprocessBackend(command), gemma_queue_caps_for(cfg),
+            frozenset({"summarize", *pilot_tasks}))

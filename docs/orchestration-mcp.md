@@ -250,3 +250,32 @@ content only, and writes a durable result the guided `onboard apply
 never applies, commits, pushes, merges, downloads a model, or enables paid
 fallback, and it refuses to run against a result path inside a temporary
 directory.
+
+## Certified extract and classify pilot
+
+The certified Gemma lane carries `summarize` by default. An operator enables
+the `extract` and/or `classify` pilot explicitly with the orchestration
+configuration's `gemma_pilot_tasks` list. Its only allowed values are
+`extract` and `classify`; the default is an empty list.
+`extract` takes `params.documents`, an ordered list of unique non-empty ids
+and UTF-8 text. The adapter invokes the delegate once per document, never
+batches documents, and returns every candidate record with `ok`, `no_record`,
+or `multiple_records`. Each non-null extracted value includes all
+document-relative character spans and an ambiguity flag. A span proves only
+that text occurred, not that a value was assigned to the right semantic field
+such as total rather than subtotal. Full-source review remains required.
+
+`classify` calls the delegate once and returns one validated label per source
+line, including blank lines. `UNSURE` remains `UNSURE`. A malformed candidate,
+receipt mismatch, deadline, or count mismatch fails the entire durable job;
+there is no partial result or cloud fallback. During this pilot extract and
+classify accept only synthetic, public, and internal_nonclient material.
+Summarize retains its existing classification behavior.
+
+An operator may opt individual repository files in with `extract_globs` and
+`classify_globs`; both default empty. `extract_document_separator`, when set,
+is an exact full separator line used by `work_extract_file`; otherwise a file
+is one document. `work_extract_file` and `work_classify_file` take only a
+path and derive task and classification from policy. Claude Code and Codex
+CLI hooks can compel those tools before a whole-file read. The Codex desktop
+app has no hook surface, so this is not enforced there.

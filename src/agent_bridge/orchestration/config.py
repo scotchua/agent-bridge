@@ -59,6 +59,9 @@ class OrchestrationConfig:
     client_data_health_timeout_seconds: float = 30.0
     client_data_health_record: Path | None = None
     client_derived_routes: frozenset[str] = frozenset()
+    # Explicit operator activation for the certified pilot.  The installed
+    # backend remains summarize-only unless this list names a pilot task.
+    gemma_pilot_tasks: tuple[str, ...] = ()
 
 
 _KEYS = frozenset({
@@ -73,6 +76,7 @@ _KEYS = frozenset({
     "client_data_health_command", "client_data_health_path",
     "client_data_health_timeout_seconds", "client_data_health_record",
     "client_derived_routes",
+    "gemma_pilot_tasks",
 })
 
 #: The certified delegate's own current budget. Config may only widen this,
@@ -155,14 +159,16 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
         # a stray gemma_* path left in a private_worker config is exactly
         # the kind of ambiguity "validate strictly and fail closed" rules
         # out, rather than silently ignoring it.
-        if any(value is not None for value in supplied) or "gemma_timeout_seconds" in raw:
+        if (any(value is not None for value in supplied) or "gemma_timeout_seconds" in raw
+                or "gemma_pilot_tasks" in raw):
             raise OrchestrationConfigError("gemma_certified_configuration_must_be_absent")
         return {"local_backend": local_backend, "gemma_delegate_executable": None,
                "gemma_python_executable": None, "gemma_receipt_root": None,
                "gemma_receipt_validator_executable": None,
                "gemma_delegate_sha256": None, "gemma_receipt_validator_sha256": None,
                "gemma_model_digest": None,
-               "gemma_timeout_seconds": GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS}
+               "gemma_timeout_seconds": GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS,
+               "gemma_pilot_tasks": ()}
     if any(value is None for value in supplied):
         raise OrchestrationConfigError("gemma_certified_configuration_incomplete")
     delegate = _existing_file(raw.get("gemma_delegate_executable"), "gemma_delegate_executable")
@@ -184,10 +190,16 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
             or float(timeout) < GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS):
         # Never silently shorten the delegate's own certified budget.
         raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget")
+    pilot_tasks = raw.get("gemma_pilot_tasks", [])
+    if (not isinstance(pilot_tasks, list)
+            or any(task not in {"extract", "classify"} for task in pilot_tasks)
+            or len(set(pilot_tasks)) != len(pilot_tasks)):
+        raise OrchestrationConfigError("gemma_pilot_tasks_invalid")
     return {"local_backend": local_backend, "gemma_delegate_executable": delegate,
            "gemma_python_executable": python_executable, "gemma_receipt_root": receipt_root,
            "gemma_receipt_validator_executable": validator,
-           **digests, "gemma_timeout_seconds": float(timeout)}
+           **digests, "gemma_timeout_seconds": float(timeout),
+           "gemma_pilot_tasks": tuple(pilot_tasks)}
 
 
 def _client_data_health(raw: dict[str, Any]) -> dict[str, Any]:

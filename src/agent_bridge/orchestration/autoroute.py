@@ -112,6 +112,9 @@ class RepoPolicy:
     #: not a second way to say "everything", so a narrow default stays narrow
     #: unless the operator names their own patterns here.
     mechanical_globs: tuple[str, ...] = ()
+    extract_globs: tuple[str, ...] = ()
+    classify_globs: tuple[str, ...] = ()
+    extract_document_separator: str | None = None
 
     def __post_init__(self) -> None:
         if self.classification not in CLASSIFICATIONS:
@@ -742,7 +745,8 @@ def parse_policy(document: object) -> Policy:
         if not isinstance(entry, dict):
             raise PolicyError(f"routing policy entry for {repo!r} must be an object")
         unknown = set(entry) - {"classification", "allowed_routes", "mechanical_ok",
-                                "mechanical_globs"}
+                                "mechanical_globs", "extract_globs", "classify_globs",
+                                "extract_document_separator"}
         if unknown:
             raise PolicyError(f"routing policy entry for {repo!r} has unknown keys: "
                               + ", ".join(sorted(unknown)))
@@ -755,11 +759,23 @@ def parse_policy(document: object) -> Policy:
         globs = entry.get("mechanical_globs", [])
         if not isinstance(globs, list) or any(not isinstance(g, str) or not g for g in globs):
             raise PolicyError(f"mechanical_globs for {repo!r} must be a list of non-empty strings")
+        extract_globs = entry.get("extract_globs", [])
+        classify_globs = entry.get("classify_globs", [])
+        if (not isinstance(extract_globs, list) or not isinstance(classify_globs, list)
+                or any(not isinstance(g, str) or not g for g in extract_globs + classify_globs)):
+            raise PolicyError(f"extract_globs/classify_globs for {repo!r} must be lists of non-empty strings")
+        separator = entry.get("extract_document_separator")
+        if separator is not None and (not isinstance(separator, str) or not separator
+                                      or "\n" in separator or "\r" in separator):
+            raise PolicyError(f"extract_document_separator for {repo!r} must be one non-empty line")
         repos[os.path.realpath(repo)] = RepoPolicy(
             classification=entry.get("classification", "unclassified"),
             allowed_routes=tuple(dict.fromkeys(routes)),
             mechanical_ok=mechanical,
-            mechanical_globs=tuple(dict.fromkeys(globs)))
+            mechanical_globs=tuple(dict.fromkeys(globs)),
+            extract_globs=tuple(dict.fromkeys(extract_globs)),
+            classify_globs=tuple(dict.fromkeys(classify_globs)),
+            extract_document_separator=separator)
     ceiling = document.get("max_local_load_ratio", DEFAULT_MAX_LOCAL_LOAD)
     if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 64:
         raise PolicyError("max_local_load_ratio must be a number above 0 and at most 64")

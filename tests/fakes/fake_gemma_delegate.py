@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job-timeout", required=True, type=float)
     args = parser.parse_args(argv)
     here = Path(__file__).resolve().parent
+    (here / "observed-argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
     mode = _read(here, "mode.txt", "complete")
     calls = here / "calls.txt"
     calls.write_text(str(int(_read(here, "calls.txt", "0")) + 1), encoding="utf-8")
@@ -38,7 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     if mode == "unavailable":
         return 3
 
-    output = b"SUMMARY: " + input_bytes[:80]
+    if args.task == "extract":
+        fields = {name: None for name in ("party", "date", "doc_type", "reference",
+                                          "description", "amount", "terms", "due_date", "account")}
+        # Synthetic test convention: a JSON fixture next to the delegate can
+        # provide exactly the candidate records this call returns.
+        records = _read(here, "extract_records.json", "")
+        output = records.encode("utf-8") if records else json.dumps([fields]).encode("utf-8")
+    elif args.task == "classify":
+        output = b"\n".join(b"UNSURE | " + line[:60] for line in input_bytes.splitlines())
+    else:
+        output = b"SUMMARY: " + input_bytes[:80]
     sys.stdout.buffer.write(output)
     sys.stdout.buffer.flush()
     if mode == "missing-receipt":
