@@ -47,6 +47,10 @@ class Harnesses:
     # default ~/.claude store stops a concurrent desktop refresh from signing
     # the lane out; claude_config decides which directory is allowed.
     claude_config_dir: Path | None = None
+    # The review harness is bundled with the bridge.  Keeping it optional
+    # preserves existing configuration objects and makes an absent review
+    # installation a named refusal rather than an implementation fallback.
+    codex_review: Path | None = None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -109,6 +113,9 @@ class SubprocessHarnessExecutor:
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
         provider = request["provider"]
+        is_review = request.get("kind") == "review"
+        if is_review and provider != "codex":
+            raise ExecutionAdmissionError("review_provider_unsupported")
         if provider == "claude" and not claude_config.is_ready(
                 self.harnesses.claude_config_dir):
             # Checked before the platform check, on every platform. A missing
@@ -122,22 +129,36 @@ class SubprocessHarnessExecutor:
         # PATH; a command that cannot start here would otherwise fail only
         # after the whole generation, minutes later (live jobs 9e66f13c,
         # 2039124c, c0849b26, beffeccc, 7dcda0b7).
-        try:
-            verify_policy.check_runnable(request["verify_argv"],
-                                         os.environ.get("PATH", "/usr/bin:/bin"))
-        except verify_policy.VerifyPolicyError as exc:
-            raise ExecutionAdmissionError(f"verify_not_runnable: {exc}") from None
+        if not is_review:
+            try:
+                verify_policy.check_runnable(request["verify_argv"],
+                                             os.environ.get("PATH", "/usr/bin:/bin"))
+            except verify_policy.VerifyPolicyError as exc:
+                raise ExecutionAdmissionError(f"verify_not_runnable: {exc}") from None
         # Imported only at execution time so the queue/status MCP remains
         # importable on Windows, where the persistent worker is not supported.
         import pwd
-        harness = getattr(self.harnesses, provider)
-        argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
-                "--repo", request["repo"], "--base", request["base"],
-                "--timeout", str(request["timeout_seconds"])]
+        if is_review:
+            harness = self.harnesses.codex_review
+            if harness is None or not harness.is_absolute() or not harness.is_file():
+                raise ExecutionAdmissionError("review_harness_unavailable")
+            argv = [str(self.harnesses.python), "-P", str(harness), "run", request["brief"],
+                   "--repo", request["repo"], "--base", request["base"], "--head", request["head"],
+                   "--classification", request["classification"], "--author-provider", request["author_provider"],
+                   "--reviewer-provider", request["provider"], "--model", request["model"],
+                   "--reasoning-effort", request["effort"], "--tasks-dir", str(job_dir / "harness"),
+                   "--dispatch-record", str(job_dir / "request.json"),
+                   "--timeout", str(request["timeout_seconds"])]
+        else:
+            harness = getattr(self.harnesses, provider)
+            argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
+                   "--repo", request["repo"], "--base", request["base"],
+                   "--timeout", str(request["timeout_seconds"])]
         if provider == "codex":
-            argv += ["--classification", request["classification"],
-                     "--model", request["model"], "--reasoning-effort", request["effort"],
-                     "--tasks-dir", str(job_dir / "harness")]
+            if not is_review:
+                argv += ["--classification", request["classification"],
+                         "--model", request["model"], "--reasoning-effort", request["effort"],
+                         "--tasks-dir", str(job_dir / "harness")]
         else:
             # Fail closed rather than let the harness fall back to the shared
             # default store; an unisolated lane is the recurring login-loss
@@ -150,7 +171,7 @@ class SubprocessHarnessExecutor:
                      "--model", request["model"], "--effort", request["effort"],
                      "--task-root", str(job_dir / "harness"),
                      "--claude-config-dir", str(directory)]
-        if "execution" in self.client_derived_routes:
+        if "execution" in self.client_derived_routes and not is_review:
             argv += ["--client-derived-routes", "execution"]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
@@ -176,6 +197,16 @@ class SubprocessHarnessExecutor:
             target.write_bytes(payload)
             os.chmod(target, 0o600)
         summary = _harness_summary(stdout)
+        if is_review and "review_receipt_path" in summary:
+            # The worker records a review receipt only when the harness put it
+            # inside this queue job's private harness directory.  A printed
+            # path is otherwise merely model output, not a capability to make
+            # verification open an arbitrary file.
+            try:
+                receipt = Path(summary["review_receipt_path"]).resolve()
+                receipt.relative_to((job_dir / "harness").resolve())
+            except (OSError, ValueError):
+                raise ExecutionAdmissionError("review_receipt_outside_job") from None
         return {"returncode": process.returncode,
                 "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
                 "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
@@ -269,8 +300,12 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
             # A status outside the vocabulary is output nobody agreed on. It
             # is not a completion, and it is not silently renamed to one.
             return _unreadable("receipt_status_unknown")
+        receipt_path = parsed.get("receipt_path")
+        review_receipt = ({"review_receipt_path": receipt_path}
+                          if isinstance(receipt_path, str) and receipt_path else {})
         return {"harness_ok": parsed.get("ok") is True and status == HARNESS_COMPLETE,
-                "harness_status": status, "harness_verdict": "read", **diagnostics}
+                "harness_status": status, "harness_verdict": "read", **diagnostics,
+                **review_receipt}
     return _unreadable("receipt_absent")
 
 
@@ -456,15 +491,27 @@ class ExecutionQueue:
                item_id: str, stage: str, owner_id: str, stage_revision: int,
                verify_argv: list[list[str]] | None = None,
                timeout_seconds: int = 900, paid_fallback: bool = False,
-               idempotency_key: str | None = None) -> dict[str, Any]:
+               idempotency_key: str | None = None, kind: str = "execution",
+               head: str | None = None, author_provider: str | None = None,
+               client_derived_admitted: bool = False) -> dict[str, Any]:
         if caller not in PROVIDER_FOR_CALLER or provider != PROVIDER_FOR_CALLER[caller]:
             raise ExecutionAdmissionError("provider_not_eligible_for_caller")
         if paid_fallback:
             raise ExecutionAdmissionError("paid_fallback_forbidden")
+        if kind not in {"execution", "review"}:
+            raise ExecutionAdmissionError("job_kind_invalid")
+        if kind == "review":
+            if provider != "codex" or not isinstance(head, str) or not head or author_provider not in {"claude", "codex", "local"}:
+                raise ExecutionAdmissionError("review_request_invalid")
+            if author_provider == provider:
+                raise ExecutionAdmissionError("review_direction_invalid")
         if (classification not in ALLOWED_CLASSIFICATIONS
                 and not (classification == CLIENT_DERIVED
                          and "execution" in self.client_derived_routes)):
             raise ExecutionAdmissionError("classification_not_eligible")
+        if (kind == "review" and classification == CLIENT_DERIVED
+                and client_derived_admitted is not True):
+            raise ExecutionAdmissionError("client_derived_dispatch_not_admitted")
         repo_path, brief_path = Path(repo), Path(brief)
         if not repo_path.is_absolute() or not brief_path.is_absolute():
             raise ExecutionAdmissionError("repo_and_brief_must_be_absolute")
@@ -497,6 +544,8 @@ class ExecutionQueue:
         except UnicodeDecodeError as exc:
             raise ExecutionAdmissionError("brief_not_utf8") from exc
         base = self._clean_text(base, "base")
+        if kind == "review":
+            head = self._clean_text(head, "head")
         model = self._clean_text(model, "model")
         # Models the operator keeps for themselves, refused where the job is
         # created rather than only where it is requested. The MCP handler
@@ -514,6 +563,8 @@ class ExecutionQueue:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 7200:
             raise ExecutionAdmissionError("timeout_invalid")
         checks = verify_argv or []
+        if kind == "review" and checks:
+            raise ExecutionAdmissionError("review_verify_argv_forbidden")
         if provider == "claude" and not checks:
             raise ExecutionAdmissionError("claude_verification_required")
         try:
@@ -532,7 +583,9 @@ class ExecutionQueue:
                     "base": base, "classification": classification, "model": model,
                     "effort": effort, "verify_argv": checks, "timeout_seconds": timeout_seconds,
                     "item_id": item_id, "stage": stage, "owner_id": owner_id,
-                    "stage_revision": stage_revision}
+                    "stage_revision": stage_revision, "kind": kind, "head": head,
+                    "author_provider": author_provider,
+                    "client_derived_admitted": client_derived_admitted}
         with self._lock:
             if key:
                 for directory in self.root.iterdir():
