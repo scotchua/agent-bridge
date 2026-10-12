@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -86,26 +88,99 @@ class QueueCaps:
     #: refuse it. See ResourceSnapshot.cpu_idle_ratio.
     min_cpu_idle_ratio: float = 0.10
 
+    def __post_init__(self) -> None:
+        for field in ("bulk_ttl_seconds", "sample_max_age_seconds", "lease_seconds", "timeout_seconds"):
+            value = getattr(self, field)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field} must be finite and positive")
 
-#: Longest failure text the ``error`` column records.
+
+_RUNTIME_REASONS = frozenset({
+    "child payload lacks job id", "child did not return a JSON object",
+    "executor result must be an object",
+})
+_BACKEND_EXCEPTION_NAMES = frozenset({
+    "RuntimeError", "ValueError", "TypeError", "OSError", "PermissionError",
+    "FileNotFoundError", "KeyError", "IndexError", "UnicodeError",
+    "UnicodeDecodeError", "JSONDecodeError", "TimeoutExpired",
+})
+_WORKER_VALUE_REASONS = frozenset({
+    "worker path must be an existing absolute regular file",
+    "worker state must be an existing absolute directory",
+    "queue database unavailable", "queue provenance unavailable",
+    "unsupported queue payload", "instruction must be text",
+    "provider must be auto, apple, or qwen", "payload is not JSON",
+    "payload must be an object",
+})
+_WORKER_RUNTIME_REASONS = frozenset({
+    "private worker exited unsuccessfully", "private worker protocol response invalid",
+    "private worker rejected request", "private worker response invalid",
+})
+_GEMMA_VALUE_REASONS = frozenset({
+    "unsupported_kind", "input_invalid", "params_invalid",
+    "params_invalid_for_gemma_certified", "job_id_invalid", "timeout_invalid",
+    "model_digest_invalid", "delegate_sha256_invalid", "validator_sha256_invalid",
+    "extract_documents_invalid", "payload_invalid",
+    "delegate must be an existing absolute regular file",
+    "python must be an existing absolute regular file",
+    "receipt_validator must be an existing absolute regular file",
+    "receipt_root must be an existing absolute directory",
+})
+_GEMMA_REFUSAL_REASONS = frozenset({
+    "custom_instruction_unsupported", "delegate_source_changed",
+    "receipt_validator_source_changed", "gemma_delegate_timeout",
+    "gemma_delegate_unavailable", "classify_line_count_mismatch",
+})
+_GEMMA_RECEIPT_REASONS = frozenset({
+    "receipt_validator_unloadable", "receipt_validator_contract_missing",
+    "receipt_missing", "receipt_unreadable", "receipt_invalid",
+    "receipt_contract_unsupported", "receipt_task_mismatch", "receipt_not_success",
+    "receipt_model_digest_mismatch", "receipt_output_hash_kind_invalid",
+    "output_not_utf8",
+})
+_CHILD_REASONS = {
+    "ValueError": _WORKER_VALUE_REASONS | _GEMMA_VALUE_REASONS,
+    "RuntimeError": _WORKER_RUNTIME_REASONS,
+    "GemmaRefusal": _GEMMA_REFUSAL_REASONS,
+    "GemmaReceiptError": _GEMMA_RECEIPT_REASONS,
+}
 FAILURE_TEXT_LIMIT = 200
 
 
-def _failure_text(exc: BaseException) -> str:
-    """``ClassName: reason`` for a backend failure, or the class name alone.
+def _fixed_child_detail(error: str, detail: str) -> bool:
+    if detail in _CHILD_REASONS[error]:
+        return True
+    match = re.fullmatch(r"extract_document_(\d+)_(invalid|oversize|deadline_exceeded|schema_invalid|value_absent)", detail)
+    if match and error in {"ValueError", "GemmaRefusal"} and len(match[1]) <= 2 and int(match[1]) < 16:
+        return True
+    match = re.fullmatch(r"classify_line_(\d+)_invalid", detail)
+    if match and error == "GemmaRefusal" and len(match[1]) <= 5 and 1 <= int(match[1]) <= 24_000:
+        return True
+    if error == "GemmaRefusal" and detail.startswith("classify_failed:"):
+        reason = detail[len("classify_failed:"):]
+        return any(_fixed_child_detail(kind, reason)
+                   for kind in ("GemmaRefusal", "GemmaReceiptError", "ValueError"))
+    if error == "GemmaRefusal":
+        match = re.fullmatch(r"extract_document_(\d+)_failed:(.+)", detail)
+        if match and len(match[1]) <= 2 and int(match[1]) < 16:
+            return any(_fixed_child_detail(kind, match[2])
+                       for kind in ("GemmaRefusal", "GemmaReceiptError", "ValueError"))
+    return False
 
-    The subprocess backend raises RuntimeError with fixed text ("child
-    exited unsuccessfully", "child did not return a JSON object"); the
-    class name alone told an operator nothing (the same defect the
-    execution queue had). Only RuntimeError text is copied, because that
-    is the backend's own fixed diagnostics; any other exception's text may
-    quote the payload and stays out of the record.
-    """
+
+class _ChildFailure(RuntimeError):
+    def __init__(self, output: str):
+        super().__init__("child exited unsuccessfully" + _child_failure_suffix(output))
+
+
+def _failure_text(exc: BaseException) -> str:
+    """Record only known local diagnostics, never arbitrary exception text."""
+    if type(exc) is _ChildFailure:
+        return f"RuntimeError: {exc}"
     name = type(exc).__name__
-    if not isinstance(exc, RuntimeError):
-        return name
-    detail = "".join(char for char in str(exc) if char.isprintable())[:FAILURE_TEXT_LIMIT]
-    return f"{name}: {detail}" if detail else name
+    if type(exc) is RuntimeError and str(exc) in _RUNTIME_REASONS:
+        return f"RuntimeError: {exc}"
+    return name if name in _BACKEND_EXCEPTION_NAMES else "backend_failure"
 
 
 class FakeBackend:
@@ -121,24 +196,19 @@ class FakeBackend:
 
 
 def _child_failure_suffix(output: str) -> str:
-    """``: <error>: <detail>`` when a failed child left its own fixed
-    diagnostics on stdout (``{"ok": false, "error": ..., "error_detail":
-    ...}``, the shape worker_child prints); empty otherwise. Printable
-    characters only, bounded, so a child cannot put a payload in the record."""
+    """Return only fixed diagnostics defined by the bundled child adapters."""
     try:
         value = json.loads(output or "")
     except (TypeError, ValueError):
         return ""
     if not isinstance(value, dict) or value.get("ok") is not False:
         return ""
-    parts = []
-    for key in ("error", "error_detail"):
-        text = value.get(key)
-        if isinstance(text, str):
-            text = "".join(char for char in text if char.isprintable())[:FAILURE_TEXT_LIMIT]
-            if text:
-                parts.append(text)
-    return ": " + ": ".join(parts) if parts else ""
+    error, detail = value.get("error"), value.get("error_detail")
+    if not isinstance(error, str) or error not in _CHILD_REASONS:
+        return ""
+    if isinstance(detail, str) and len(detail) <= FAILURE_TEXT_LIMIT and _fixed_child_detail(error, detail):
+        return f": {error}: {detail}"
+    return f": {error}"
 
 
 class SubprocessBackend:
@@ -176,7 +246,7 @@ class SubprocessBackend:
             with self._lock:
                 self._processes.pop(job_id, None)
         if proc.returncode != 0:
-            raise RuntimeError("child exited unsuccessfully" + _child_failure_suffix(output))
+            raise _ChildFailure(output)
         try:
             value = json.loads(output)
         except (TypeError, ValueError) as exc:

@@ -106,6 +106,50 @@ class RoundTests(unittest.TestCase):
         for t in workers: t.join()
         self.assertEqual(len(self.adapters['claude'].calls), 1)
 
+    def test_worker_reconciles_post_claim_failure_without_retry(self):
+        r = self.prepare()
+        self.rounds.approve(r['round_id'])
+        consult = self.rounds._consult
+        def fail_after_call(*args):
+            consult(*args)
+            raise RuntimeError('invented post-claim failure')
+        def stop_worker(_delay):
+            self.rounds.closed.set()
+        with patch.object(self.rounds, '_consult', side_effect=fail_after_call), patch.object(self.rounds.closed, 'wait', side_effect=stop_worker):
+            self.rounds.loop()
+        result = self.rounds.read('codex', r['round_id'])
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['selection'], {})
+        with self.store.db() as db:
+            row = db.execute('SELECT payload, payload_hash, terminal_at FROM peer_rounds WHERE id=?', (r['round_id'],)).fetchone()
+        self.assertIsNone(row['payload'])
+        self.assertIsNotNone(row['payload_hash'])
+        self.assertIsNotNone(row['terminal_at'])
+        self.assertFalse(self.rounds.run_once())
+        self.assertEqual(len(self.adapters['claude'].calls), 1)
+
+    def test_post_claim_failure_preserves_recorded_reply(self):
+        self.adapters['gemini'] = Fake()
+        self.rounds.participants = tuple(self.adapters)
+        r = self.prepare(targets=['claude', 'gemini'])
+        self.rounds.approve(r['round_id'])
+        consult = self.rounds._consult
+        def fail_after_second_call(target, *args):
+            reply = consult(target, *args)
+            if target == 'gemini':
+                raise RuntimeError('invented post-claim failure')
+            return reply
+        with patch.object(self.rounds, '_consult', side_effect=fail_after_second_call), self.assertRaises(RuntimeError):
+            self.rounds.run_once()
+        result = self.rounds.read('codex', r['round_id'])
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['selection'], {})
+        self.assertEqual(result['replies']['claude']['status'], 'completed')
+        self.assertNotIn('gemini', result['replies'])
+        self.assertEqual(len(self.store.snapshot(result['room_id'])['messages']), 2)
+        self.assertFalse(self.rounds.run_once())
+        self.assertEqual([len(self.adapters[p].calls) for p in ('claude', 'gemini')], [1, 1])
+
     def test_expired_pending_rounds_release_capacity_and_can_be_rejected(self):
         with patch('agent_bridge.chat.rounds.time.time', return_value=1):
             for i in range(50): self.prepare(request_id=str(i))
