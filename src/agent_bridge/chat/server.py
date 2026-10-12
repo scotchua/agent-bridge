@@ -123,11 +123,12 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
                     elif len(parts) == 4 and self.command == 'POST':
                         if parts[3] == 'messages':
                             label = body['classification']
-                            policy.effective_classification([label])
+                            labels = [message['classification'] for message in store.snapshot(room)['messages']]
+                            classification = policy.effective_classification([*labels, label])
                             if not isinstance(body['recipients'], list):
                                 raise ValueError('Recipients must be a list')
                             for target in body['recipients']:
-                                policy.authorize(target, label)
+                                policy.authorize(target, classification)
                                 adapter = dispatcher.adapters.get(target)
                                 if adapter is None:
                                     raise ValueError('Selected agent is not connected')
