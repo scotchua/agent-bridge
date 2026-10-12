@@ -54,6 +54,8 @@ class AutoCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
         self.state = self.base / "state"
         (self.state / "routing").mkdir(parents=True)
         os.chmod(self.state, 0o700)
@@ -109,7 +111,8 @@ class AutoCase(unittest.TestCase):
             [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
              "--client", client, "--config", str(self.config), *args],
             input=json.dumps(payload).encode("utf-8"), capture_output=True,
-            timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
+            timeout=120, env={**os.environ, "HOME": str(self.home),
+                              "PYTHONPATH": str(ROOT / "src")})
         elapsed = time.monotonic() - started
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
@@ -141,6 +144,125 @@ class AutoCase(unittest.TestCase):
 
     def receipt_for(self, repo: Path) -> dict:
         return gate.read_receipt(str(self.state), str(repo))
+
+
+class WorktreeCleanup(AutoCase):
+    def setUp(self):
+        super().setUp()
+        self.checkout_root = self.base / "linked-checkouts"
+        self.checkout_root.mkdir()
+        self.linked = self.checkout_root / "merged"
+        self.git("add", "-A")
+        self.git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid",
+                 "commit", "-qm", "initial")
+        self.git("worktree", "add", "-q", "--detach", str(self.linked))
+
+    def git(self, *args):
+        subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                       capture_output=True, timeout=60,
+                       env={**os.environ, "HOME": str(self.home)})
+
+    def configure_roots(self, roots):
+        self.config.write_text(json.dumps({"state_root": str(self.state),
+                                           "capacity_db": str(self.db),
+                                           "worktree_prune_roots": roots}), encoding="utf-8")
+
+    def bash(self, command):
+        return self.run_hook("codex", {"tool_name": "Bash",
+                                       "tool_input": {"command": command},
+                                       "cwd": str(self.repo)},
+                             "--no-automatic-routing")
+
+    def remove(self, path=None, flags=""):
+        return f"git -C {self.repo} worktree remove {flags} {path or self.linked}"
+
+    def test_only_list_and_dry_run_prune_are_reads(self):
+        self.assertFalse(gate.shell_writes('git -C"/repo with spaces" worktree list'))
+        self.assertTrue(gate.shell_writes('git -C"/repo with spaces" worktree add /new'))
+        for command in (f"git -C {self.repo} worktree list",
+                        f"git -C{self.repo} worktree list",
+                        f"git -C {self.repo} worktree list --porcelain",
+                        f"git -C {self.repo} worktree list -v",
+                        f"git -C {self.repo} worktree prune -n",
+                        f"git -C {self.repo} worktree prune --dry-run",
+                        f"git -C {self.repo} worktree prune -vn"):
+            with self.subTest(command=command):
+                self.assertFalse(gate.shell_writes(command))
+                self.assertAllowed(self.bash(command))
+        for command in (f"git -C {self.repo} worktree add {self.base / 'new'}",
+                        f"git -C{self.repo} worktree add {self.base / 'new'}",
+                        f"git -C {self.repo} worktree move {self.linked} {self.base / 'new'}",
+                        f"git -C {self.repo} worktree lock {self.linked}",
+                        f"git -C {self.repo} worktree unlock {self.linked}",
+                        f"git -C {self.repo} worktree repair",
+                        f"git -C {self.repo} worktree prune",
+                        self.remove()):
+            with self.subTest(command=command):
+                self.assertTrue(gate.shell_writes(command))
+                self.assertDenied(self.bash(command), "no_routing_receipt")
+
+    def test_remove_is_off_by_default_and_logged_when_opted_in(self):
+        self.assertDenied(self.bash(self.remove()), "no_routing_receipt")
+        self.configure_roots([str(self.checkout_root)])
+        self.assertAllowed(self.bash(self.remove()))
+        events = [json.loads(line) for line in
+                  (self.state / "routing" / "gate-events.jsonl").read_text(
+                      encoding="utf-8").splitlines()]
+        self.assertEqual(events[-1]["code"], "worktree_prune_root")
+        self.assertEqual(events[-1]["permission"], "allow")
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.git("worktree", "remove", str(self.linked))
+        self.assertFalse(self.linked.exists())
+
+    def test_force_and_shell_constructs_never_get_the_exemption(self):
+        self.configure_roots([str(self.checkout_root)])
+        for command in (self.remove(flags="--force"), self.remove(flags="-f"),
+                        self.remove() + "; echo done",
+                        self.remove() + " && echo done",
+                        self.remove() + " || echo done",
+                        self.remove() + " | cat",
+                        self.remove() + " `echo x`",
+                        self.remove() + " $(echo x)",
+                        self.remove() + " > log"):
+            with self.subTest(command=command):
+                self.assertDenied(self.bash(command), "no_routing_receipt")
+
+    def test_target_must_stay_inside_a_valid_root(self):
+        self.configure_roots([str(self.checkout_root)])
+        outside = self.base / "outside-linked"
+        self.git("worktree", "add", "-q", "--detach", str(outside))
+        self.assertDenied(self.bash(self.remove(outside)), "no_routing_receipt")
+        escaped = self.checkout_root / "escape"
+        try:
+            escaped.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks unavailable")
+        self.assertDenied(self.bash(self.remove(escaped)), "no_routing_receipt")
+
+    def test_repository_root_and_malformed_config_are_denied(self):
+        self.configure_roots([str(self.repo)])
+        self.assertDenied(self.bash(self.remove()), "worktree_prune_config_invalid")
+        for roots in (str(self.checkout_root), ["relative/root"],
+                      [str(self.base / "missing")], [42]):
+            with self.subTest(roots=roots):
+                self.configure_roots(roots)
+                self.assertDenied(self.bash(self.remove()), "worktree_prune_config_invalid")
+
+    def test_target_nested_in_another_repository_is_denied(self):
+        container = self.checkout_root / "container"
+        git_repo(container)
+        nested = container / "linked"
+        self.git("worktree", "add", "-q", "--detach", str(nested))
+        self.configure_roots([str(self.checkout_root)])
+        self.assertDenied(self.bash(self.remove(nested)), "no_routing_receipt")
+
+    def test_cleanup_cannot_remove_an_ancestor_of_gate_state(self):
+        self.configure_roots([str(self.checkout_root)])
+        decision = gate.judge(
+            "codex", "Bash", {"command": self.remove()}, str(self.repo),
+            state_root=str(self.state), config_path=str(self.config),
+            protected=(str(self.linked / "protected-state"),))
+        self.assertEqual(decision.code, "gate_state_protected")
 
 
 class DecisionIsCreatedWithoutBeingAsked(AutoCase):

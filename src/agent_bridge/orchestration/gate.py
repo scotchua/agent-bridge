@@ -68,7 +68,7 @@ from .. import store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
-from . import autoroute, localfirst
+from . import autoroute, config as orchestration_config, localfirst
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -138,7 +138,7 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # repository is how the nested-.git routing escape was manufactured: a
     # second receipt key inside a repository the caller was routed away from.
     # The trailing (\s|$) keeps ``git init-db-not-a-verb`` a read.
-    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|worktree|init|clone|submodule|branch\s+-[dDmM])(\s|$)",
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s+" + _WORD + r"|--[\w-]+(=" + _WORD + r")?))*\s+(commit|apply|am|push|checkout|switch|reset|merge|rebase|stash|cherry-pick|revert|clean|rm|mv|add|restore|init|clone|submodule|branch\s+-[dDmM])(\s|$)",
     r"(^|[\s;&|('\"])(pip3?|npm|pnpm|yarn|cargo|go|uv|poetry|brew)\s+(install|add|remove|uninstall|update|upgrade|link)(\s|$)",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|php)\s+-c\s",
     r"(^|[\s;&|('\"])(python3?|node|ruby|perl|bash|sh|zsh)\s+-\s*($|<)",
@@ -211,6 +211,9 @@ _FORMATTER_REPORT_ONLY = re.compile(r"(^|\s)(--check(-only)?|--diff|--dry-run|-l
 _GIT_TAG = re.compile(r"(^|[\s;&|('\"])git\s+tag(\s+(?P<rest>[^;&|]*))?")
 _GIT_TAG_READ_FLAGS = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at",
                        "--merged", "--no-merged", "--sort", "--format", "--verify", "-v", "--column")
+_GIT_WORKTREE = re.compile(
+    r"(^|[\s;&|('\"])git(\s+(-[Cc]\s*" + _WORD +
+    r"|--[\w-]+(=" + _WORD + r")?))*\s+worktree(\s|$)")
 
 #: Codex whole-file readers (design section 2.1): invoking one of these
 #: reads a file's entire content, the read-gate equivalent of Claude's
@@ -1096,9 +1099,31 @@ def _formatter_writes(command: str) -> bool:
     return bool(_FORMATTERS.search(command)) and not _FORMATTER_REPORT_ONLY.search(command)
 
 
+def _git_worktree_writes(command: str) -> bool:
+    """Only listing and a dry run of prune are read-shaped worktree calls."""
+    for match in _GIT_WORKTREE.finditer(command):
+        tail = re.split(r"[;&|<>\r\n]", command[match.end():], maxsplit=1)[0]
+        try:
+            words = shlex.split(tail, posix=True)
+        except ValueError:
+            return True
+        if not words:
+            return True
+        if words[0] == "list":
+            continue
+        if words[0] == "prune" and any(
+                word == "--dry-run" or word.startswith("--dry-run=")
+                or (word.startswith("-") and not word.startswith("--") and "n" in word[1:])
+                for word in words[1:]):
+            continue
+        return True
+    return False
+
+
 def shell_writes(command: str) -> bool:
     """Whether ``command`` looks like it writes. A heuristic; see the module docstring."""
     return (any(pattern.search(command) for pattern in _WRITE_PATTERNS)
+            or _git_worktree_writes(command)
             or _git_tag_writes(command) or _formatter_writes(command))
 
 
@@ -1548,9 +1573,78 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
     return replace(primary, also_log=primary.also_log + others) if others else primary
 
 
+def _worktree_prune_decision(command: str, cwd: str, config_path: str | None,
+                             protected: tuple[str, ...]) -> Decision | None:
+    """Allow only an operator-opted-in, plain linked-checkout removal.
+
+    A returned ``None`` means the command has no exemption and must take the
+    ordinary write/receipt path. A malformed opt-in is an explicit deny.
+    """
+    if not _GIT_WORKTREE.search(command) or "remove" not in command:
+        return None
+    # This exemption is intentionally narrower than the shell-write heuristic.
+    # No shell control, substitution, expansion, glob, or second command may
+    # be interpreted as part of the path we check here.
+    if any(mark in command for mark in (";", "&&", "||", "|", "`", "$(", ">", "<",
+                                        "\n", "\r", "&", "$", "*", "?", "[", "]",
+                                        "%", "!", "^")):
+        return None
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    if os.name == "nt":
+        lexer.escape = ""
+    try:
+        words = list(lexer)
+    except ValueError:
+        return None
+    if (len(words) != 6 or words[0] != "git" or words[1] != "-C"
+            or words[3:5] != ["worktree", "remove"]
+            or not words[2] or not words[5] or words[5].startswith("-")):
+        return None
+    if not config_path:
+        return None
+    try:
+        raw = store.read_json(config_path)
+        if not isinstance(raw, dict):
+            raise ValueError("config_shape_invalid")
+        roots = orchestration_config.parse_worktree_prune_roots(raw)
+        if any(enclosing_repos(str(root)) or not os.access(root, os.R_OK | os.X_OK)
+               for root in roots):
+            raise ValueError("worktree_prune_root_is_repository_or_unreadable")
+    except (OSError, ValueError) as exc:
+        return Decision("deny", "worktree_prune_config_invalid",
+                        f"delegation-first gate: checkout cleanup configuration is invalid "
+                        f"({type(exc).__name__})")
+    if not roots:
+        return None
+    repo_dir = os.path.realpath(words[2] if os.path.isabs(words[2])
+                                else os.path.join(cwd, words[2]))
+    repo = (repo_key(repo_dir) if os.path.isdir(repo_dir)
+            and os.access(repo_dir, os.R_OK | os.X_OK) else None)
+    if repo is None:
+        return None
+    target = os.path.realpath(words[5] if os.path.isabs(words[5])
+                              else os.path.join(repo_dir, words[5]))
+    if any(_reaches(target, root, through_ancestors=True) for root in protected):
+        return Decision("deny", "gate_state_protected",
+                        "delegation-first gate: checkout cleanup reaches protected state")
+    git_file = os.path.join(target, ".git")
+    if (not os.path.isdir(target) or not os.access(target, os.R_OK | os.X_OK)
+            or not os.path.isfile(git_file) or not os.access(git_file, os.R_OK)
+            or enclosing_repos(os.path.dirname(target))):
+        return None
+    if not any(target != str(root) and _under(target, str(root)) for root in roots):
+        return None
+    return Decision("allow", "worktree_prune_root",
+                    f"operator-configured checkout cleanup root covers {target}",
+                    (repo,))
+
+
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
-                 capacity_db: str | None, decide: Any) -> Decision:
+                 capacity_db: str | None, decide: Any,
+                 config_path: str | None = None) -> Decision:
     """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
     classification: protected paths, then routing receipts. Split out of
     ``judge`` so a Codex shell command that both writes and reads a file
@@ -1569,6 +1663,10 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         return Decision("deny", "gate_state_protected",
                         "delegation-first gate: the target is the gate's own state or a hook file; "
                         "nothing may write them through this client", tuple(sorted(set(hit))))
+    if kind == "shell":
+        prune = _worktree_prune_decision(command, cwd, config_path, protected)
+        if prune is not None:
+            return prune
     # Every enclosing repository, so a nested .git cannot shadow an outer
     # routed decision. See enclosing_repos for the escape this closes.
     repos = tuple(sorted({repo for path in paths for repo in enclosing_repos(path)}))
@@ -1743,7 +1841,8 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           state_root: str, clock: Any = time.time, protected: tuple[str, ...] = (),
           capacity_db: str | None = None,
           local_queue_root: str = "", worker_executable: str = "",
-          decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
+          decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset(),
+          config_path: str | None = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
     with ``capacity_db`` every allow also requires the receipt's stage to be
@@ -1781,7 +1880,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                           allowed_pilot_tasks=allowed_pilot_tasks)
     write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
                                   clock=clock, protected=protected, capacity_db=capacity_db,
-                                  decide=decide)
+                                  decide=decide, config_path=config_path)
     # classify's own contract (tested, unchanged) picks a command's write
     # shape over its read shape: shell_writes is checked before
     # _shell_whole_file_read, so a Codex command that both writes and reads
@@ -2186,7 +2285,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
              clock: Any = time.time, capacity_db: str | None = None,
              protected: tuple[str, ...] = (),
              local_queue_root: str = "", worker_executable: str = "",
-             decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
+             decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset(),
+             config_path: str | None = None) -> Decision:
     tool_name = payload.get("tool_name")
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
     if not isinstance(tool_name, str):
@@ -2197,7 +2297,8 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
                          state_root=state_root, clock=clock, protected=protected,
                          capacity_db=capacity_db, local_queue_root=local_queue_root,
                          worker_executable=worker_executable, decide=decide,
-                         allowed_pilot_tasks=allowed_pilot_tasks)
+                         allowed_pilot_tasks=allowed_pilot_tasks,
+                         config_path=config_path)
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
@@ -2866,6 +2967,7 @@ def main(argv: list[str] | None = None) -> int:
                             protected=protected, local_queue_root=local_queue_root,
                             worker_executable=worker_executable,
                             allowed_pilot_tasks=allowed_pilot_tasks,
+                            config_path=args.config,
                             decide=None if args.no_automatic_routing else
                             automatic_decider(args.client, state_root, capacity_db,
                                               local_queue_root))

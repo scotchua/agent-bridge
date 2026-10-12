@@ -98,6 +98,20 @@ is known. Calls the gate classifies as reads or as non-editing tools are not
 logged, so a shell write the heuristic misses leaves no trace here; the log
 shows what the gate judged, not what it did not see.
 
+`git worktree list` (including its flags) and `git worktree prune -n` or
+`--dry-run` are classified as reads. Other `git worktree` subcommands remain
+writes. An operator can opt into receipt-free cleanup by adding
+`"worktree_prune_roots": ["/absolute/path/to/linked-checkouts"]` to the
+private orchestration config (the example leaves it empty). The root must
+exist outside every repository working tree. Only a single
+`git -C <repo> worktree remove <path>` with no force flag, shell chaining,
+substitution, or redirection qualifies. The resolved target must be a linked
+checkout root strictly inside a configured root and outside any other
+repository working tree. Invalid or unreadable configuration never grants
+the exemption. These allows are logged with `worktree_prune_root`, distinct
+from reads and from receipt-backed writes. Git itself refuses to remove a
+checkout with modified or untracked files without `--force`.
+
 ## Automatic routing
 
 ### What decides
