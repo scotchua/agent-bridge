@@ -1,6 +1,7 @@
 """Deterministic tests for the isolated local queue foundation."""
 
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -114,19 +115,19 @@ class LocalQueueTests(unittest.TestCase):
     def test_a_child_failure_records_the_backend_reason_not_only_the_class(self):
         import dataclasses
         caps = dataclasses.replace(self.caps, timeout_seconds=30)
-        for command, reason in (
+        for index, (command, reason) in enumerate((
                 ("import sys; sys.exit(3)", "child exited unsuccessfully"),
                 ("import sys; print('{\"ok\": false, \"error\": \"ValueError\", "
                  "\"error_detail\": \"queue provenance unavailable\"}'); sys.exit(1)",
                  "child exited unsuccessfully: ValueError: queue provenance unavailable"),
                 ("import sys; print('{\"ok\": false, \"error\": \"x\\\\u0007y\"}'); sys.exit(1)",
-                 "child exited unsuccessfully: xy"),
-                ("print('not json')", "child did not return a JSON object")):
+                 "child exited unsuccessfully"),
+                ("print('not json')", "child did not return a JSON object"))):
             with self.subTest(reason):
                 queue = LocalQueue(self.temp.name, sampler=self.sampler, caps=caps,
                                    backend=SubprocessBackend([sys.executable, "-c", command]),
                                    clock=self.clock)
-                job = queue.submit(task_type="summarize", input=reason, params={},
+                job = queue.submit(task_type="summarize", input=f"{index}:{reason}", params={},
                                    priority="interactive", classification="synthetic",
                                    caller="codex", purpose="work")
                 terminal = queue.run_once("runner")
@@ -142,6 +143,58 @@ class LocalQueueTests(unittest.TestCase):
         terminal = self.queue.run_once("runner")
         self.assertEqual(terminal["status"], "failed")
         self.assertEqual(terminal["error"], "ValueError")
+
+    def test_runtime_error_does_not_store_client_text(self):
+        sentinel = "INVENTED_CLIENT_SENTINEL_731"
+
+        def boom(payload):
+            raise RuntimeError("backend failed near " + payload["input"])
+
+        self.queue.backend = FakeBackend(boom)
+        job = self.submit(input=sentinel)
+        terminal = self.queue.run_once("runner")
+        with self.queue._db() as db:
+            stored = db.execute("SELECT error FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+        self.assertEqual(stored, "RuntimeError")
+        self.assertEqual(terminal["status"], "failed")
+        self.assertNotIn(sentinel, json.dumps(terminal))
+
+    def test_child_failure_does_not_store_client_text(self):
+        import dataclasses
+        sentinel = "INVENTED_CHILD_SENTINEL_842"
+        self.queue.caps = dataclasses.replace(self.caps, timeout_seconds=30)
+        for index, response in enumerate((
+                {"ok": False, "error": "ValueError", "error_detail": "queue provenance unavailable " + sentinel},
+                {"ok": False, "error": "ValueError " + sentinel, "error_detail": "queue provenance unavailable"})):
+            with self.subTest(index=index):
+                command = "import sys; print(" + repr(json.dumps(response)) + "); sys.exit(1)"
+                self.queue.backend = SubprocessBackend([sys.executable, "-c", command])
+                job = self.submit(input=f"invented input {index}")
+                terminal = self.queue.run_once("runner")
+                with self.queue._db() as db:
+                    stored = db.execute("SELECT error FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+                expected = ("RuntimeError: child exited unsuccessfully: ValueError" if index == 0
+                            else "RuntimeError: child exited unsuccessfully")
+                self.assertEqual(stored, expected)
+                self.assertEqual(terminal["status"], "failed")
+                self.assertNotIn(sentinel, json.dumps(terminal))
+
+    def test_child_keeps_fixed_worker_and_delegate_reasons(self):
+        import dataclasses
+        self.queue.caps = dataclasses.replace(self.caps, timeout_seconds=30)
+        for error, detail in (("RuntimeError", "private worker rejected request"),
+                              ("GemmaReceiptError", "receipt_model_digest_mismatch"),
+                              ("GemmaRefusal", "extract_document_1_failed:receipt_invalid"),
+                              ("GemmaRefusal", "classify_line_1_invalid")):
+            with self.subTest(detail=detail):
+                response = json.dumps({"ok": False, "error": error, "error_detail": detail})
+                command = "import sys; print(" + repr(response) + "); sys.exit(1)"
+                self.queue.backend = SubprocessBackend([sys.executable, "-c", command])
+                self.submit(input=detail)
+                terminal = self.queue.run_once("runner")
+                self.assertEqual(terminal["status"], "failed")
+                self.assertEqual(terminal["error"],
+                                 f"RuntimeError: child exited unsuccessfully: {error}: {detail}")
 
     def test_child_process_timeout_is_hard_and_indeterminate(self):
         self.queue.backend = SubprocessBackend([sys.executable, "-c", "import time; time.sleep(1)"])
