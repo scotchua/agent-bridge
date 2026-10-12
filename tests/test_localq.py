@@ -1,7 +1,9 @@
 """Deterministic tests for the isolated local queue foundation."""
 
 import inspect
+import dataclasses
 import json
+import math
 import os
 import sys
 import tempfile
@@ -34,6 +36,27 @@ class Sampler:
 
 
 class LocalQueueTests(unittest.TestCase):
+    def test_duration_caps_require_finite_positive_values(self):
+        for field in ("bulk_ttl_seconds", "sample_max_age_seconds", "lease_seconds", "timeout_seconds"):
+            for value in (-1.0, 0.0, math.nan, math.inf, -math.inf):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        dataclasses.replace(QueueCaps(), **{field: value})
+
+    def test_default_and_custom_duration_caps_allow_jobs(self):
+        for caps in (QueueCaps(), QueueCaps(bulk_ttl_seconds=5.0,
+                                           sample_max_age_seconds=2.0,
+                                           lease_seconds=3.0, timeout_seconds=4.0)):
+            with self.subTest(caps=caps), tempfile.TemporaryDirectory() as root:
+                queue = LocalQueue(root, sampler=self.sampler, backend=self.backend,
+                                   caps=caps, clock=self.clock)
+                job = queue.submit(task_type="summarize", input="invented bulk input",
+                                   params={}, priority="bulk", classification="synthetic",
+                                   caller="codex", purpose="test")
+                self.assertEqual(queue.status(job["job_id"])["expires_at"],
+                                 self.clock() + caps.bulk_ttl_seconds)
+                self.assertEqual(queue.run_once("runner")["status"], "complete")
+
     def test_default_resource_policy_is_intentionally_aggressive(self):
         caps = QueueCaps()
         self.assertEqual(caps.bulk_min_idle_seconds, 0.0)

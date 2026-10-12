@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -86,6 +87,12 @@ class QueueCaps:
     #: at or above this rescues admission when cpu_load_ratio alone would
     #: refuse it. See ResourceSnapshot.cpu_idle_ratio.
     min_cpu_idle_ratio: float = 0.10
+
+    def __post_init__(self) -> None:
+        for field in ("bulk_ttl_seconds", "sample_max_age_seconds", "lease_seconds", "timeout_seconds"):
+            value = getattr(self, field)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field} must be finite and positive")
 
 
 _RUNTIME_REASONS = frozenset({
