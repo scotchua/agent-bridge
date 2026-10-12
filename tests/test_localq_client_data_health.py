@@ -379,6 +379,35 @@ class ClientDataHealthTests(unittest.TestCase):
         with self.assertRaisesRegex(OrchestrationConfigError, "configuration_incomplete"):
             load_config(config)
 
+    def test_config_loader_rejects_nonfinite_health_timeouts(self):
+        doc = {"config_version": "1", "state_root": str(self.root / "state"),
+               "local_queue_root": str(self.root / "queue-config"),
+               "capacity_db": str(self.root / "capacity.sqlite3"),
+               "worker_executable": str(self.root / "worker"), "worker_state": str(self.root / "worker-state"),
+               "client_data_health_command": [str(self.root / "health-command"), "status", "--json"],
+               "client_data_health_path": os.defpath, "client_data_health_timeout_seconds": 2.5,
+               "client_data_health_record": str(self.record)}
+        config = self.root / "orchestration.json"
+        config.write_text(json.dumps(doc), encoding="utf-8")
+        loaded = load_config(config)
+        self.assertEqual(loaded.client_data_health_timeout_seconds, 2.5)
+        self.assertEqual(ClientDataHealthGate.from_config(loaded).timeout_seconds, 2.5)
+        for token in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                doc["client_data_health_timeout_seconds"] = json.loads(token)
+                config.write_text(json.dumps(doc), encoding="utf-8")
+                with self.assertRaisesRegex(OrchestrationConfigError,
+                                            "^client_data_health_timeout_seconds_invalid$"):
+                    load_config(config)
+
+    def test_direct_gate_rejects_nonfinite_health_timeouts(self):
+        for token in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                timeout = json.loads('{"timeout": ' + token + '}')["timeout"]
+                with self.assertRaisesRegex(ValueError, "^client_data_health_timeout_seconds_invalid$"):
+                    self.gate(timeout_seconds=timeout)
+        self.assertEqual(self.gate(timeout_seconds=2.5).timeout_seconds, 2.5)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

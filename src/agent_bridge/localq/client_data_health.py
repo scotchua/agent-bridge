@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -74,7 +75,8 @@ class ClientDataHealthGate:
             raise ValueError("client_data_health_command_invalid")
         if not isinstance(path, str) or not path:
             raise ValueError("client_data_health_path_invalid")
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or timeout <= 0 or (isinstance(timeout, float) and not math.isfinite(timeout))):
             raise ValueError("client_data_health_timeout_seconds_invalid")
         if not isinstance(record, Path) or not record.is_absolute():
             raise ValueError("client_data_health_record_invalid")

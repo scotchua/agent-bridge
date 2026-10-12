@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -222,7 +223,8 @@ def _client_data_health(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(path, str) or not path:
         raise OrchestrationConfigError("client_data_health_path_invalid")
     timeout = raw["client_data_health_timeout_seconds"]
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or timeout <= 0 or (isinstance(timeout, float) and not math.isfinite(timeout))):
         raise OrchestrationConfigError("client_data_health_timeout_seconds_invalid")
     record = _absolute_path(raw["client_data_health_record"], "client_data_health_record")
     return {"client_data_health_command": tuple(command), "client_data_health_path": path,
