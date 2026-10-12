@@ -4208,14 +4208,17 @@ def test_reported_issues() -> None:
 
     # I1: a temp-directory shim must not outrank a durable install.
     tmp_root = tempfile.gettempdir()
+    durable_root = os.path.join(os.path.abspath(os.sep),
+                                "agent-bridge-test-install", "bin")
+    durable = os.path.join(durable_root, "claude")
     check("I1: a temp-directory path is not durable",
           not setup_cmd.is_durable(os.path.join(tmp_root, "cmux-cli-shims",
                                                 "abc", "claude")))
     check("I1: /var/folders is not durable",
           not setup_cmd.is_durable("/var/folders/t2/xyz/T/shim/codex"))
     check("I1: a normal install location is durable",
-          setup_cmd.is_durable(os.path.expanduser("~/.local/bin/claude"))
-          and setup_cmd.is_durable("/opt/homebrew/bin/codex"))
+          setup_cmd.is_durable(durable)
+          and setup_cmd.is_durable(os.path.join(durable_root, "codex")))
 
     # The ranking itself: signed-in first, then durable.
     def rank(path, signed):
@@ -4223,13 +4226,20 @@ def test_reported_issues() -> None:
         return (signed_rank, 0 if setup_cmd.is_durable(path) else 1)
 
     shim = os.path.join(tmp_root, "shims", "claude")
-    durable = os.path.expanduser("~/.local/bin/claude")
     ordered = sorted([(shim, True), (durable, True)], key=lambda r: rank(*r))
     check("I1: a durable signed-in install outranks a signed-in shim",
           ordered[0][0] == durable, ordered[0][0])
     ordered = sorted([(durable, False), (shim, True)], key=lambda r: rank(*r))
     check("I1: but signed-in still beats durable-but-not-signed-in",
           ordered[0][0] == shim, ordered[0][0])
+    temporary_home_install = os.path.join(tmp_root, "agent-bridge-test-home",
+                                          ".local", "bin", "claude")
+    candidates = [(shim, None), (durable, False), (shim, True),
+                  (durable, True)]
+    check("I1: signed-in durable and temporary candidates rank independently of HOME",
+          not setup_cmd.is_durable(temporary_home_install)
+          and sorted(candidates, key=lambda r: rank(*r)) == [
+              (durable, True), (shim, True), (shim, None), (durable, False)])
     source = inspect.getsource(setup_cmd)
     check("I1: choosing a temporary path warns loudly rather than silently",
           "WARNING" in source and "temporary directory" in source)
