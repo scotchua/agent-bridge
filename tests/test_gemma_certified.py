@@ -113,6 +113,23 @@ class ConfigAndSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(OrchestrationConfigError, "below_certified_budget"):
             load(self.write(doc))
 
+    def test_gemma_timeout_rejects_nonfinite_values(self):
+        for timeout in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=timeout):
+                doc = config_doc(self.root, self.fx)
+                doc["gemma_timeout_seconds"] = timeout
+                with self.assertRaisesRegex(OrchestrationConfigError,
+                                            "gemma_timeout_seconds_below_certified_budget"):
+                    load(self.write(doc))
+
+    def test_gemma_timeout_accepts_default_and_finite_budget(self):
+        doc = config_doc(self.root, self.fx)
+        self.assertEqual(load(self.write(doc)).gemma_timeout_seconds, 600.0)
+        for timeout in (600, 720.5):
+            with self.subTest(timeout=timeout):
+                doc["gemma_timeout_seconds"] = timeout
+                self.assertEqual(load(self.write(doc)).gemma_timeout_seconds, timeout)
+
     def test_selected_backend_is_fixed_and_summarize_only_by_default(self):
         cfg = load(self.write(config_doc(self.root, self.fx)))
         if os.name != "posix":

@@ -187,8 +187,13 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
                 or any(char not in "0123456789abcdef" for char in digest)):
             raise OrchestrationConfigError(f"{field}_invalid")
     timeout = raw.get("gemma_timeout_seconds", GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS)
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or float(timeout) < GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget")
+    try:
+        timeout = float(timeout)
+    except OverflowError as exc:
+        raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget") from exc
+    if not math.isfinite(timeout) or timeout < GEMMA_CERTIFIED_MIN_TIMEOUT_SECONDS:
         # Never silently shorten the delegate's own certified budget.
         raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget")
     pilot_tasks = raw.get("gemma_pilot_tasks", [])
@@ -199,7 +204,7 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
     return {"local_backend": local_backend, "gemma_delegate_executable": delegate,
            "gemma_python_executable": python_executable, "gemma_receipt_root": receipt_root,
            "gemma_receipt_validator_executable": validator,
-           **digests, "gemma_timeout_seconds": float(timeout),
+           **digests, "gemma_timeout_seconds": timeout,
            "gemma_pilot_tasks": tuple(pilot_tasks)}
 
 
