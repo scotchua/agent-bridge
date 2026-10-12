@@ -148,22 +148,30 @@ class PeerRounds:
             text = json.dumps(selection, ensure_ascii=False)
             db.execute('INSERT INTO messages(room,author,text,classification,created) VALUES(?,?,?,?,?)',
                        (room, 'Human', text, data['source_classification'], time.time()))
+        try:
+            self._run_claimed(row['id'], room, data, text)
+        except Exception:
+            with self.store.db() as db:
+                db.execute("UPDATE peer_rounds SET status='interrupted', payload=NULL, terminal_at=? WHERE id=? AND status='running'", (time.time(), row['id']))
+            raise
+        return True
+
+    def _run_claimed(self, rid, room, data, text):
         replies = {}
         for target in data['targets']:
-            if not self._active(row['id']): break
-            reply = self._consult(target, RULES + text, data['source_classification'], lambda: self._active(row['id']))
+            if not self._active(rid): break
+            reply = self._consult(target, RULES + text, data['source_classification'], lambda: self._active(rid))
             replies[target] = reply
             with self.store.db() as db:
                 db.execute('BEGIN IMMEDIATE')
-                if not db.execute("SELECT 1 FROM peer_rounds WHERE id=? AND status='running'", (row['id'],)).fetchone(): break
-                db.execute('UPDATE peer_rounds SET replies=? WHERE id=?', (json.dumps(replies, ensure_ascii=False), row['id']))
+                if not db.execute("SELECT 1 FROM peer_rounds WHERE id=? AND status='running'", (rid,)).fetchone(): break
+                db.execute('UPDATE peer_rounds SET replies=? WHERE id=?', (json.dumps(replies, ensure_ascii=False), rid))
                 # Deleting a room during a call never recreates that room.
                 if db.execute('SELECT 1 FROM rooms WHERE id=?', (room,)).fetchone():
                     db.execute('INSERT INTO messages(room,author,text,classification,created) VALUES(?,?,?,?,?)',
                                (room, target, reply.get('text', reply.get('error', 'No reply')), data['source_classification'], time.time()))
         with self.store.db() as db:
-            db.execute("UPDATE peer_rounds SET status='completed', payload=NULL, terminal_at=? WHERE id=? AND status='running'", (time.time(), row['id']))
-        return True
+            db.execute("UPDATE peer_rounds SET status='completed', payload=NULL, terminal_at=? WHERE id=? AND status='running'", (time.time(), rid))
 
     def _consult(self, target, prompt, classification, active):
         adapter, job = self.adapters.get(target), None
