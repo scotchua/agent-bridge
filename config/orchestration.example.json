@@ -3,6 +3,7 @@
   "state_root": "/absolute/path/to/orchestration-state",
   "local_queue_root": "/absolute/path/to/orchestration-state/local-queue",
   "capacity_db": "/absolute/path/to/orchestration-state/capacity.sqlite3",
+  "worktree_prune_roots": [],
   "worker_executable": "/absolute/path/to/private-local-worker",
   "worker_state": "/absolute/path/to/private-local-worker-state",
   "execution_queue_root": "/absolute/path/to/orchestration-state/execution-queue",

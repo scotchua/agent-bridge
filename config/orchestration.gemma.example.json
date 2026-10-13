@@ -3,6 +3,7 @@
   "state_root": "/absolute/private/state",
   "local_queue_root": "/absolute/private/state/local-queue",
   "capacity_db": "/absolute/private/state/capacity.sqlite3",
+  "worktree_prune_roots": [],
   "worker_executable": "/absolute/path/to/existing/private-worker",
   "worker_state": "/absolute/private/worker-state",
   "interval_seconds": 5.0,

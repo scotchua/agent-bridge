@@ -63,6 +63,7 @@ class OrchestrationConfig:
     # Explicit operator activation for the certified pilot.  The installed
     # backend remains summarize-only unless this list names a pilot task.
     gemma_pilot_tasks: tuple[str, ...] = ()
+    worktree_prune_roots: tuple[Path, ...] = ()
 
 
 _KEYS = frozenset({
@@ -78,6 +79,7 @@ _KEYS = frozenset({
     "client_data_health_timeout_seconds", "client_data_health_record",
     "client_derived_routes",
     "gemma_pilot_tasks",
+    "worktree_prune_roots",
 })
 
 #: The certified delegate's own current budget. Config may only widen this,
@@ -148,6 +150,22 @@ def _existing_dir(value: Any, field: str) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise OrchestrationConfigError(f"{field}_must_be_an_existing_directory")
     return path
+
+
+def parse_worktree_prune_roots(raw: dict[str, Any]) -> tuple[Path, ...]:
+    """Parse the operator's opt-in checkout cleanup directories."""
+    values = raw.get("worktree_prune_roots", [])
+    if not isinstance(values, list):
+        raise OrchestrationConfigError("worktree_prune_roots_invalid")
+    roots = []
+    for value in values:
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise OrchestrationConfigError("worktree_prune_roots_invalid")
+        path = Path(value)
+        if not path.is_dir():
+            raise OrchestrationConfigError("worktree_prune_roots_invalid")
+        roots.append(path.resolve())
+    return tuple(roots)
 
 
 def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
@@ -274,6 +292,7 @@ def load(path: str | Path) -> OrchestrationConfig:
     windows_paths = _windows_paths(raw)
     gemma_paths = _gemma_paths(raw)
     health = _client_data_health(raw)
+    prune_roots = parse_worktree_prune_roots(raw)
     if capacity_db == local_root or capacity_db == state_root:
         raise OrchestrationConfigError("capacity_db_must_be_file")
     return OrchestrationConfig(
@@ -284,6 +303,7 @@ def load(path: str | Path) -> OrchestrationConfig:
         claude_task_executable=execution_paths[2], python_executable=execution_paths[3],
         claude_config_dir=claude_config_dir,
         client_derived_routes=frozenset(client_routes),
+        worktree_prune_roots=prune_roots,
         **windows_paths,
         **gemma_paths,
         **health,
