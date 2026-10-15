@@ -233,6 +233,17 @@ HARNESS_ABORTED = "aborted"
 HARNESS_STATUSES = frozenset({HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
                               HARNESS_FAILED, HARNESS_ABORTED})
 
+#: How an execution harness arrived at its status.  These are fixed queue and
+#: Windows-runtime diagnostics, not provider text.  Status reports expose
+#: only this vocabulary so an executor cannot turn a status poll into a route
+#: for arbitrary harness output.
+PUBLIC_HARNESS_VERDICTS = frozenset({
+    "read", "read_failure", "receipt_absent", "receipt_not_an_object",
+    "receipt_status_unknown", "receipt_unparseable", "runtime_aborted",
+    "refused", "translation_refused", "guest_receipt",
+    "guest_response_rejected", "result_not_stored",
+})
+
 #: Fields every outcome must carry. ``harness_verdict`` says how the status was
 #: learned, which is what distinguishes "the harness said it failed" from "the
 #: harness said nothing we could read".
@@ -630,6 +641,32 @@ class ExecutionQueue:
         answer = {"job_id": job_id, "state": receipt["state"],
                 "caller": receipt["caller"], "provider": receipt["provider"],
                 "classification": receipt["classification"]}
+        # Keep status a deliberately small, safe projection of the private
+        # receipt.  In particular, stdout, stderr, a brief, and arbitrary
+        # executor fields never belong on this read-only polling surface.
+        # Harness diagnostics have already passed _harness_diagnostics()
+        # before they are recorded; require the stored value to still be
+        # printable and bounded rather than cleaning new text while exposing
+        # it.
+        harness = receipt.get("harness")
+        sources = (receipt, harness) if isinstance(harness, Mapping) else (receipt,)
+        for name in ("error", "error_detail"):
+            for source in sources:
+                value = source.get(name)
+                cleaned = _clean_diagnostic(value)
+                if cleaned is not None and cleaned == value:
+                    answer[name] = value
+                    break
+        if isinstance(harness, Mapping):
+            status = harness.get("harness_status")
+            if status in HARNESS_STATUSES:
+                answer["harness_status"] = status
+            verdict = harness.get("harness_verdict")
+            if verdict in PUBLIC_HARNESS_VERDICTS:
+                answer["harness_verdict"] = verdict
+        finished_at = receipt.get("finished_at")
+        if isinstance(finished_at, (int, float)) and not isinstance(finished_at, bool):
+            answer["finished_at"] = finished_at
         if receipt.get("waiting_on_dependency"):
             answer["waiting_on_dependency"] = "waiting_on_dependency:" + str(receipt["waiting_on_dependency"])
         return answer

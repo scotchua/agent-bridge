@@ -195,6 +195,53 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["error_detail"], UNEXPECTED_FAILURE_DETAIL)
         self.assertNotIn("do-not-record", json.dumps(result))
 
+    def test_status_reports_safe_distinct_failure_details_without_job_content(self):
+        """One status call makes terminal failures actionable, not revealing."""
+        cases = (
+            ("auth", {"returncode": 1, "harness_ok": False,
+                      "harness_status": "failed", "harness_verdict": "read_failure",
+                      "error": "TaskError", "error_detail": "provider is not authenticated",
+                      "stdout": "Synthetic implementation brief"},
+             {"error": "TaskError", "error_detail": "provider is not authenticated",
+              "harness_status": "failed", "harness_verdict": "read_failure"}),
+            ("unreadable", {"returncode": 1, "harness_ok": False,
+                            "harness_status": "aborted",
+                            "harness_verdict": "receipt_unparseable",
+                            "stdout": "Synthetic implementation brief"},
+             {"harness_status": "aborted", "harness_verdict": "receipt_unparseable"}),
+            ("verification", {"returncode": 0, "harness_ok": False,
+                              "harness_status": "verification_failed",
+                              "harness_verdict": "read",
+                              "stdout": "Synthetic implementation brief"},
+             {"harness_status": "verification_failed", "harness_verdict": "read"}),
+        )
+        details = {}
+        for label, outcome, expected in cases:
+            self.queue.executor = lambda _request, _directory, outcome=outcome: outcome
+            job = self.submit()
+            status = self.queue.run_once("worker-1")
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual({key: status[key] for key in expected}, expected)
+            self.assertEqual(status["finished_at"], 100.0)
+            self.assertNotIn("stdout", status)
+            self.assertNotIn("Synthetic implementation brief", json.dumps(status))
+            details[label] = (status.get("error_detail"), status.get("harness_verdict"))
+
+        def timeout(_request, _directory):
+            raise ExecutionAdmissionError("execution_harness_timeout")
+
+        self.queue.executor = timeout
+        job = self.submit()
+        status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error"], "ExecutionAdmissionError")
+        self.assertEqual(status["error_detail"], "execution_harness_timeout")
+        self.assertEqual(status["finished_at"], 100.0)
+        self.assertNotIn("stdout", status)
+        details["timeout"] = (status.get("error_detail"), status.get("harness_verdict"))
+
+        self.assertEqual(len(set(details.values())), 4)
+
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")
         duplicate = self.submit(idempotency_key="same-task")
