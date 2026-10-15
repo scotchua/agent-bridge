@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import ntpath
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -1102,7 +1103,60 @@ class TheLauncherNeverFailsOpen(unittest.TestCase):
             argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
                     subprocess.list2cmdline(argv)]
         return subprocess.run(argv, input="{}", capture_output=True, text=True,
-                              timeout=120, env=environment, cwd=str(ROOT))
+                              timeout=120, env=environment, cwd=str(ROOT), shell=False)
+
+    @unittest.skipIf(os.name == "nt", "the POSIX launcher is exercised on this host")
+    def test_a_child_allow_followed_by_signal_emits_only_one_deny(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "allow-then-signal"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' '{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"allow\"}}'\n"
+                "kill -TERM $$\n",
+                encoding="utf-8")
+            fake.chmod(0o700)
+            completed = self.run_launcher("--client", "claude", python=str(fake))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = [line for line in completed.stdout.splitlines() if line]
+        self.assertEqual(len(lines), 1, completed.stdout)
+        payload = json.loads(lines[0])
+        output = payload["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("child signal 15", output["permissionDecisionReason"])
+
+    @unittest.skipIf(os.name == "nt", "the POSIX launcher is exercised on this host")
+    def test_a_healthy_child_decision_passes_through_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "healthy-decision"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = \"-c\" ]; then exec {shlex.quote(sys.executable)} \"$@\"; fi\n"
+                "printf '%s\\n' '{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"allow\"}}'\n",
+                encoding="utf-8")
+            fake.chmod(0o700)
+            completed = self.run_launcher("--client", "claude", python=str(fake))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines(), [
+            '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}'])
+
+    @unittest.skipIf(os.name == "nt", "the POSIX launcher is exercised on this host")
+    def test_a_zero_exit_without_one_json_decision_is_a_deny(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "two-decisions"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = \"-c\" ]; then exec {shlex.quote(sys.executable)} \"$@\"; fi\n"
+                "printf '%s\\n%s\\n' '{}' '{}'\n",
+                encoding="utf-8")
+            fake.chmod(0o700)
+            completed = self.run_launcher("--client", "claude", python=str(fake))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertNotIn("{}", completed.stdout)
 
     def test_an_interpreter_that_cannot_start_is_a_deny(self):
         completed = self.run_launcher("--client", "claude", "--state-root",
