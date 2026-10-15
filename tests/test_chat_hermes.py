@@ -146,7 +146,8 @@ class HermesMutationTests(unittest.TestCase):
     def test_constructor_removes_stale_jobs(self):
         jobs = self.root / 'jobs'
         old = jobs / 'old'
-        old.mkdir(parents=True)
+        jobs.mkdir(mode=0o700)
+        old.mkdir(mode=0o700)
         os.utime(old, (1, 1))
         with patch('agent_bridge.chat.hermes.time.time', return_value=1_000_000):
             self.adapter()
@@ -186,7 +187,7 @@ class HermesMutationTests(unittest.TestCase):
         running = Mock(pid=456, poll=Mock(return_value=None))
         with patch('agent_bridge.chat.hermes.os.name', 'posix'), \
                 patch('agent_bridge.chat.hermes.signal.SIGKILL', 9, create=True), \
-                patch('agent_bridge.chat.hermes.os.killpg') as kill, \
+                patch('agent_bridge.chat.hermes.os.killpg', create=True) as kill, \
                 patch('agent_bridge.chat.hermes.subprocess.run') as run:
             HermesAdapter._terminate_process_group(finished)
             kill.assert_not_called()
