@@ -16,7 +16,7 @@ from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration import autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
-    _harness_summary, outcome_is_success,
+    _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
@@ -91,6 +91,23 @@ class ExecutionDispatcherTests(unittest.TestCase):
         claude_to_codex = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra",
                                       verify_argv=[])
         self.assertEqual(claude_to_codex["provider"], "codex")
+
+    def test_deadline_contract_is_bounded_and_covers_every_verification_and_cleanup(self):
+        job = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra",
+                          verify_argv=[["git", "status"], ["git", "diff"]],
+                          timeout_seconds=10, verify_timeout_seconds=20,
+                          cleanup_timeout_seconds=30)
+        request = json.loads((self.queue.root / job["job_id"] / "request.json").read_text())
+        self.assertEqual(request["verify_timeout_seconds"], 20)
+        self.assertEqual(request["cleanup_timeout_seconds"], 30)
+        # Generation + two verifiers + three possible bounded cleanup attempts
+        # (initial generation cleanup, retry, verification cleanup) + fixed
+        # setup/integrity allowance.  This is the parent hard deadline.
+        self.assertEqual(request["total_timeout_seconds"], 440)
+        with self.assertRaisesRegex(ExecutionAdmissionError, "total_timeout_invalid"):
+            self.submit(total_timeout_seconds=439, verify_argv=[["git", "status"], ["git", "diff"]],
+                        timeout_seconds=10, verify_timeout_seconds=20,
+                        cleanup_timeout_seconds=30)
 
     def test_atomic_receipt_closes_descriptor_and_preserves_acl_failure(self):
         target = self.root / "queue" / "acl-test.json"
@@ -304,6 +321,98 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["error"], "interrupted_requires_reconciliation")
         self.assertEqual(self.fake.requests, [])
 
+
+
+@unittest.skipIf(os.name != "posix", "the subprocess harness executor is POSIX only")
+class CoherentDeadlineHarnessTests(unittest.TestCase):
+    """A single parent job budget covers generation, verification and cleanup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = self.root / "brief.txt"
+        self.brief.write_text("complete", encoding="utf-8")
+        self.harness = self.root / "fake_harness.py"
+        self.harness.write_text(
+            "import argparse, json, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "p = argparse.ArgumentParser(); p.add_argument('brief')\n"
+            "p.add_argument('--repo'); p.add_argument('--base')\n"
+            "p.add_argument('--timeout', type=float); p.add_argument('--verify-timeout', type=float)\n"
+            "p.add_argument('--cleanup-timeout', type=float); p.add_argument('--tasks-dir', type=Path)\n"
+            "p.add_argument('--verify-json', action='append', default=[])\n"
+            "p.add_argument('--classification'); p.add_argument('--model'); p.add_argument('--reasoning-effort')\n"
+            "a, _ = p.parse_known_args(); a.tasks_dir.mkdir(parents=True, exist_ok=True)\n"
+            "(a.tasks_dir / 'observed-deadlines.json').write_text(json.dumps({'generation': a.timeout, 'verification': a.verify_timeout, 'cleanup': a.cleanup_timeout, 'checks': len(a.verify_json)}))\n"
+            "time.sleep(a.timeout * 0.8)\n"
+            "if Path(a.brief).read_text(encoding='utf-8') == 'late':\n"
+            "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], shell=False)\n"
+            "    try: child.communicate(timeout=a.verify_timeout)\n"
+            "    except subprocess.TimeoutExpired:\n"
+            "        child.kill(); child.communicate()\n"
+            "        print(json.dumps({'ok': False, 'status': 'failed', 'error': 'TaskError', 'error_detail': 'verification command timed out'})); raise SystemExit(1)\n"
+            "for _ in a.verify_json: time.sleep(min(a.verify_timeout * 0.25, 0.25))\n"
+            "print(json.dumps({'ok': True, 'status': 'complete'}))\n",
+            encoding="utf-8")
+        executor = SubprocessHarnessExecutor(Harnesses(
+            codex=self.harness, claude=self.harness, python=Path(sys.executable)))
+        self.queue = ExecutionQueue(self.root / "queue", executor,
+                                    model_reserved=reserve_nothing)
+
+    def _submit(self):
+        return self.queue.submit(
+            caller="claude", provider="codex", repo=str(self.repo), brief=str(self.brief),
+            base="HEAD", classification="synthetic", model="gpt-5.6-terra", effort="low",
+            item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1,
+            verify_argv=[["git", "status"], ["git", "diff"]], timeout_seconds=1,
+            verify_timeout_seconds=1, cleanup_timeout_seconds=1)
+
+    def test_near_generation_limit_then_two_checks_finishes_with_explicit_deadlines(self):
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "complete")
+        observed = self.queue.root / queued["job_id"] / "harness" / "observed-deadlines.json"
+        self.assertEqual(json.loads(observed.read_text()),
+                         {"generation": 1.0, "verification": 1.0,
+                          "cleanup": 1.0, "checks": 2})
+
+    def test_a_request_queued_before_the_deadline_contract_still_runs(self):
+        queued = self._submit()
+        path = self.queue.root / queued["job_id"] / "request.json"
+        request = json.loads(path.read_text())
+        for key in ("verify_timeout_seconds", "cleanup_timeout_seconds",
+                    "total_timeout_seconds"):
+            del request[key]
+        path.write_text(json.dumps(request), encoding="utf-8")
+        self.queue.run_once("worker-1")
+        self.assertEqual(self.queue.result(queued["job_id"])["state"], "complete")
+        observed = self.queue.root / queued["job_id"] / "harness" / "observed-deadlines.json"
+        self.assertEqual(json.loads(observed.read_text())["verification"], 300.0)
+
+    def test_a_partial_deadline_contract_is_refused(self):
+        queued = self._submit()
+        path = self.queue.root / queued["job_id"] / "request.json"
+        request = json.loads(path.read_text())
+        del request["total_timeout_seconds"]
+        path.write_text(json.dumps(request), encoding="utf-8")
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_detail"], "execution_deadline_invalid")
+
+    def test_verification_past_its_own_deadline_is_killed_and_recorded_failed(self):
+        self.brief.write_text("late", encoding="utf-8")
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["harness"]["harness_status"], "failed")
+        self.assertEqual(result["harness"]["error_detail"], "verification command timed out")
 
 
 class HarnessVerdictTests(unittest.TestCase):

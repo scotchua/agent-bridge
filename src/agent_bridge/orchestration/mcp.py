@@ -722,6 +722,9 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "model": {"type": "string"}, "effort": {"type": "string"},
             "verify_argv": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200},
+            "verify_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+            "cleanup_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+            "total_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 14400},
             "paid_fallback": {"type": "boolean"},
             "idempotency_key": {"type": "string", "maxLength": 256},
             "item_id": {"type": "string"}, "stage": {"type": "string"},
@@ -813,6 +816,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                             f"execution_dispatch_refused:model_reserved_to_operator:{reserved}"}
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
+                    "verify_timeout_seconds": 300, "cleanup_timeout_seconds": 60,
+                    "total_timeout_seconds": None,
                     "paid_fallback": False, "idempotency_key": None,
                     **args, "classification": repo_policy.classification, "caller": caller,
                     "client_derived_admitted": repo_policy.classification == "client_derived"})

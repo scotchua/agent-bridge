@@ -417,10 +417,11 @@ def _patch(tree:Path,base:str,env):
     if not r.stdout: raise TaskError("Codex produced an empty patch")
     return r.stdout
 
-def _remove(repo:Path,tree:Path,env):
+def _remove(repo:Path,tree:Path,env,timeout:float=60):
     if not tree.exists(): return True
+    if timeout <= 0: return False
     try:
-        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=60)
+        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=timeout)
     except (OSError,TaskError,subprocess.SubprocessError):
         return False
     # Never run repository-wide `worktree prune`: it can discard unrelated
@@ -582,10 +583,14 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
                   codex_home:Path=DEFAULT_CODEX_HOME,
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
                   client_derived_routes: tuple[str, ...] = (),
-                  verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,verify_timeout:int=300):
+                  verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,
+                  verify_timeout:int=300,cleanup_timeout:int=60):
     if classification not in ALLOWED_CLASSIFICATIONS and not (
             classification == "client_derived" and "execution" in client_derived_routes):
         raise TaskError("execution lane refuses client-derived material")
+    if (any(isinstance(value,bool) or not isinstance(value,int) or value < 1
+            for value in (timeout,verify_timeout,cleanup_timeout))):
+        raise TaskError("execution deadline invalid")
     if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
@@ -656,7 +661,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         if not last_message.strip(): raise TaskError("Codex produced no final message")
         receipt["last_message_sha256"]=hashlib.sha256(last_message).hexdigest()
         if (gen/".git").read_bytes()!=marker: raise TaskError("Codex altered git metadata")
-        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env)
+        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env,cleanup_timeout)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
@@ -692,8 +697,8 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         receipt.update(status="failed_pending_integrity",error=type(exc).__name__,
                        error_detail=detail,finished_at=time.time())
     finally:
-        generation_removed=_remove(repo,gen,env)
-        verification_removed=_remove(repo,fresh,env)
+        generation_removed=_remove(repo,gen,env,cleanup_timeout)
+        verification_removed=_remove(repo,fresh,env,cleanup_timeout)
         cleanup_ok=generation_removed and verification_removed
         receipt["cleanup"]={"generation_worktree":str(gen),"generation_removed":generation_removed,
                             "verification_worktree":str(fresh),"verification_removed":verification_removed}
@@ -730,6 +735,7 @@ def main(argv=None):
     p.add_argument("--model",default=None); p.add_argument("--reasoning-effort",default=None,dest="reasoning_effort")
     p.add_argument("--base",default="HEAD"); p.add_argument("--timeout",type=int,default=900)
     p.add_argument("--verify-timeout",type=int,default=300)
+    p.add_argument("--cleanup-timeout",type=int,default=60)
     p.add_argument("--tasks-dir",type=Path,default=DEFAULT_TASK_ROOT,dest="task_root")
     p.add_argument("--verify-json",action="append",default=[])
     a=p.parse_args(argv)
