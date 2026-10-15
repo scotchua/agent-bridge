@@ -1,9 +1,11 @@
 """Focused tests for conservative capacity-aware stage binding."""
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -285,6 +287,133 @@ class TheCapacityFingerprint(unittest.TestCase):
         rows[1]["trusted"] = 0
         rows[2]["available"] = 0
         self.assertEqual(capacity_fingerprint(rows, 1500.0), CAPACITY_NONE)
+
+
+class CapacityRouterMutationGuards(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.clock = Clock()
+        self.path = os.path.join(self.temp.name, "routing.sqlite3")
+        self.router = StageRouter(self.path, clock=self.clock)
+
+    def observe(self, route="codex", *, available=True):
+        self.router.observe_capacity(CapacityObservation(
+            route, 1000.0, 1060.0, available, "invented-feed"), trusted=True)
+
+    def test_init_creates_private_parent_and_wal_database(self):
+        path = os.path.join(self.temp.name, "nested", "routing.sqlite3")
+        mkdir = type(self.router.path).mkdir
+        modes = []
+
+        def record_mkdir(directory, *args, **kwargs):
+            modes.append(kwargs["mode"])
+            return mkdir(directory, *args, **kwargs)
+
+        with mock.patch.object(type(self.router.path), "mkdir", record_mkdir):
+            router = StageRouter(path, clock=self.clock)
+        self.assertEqual(modes, [0o700])
+        self.assertTrue(os.path.isdir(os.path.dirname(path)))
+        with router._db() as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_init_explicitly_sets_full_synchronization(self):
+        statements = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+
+        path = os.path.join(self.temp.name, "traced.sqlite3")
+        with mock.patch("agent_bridge.capacity_router.sqlite3.connect",
+                        side_effect=traced_connect):
+            StageRouter(path, clock=self.clock)
+        self.assertIn("PRAGMA synchronous=FULL", statements)
+
+    def test_connect_uses_bounded_sqlite_wait(self):
+        connect = sqlite3.connect
+        with mock.patch("agent_bridge.capacity_router.sqlite3.connect", wraps=connect) as patched:
+            db = self.router._connect()
+        db.close()
+        patched.assert_called_once_with(self.router.path, timeout=5.0, isolation_level=None)
+
+    def test_db_context_closes_connection(self):
+        with self.router._db() as db:
+            db.execute("SELECT 1")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
+    def test_routes_reject_empty_list(self):
+        with self.assertRaisesRegex(RoutingError, "routes_invalid"):
+            self.router.register("invented-account", "build", allowed_routes=[])
+
+    def test_register_rejects_blank_identity_and_returns_row(self):
+        with self.assertRaisesRegex(RoutingError, "identity_invalid"):
+            self.router.register("", "build", allowed_routes=["codex"])
+        row = self.router.register("invented-account", "build", allowed_routes=["codex"])
+        self.assertEqual(row["item_id"], "invented-account")
+
+    def test_missing_stage_has_routing_error(self):
+        with self.assertRaisesRegex(RoutingError, "stage_not_found"):
+            self.router.get("invented-account", "absent")
+
+    def test_register_records_event(self):
+        self.router.register("invented-account", "build", allowed_routes=["codex"])
+        with self.router._db() as db:
+            events = db.execute("SELECT event FROM events WHERE item_id=?",
+                                ("invented-account",)).fetchall()
+        self.assertEqual([row[0] for row in events], ["registered"])
+
+    def test_capacity_rows_returns_stored_observation(self):
+        self.observe()
+        self.assertEqual(self.router.capacity_rows()[0]["source"], "invented-feed")
+
+    def test_observation_rejects_unknown_route(self):
+        with self.assertRaisesRegex(RoutingError, "route_invalid"):
+            self.router.observe_capacity(CapacityObservation(
+                "invented-route", 1000.0, 1060.0, True, "invented-feed"), trusted=True)
+
+    def test_future_capacity_cannot_assign(self):
+        with self.router._db() as db:
+            db.execute("""INSERT INTO capacity
+                (route,observed_at,fresh_until,available,source,trusted)
+                VALUES(?,?,?,?,?,?)""",
+                       ("codex", 1002.0, 1060.0, 1, "invented-feed", 1))
+        self.router.register("invented-account", "build", allowed_routes=["codex"])
+        row = self.router.assign("invented-account", "build", owner_id="invented-owner",
+                                 lease_seconds=10, expected_revision=0)
+        self.assertEqual(row["state"], "blocked")
+
+    def test_assign_rejects_blank_owner(self):
+        self.observe()
+        self.router.register("invented-account", "build", allowed_routes=["codex"])
+        with self.assertRaisesRegex(RoutingError, "assignment_invalid"):
+            self.router.assign("invented-account", "build", owner_id="",
+                               lease_seconds=10, expected_revision=0)
+
+    def test_renew_rejects_zero_lease(self):
+        self.observe()
+        self.router.register("invented-account", "build", allowed_routes=["codex"])
+        owned = self.router.assign("invented-account", "build", owner_id="invented-owner",
+                                   lease_seconds=10, expected_revision=0)
+        with self.assertRaisesRegex(RoutingError, "lease_invalid"):
+            self.router.renew("invented-account", "build", owner_id="invented-owner",
+                              lease_seconds=0, expected_revision=owned["revision"])
+
+    def test_report_distinguishes_stale_boundary_and_unavailable(self):
+        self.observe()
+        self.clock.now = 1060.0
+        self.assertEqual(self.router.report()["capacity"]["codex"]["status"], "available")
+        self.router.observe_capacity(CapacityObservation(
+            "local", 1000.0, 1060.0, False, "invented-feed"), trusted=True)
+        self.assertEqual(self.router.report()["capacity"]["local"]["status"], "unavailable")
+
+    def test_fingerprint_includes_inclusive_time_boundaries(self):
+        rows = [{"route": "codex", "available": 1, "trusted": 1,
+                 "observed_at": 1001.0, "fresh_until": 1000.0}]
+        self.assertEqual(capacity_fingerprint(rows, 1000.0), "codex")
 
 
 if __name__ == "__main__":

@@ -18,12 +18,15 @@ hard-code this again" is not enforcement; a failing test is.
 
 from __future__ import annotations
 
+import ast
+import io
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -86,6 +89,153 @@ class ResolveGit(unittest.TestCase):
         if not present:
             self.skipTest("no fixed candidate exists on this host, so PATH is the source")
         self.assertEqual(str(hostenv.resolve_git({"PATH": ""})), present[0])
+
+    def test_unusable_candidates_are_named_and_not_selected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "unexecutable-git"
+            candidate.write_text("invented program\n", encoding="utf-8")
+            candidate.chmod(0o600)
+            with patch.dict(hostenv.GIT_CANDIDATES, {"InventedOS": (str(candidate),)}):
+                with self.assertRaises(hostenv.HostCapabilityError) as caught:
+                    hostenv.resolve_git({"PATH": "/no/invented/git"}, system="InventedOS")
+            self.assertIn(str(candidate), caught.exception.detail)
+
+    def test_path_fallback_returns_the_found_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "git"
+            executable.write_text("invented program\n", encoding="utf-8")
+            executable.chmod(0o700)
+            self.assertEqual(hostenv.resolve_git({"PATH": temporary}, system="InventedOS"),
+                             executable)
+
+
+class HostCapabilityErrorDetails(unittest.TestCase):
+    def test_message_places_detail_before_code(self):
+        error = hostenv.HostCapabilityError("invented_code", "invented detail")
+        self.assertEqual(str(error), "invented detail [invented_code]")
+
+
+class HelperSource(unittest.TestCase):
+    def helper_function(self, name):
+        source = hostenv.helper_source()
+        function = next(node for node in ast.parse(source).body
+                        if isinstance(node, ast.FunctionDef) and node.name == name)
+        scope = {"os": os, "ctypes": None}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<helper>", "exec"), scope)
+        return scope, scope[name]
+
+    def test_embeds_the_numeric_selftest_exit(self):
+        source = hostenv.helper_source()
+        self.assertIsInstance(source, str)
+        self.assertNotIn("SELFTEST_EXIT", source)
+        self.assertIn(f"SystemExit({hostenv.CONFINEMENT_SELFTEST_EXIT})", source)
+
+    def test_mount_reports_a_failed_system_call(self):
+        scope, mount = self.helper_function("mount")
+
+        class Libc:
+            def __init__(self):
+                self.result = 0
+
+            def mount(self, *args):
+                return self.result
+
+        libc = Libc()
+        scope["libc"] = libc
+        scope["ctypes"] = type("Errno", (), {"get_errno": staticmethod(lambda: 1)})
+        mount(None, "/invented/tree", 1)
+        libc.result = -1
+        with self.assertRaises(OSError):
+            mount(None, "/invented/tree", 1)
+
+    def test_mount_points_reads_valid_records(self):
+        scope, mount_points = self.helper_function("mount_points")
+        records = b"1 2 3 4 /invented 5\n2 3 4 5 /invented/deeper 6\n"
+        scope["open"] = lambda *args: io.BytesIO(records)
+        self.assertEqual(mount_points(), ["/invented/deeper", "/invented"])
+
+    def test_writable_reports_failed_and_successful_probes(self):
+        _, writable = self.helper_function("writable")
+        with patch.object(os, "open", side_effect=OSError("invented refusal")):
+            self.assertFalse(writable("/invented/read-only"))
+        with patch.object(os, "open", return_value=7), \
+             patch.object(os, "close"), patch.object(os, "unlink"):
+            self.assertTrue(writable("/invented/writable"))
+
+
+class ConfinedArgv(unittest.TestCase):
+    def test_includes_the_network_boundary_and_every_canary(self):
+        argv = hostenv.confined_argv(["invented-check", "arg"], tree=Path("/tree"),
+                                     scratch=Path("/scratch"),
+                                     canaries=["/canary-one", "/canary-two"],
+                                     python="/invented/python")
+        self.assertEqual(argv[argv.index("--net") + 1], "--propagation")
+        self.assertEqual(argv[argv.index("-c") - 1], "/invented/python")
+        self.assertEqual(argv[-5:], ["/canary-one", "/canary-two", "--",
+                                     "invented-check", "arg"])
+
+
+class SelftestArgv(unittest.TestCase):
+    def test_creates_roots_and_checks_home_and_available_extra_locations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            argv = hostenv._selftest_argv(temporary, python="/invented/python")
+            for name in ("tree", "scratch", "canary"):
+                self.assertTrue((Path(temporary) / name).is_dir())
+            self.assertIn(str(Path.home()), argv)
+            for extra in ("/dev/shm", "/run", "/var/tmp"):
+                if os.path.isdir(extra):
+                    self.assertIn(extra, argv)
+            self.assertEqual(argv[-2:], ["--", "/bin/true"])
+
+
+class UserNamespaceProbe(unittest.TestCase):
+    def test_requires_an_executable_unshare_without_running_a_probe(self):
+        with patch.object(hostenv.os.path, "isfile", return_value=True), \
+             patch.object(hostenv.os, "access", return_value=False), \
+             patch.object(hostenv.subprocess, "run") as run:
+            self.assertFalse(hostenv._userns_usable())
+            run.assert_not_called()
+
+    def test_probe_uses_a_bounded_subprocess_and_its_exit_status(self):
+        with patch.object(hostenv.os.path, "isfile", return_value=True), \
+             patch.object(hostenv.os, "access", return_value=True), \
+             patch.object(hostenv, "_selftest_argv", return_value=["invented-probe"]), \
+             patch.object(hostenv.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(hostenv._userns_usable())
+            self.assertEqual(run.call_args.kwargs["timeout"], 30)
+            run.return_value.returncode = 1
+            self.assertFalse(hostenv._userns_usable())
+            run.side_effect = OSError("invented spawn failure")
+            self.assertFalse(hostenv._userns_usable())
+
+
+class ConfinementSelectionOffline(unittest.TestCase):
+    def test_linux_needs_a_successful_probe_and_rejects_non_synthetic_work(self):
+        with patch.object(hostenv, "_userns_usable", return_value=False):
+            with self.assertRaises(hostenv.HostCapabilityError) as caught:
+                hostenv.confinement("synthetic", system="Linux")
+            self.assertEqual(caught.exception.code, "verification_confinement_unavailable")
+        with patch.object(hostenv, "_userns_usable", return_value=True):
+            self.assertEqual(hostenv.confinement("synthetic", system="Linux"),
+                             hostenv.LINUX_CONFINEMENT)
+            with self.assertRaises(hostenv.HostCapabilityError) as caught:
+                hostenv.confinement("internal_nonclient", system="Linux")
+            self.assertEqual(caught.exception.code, "verification_confinement_insufficient")
+
+
+class DescribeOffline(unittest.TestCase):
+    def test_reports_git_path_or_its_refusal(self):
+        with patch.object(hostenv, "resolve_git", return_value=Path("/invented/git")), \
+             patch.object(hostenv, "confinement", return_value=hostenv.MACOS_CONFINEMENT):
+            self.assertEqual(hostenv.describe("synthetic", system="InventedOS")["git"],
+                             "/invented/git")
+        with patch.object(hostenv, "resolve_git", side_effect=hostenv.HostCapabilityError(
+                "git_unavailable", "invented refusal")), \
+             patch.object(hostenv, "confinement", return_value=hostenv.MACOS_CONFINEMENT):
+            report = hostenv.describe("synthetic", system="InventedOS")
+            self.assertIsNone(report["git"])
+            self.assertEqual(report["git_refusal"], "git_unavailable")
 
 
 class SpawnDiagnostics(unittest.TestCase):

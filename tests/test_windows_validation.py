@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -498,6 +499,65 @@ class HonestyTests(unittest.TestCase):
         # It must not write one. The evidence module owns that, refuses off
         # Windows, and binds its record to the machine.
         self.assertNotIn("record_verification", source)
+
+
+class ValidateObservationMutationTests(unittest.TestCase):
+    def test_a_string_fact_key_with_spaces_is_refused(self):
+        with self.assertRaises(wv.ValidationError):
+            wv.validate_observation("sample", wv.Observation(
+                wv.PASS, "ok", {"account name": 1}))
+
+
+class BuildReportMutationTests(unittest.TestCase):
+    def test_envelope_names_the_supplied_suite(self):
+        check = wv.Check("sample", "Sample", "sample passes", "other work")
+        report = wv.build_report([], checks=(check,))
+        self.assertEqual(report["envelope"]["suite"], ["sample"])
+
+
+class BuildNumberMutationTests(unittest.TestCase):
+    def test_an_unparseable_build_number_is_zero(self):
+        self.assertEqual(wv._build_number("10.0.unknown"), 0)
+
+
+class RuntimeRootMutationTests(unittest.TestCase):
+    def test_a_private_root_is_reported_as_passing(self):
+        with mock.patch.object(wv.wpv, "require_private_directory") as require:
+            observation = wv.runtime_root_runner("C:\\FableWorks\\runtime")()
+        require.assert_called_once_with("C:\\FableWorks\\runtime")
+        self.assertEqual(observation.status, wv.PASS)
+
+
+class CanariesCheckMutationTests(unittest.TestCase):
+    def test_passed_canaries_report_the_observed_count(self):
+        class Result:
+            canaries_passed = True
+            timings = {"mount": 1.0, "egress": 2.0}
+
+        observation = wv.GuestRoundTrip(lambda: Result()).canaries_check()
+        self.assertEqual(observation.facts["count"], 2)
+
+
+class ShortMutationTests(unittest.TestCase):
+    def test_a_token_keeps_exactly_the_first_64_characters(self):
+        self.assertEqual(wv._short("x" * 64), "x" * 64)
+        self.assertEqual(wv._short("x" * 65), "x" * 64)
+
+
+class DefaultRunnersMutationTests(unittest.TestCase):
+    def test_image_check_requires_both_path_and_manifest(self):
+        for inputs in ({"rootfs_path": "C:\\FableWorks\\image.tar"},
+                       {"manifest": object()}):
+            with self.subTest(inputs=tuple(inputs)):
+                runners = wv.default_runners(run=lambda argv: None, **inputs)
+                self.assertNotIn("image_pinned", runners)
+
+    def test_guest_checks_require_a_job_runner(self):
+        runners = wv.default_runners(run=lambda argv: None)
+        for check_id in ("guest_runner", "canaries", "egress_policy",
+                         "round_trip"):
+            with self.subTest(check_id=check_id):
+                self.assertNotIn(check_id, runners)
 
 
 if __name__ == "__main__":

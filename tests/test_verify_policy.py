@@ -10,6 +10,27 @@ from agent_bridge.execution import claude_task, codex_task, verify_policy
 from agent_bridge.execution.verify_policy import VerifyPolicyError, check_verify_argv
 
 
+class BareNameTests(unittest.TestCase):
+    def test_paths_are_not_bare_names_on_either_platform(self):
+        for program in ("tools/pytest", "tools\\pytest"):
+            with self.subTest(program=program):
+                self.assertFalse(verify_policy._bare_name(program))
+
+
+class CheckVerifyArgvBoundaryTests(unittest.TestCase):
+    def test_outer_container_must_be_a_list(self):
+        with self.assertRaisesRegex(VerifyPolicyError, verify_policy.MESSAGE_SHAPE):
+            check_verify_argv((["pytest"],))
+
+    def test_python_module_boundary(self):
+        for module in ("pytest", "unittest"):
+            with self.subTest(module=module):
+                command = ["python3", "-m", module]
+                self.assertEqual(check_verify_argv([command]), [command])
+        with self.assertRaisesRegex(VerifyPolicyError, verify_policy.MESSAGE_PYTHON):
+            check_verify_argv([["python3", "-m"]])
+
+
 class VerifyPolicyTests(unittest.TestCase):
     def test_the_repository_s_own_test_runner_is_permitted(self):
         # Job d8e5763d in the live queue asked for exactly this and failed as

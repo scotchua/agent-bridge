@@ -97,6 +97,20 @@ class QuotingTests(unittest.TestCase):
 
 
 class ActionTests(unittest.TestCase):
+    def test_validate_executable_returns_the_accepted_path(self):
+        command = "C:\\Users\\Aster\\AppData\\Local\\Northstar\\worker.exe"
+        self.assertEqual(wa.validate_executable(command), command)
+
+    def test_validate_executable_rejects_missing_path_with_specific_reason(self):
+        with self.assertRaisesRegex(wa.ActivationError,
+                                    "^the command must be an absolute path$"):
+            wa.validate_executable(None)
+
+    def test_validate_executable_rejects_non_string_path_with_specific_reason(self):
+        with self.assertRaisesRegex(wa.ActivationError,
+                                    "^the command must be an absolute path$"):
+            wa.validate_executable(7)
+
     def test_the_action_joins_the_quoted_arguments(self):
         action = wa.build_action([WORKER, "--worker", "--once"])
         self.assertEqual(action, f"{WORKER} --worker --once")
@@ -179,6 +193,10 @@ class RegisterArgvTests(unittest.TestCase):
                 with self.assertRaises(wa.ActivationError):
                     wa.register_argv([WORKER], delay=bad)
 
+    def test_an_invalid_custom_task_name_is_refused(self):
+        with self.assertRaises(wa.ActivationError):
+            wa.register_argv([WORKER], task_name="Northstar Task")
+
     def test_a_bad_command_is_refused_before_any_argv_is_produced(self):
         with self.assertRaises(wa.ActivationError):
             wa.register_argv(['C:\\x\\"y.exe'])
@@ -209,6 +227,14 @@ class TaskNameTests(unittest.TestCase):
 
 
 class OtherArgvTests(unittest.TestCase):
+    def test_status_refuses_an_invalid_custom_task_name(self):
+        with self.assertRaises(wa.ActivationError):
+            wa.status_argv("Northstar Task")
+
+    def test_run_now_refuses_an_invalid_custom_task_name(self):
+        with self.assertRaises(wa.ActivationError):
+            wa.run_now_argv("Northstar Task")
+
     def test_unregister_deletes_exactly_the_named_task(self):
         self.assertEqual(
             wa.unregister_argv(),
@@ -394,6 +420,21 @@ class OwnershipTests(unittest.TestCase):
 
     def test_an_unterminated_quote_parses_to_nothing_rather_than_a_guess(self):
         self.assertEqual(wa.action_executable('"C:\\a b\\w.exe --x'), "")
+
+    def test_an_empty_action_has_no_executable(self):
+        self.assertEqual(wa.action_executable(""), "")
+
+    def test_an_extra_leading_quote_has_no_executable(self):
+        self.assertEqual(wa.action_executable('""C:\\Users\\Aster\\worker.exe"'), "")
+
+    def test_an_unparseable_action_blocks_ownership(self):
+        status = wa.ActivationStatus(True, "Ready", "", '"C:\\Users\\Aster\\worker.exe')
+        self.assertEqual(wa.proves_ownership(status, [WORKER]),
+                         "task_action_unparseable")
+
+    def test_a_matching_executable_has_an_empty_ownership_blocker(self):
+        status = wa.ActivationStatus(True, "Ready", "", WORKER)
+        self.assertEqual(wa.proves_ownership(status, [WORKER]), "")
 
     def test_a_drive_letter_in_the_action_survives_status_parsing(self):
         status = wa.parse_status(0, _query_output())

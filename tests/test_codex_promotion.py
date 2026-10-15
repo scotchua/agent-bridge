@@ -117,6 +117,16 @@ class DigestVector(TmpCase):
         with_id = {**VECTOR["record"], "record_id": "f" * 64}
         self.assertEqual(cp.record_id_of(with_id), VECTOR["expected_record_id"])
 
+    def test_canonical_bytes_rejects_floats_and_non_string_keys(self):
+        with self.assertRaises(cp.AdmissionRefused):
+            cp.canonical_bytes(1.5)
+        with self.assertRaises(cp.AdmissionRefused):
+            cp.canonical_bytes({1: "synthetic"})
+
+    def test_hex_digest_requires_length_and_hex_digits(self):
+        self.assertFalse(cp._is_hex64("a" * 63))
+        self.assertFalse(cp._is_hex64("g" * 64))
+
 
 class DigestDetects(TmpCase):
     def setUp(self):
@@ -159,6 +169,92 @@ class DigestDetects(TmpCase):
         os.mkfifo(self.slot / "node_modules/fifo")
         with self.assertRaisesRegex(cp.AdmissionRefused, "unsupported file type"):
             cp.tree_digest(self.slot)
+
+    def test_file_root_is_refused_as_a_slot(self):
+        p = self.root / "file-slot"
+        p.write_text("synthetic")
+        with self.assertRaisesRegex(cp.AdmissionRefused, "not a directory"):
+            cp.tree_digest(p)
+
+    def test_file_hash_refuses_an_inode_changed_since_stat(self):
+        first, second = self.root / "first", self.root / "second"
+        first.write_text("synthetic")
+        second.write_text("synthetic")
+        with self.assertRaisesRegex(cp.AdmissionRefused, "changed while it was being hashed"):
+            cp._file_sha256(str(first), os.stat(second))
+
+    def test_file_hash_fallback_flags_remain_read_only(self):
+        p = self.root / "synthetic-file"
+        p.write_text("synthetic")
+        for name in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(flag=name):
+                original = getattr(os, name, None)
+                if original is not None:
+                    delattr(os, name)
+                try:
+                    actual_open = os.open
+                    with mock.patch.object(cp.os, "open", wraps=actual_open) as opened:
+                        cp._file_sha256(str(p), os.stat(p))
+                    self.assertEqual(opened.call_args.args[1] & os.O_ACCMODE, os.O_RDONLY)
+                finally:
+                    if original is not None:
+                        setattr(os, name, original)
+
+
+class StateFileBoundaries(TmpCase):
+    def write_json(self, content=b"{}", mode=0o600):
+        p = self.root / "state.json"
+        p.write_bytes(content)
+        os.chmod(p, mode)
+        return p
+
+    def test_state_reader_requires_a_regular_file(self):
+        with self.assertRaisesRegex(cp.AdmissionRefused, "not a regular file"):
+            cp._read_state_json(self.root, "synthetic state")
+
+    def test_state_reader_requires_private_permissions(self):
+        p = self.write_json(mode=0o644)
+        with self.assertRaisesRegex(cp.AdmissionRefused, "readable or writable by others"):
+            cp._read_state_json(p, "synthetic state")
+
+    def test_state_reader_accepts_exact_size_limit(self):
+        p = self.write_json(b"{}" + b" " * (cp.MAX_STATE_FILE_BYTES - 2))
+        self.assertEqual(cp._read_state_json(p, "synthetic state"), {})
+
+    def test_state_reader_refuses_oversized_stat_even_if_read_is_short(self):
+        p = self.write_json(b"{}" + b" " * (cp.MAX_STATE_FILE_BYTES - 1))
+        with mock.patch.object(cp.os, "read", side_effect=(b"{}", b"")):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "too large"):
+                cp._read_state_json(p, "synthetic state")
+
+    def test_state_reader_refuses_growth_during_read(self):
+        p = self.write_json()
+        oversized = b"{}" + b" " * (cp.MAX_STATE_FILE_BYTES - 1)
+        with mock.patch.object(cp.os, "read", side_effect=(oversized, b"")):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "too large"):
+                cp._read_state_json(p, "synthetic state")
+
+    def test_ownership_check_refuses_another_uid(self):
+        p = self.write_json()
+        with mock.patch.object(cp.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "not owned"):
+                cp._owned_private(os.stat(p), "synthetic state", mode_mask=0o077)
+
+    def test_state_reader_fallback_flags_remain_read_only(self):
+        p = self.write_json()
+        for name in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(flag=name):
+                original = getattr(os, name, None)
+                if original is not None:
+                    delattr(os, name)
+                try:
+                    actual_open = os.open
+                    with mock.patch.object(cp.os, "open", wraps=actual_open) as opened:
+                        self.assertEqual(cp._read_state_json(p, "synthetic state"), {})
+                    self.assertEqual(opened.call_args.args[1] & os.O_ACCMODE, os.O_RDONLY)
+                finally:
+                    if original is not None:
+                        setattr(os, name, original)
 
 
 class Fixture:
@@ -337,6 +433,16 @@ class Admission(TmpCase):
         self.f.write_gate(raw=b'{"transaction_id": "x"}')
         self.refused("gate is malformed")
 
+    def test_gate_transaction_id_is_bounded_in_refusal(self):
+        transaction = "z" * 65
+        self.f.write_gate(raw=json.dumps({"transaction_id": transaction, "state": "opened",
+                                          "opened_at": "2030-01-01T00:00:00Z", "controller_pid": 1}).encode())
+        with self.assertRaises(cp.AdmissionRefused) as caught:
+            with self.f.admit():
+                self.fail("admitted")
+        self.assertIn("z" * 64 + ")", str(caught.exception))
+        self.assertNotIn("z" * 65, str(caught.exception))
+
     def test_a_symlinked_gate_fails_closed(self):
         other = self.root / "elsewhere.json"; other.write_text("{}")
         os.symlink(other, self.f.pdir / "gate.json")
@@ -418,6 +524,14 @@ class Admission(TmpCase):
         self.f.write_record(r)
         self.refused("wrong fields")
 
+    def test_record_with_another_schema_version_is_refused(self):
+        self.f.write_record(self.f.make_record(schema_version=2))
+        self.refused("schema version is not 1")
+
+    def test_record_with_an_unknown_promoter_is_refused(self):
+        self.f.write_record(self.f.make_record(promoted_by="synthetic-unknown"))
+        self.refused("unknown promoter")
+
     def test_record_with_a_float_is_refused(self):
         self.f.write_record(raw=json.dumps({**self.f.record, "schema_version": 1.0}).encode())
         self.refused("does not parse")
@@ -466,6 +580,47 @@ class Admission(TmpCase):
         self.f.write_record()
         other = self.root / "node2"; other.write_bytes(self.f.node.read_bytes())
         self.refused("differs from the one the canaries ran", node=other)
+
+    def test_promoted_task_requires_a_node_on_path(self):
+        self.f.write_record()
+        with self.assertRaisesRegex(cp.AdmissionRefused, "no node runtime"):
+            with cp.admit(self.f.launcher, promotion_dir=self.f.pdir, node_bin=None):
+                self.fail("admitted")
+
+    def test_missing_recorded_node_is_refused(self):
+        missing = self.root / "missing-node"
+        with self.assertRaisesRegex(cp.AdmissionRefused, "is missing"):
+            cp._verify_node_file({"path": str(missing), "sha256": "0" * 64}, "local")
+
+    def test_missing_slot_package_is_refused(self):
+        with self.assertRaisesRegex(cp.AdmissionRefused, "no Codex package.json"):
+            cp._slot_package_version(self.root)
+
+    def test_symlinked_slot_package_is_refused(self):
+        slot = self.root / "synthetic-slot"
+        package = slot / "node_modules/@openai/codex/package.json"
+        package.parent.mkdir(parents=True)
+        real = self.root / "real-package.json"
+        real.write_text('{"version":"1.2.3"}')
+        os.symlink(real, package)
+        with self.assertRaisesRegex(cp.AdmissionRefused, "not a regular file"):
+            cp._slot_package_version(slot)
+
+    def test_slot_package_accepts_exact_size_limit(self):
+        slot = self.root / "synthetic-slot"
+        package = slot / "node_modules/@openai/codex/package.json"
+        package.parent.mkdir(parents=True)
+        payload = b'{"version":"1.2.3"}'
+        package.write_bytes(payload + b" " * (cp.MAX_STATE_FILE_BYTES - len(payload)))
+        self.assertEqual(cp._slot_package_version(slot), "1.2.3")
+
+    def test_malformed_slot_package_is_refused(self):
+        slot = self.root / "synthetic-slot"
+        package = slot / "node_modules/@openai/codex/package.json"
+        package.parent.mkdir(parents=True)
+        package.write_text("{broken")
+        with self.assertRaisesRegex(cp.AdmissionRefused, "does not parse"):
+            cp._slot_package_version(slot)
 
     def test_unrecorded_binary_is_refused_once_a_record_exists(self):
         """Re-review finding 1: nothing the record does not name runs on a real task."""
@@ -532,6 +687,75 @@ class Admission(TmpCase):
                         with cp.admit(launcher, promotion_dir=pdir, node_bin=None):
                             self.fail("admitted")
         self.assertFalse(pdir.exists())
+
+    def test_account_home_fallback_uses_path_home(self):
+        with mock.patch.object(cp, "pwd", None), mock.patch.object(cp.Path, "home", return_value=self.root):
+            self.assertEqual(REAL_ACCOUNT_HOME(), self.root)
+
+    def test_relative_codex_path_is_refused(self):
+        with self.assertRaisesRegex(cp.AdmissionRefused, "must be absolute"):
+            with cp.admit(Path("synthetic-codex"), promotion_dir=self.f.pdir):
+                self.fail("admitted")
+
+    def test_absent_file_lock_support_is_refused(self):
+        with mock.patch.object(cp, "fcntl", None):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "needs POSIX file locks"):
+                with self.f.admit():
+                    self.fail("admitted")
+
+    def test_fresh_directory_and_lock_modes_ignore_umask(self):
+        pdir = self.root / "fresh-parent" / "promotion"
+        previous = os.umask(0)
+        try:
+            with cp.admit(self.f.launcher, promotion_dir=pdir) as admission:
+                self.assertEqual(admission.state, "no_record")
+            self.assertEqual(os.stat(pdir.parent).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(pdir).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(pdir / "admission.lock").st_mode & 0o777, 0o600)
+        finally:
+            os.umask(previous)
+
+    def test_parent_creation_error_is_wrapped(self):
+        pdir = self.root / "fresh-promotion"
+        with mock.patch.object(cp.Path, "mkdir", side_effect=PermissionError("synthetic")):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "promotion directory could not be created"):
+                with cp.admit(self.f.launcher, promotion_dir=pdir):
+                    self.fail("admitted")
+
+    def test_existing_lock_is_opened_read_only(self):
+        actual_open = os.open
+        with mock.patch.object(cp.os, "open", wraps=actual_open) as opened:
+            with self.f.admit():
+                pass
+        self.assertEqual(opened.call_args.args[1] & os.O_ACCMODE, os.O_RDONLY)
+
+    def test_lock_fallback_flag_remains_read_only(self):
+        original = getattr(os, "O_NOFOLLOW", None)
+        if original is not None:
+            delattr(os, "O_NOFOLLOW")
+        try:
+            actual_open = os.open
+            with mock.patch.object(cp.os, "open", wraps=actual_open) as opened:
+                with self.f.admit():
+                    pass
+            self.assertEqual(opened.call_args.args[1] & os.O_ACCMODE, os.O_RDONLY)
+        finally:
+            if original is not None:
+                setattr(os, "O_NOFOLLOW", original)
+
+    def test_promotion_directory_creation_error_is_wrapped(self):
+        pdir = self.root / "fresh-promotion"
+        with mock.patch.object(cp.os, "mkdir", side_effect=PermissionError("synthetic")):
+            with self.assertRaisesRegex(cp.AdmissionRefused, "promotion directory could not be created"):
+                with cp.admit(self.f.launcher, promotion_dir=pdir):
+                    self.fail("admitted")
+
+    def test_promotion_directory_must_be_a_directory(self):
+        pdir = self.root / "file-promotion"
+        pdir.write_text("synthetic")
+        with self.assertRaisesRegex(cp.AdmissionRefused, "promotion directory is not a directory"):
+            with cp.admit(self.f.launcher, promotion_dir=pdir):
+                self.fail("admitted")
 
 
 @unittest.skipIf(fcntl is None, "POSIX file locks required")

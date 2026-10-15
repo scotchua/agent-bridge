@@ -4715,12 +4715,43 @@ def test_platform_guard() -> None:
           source.rstrip().endswith("assert_platform_supported()"))
 
 
+def test_assert_platform_supported_return() -> None:
+    """A supported platform passes the guard without a return value."""
+    import agent_bridge as pkg
+
+    real = os.name
+    try:
+        for name in ("posix", "nt"):
+            os.name = name
+            check(f"PG: {name} guard returns None",
+                  pkg.assert_platform_supported() is None)
+    finally:
+        os.name = real
+
+
 def main() -> int:
     import unittest
     import test_health
+    import test_registry_mutations
+    import test_codex_backend_mutation
+    import test_receipts_mutation
     health_results = unittest.TextTestRunner(verbosity=1).run(
         unittest.defaultTestLoader.loadTestsFromModule(test_health))
     check("Health and authentication regressions", health_results.wasSuccessful())
+    registry_results = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_registry_mutations))
+    check("Registry mutation regressions", registry_results.wasSuccessful())
+    codex_results = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_codex_backend_mutation))
+    check("Codex backend mutation regressions", codex_results.wasSuccessful())
+    receipt_results = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_receipts_mutation))
+    check("Failure receipt regressions", receipt_results.wasSuccessful())
+    test_worker_quarantine_mutations()
+    test_worker_run_peer_mutations()
+    test_worker_cleared_prompt_mutations()
+    test_worker_execute_mutations()
+    test_worker_main_mutations()
     test_contract_accepted_by_both_peers()
     test_timeout_canary_effective_config_and_verdict()
     test_candidate_verification_path()
@@ -4744,6 +4775,7 @@ def main() -> int:
     test_state_root_permissions()
     test_windows_acl_parser()
     test_platform_guard()
+    test_assert_platform_supported_return()
     test_external_review_findings()
     test_per_peer_classification_limits()
     test_output_cap()
@@ -4774,6 +4806,120 @@ def main() -> int:
     test_attempt_marker_lifecycle()
     test_attempt_marker_crash_injection()
     return summary(SKIPPED)
+
+
+def test_worker_quarantine_mutations() -> None:
+    from agent_bridge.backends.base import PeerOutcome
+
+    with tempfile.TemporaryDirectory() as job_dir:
+        outcome = PeerOutcome(ErrorCategory.PEER_OUTPUT_MALFORMED,
+                              raw_stdout=b"invented stdout",
+                              raw_stderr=b"invented stderr",
+                              raw_last_message=b"invented last message")
+        qdir = worker._quarantine(None, job_dir, 1, outcome)
+        for name, expected in (("stdout.bin", outcome.raw_stdout),
+                               ("stderr.bin", outcome.raw_stderr),
+                               ("last_message.bin", outcome.raw_last_message)):
+            with open(os.path.join(qdir, name), "rb") as handle:
+                actual = handle.read()
+            check(f"worker quarantine retains {name} byte-exact", actual == expected)
+
+
+def test_worker_run_peer_mutations() -> None:
+    from unittest.mock import patch
+    from agent_bridge.backends.base import PeerOutcome
+
+    expected = PeerOutcome(ErrorCategory.OK)
+    with patch.object(worker.claude_backend, "run_consultation", return_value=expected) as claude, \
+            patch.object(worker.codex_backend, "run_consultation") as codex:
+        actual = worker._run_peer(None, "claude", prompt=b"invented question",
+                                  schema={}, schema_file="unused", peer_session_id="session-1",
+                                  resume=True, workspace="unused", attempt_dir="unused", deadline=10)
+        check("worker selects Claude for a Claude peer", actual is expected
+              and claude.call_count == 1 and codex.call_count == 0
+              and claude.call_args.kwargs["prompt"] == "invented question")
+
+
+def test_worker_cleared_prompt_mutations() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    schema = {"type": "object"}
+    request = {"job_id": "invented-job", "conversation_id": "invented-conversation",
+               "peer": "claude", "caller": "codex", "resume": False,
+               "prompt": "invented question", "redaction_handoff": None}
+    conversation = {"peer": "claude", "caller": "codex", "peer_session_id": None}
+    with tempfile.TemporaryDirectory() as job_dir:
+        cfg = SimpleNamespace(job_dir=lambda _job_id: job_dir,
+                              load_schema=lambda: (schema, "invented-schema-hash"))
+        schema_file = os.path.join(job_dir, "contract.schema.json")
+        with open(schema_file, "wb") as handle:
+            handle.write(json.dumps(schema, indent=2, sort_keys=True).encode("utf-8"))
+        with patch.object(store, "read_json_atomic", return_value=request), \
+                patch.object(registry, "load_conversation", return_value=conversation), \
+                patch.object(broker, "validate_handoff", return_value=None):
+            try:
+                worker._cleared_prompt(cfg, request, None, "invented question", schema,
+                                       schema_file, None, False)
+            except BrokerError as exc:
+                missing_pin_rejected = exc.category is ErrorCategory.INPUT_SCHEMA_INVALID
+            else:
+                missing_pin_rejected = False
+            check("worker cleared prompt requires a pin", missing_pin_rejected)
+
+        pinned = {"invented": "pin"}
+        request["redaction_handoff"] = pinned
+        with patch.object(store, "read_json_atomic", return_value=request), \
+                patch.object(registry, "load_conversation", return_value=conversation), \
+                patch.object(broker, "validate_handoff", return_value=pinned):
+            cleared = worker._cleared_prompt(cfg, request, pinned, "invented question",
+                                             schema, schema_file, None, False)
+            check("worker cleared prompt returns verified bytes",
+                  cleared == b"invented question")
+            with open(schema_file, "wb") as handle:
+                handle.write(b"{}")
+            try:
+                worker._cleared_prompt(cfg, request, pinned, "invented question",
+                                       schema, schema_file, None, False)
+            except BrokerError as exc:
+                changed_contract_rejected = exc.category is ErrorCategory.INPUT_SCHEMA_INVALID
+            else:
+                changed_contract_rejected = False
+            check("worker cleared prompt rejects a changed schema snapshot",
+                  changed_contract_rejected)
+
+
+def test_worker_execute_mutations() -> None:
+    from unittest.mock import patch
+
+    sb = Sandbox(limits={"prompt_start_max_chars": 40})
+    try:
+        with patch.object(broker, "_dispatch", side_effect=lambda cfg, peer, cid, job: {
+                "job_id": job, "conversation_id": cid}):
+            started = sb.consult("codex", prompt="x" * 40)
+        code = worker.execute(sb.cfg.job_dir(started["job_id"]))
+        status = registry.read_status(sb.cfg, started["job_id"])
+        check("worker accepts a prompt exactly at its start budget",
+              status["status"] == "complete")
+        check("worker execute returns success for a completed job", code == 0)
+        provenance = sb.provenance(started["job_id"])
+        check("worker admission time measures elapsed time",
+              provenance["elapsed_stages"][0]["elapsed_seconds"]
+              <= provenance["elapsed_seconds"])
+        check("worker records the first peer argv",
+              os.path.isfile(os.path.join(sb.cfg.job_dir(started["job_id"]),
+                                          "attempts", "1", "argv.json")))
+    finally:
+        sb.cleanup()
+
+
+def test_worker_main_mutations() -> None:
+    from unittest.mock import patch
+
+    with patch.object(worker, "execute", return_value=7) as execute:
+        result = worker.main(["--job-dir", "invented-job-dir"])
+    check("worker main returns execute's exit code",
+          result == 7 and execute.call_args.args == ("invented-job-dir",))
 
 
 def test_peer_home_config_guard_is_contents_based() -> None:

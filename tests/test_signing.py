@@ -243,5 +243,57 @@ class CoverageHonestyTests(unittest.TestCase):
         self.assertIn("small-order", signing.SIGNATURE_GUARANTEE)
 
 
+class PointEqualMutationTests(unittest.TestCase):
+    def test_unequal_points_return_exactly_false(self):
+        self.assertIs(signing._point_equal(signing._G, signing._IDENTITY), False)
+
+
+class RecoverXMutationTests(unittest.TestCase):
+    def test_field_modulus_is_not_a_canonical_y(self):
+        self.assertIsNone(signing._recover_x(signing._P, 0))
+
+    def test_zero_x_cannot_have_odd_sign(self):
+        self.assertIsNone(signing._recover_x(1, 1))
+
+    def test_y_without_a_curve_point_returns_none(self):
+        self.assertIsNone(signing._recover_x(2, 0))
+
+
+class DecompressMutationTests(unittest.TestCase):
+    def test_wrong_length_returns_none(self):
+        self.assertIsNone(signing._decompress(b"\x00" * 31))
+
+
+class VerifyMutationTests(unittest.TestCase):
+    def test_a_valid_signature_with_trailing_zero_byte_is_rejected(self):
+        message = b"Hearthlight Fabrication October ledger"
+        public, signature = sign(message, b"hearthlight".ljust(32, b"!"))
+        self.assertIs(signing.verify(message, signature + b"\x00", public), False)
+
+    def test_a_wrong_length_returns_exactly_false(self):
+        self.assertIs(signing.verify(b"Hearthlight Fabrication", b"", b""), False)
+
+    def test_each_malformed_component_returns_exactly_false(self):
+        message = b"Hearthlight Fabrication October ledger"
+        public, signature = sign(message, b"hearthlight".ljust(32, b"!"))
+        non_canonical_y = signing._P.to_bytes(32, "little")
+        cases = (
+            ("key point", signature, non_canonical_y),
+            ("small-order key", signature, IDENTITY_KEY),
+            ("commitment point", non_canonical_y + signature[32:], public),
+            ("small-order commitment", IDENTITY_KEY + signature[32:], public),
+            ("scalar", signature[:32] + signing._Q.to_bytes(32, "little"), public),
+        )
+        for label, candidate, key in cases:
+            with self.subTest(label=label):
+                self.assertIs(signing.verify(message, candidate, key), False)
+
+
+class VerifyHexMutationTests(unittest.TestCase):
+    def test_invalid_hex_returns_exactly_false(self):
+        self.assertIs(signing.verify_hex(b"Hearthlight Fabrication", "zz", "00" * 32),
+                      False)
+
+
 if __name__ == "__main__":
     unittest.main()

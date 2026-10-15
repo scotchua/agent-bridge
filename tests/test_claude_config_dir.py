@@ -58,6 +58,81 @@ class WindowsEnforcementWrapperTests(unittest.TestCase):
         self.assertEqual(str(caught.exception),
                          "Claude configuration directory could not be read")
 
+    def test_a_failed_root_acl_is_refused(self):
+        directory = Path("C:/ExampleCo/store")
+        with mock.patch.object(cc, "_store_entries", return_value=[]), \
+             mock.patch("agent_bridge.platform.platform.enforce_owner_only_tree",
+                        return_value=(False, {"objects_failed": ["."]}), create=True):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._enforce_private_nt(directory)
+        self.assertEqual(str(caught.exception),
+                         "Claude configuration directory permissions could not be set")
+
+    def test_a_failed_child_acl_is_refused(self):
+        directory = Path("C:/ExampleCo/store")
+        with mock.patch.object(cc, "_store_entries", return_value=[]), \
+             mock.patch("agent_bridge.platform.platform.enforce_owner_only_tree",
+                        return_value=(False, {"objects_failed": ["session.json"]}), create=True), \
+             mock.patch("agent_bridge.platform.platform.observe_owner_only_tree",
+                        return_value=(True, {}), create=True):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._enforce_private_nt(directory)
+        self.assertEqual(str(caught.exception),
+                         "Claude configuration directory contents could not be protected")
+
+    def test_a_failed_child_acl_read_back_is_refused_as_content(self):
+        directory = Path("C:/ExampleCo/store")
+        with mock.patch.object(cc, "_store_entries", return_value=[]), \
+             mock.patch("agent_bridge.platform.platform.enforce_owner_only_tree",
+                        return_value=(True, {}), create=True), \
+             mock.patch("agent_bridge.platform.platform.observe_owner_only_tree",
+                        return_value=(False, {"objects_failed": ["session.json"]}), create=True):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._enforce_private_nt(directory)
+        self.assertEqual(str(caught.exception),
+                         "Claude configuration directory contains a file readable by other accounts")
+
+    def test_successful_acl_pass_returns_the_directory(self):
+        directory = Path("C:/ExampleCo/store")
+        with mock.patch.object(cc, "_store_entries", return_value=[]), \
+             mock.patch("agent_bridge.platform.platform.enforce_owner_only_tree",
+                        return_value=(True, {}), create=True), \
+             mock.patch("agent_bridge.platform.platform.observe_owner_only_tree",
+                        return_value=(True, {}), create=True):
+            self.assertEqual(cc._enforce_private_nt(directory), directory)
+
+
+class WindowsRefusalTests(unittest.TestCase):
+    def test_foreign_owner_has_its_own_refusal(self):
+        with self.assertRaises(cc.ConfigDirError) as caught:
+            cc._refuse_nt({"objects_foreign_owned": ["session.json"]})
+        self.assertIn("owned by another account", str(caught.exception))
+
+    def test_reparse_point_has_its_own_refusal(self):
+        with self.assertRaises(cc.ConfigDirError) as caught:
+            cc._refuse_nt({"refused": "reparse point"})
+        self.assertIn("link or alias", str(caught.exception))
+
+
+class StoreEntryTests(unittest.TestCase):
+    def test_exactly_the_maximum_entries_are_allowed(self):
+        names = [f"entry-{number}" for number in range(cc.MAX_STORE_ENTRIES)]
+        with mock.patch.object(cc.os, "listdir", return_value=names):
+            self.assertEqual(cc._store_entries(Path("ExampleCo/store")), sorted(names))
+
+    def test_one_entry_over_the_maximum_is_refused(self):
+        names = [f"entry-{number}" for number in range(cc.MAX_STORE_ENTRIES + 1)]
+        with mock.patch.object(cc.os, "listdir", return_value=names):
+            with self.assertRaises(cc.ConfigDirError) as caught:
+                cc._store_entries(Path("ExampleCo/store"))
+        self.assertIn("more files", str(caught.exception))
+
+
+class ReparseTests(unittest.TestCase):
+    def test_a_nonzero_reparse_tag_is_detected(self):
+        info = mock.Mock(st_reparse_tag=1)
+        self.assertTrue(cc._is_reparse(info))
+
 
 class CanonicalDirectoryTests(ConfigDirTestCase):
     def test_the_lane_s_own_store_is_accepted(self):
