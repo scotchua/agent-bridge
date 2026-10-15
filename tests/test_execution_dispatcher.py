@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -303,6 +304,50 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["error"], "interrupted_requires_reconciliation")
         self.assertEqual(self.fake.requests, [])
+
+    def test_damaged_and_claimed_entries_do_not_block_a_later_job(self):
+        """Unreadable and uncertain jobs remain held while healthy work runs."""
+        identifiers = iter(("0" * 31 + "1", "0" * 31 + "2", "0" * 31 + "3"))
+        with mock.patch(
+                "agent_bridge.orchestration.execution_queue.uuid.uuid4",
+                side_effect=lambda: SimpleNamespace(hex=next(identifiers))):
+            damaged = self.submit()
+            claimed = self.submit()
+            valid = self.submit()
+
+        damaged_directory = self.root / "queue" / damaged["job_id"]
+        claimed_directory = self.root / "queue" / claimed["job_id"]
+        # Do not repair or reinterpret the damaged receipt: its original
+        # bytes are evidence, and it is never eligible to run.
+        (damaged_directory / "receipt.json").write_text(
+            "not a receipt: private brief text must not be reported", encoding="utf-8")
+        (claimed_directory / "claim.lock").write_bytes(b"")
+
+        # Construction exercises restart recovery; run_once then must scan
+        # past both earlier entries and invoke only the valid fake executor.
+        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 101.0,
+                                   model_reserved=reserve_nothing)
+        # The real worker annotates dependency holds before it selects work.
+        # That scan must isolate the same damaged entry too.
+        restarted.hold_dependencies({})
+        self.assertEqual(restarted.run_once("worker-1"),
+                         {"job_id": valid["job_id"], "state": "complete",
+                          "caller": "codex", "provider": "claude",
+                          "classification": "synthetic"})
+        self.assertEqual([request["job_id"] for request in self.fake.requests],
+                         [valid["job_id"]])
+        self.assertEqual(restarted.result(claimed["job_id"])["state"], "blocked")
+        self.assertEqual(restarted.result(claimed["job_id"])["error"],
+                         "interrupted_requires_reconciliation")
+        self.assertTrue((claimed_directory / "claim.lock").exists())
+        self.assertEqual((damaged_directory / "receipt.json").read_text(encoding="utf-8"),
+                         "not a receipt: private brief text must not be reported")
+        with self.assertRaisesRegex(ExecutionAdmissionError, "execution_receipt_unreadable"):
+            restarted.status(damaged["job_id"])
+        report = restarted.state_report()
+        self.assertEqual(report, {
+            "blocked": 1, "complete": 1, "queue_health_receipt_unreadable": 1})
+        self.assertNotIn("private brief text", json.dumps(report))
 
 
 
