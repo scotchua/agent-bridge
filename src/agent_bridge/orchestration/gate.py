@@ -1644,7 +1644,7 @@ def _worktree_prune_decision(command: str, cwd: str, config_path: str | None,
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
-                 config_path: str | None = None) -> Decision:
+                 config_path: str | None = None, monotonic: Any = time.monotonic) -> Decision:
     """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
     classification: protected paths, then routing receipts. Split out of
     ``judge`` so a Codex shell command that both writes and reads a file
@@ -1673,7 +1673,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     if not repos:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")
-    budget_ends = time.monotonic() + JUDGMENT_BUDGET_SECONDS
+    budget_ends = monotonic() + JUDGMENT_BUDGET_SECONDS
     now = float(clock())
     task_type = infer_task_type(paths)
 
@@ -1745,12 +1745,12 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     def judge_held() -> Decision:
         governing: dict[str, dict[str, Any]] = {}
         for repo in repos:
-            if time.monotonic() >= budget_ends:
+            if monotonic() >= budget_ends:
                 return out_of_time()
             try:
                 receipt, alongside = effective(repo)
                 if receipt is None and decide is not None:
-                    if time.monotonic() >= budget_ends:
+                    if monotonic() >= budget_ends:
                         return out_of_time()
                     # No receipt yet: make the decision now rather than
                     # refusing and asking the agent to make it. This is the
@@ -1821,10 +1821,10 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         with contextlib.ExitStack() as held:
             # One budget for all of them, so nested repositories cannot stack
             # a full wait each against the hook's own timeout.
-            deadline = min(time.monotonic() + DECISION_LOCK_TIMEOUT_SECONDS, budget_ends)
+            deadline = min(monotonic() + DECISION_LOCK_TIMEOUT_SECONDS, budget_ends)
             for repo in repos:
                 held.enter_context(decision_lock(state_root, repo,
-                                                 timeout=deadline - time.monotonic()))
+                                                 timeout=deadline - monotonic()))
             # After the wait, not before: a decision another process made
             # meanwhile carries capacity observed after the old instant, and
             # judged against that it read as overtaken and was made again.
