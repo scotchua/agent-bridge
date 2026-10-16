@@ -68,16 +68,18 @@ class SourceHashTests(unittest.TestCase):
             self.assertEqual(provenance.source_hash(str(root)),
                              expected_hash(files, walk_order))
 
-    @unittest.expectedFailure
-    def test_hash_uses_global_relative_path_order(self):
-        # The documented global sort is absent: root files precede nested files.
+    def test_hash_uses_top_down_walk_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "z.py").write_bytes(b"synthetic root")
             (root / "alpha").mkdir()
+            (root / "beta").mkdir()
             (root / "alpha" / "a.py").write_bytes(b"synthetic nested")
-            files = {"alpha/a.py": b"synthetic nested", "z.py": b"synthetic root"}
-            self.assertEqual(provenance.source_hash(str(root)), expected_hash(files))
+            (root / "beta" / "b.py").write_bytes(b"synthetic sibling")
+            files = {"z.py": b"synthetic root", "alpha/a.py": b"synthetic nested",
+                     "beta/b.py": b"synthetic sibling"}
+            self.assertEqual(provenance.source_hash(str(root)),
+                             expected_hash(files, ["z.py", "alpha/a.py", "beta/b.py"]))
 
     def test_skips_unreadable_files(self):
         with tempfile.TemporaryDirectory() as tmp:

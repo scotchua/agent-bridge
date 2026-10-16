@@ -19,8 +19,9 @@ The existing check was `test_suite.test_provenance_completeness` against a
 temporary package in a synthetic local Git repository. It killed H13, C07,
 and C11 by error, and G07 by five-second noncompletion after the worker failed.
 The after column combines those results with `test_provenance_mutation.py`.
-The new tests mechanically flag H16 as an unexpected success of an expected
-failure; it is classified as a defect finding rather than a regression kill.
+At the time of the sweep, the new tests mechanically flagged H16 as an
+unexpected success of an expected failure. It was classified as a defect
+finding rather than a regression kill.
 Thus mechanical detection after new tests is 35/36 (97.2%).
 
 | ID | Function | Mutation | Before | After |
@@ -71,28 +72,29 @@ Thus mechanical detection after new tests is 35/36 (97.2%).
 | `SourceHashTests.test_hashes_walk_order_relative_paths_and_allowed_suffixes` | H01 |
 | `SourceHashTests.test_skips_unreadable_files` | H08 |
 | `SourceHashTests.test_content_changes_hash_and_empty_tree_has_zero_files` | H07 |
-| `SourceHashTests.test_hash_uses_global_relative_path_order` (expected failure) | H16 |
+| `SourceHashTests.test_hash_uses_global_relative_path_order` (expected failure at sweep time) | H16 |
 | `CollectProvenanceTests.test_collect_reports_clean_and_dirty_state_exactly` | C02 |
 | `CollectProvenanceTests.test_collect_preserves_unknown_git_state` | C01 |
 
-Every normal test passes on the original and fails on its witness mutant. The
-expected-failure test is an expected failure on the original and an unexpected
-success on H16.
+At sweep time, every normal test passed on the original and failed on its
+witness mutant. The expected-failure test failed as expected on the original
+and succeeded unexpectedly on H16.
 
 ## Survivors left
 
 - **H14, equivalent:** SHA-256 receives the same byte sequence whether the
   file is read in 65,536 or 65,537 byte chunks. No behavior test can separate it.
-- **H16, defect:** The mutation implements the documented global sort and is
-  retained as a finding, not as a requested production fix.
+- **H16, historical defect:** The mutation implemented the formerly documented
+  global sort. The documentation now states the actual top-down walk order.
 - **Untestable offline:** none.
 
 ## Defects found
 
-- `source_hash` documents a sorted relative-path manifest, but its root files
-  precede nested files because entries follow `os.walk` preorder. The
-  `test_hash_uses_global_relative_path_order` expected failure states this
-  mismatch without changing production code.
+- At sweep time, `source_hash` documented a globally sorted relative-path
+  manifest, while root files preceded nested files in `os.walk` preorder.
+  The docstring now describes the actual order, and
+  `test_hash_uses_top_down_walk_order` passes on that order. Production
+  behavior and fingerprints are unchanged.
 
 The mutation operators used were comparison flips, condition negation,
 constant changes, empty/false return replacement, and statement removal.
