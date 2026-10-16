@@ -358,6 +358,18 @@ class ExecutionDispatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionAdmissionError, "worker_not_configured"):
             status_only.run_once("mcp-process")
 
+    def test_running_status_names_the_active_repository_only_while_running(self):
+        job = self.submit()
+        directory = self.root / "queue" / job["job_id"]
+        receipt = json.loads((directory / "receipt.json").read_text())
+        receipt["state"] = "running"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
+                         str(self.repo.resolve()))
+        receipt["state"] = "failed"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertNotIn("active_repository", self.queue.status(job["job_id"]))
+
     def test_restart_blocks_claimed_but_not_yet_running_job(self):
         job = self.submit()
         directory = self.root / "queue" / job["job_id"]
