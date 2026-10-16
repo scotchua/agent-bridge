@@ -27,32 +27,77 @@ case "${1:-}" in
     ;;
 esac
 
-# `cmd && exit 0` rather than `if cmd; then exit 0; fi`, because POSIX
-# defines $? after an `if` whose branches did not run as zero, so the
-# diagnostic reported "launcher exit 0" for a failure that was exit 1.
-"$PY" -P -m agent_bridge.orchestration.gate "$@" && exit 0
-status=$?
-# A PostToolUse invocation (Phase 5, inline output measurement) never
-# denies and the tool call it answers for has already finished, so a
-# PreToolUse-shaped deny hint below would be meaningless here; the same
-# argv-only mode selection the gate module itself uses, since this
-# script runs before any Python is confirmed to work at all.
-#
-# Checked positionally over "$@", one argument at a time, rather than by
-# searching " $* " for the literal substring: a review found the substring
-# form matches "--event PostToolUse" anywhere in the flattened argument
-# line, including inside a single argument's own text (an installed
-# --config path that happens to contain that text) -- turning a real
-# PreToolUse call, at the one moment the interpreter has already failed to
-# start, into a silent {} instead of the fail-closed deny this whole
-# branch exists to guarantee.
+# PostToolUse only measures output after a tool has finished; it never makes a
+# permission decision.  Determine that mode from argv before starting the
+# child, including when the child later returns malformed output.
+post_event=false
 previous=""
 for word in "$@"; do
   if [ "$previous" = "--event" ] && [ "$word" = "PostToolUse" ]; then
-    printf '%s\n' "{}"
-    exit 0
+    post_event=true
+    break
   fi
   previous=$word
 done
-printf '%s\n' "{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"delegation-first gate: the hook could not start its interpreter (launcher exit ${status}); nothing is implemented until the installation is repaired [gate_launcher_failed]\"}}"
+
+# Do not let a child that has printed a decision make that decision visible
+# until it has exited cleanly.  A signal after stdout was written used to make
+# the host receive both that (possibly allow) decision and our fail-closed
+# fallback below.  The file also lets us reject a malformed or multi-document
+# reply without exposing its raw contents.
+umask 077
+output=$(mktemp "${TMPDIR:-/tmp}/agent-bridge-gate-hook.XXXXXX" 2>/dev/null) || {
+  printf '%s\n' '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "delegation-first gate: the launcher could not prepare its decision channel; nothing is implemented until the installation is repaired [gate_launcher_failed]"}}'
+  exit 0
+}
+trap 'rm -f "$output"' EXIT HUP INT TERM
+"$PY" -P -m agent_bridge.orchestration.gate "$@" >"$output" 2>/dev/null
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  # A normal PreToolUse reply is either {} (an unlogged allow) or one
+  # hookSpecificOutput decision.  json.load consumes the whole stream, so a
+  # second decision is rejected too.  This validator deliberately emits
+  # nothing: only the verified child reply is ever forwarded.
+  if "$PY" -P -c '
+import json
+import sys
+
+value = json.load(sys.stdin)
+decision = value.get("hookSpecificOutput") if isinstance(value, dict) else None
+valid = (
+    isinstance(value, dict)
+    and (not value or (
+        isinstance(decision, dict)
+        and decision.get("hookEventName") == "PreToolUse"
+        and decision.get("permissionDecision") in ("allow", "deny")
+    ))
+)
+raise SystemExit(0 if valid else 1)
+' <"$output" >/dev/null 2>&1; then
+    cat "$output"
+    exit 0
+  fi
+  if [ "$post_event" = true ]; then
+    printf '%s\n' "{}"
+    exit 0
+  fi
+  printf '%s\n' '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "delegation-first gate: the hook returned no valid decision; nothing is implemented until the installation is repaired [gate_launcher_failed]"}}'
+  exit 0
+fi
+
+# POSIX shells conventionally report a signal as 128 plus its number.  Keep
+# that class visible to the operator while retaining the fixed, sanitized
+# launcher diagnostic code.  Other nonzero results are ordinary child exits.
+if [ "$status" -gt 128 ] && [ "$status" -le 255 ]; then
+  signal=$((status - 128))
+  failure="child signal ${signal} (status ${status})"
+else
+  failure="child exit ${status}"
+fi
+if [ "$post_event" = true ]; then
+  printf '%s\n' "{}"
+  exit 0
+fi
+printf '%s\n' "{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"delegation-first gate: the hook failed (${failure}); nothing is implemented until the installation is repaired [gate_launcher_failed]\"}}"
 exit 0
