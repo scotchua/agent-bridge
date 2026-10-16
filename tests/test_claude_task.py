@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task as module
 from agent_bridge.execution import hostenv
+from tests import verification_capabilities
 
 
 def requires_confinement(case):
@@ -41,6 +42,7 @@ def requires_confinement(case):
         hostenv.confinement("synthetic")
     except hostenv.HostCapabilityError as exc:
         case.skipTest("no verification confinement backend on this host: " + exc.code)
+    verification_capabilities.requires_nested_confinement(case)
 
 from agent_bridge.execution import claude_task
 from agent_bridge.execution.claude_task import (

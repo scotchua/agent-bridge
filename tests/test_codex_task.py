@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import codex_task as module
 from agent_bridge.execution import hostenv
+from tests import verification_capabilities
 
 
 def requires_confinement(case):
@@ -42,6 +43,7 @@ def requires_confinement(case):
         hostenv.confinement("synthetic")
     except hostenv.HostCapabilityError as exc:
         case.skipTest("no verification confinement backend on this host: " + exc.code)
+    verification_capabilities.requires_nested_confinement(case)
 
 _PROMOTION_TMP = None
 _PROMOTION_PATCH = None
@@ -213,6 +215,24 @@ class CodexTaskTests(unittest.TestCase):
         self.assertFalse((Path(result["job_dir"]) / "generation-worktree").exists())
         self.assertFalse((Path(result["job_dir"]) / "verification-worktree").exists())
         self.assertEqual(receipt["auth"]["auth_method"], "chatgpt")
+
+    def test_receipt_records_only_the_fixed_capability_skip_count(self):
+        requires_confinement(self)
+
+        def skipped_verify(command, tree, scratch, env, timeout, backend):
+            scratch.mkdir(mode=0o700)
+            (scratch / module.verification_diagnostics.SKIP_RECORD_NAME).write_text(
+                module.verification_diagnostics.NESTED_CONFINEMENT_UNAVAILABLE + "\n")
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"",
+                                   sandbox_backend=backend.name,
+                                   sandbox_profile_sha256=None, duration_seconds=0.0)
+
+        with mock.patch.object(module, "_sandboxed", side_effect=skipped_verify):
+            result = self.run_default()
+        self.assertEqual(result["verification"][0]["capability_skips"], {
+            module.verification_diagnostics.NESTED_CONFINEMENT_UNAVAILABLE: 1})
+        self.assertEqual(result["verification_capability_skips"], {
+            module.verification_diagnostics.NESTED_CONFINEMENT_UNAVAILABLE: 1})
 
     def test_receipt_records_usage_from_the_codex_jsonl_stream(self):
         requires_confinement(self)
