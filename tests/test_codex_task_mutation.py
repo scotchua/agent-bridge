@@ -91,6 +91,13 @@ class CacheArtifactTests(unittest.TestCase):
         self.assertTrue(task._is_cache_artifact("__pycache__/example.cpython-311.pyc"))
 
 
+class CachePreventionEnvironmentTests(unittest.TestCase):
+    def test_generation_and_verification_cache_prevention_is_deterministic(self):
+        environment = task._env()
+        self.assertEqual({name: environment[name] for name in task.CACHE_PREVENTION_ENV},
+                         task.CACHE_PREVENTION_ENV)
+
+
 class UnlinkBeneathTests(unittest.TestCase):
     def test_unlinks_regular_file_only(self):
         if os.open not in os.supports_dir_fd or os.lstat not in os.supports_dir_fd:
@@ -117,12 +124,34 @@ class DropCachesTests(unittest.TestCase):
 
 class PatchTests(unittest.TestCase):
     def test_returns_nonempty_diff(self):
+        ignored = SimpleNamespace(returncode=0, stdout=b"")
         add = SimpleNamespace(returncode=0, stdout=b"")
         diff = SimpleNamespace(returncode=0, stdout=b"synthetic diff")
         with mock.patch.object(task, "_drop_caches"), \
-             mock.patch.object(task, "_git", return_value=""), \
-             mock.patch.object(task, "_run", side_effect=[add, diff]):
+             mock.patch.object(task, "_run", side_effect=[ignored, add, diff]):
             self.assertEqual(task._patch(SYNTHETIC_ROOT / "tree", "HEAD", {}), b"synthetic diff")
+
+    def test_unexpected_ignored_file_refuses_with_bounded_relative_path(self):
+        ignored = b"generated/unexpected.cache\0"
+        listing = SimpleNamespace(returncode=0, stdout=ignored)
+        with mock.patch.object(task, "_drop_caches"), \
+             mock.patch.object(task, "_run", return_value=listing):
+            with self.assertRaises(task.TaskError) as caught:
+                task._patch(SYNTHETIC_ROOT / "tree", "HEAD", {})
+        self.assertEqual(caught.exception.ignored_artifact_paths, ["generated/unexpected.cache"])
+
+    def test_ignored_path_list_is_bounded(self):
+        entries = [f"cache-{number}".encode() for number in range(task.MAX_IGNORED_ARTIFACT_PATHS + 1)]
+        listing = SimpleNamespace(returncode=0, stdout=b"\0".join(entries) + b"\0")
+        with mock.patch.object(task, "_run", return_value=listing):
+            paths = task._ignored_artifact_paths(SYNTHETIC_ROOT / "tree", {})
+        self.assertEqual(len(paths), task.MAX_IGNORED_ARTIFACT_PATHS)
+
+    def test_ignored_path_diagnostic_escapes_control_characters(self):
+        listing = SimpleNamespace(returncode=0, stdout=b"unsafe\nname\0")
+        with mock.patch.object(task, "_run", return_value=listing):
+            paths = task._ignored_artifact_paths(SYNTHETIC_ROOT / "tree", {})
+        self.assertEqual(paths, ["unsafe\\u000aname"])
 
 
 class PinnedPythonTests(unittest.TestCase):
