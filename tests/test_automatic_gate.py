@@ -2127,27 +2127,6 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         self.assertEqual((decision.permission, decision.code),
                          ("deny", "gate_state_unavailable"))
 
-    def test_nested_locks_share_one_wait_budget(self):
-        """Two enclosing repositories must not stack two full waits against
-        the hook's own timeout."""
-        from unittest import mock
-
-        inner = git_repo(self.repo / "inner")
-        self.arrange({})
-        self.hook("codex", inner, "mod.py")
-        patch = ("*** Begin Patch\n*** Update File: mod.py\n@@\n-x = 1\n+x = 2\n"
-                 "*** End Patch\n")
-        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.5), \
-                gate.decision_lock(str(self.state), str(inner)):
-            started = time.monotonic()
-            decision = gate.judge("codex", "apply_patch", {"input": patch}, str(inner),
-                                  state_root=str(self.state), capacity_db=str(self.db),
-                                  decide=gate.automatic_decider("codex", str(self.state),
-                                                                str(self.db)))
-            waited = time.monotonic() - started
-        self.assertEqual(decision.code, "gate_state_unavailable")
-        self.assertLess(waited, 0.9, "each repository waited a full budget of its own")
-
     def test_an_existing_own_slot_is_no_escape_from_a_binding_shared_receipt(self):
         """Once codex holds its own retain, a binding shared receipt (manual,
         or routed away) still denies it: the slot governs only while the
@@ -2191,21 +2170,17 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
                    "tool_input": {"file_path": str(self.repo / "app.py")}, "cwd": str(self.repo)}
         env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), gate.HOOK_WATCHDOG_ENV: "0.5"}
         with gate.decision_lock(str(self.state), str(self.repo)):
-            started = time.monotonic()
             completed = subprocess.run(
                 [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
                  "--client", "claude", "--config", str(self.config)],
                 input=json.dumps(payload).encode("utf-8"), capture_output=True,
-                timeout=60, env=env)
-            elapsed = time.monotonic() - started
+                timeout=10, env=env, shell=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         out = json.loads(completed.stdout)
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertTrue(reason.endswith("[gate_timeout]"), reason)
         self.assertEqual(completed.stdout.count(b"hookSpecificOutput"), 1)
-        self.assertLess(elapsed, gate.DECISION_LOCK_TIMEOUT_SECONDS,
-                        "the deny waited for the lock timeout, not the watchdog")
 
     def test_the_watchdog_can_only_be_lowered(self):
         from unittest import mock
@@ -2218,47 +2193,55 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
                     mock.patch.dict(os.environ, {gate.HOOK_WATCHDOG_ENV: value}):
                 self.assertEqual(gate._watchdog_seconds(), expected)
 
-    def test_a_deeply_nested_routed_away_deny_arrives_well_inside_the_budget(self):
-        """Measured on the previous design: five nested repositories, first
-        decision, routed-away innermost, 10.3 s -- past the 10 s hook timeout,
-        with no contention at all. Under the lock a missing receipt is read
-        without the store's one-second retry window. A fixed 3 s bound failed
-        on windows-latest on 2026-10-06: 3.2 s on Python 3.13 (PR #31) and
-        8.1 s on Python 3.11 (docs-only PR #32), versus about 0.14 s on macOS.
-        Calibrate on this runner so host speed gets proportional headroom."""
-        deepest = self.repo
-        for depth in range(4):
-            deepest = git_repo(deepest / f"n{depth}")
-        self.write_policy({str(deepest): {
-            "classification": "internal_nonclient",
-            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex", "local"])
-        for route in ("claude", "codex", "local"):
-            self.observe(route)
-        started = time.monotonic()
-        reason = self.assertDenied(self.hook("codex", deepest, "mod.py", timeout_is_host_limit=False),
-                                   "routed_elsewhere")
-        elapsed = time.monotonic() - started
-        self.assertIn("routed to claude", reason)
-        # The receipt now exists, so the same hook pays interpreter start-up,
-        # imports, git discovery and a gate decision without missing-receipt
-        # retries under the decision lock. Take the faster of two warm calls
-        # to reduce the effect of transient host load on the baseline.
-        warm_times = []
-        for _ in range(2):
-            started = time.monotonic()
-            self.assertDenied(self.hook("codex", deepest, "mod.py", timeout_is_host_limit=False),
-                              "routed_elsewhere")
-            warm_times.append(time.monotonic() - started)
-        baseline = min(warm_times)
-        if baseline > 2.0:
-            self.skipTest(f"this host's warm hook baseline is {baseline:.2f} s; "
-                          "above 2 s the timing bound cannot distinguish retry sleeps")
-        # At a 0.14 s baseline the bound is 3.28 s. With baseline <= 2 s,
-        # baseline + 5 s of retry sleeps is >= 3 + 2 * baseline and fails.
-        limit = 3.0 + 2 * baseline
-        self.assertLess(elapsed, limit,
-                        f"a routed-away deny took {elapsed:.2f} s; "
-                        f"warm baseline {baseline:.2f} s, bound {limit:.2f} s")
+    def test_nested_locks_receive_one_shared_deadline(self):
+        """Nested lock delays use one deadline, not one full budget each.
+
+        The first controlled lock consumes four seconds of a five-second
+        budget. The second must receive the one second remaining and fail
+        closed. Passing it five seconds would reproduce the stacked-wait
+        regression this test guards, without depending on runner wall time.
+        """
+        from contextlib import contextmanager
+        from unittest import mock
+
+        inner = git_repo(self.repo / "inner")
+
+        class Clock:
+            now = 100.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        clock = Clock()
+        received_timeouts = []
+        delays = iter((4.0, 4.0))
+
+        @contextmanager
+        def controlled_lock(state_root, repo, timeout=None):
+            received_timeouts.append(timeout)
+            delay = next(delays)
+            if timeout is None or delay <= timeout:
+                clock.advance(delay)
+                yield
+                return
+            clock.advance(timeout)
+            raise TimeoutError("controlled lock delay exceeded its deadline")
+
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 5.0), \
+                mock.patch.object(gate, "JUDGMENT_BUDGET_SECONDS", 12.0), \
+                mock.patch.object(gate, "decision_lock", controlled_lock):
+            decision = gate._judge_write(
+                "codex", "edit", [str(inner / "mod.py")], {}, str(inner),
+                state_root=str(self.state), clock=time.time, protected=(),
+                capacity_db=None, decide=None, monotonic=clock)
+
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+        self.assertEqual(received_timeouts, [5.0, 1.0])
+        self.assertEqual(clock.now, 105.0)
 
     def test_routing_decide_takes_the_same_lock(self):
         """The hand-made writer is serialised with the gate too."""

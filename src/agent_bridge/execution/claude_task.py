@@ -227,6 +227,14 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
+def _source_integrity_reasons(before,after):
+    """Return the closed, operator-safe names of changed source components."""
+    return [code for key,code in (("config_sha256","git_config_changed"),
+                                  ("head","head_changed"),
+                                  ("status","status_changed"),
+                                  ("content","dirty_content_changed"))
+            if before.get(key)!=after.get(key)]
+
 def _require_confinement(classification:str)->hostenv.Confinement:
     """The verification confinement this host will apply, or a named refusal.
 
@@ -379,10 +387,11 @@ def _patch(tree:Path,base:str,env):
     if not r.stdout: raise TaskError("Claude produced an empty patch")
     return r.stdout
 
-def _remove(repo:Path,tree:Path,env):
+def _remove(repo:Path,tree:Path,env,timeout:float=60):
     if not tree.exists(): return True
+    if timeout <= 0: return False
     try:
-        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=60)
+        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=timeout)
     except (OSError,TaskError,subprocess.SubprocessError):
         return False
     # Never run repository-wide `worktree prune`: it can discard unrelated
@@ -585,10 +594,14 @@ def _fenced_generation(command:list[str],job:Path,gen:Path,config_dir:Path|None,
 
 def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
              classification:str,model:str,effort:str,client_derived_routes: tuple[str, ...] = (),
-             verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
+             verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300,
+             cleanup_timeout:int=60):
     if classification not in ALLOWED_CLASSIFICATIONS and not (
             classification == "client_derived" and "execution" in client_derived_routes):
         raise TaskError("execution lane refuses client-derived material")
+    if (any(isinstance(value,bool) or not isinstance(value,int) or value < 1
+            for value in (timeout,verify_timeout,cleanup_timeout))):
+        raise TaskError("execution deadline invalid")
     if any(not p.is_absolute() for p in (brief,repo,task_root,claude_bin)): raise TaskError("all paths must be absolute")
     claude_config_dir=_checked_config_dir(claude_config_dir)
     if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
@@ -651,7 +664,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         if response.get("is_error") is not False or not isinstance(response.get("result"),str):
             raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
-        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env)
+        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env,cleanup_timeout)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
@@ -687,8 +700,8 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         receipt.update(status="failed_pending_integrity",error=type(exc).__name__,
                        error_detail=detail,finished_at=time.time())
     finally:
-        generation_removed=_remove(repo,gen,env)
-        verification_removed=_remove(repo,fresh,env)
+        generation_removed=_remove(repo,gen,env,cleanup_timeout)
+        verification_removed=_remove(repo,fresh,env,cleanup_timeout)
         cleanup_ok=generation_removed and verification_removed
         receipt["cleanup"]={"generation_worktree":str(gen),"generation_removed":generation_removed,
                             "verification_worktree":str(fresh),"verification_removed":verification_removed}
@@ -696,12 +709,20 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         source_after=_source_state(repo,env)
         source_match=source_after==source_before
         receipt["source_after"]=source_after
+        if not source_match:
+            receipt["source_integrity_reasons"]=_source_integrity_reasons(source_before,source_after)
     except Exception:
         source_match=False
+        receipt["source_integrity_reasons"]=["source_snapshot_unavailable"]
     receipt["source_integrity_match"]=source_match
     if not cleanup_ok:
         receipt.update(status="failed",error="WorktreeCleanupError",finished_at=time.time())
     elif not source_match:
+        if pending_exc is not None:
+            # Keep the first fixed harness diagnostic beside the authoritative
+            # integrity failure, rather than replacing it with a bare class.
+            receipt["prior_harness_failure"]={key:receipt[key] for key in ("error","error_detail")
+                                                if key in receipt}
         receipt.update(status="failed",error="SourceIntegrityError",finished_at=time.time())
     elif pending_exc is not None:
         receipt.update(status="failed",error=type(pending_exc).__name__,finished_at=time.time())
@@ -711,7 +732,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         receipt["status"]="verification_failed"
     _atomic_json(job/"receipt.json",receipt)
     if not cleanup_ok: raise TaskError("disposable worktree cleanup failed")
-    if not source_match: raise TaskError("source repository integrity changed during task")
+    if not source_match: raise TaskError("source repository integrity changed: "+",".join(receipt["source_integrity_reasons"]))
     if pending_exc is not None: raise pending_exc
     return {**receipt,"job_dir":str(job),"patch":str(job/"changes.patch")}
 
@@ -727,6 +748,7 @@ def main(argv=None):
     p.add_argument("--classification",required=True,choices=sorted(ALLOWED_CLASSIFICATIONS | {"client_derived"})); p.add_argument("--client-derived-routes",action="append",default=[],choices=["execution"]); p.add_argument("--model",default="sonnet")
     p.add_argument("--effort",default="medium",choices=("low","medium","high","xhigh","max")); p.add_argument("--base",default="HEAD")
     p.add_argument("--timeout",type=int,default=900); p.add_argument("--verify-timeout",type=int,default=300)
+    p.add_argument("--cleanup-timeout",type=int,default=60)
     p.add_argument("--verify-json",action="append",required=True)
     a=p.parse_args(argv)
     try:

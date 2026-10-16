@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -16,7 +17,7 @@ from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration import autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
-    _harness_summary, outcome_is_success,
+    _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
@@ -91,6 +92,23 @@ class ExecutionDispatcherTests(unittest.TestCase):
         claude_to_codex = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra",
                                       verify_argv=[])
         self.assertEqual(claude_to_codex["provider"], "codex")
+
+    def test_deadline_contract_is_bounded_and_covers_every_verification_and_cleanup(self):
+        job = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra",
+                          verify_argv=[["git", "status"], ["git", "diff"]],
+                          timeout_seconds=10, verify_timeout_seconds=20,
+                          cleanup_timeout_seconds=30)
+        request = json.loads((self.queue.root / job["job_id"] / "request.json").read_text())
+        self.assertEqual(request["verify_timeout_seconds"], 20)
+        self.assertEqual(request["cleanup_timeout_seconds"], 30)
+        # Generation + two verifiers + three possible bounded cleanup attempts
+        # (initial generation cleanup, retry, verification cleanup) + fixed
+        # setup/integrity allowance.  This is the parent hard deadline.
+        self.assertEqual(request["total_timeout_seconds"], 440)
+        with self.assertRaisesRegex(ExecutionAdmissionError, "total_timeout_invalid"):
+            self.submit(total_timeout_seconds=439, verify_argv=[["git", "status"], ["git", "diff"]],
+                        timeout_seconds=10, verify_timeout_seconds=20,
+                        cleanup_timeout_seconds=30)
 
     def test_atomic_receipt_closes_descriptor_and_preserves_acl_failure(self):
         target = self.root / "queue" / "acl-test.json"
@@ -195,6 +213,53 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["error_detail"], UNEXPECTED_FAILURE_DETAIL)
         self.assertNotIn("do-not-record", json.dumps(result))
 
+    def test_status_reports_safe_distinct_failure_details_without_job_content(self):
+        """One status call makes terminal failures actionable, not revealing."""
+        cases = (
+            ("auth", {"returncode": 1, "harness_ok": False,
+                      "harness_status": "failed", "harness_verdict": "read_failure",
+                      "error": "TaskError", "error_detail": "provider is not authenticated",
+                      "stdout": "Synthetic implementation brief"},
+             {"error": "TaskError", "error_detail": "provider is not authenticated",
+              "harness_status": "failed", "harness_verdict": "read_failure"}),
+            ("unreadable", {"returncode": 1, "harness_ok": False,
+                            "harness_status": "aborted",
+                            "harness_verdict": "receipt_unparseable",
+                            "stdout": "Synthetic implementation brief"},
+             {"harness_status": "aborted", "harness_verdict": "receipt_unparseable"}),
+            ("verification", {"returncode": 0, "harness_ok": False,
+                              "harness_status": "verification_failed",
+                              "harness_verdict": "read",
+                              "stdout": "Synthetic implementation brief"},
+             {"harness_status": "verification_failed", "harness_verdict": "read"}),
+        )
+        details = {}
+        for label, outcome, expected in cases:
+            self.queue.executor = lambda _request, _directory, outcome=outcome: outcome
+            job = self.submit()
+            status = self.queue.run_once("worker-1")
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual({key: status[key] for key in expected}, expected)
+            self.assertEqual(status["finished_at"], 100.0)
+            self.assertNotIn("stdout", status)
+            self.assertNotIn("Synthetic implementation brief", json.dumps(status))
+            details[label] = (status.get("error_detail"), status.get("harness_verdict"))
+
+        def timeout(_request, _directory):
+            raise ExecutionAdmissionError("execution_harness_timeout")
+
+        self.queue.executor = timeout
+        job = self.submit()
+        status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error"], "ExecutionAdmissionError")
+        self.assertEqual(status["error_detail"], "execution_harness_timeout")
+        self.assertEqual(status["finished_at"], 100.0)
+        self.assertNotIn("stdout", status)
+        details["timeout"] = (status.get("error_detail"), status.get("harness_verdict"))
+
+        self.assertEqual(len(set(details.values())), 4)
+
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")
         duplicate = self.submit(idempotency_key="same-task")
@@ -293,6 +358,18 @@ class ExecutionDispatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionAdmissionError, "worker_not_configured"):
             status_only.run_once("mcp-process")
 
+    def test_running_status_names_the_active_repository_only_while_running(self):
+        job = self.submit()
+        directory = self.root / "queue" / job["job_id"]
+        receipt = json.loads((directory / "receipt.json").read_text())
+        receipt["state"] = "running"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
+                         str(self.repo.resolve()))
+        receipt["state"] = "failed"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertNotIn("active_repository", self.queue.status(job["job_id"]))
+
     def test_restart_blocks_claimed_but_not_yet_running_job(self):
         job = self.submit()
         directory = self.root / "queue" / job["job_id"]
@@ -304,6 +381,143 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(result["error"], "interrupted_requires_reconciliation")
         self.assertEqual(self.fake.requests, [])
 
+    def test_damaged_and_claimed_entries_do_not_block_a_later_job(self):
+        """Unreadable and uncertain jobs remain held while healthy work runs."""
+        identifiers = iter(("0" * 31 + "1", "0" * 31 + "2", "0" * 31 + "3"))
+        with mock.patch(
+                "agent_bridge.orchestration.execution_queue.uuid.uuid4",
+                side_effect=lambda: SimpleNamespace(hex=next(identifiers))):
+            damaged = self.submit()
+            claimed = self.submit()
+            valid = self.submit()
+
+        damaged_directory = self.root / "queue" / damaged["job_id"]
+        claimed_directory = self.root / "queue" / claimed["job_id"]
+        # Do not repair or reinterpret the damaged receipt: its original
+        # bytes are evidence, and it is never eligible to run.
+        (damaged_directory / "receipt.json").write_text(
+            "not a receipt: private brief text must not be reported", encoding="utf-8")
+        (claimed_directory / "claim.lock").write_bytes(b"")
+
+        # Construction exercises restart recovery; run_once then must scan
+        # past both earlier entries and invoke only the valid fake executor.
+        restarted = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 101.0,
+                                   model_reserved=reserve_nothing)
+        # The real worker annotates dependency holds before it selects work.
+        # That scan must isolate the same damaged entry too.
+        restarted.hold_dependencies({})
+        self.assertEqual(restarted.run_once("worker-1"),
+                         {"job_id": valid["job_id"], "state": "complete",
+                          "caller": "codex", "provider": "claude",
+                          "classification": "synthetic", "harness_status": "complete",
+                          "harness_verdict": "read", "finished_at": 101.0})
+        self.assertEqual([request["job_id"] for request in self.fake.requests],
+                         [valid["job_id"]])
+        self.assertEqual(restarted.result(claimed["job_id"])["state"], "blocked")
+        self.assertEqual(restarted.result(claimed["job_id"])["error"],
+                         "interrupted_requires_reconciliation")
+        self.assertTrue((claimed_directory / "claim.lock").exists())
+        self.assertEqual((damaged_directory / "receipt.json").read_text(encoding="utf-8"),
+                         "not a receipt: private brief text must not be reported")
+        with self.assertRaisesRegex(ExecutionAdmissionError, "execution_receipt_unreadable"):
+            restarted.status(damaged["job_id"])
+        report = restarted.state_report()
+        self.assertEqual(report, {
+            "blocked": 1, "complete": 1, "queue_health_receipt_unreadable": 1})
+        self.assertNotIn("private brief text", json.dumps(report))
+
+
+
+@unittest.skipIf(os.name != "posix", "the subprocess harness executor is POSIX only")
+class CoherentDeadlineHarnessTests(unittest.TestCase):
+    """A single parent job budget covers generation, verification and cleanup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = self.root / "brief.txt"
+        self.brief.write_text("complete", encoding="utf-8")
+        self.harness = self.root / "fake_harness.py"
+        self.harness.write_text(
+            "import argparse, json, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "p = argparse.ArgumentParser(); p.add_argument('brief')\n"
+            "p.add_argument('--repo'); p.add_argument('--base')\n"
+            "p.add_argument('--timeout', type=float); p.add_argument('--verify-timeout', type=float)\n"
+            "p.add_argument('--cleanup-timeout', type=float); p.add_argument('--tasks-dir', type=Path)\n"
+            "p.add_argument('--verify-json', action='append', default=[])\n"
+            "p.add_argument('--classification'); p.add_argument('--model'); p.add_argument('--reasoning-effort')\n"
+            "a, _ = p.parse_known_args(); a.tasks_dir.mkdir(parents=True, exist_ok=True)\n"
+            "(a.tasks_dir / 'observed-deadlines.json').write_text(json.dumps({'generation': a.timeout, 'verification': a.verify_timeout, 'cleanup': a.cleanup_timeout, 'checks': len(a.verify_json)}))\n"
+            "time.sleep(a.timeout * 0.8)\n"
+            "if Path(a.brief).read_text(encoding='utf-8') == 'late':\n"
+            "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], shell=False)\n"
+            "    try: child.communicate(timeout=a.verify_timeout)\n"
+            "    except subprocess.TimeoutExpired:\n"
+            "        child.kill(); child.communicate()\n"
+            "        print(json.dumps({'ok': False, 'status': 'failed', 'error': 'TaskError', 'error_detail': 'verification command timed out'})); raise SystemExit(1)\n"
+            "for _ in a.verify_json: time.sleep(min(a.verify_timeout * 0.25, 0.25))\n"
+            "print(json.dumps({'ok': True, 'status': 'complete'}))\n",
+            encoding="utf-8")
+        executor = SubprocessHarnessExecutor(Harnesses(
+            codex=self.harness, claude=self.harness, python=Path(sys.executable)))
+        self.queue = ExecutionQueue(self.root / "queue", executor,
+                                    model_reserved=reserve_nothing)
+
+    def _submit(self):
+        return self.queue.submit(
+            caller="claude", provider="codex", repo=str(self.repo), brief=str(self.brief),
+            base="HEAD", classification="synthetic", model="gpt-5.6-terra", effort="low",
+            item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1,
+            verify_argv=[["git", "status"], ["git", "diff"]], timeout_seconds=1,
+            verify_timeout_seconds=1, cleanup_timeout_seconds=1)
+
+    def test_near_generation_limit_then_two_checks_finishes_with_explicit_deadlines(self):
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "complete")
+        observed = self.queue.root / queued["job_id"] / "harness" / "observed-deadlines.json"
+        self.assertEqual(json.loads(observed.read_text()),
+                         {"generation": 1.0, "verification": 1.0,
+                          "cleanup": 1.0, "checks": 2})
+
+    def test_a_request_queued_before_the_deadline_contract_still_runs(self):
+        queued = self._submit()
+        path = self.queue.root / queued["job_id"] / "request.json"
+        request = json.loads(path.read_text())
+        for key in ("verify_timeout_seconds", "cleanup_timeout_seconds",
+                    "total_timeout_seconds"):
+            del request[key]
+        path.write_text(json.dumps(request), encoding="utf-8")
+        self.queue.run_once("worker-1")
+        self.assertEqual(self.queue.result(queued["job_id"])["state"], "complete")
+        observed = self.queue.root / queued["job_id"] / "harness" / "observed-deadlines.json"
+        self.assertEqual(json.loads(observed.read_text())["verification"], 300.0)
+
+    def test_a_partial_deadline_contract_is_refused(self):
+        queued = self._submit()
+        path = self.queue.root / queued["job_id"] / "request.json"
+        request = json.loads(path.read_text())
+        del request["total_timeout_seconds"]
+        path.write_text(json.dumps(request), encoding="utf-8")
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_detail"], "execution_deadline_invalid")
+
+    def test_verification_past_its_own_deadline_is_killed_and_recorded_failed(self):
+        self.brief.write_text("late", encoding="utf-8")
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["harness"]["harness_status"], "failed")
+        self.assertEqual(result["harness"]["error_detail"], "verification command timed out")
 
 
 class HarnessVerdictTests(unittest.TestCase):
