@@ -25,7 +25,7 @@ class RuntimeTests(unittest.TestCase):
                    return_value="ready") as check_output:
             self.assertEqual(system_runner(["/usr/bin/uptime"]), "ready")
         check_output.assert_called_once_with(["/usr/bin/uptime"], text=True,
-                                             stderr=subprocess.DEVNULL, timeout=2)
+                                             stderr=subprocess.DEVNULL, timeout=2, shell=False)
 
     def test_foundation_thermal_probe_rejects_missing_process_info(self):
         objc = Mock()
