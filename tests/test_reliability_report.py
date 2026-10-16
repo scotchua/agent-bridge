@@ -70,14 +70,63 @@ class ReliabilityReportTests(unittest.TestCase):
         self.assertEqual(report["consultations"]["by_outcome"], {})
         self.assertEqual(report["local_queue"]["by_state"], {})
 
+    def test_execution_receipt_diagnostics_are_fixed_codes_only(self):
+        receipts = (
+            {"harness": {"error_detail": "source repository integrity changed: head_changed,status_changed,RELIABILITY_REPORT_SECRET_SENTINEL"}},
+            {"harness": {"error_detail": "command timed out after 30s"}},
+            {"error": "interrupted_requires_reconciliation"},
+        )
+        for number, receipt in enumerate(receipts):
+            directory = self.execution / str(number); directory.mkdir()
+            receipt.update(submitted_at=NOW - 1, provider="claude", state="failed")
+            (directory / "receipt.json").write_text(json.dumps(receipt))
+        report = self._report()
+        self.assertEqual(report["execution"]["by_error_detail"], {
+            "command_timeout": 1,
+            "interrupted_requires_reconciliation": 1,
+            "source_repository_changed": 1,
+        })
+        self.assertEqual(report["execution"]["by_source_integrity_reasons"], {
+            "head_changed": 1, "status_changed": 1,
+        })
+        rendered = reliability_report._markdown(report) + json.dumps(report)
+        self.assertNotIn("RELIABILITY_REPORT_SECRET_SENTINEL", rendered)
+        self.assertNotIn("command timed out after 30s", rendered)
+
+    def test_ok_is_not_an_error_category(self):
+        for number, category in enumerate(("ok", "peer_timeout")):
+            directory = self.broker / "jobs" / str(number); directory.mkdir()
+            (directory / "status.json").write_text(json.dumps({
+                "updated_at": NOW - 1, "caller": "claude", "peer": "codex",
+                "status": "complete", "error_category": category,
+            }))
+        self.assertEqual(self._report()["consultations"]["by_error_category"], {"peer_timeout": 1})
+
     def test_ci_uses_fake_gh_with_bounded_argv_calls(self):
         fake = self.root / "gh"
-        fake.write_text("#!/usr/bin/env python3\nimport json,sys\na=sys.argv\nif 'list' in a: print(json.dumps([{'databaseId': 7}]))\nelif '--json' in a: print(json.dumps({'jobs':[{'name':'offline','conclusion':'failure'}]}))\nelse: print('FAILED tests/test_report.py::test_failure')\n")
+        fake.write_text("#!/usr/bin/env python3\nimport json,sys\na=sys.argv\nif 'repo' in a: print(json.dumps({'nameWithOwner':'example/bridge'}))\nelif 'list' in a: print(json.dumps([{'databaseId': 7}]))\nelif '--json' in a: print(json.dumps({'jobs':[{'name':'offline','conclusion':'failure'}]}))\nelse: print('FAILED tests/test_report.py::test_failure')\n")
         fake.chmod(0o700)
         with mock.patch.object(reliability_report.shutil, "which", return_value=str(fake)):
             report = self._report(ci=True)
         self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline"]["rate"], 1.0)
         self.assertEqual(report["ci"]["frequent_failing_test_ids"], {"tests/test_report.py::test_failure": 1})
+
+    def test_ci_does_not_fetch_logs_for_a_green_run(self):
+        calls = []
+
+        def fake_gh(argv, *, cwd):
+            calls.append(argv)
+            if "repo" in argv:
+                return 0, json.dumps({"nameWithOwner": "example/bridge"}), True
+            if "list" in argv:
+                return 0, json.dumps([{ "databaseId": 7 }]), True
+            return 0, json.dumps({"jobs": [{"name": "offline", "conclusion": "success"}]}), True
+
+        with mock.patch.object(reliability_report.shutil, "which", return_value="gh"), \
+             mock.patch.object(reliability_report, "_gh", side_effect=fake_gh):
+            report = self._report(ci=True)
+        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline"]["rate"], 0.0)
+        self.assertFalse(any("--log-failed" in call for call in calls))
 
     def test_ci_notes_missing_gh(self):
         with mock.patch.object(reliability_report.shutil, "which", return_value=None):

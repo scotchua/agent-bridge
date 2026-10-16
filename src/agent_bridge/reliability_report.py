@@ -14,8 +14,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
-import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -25,10 +23,12 @@ from . import config as broker_config
 from . import drift, store
 from .errors import ErrorCategory
 from .orchestration import config as orchestration_config
+from . import runner
 
 _SAFE_EXECUTION_CODES = frozenset({
     "interrupted_requires_reconciliation", "execution_harness_timeout",
     "execution_receipt_unreadable", "execution_receipt_invalid",
+    "command_timeout",
     "source_snapshot_unavailable", "source_repository_changed",
     "brief_changed_after_admission", "model_reserved", "model_invalid",
     "reservation_policy_check_failed", "claude_config_dir_unavailable",
@@ -49,6 +49,9 @@ _SAFE_STAGE_REASONS = frozenset({
 })
 _TEST_ID = re.compile(r"^[A-Za-z0-9_./:-]{1,240}$")
 _GH_OUTPUT_LIMIT = 1_000_000
+_SOURCE_INTEGRITY_PREFIX = "source repository integrity changed: "
+_COMMAND_TIMEOUT = re.compile(r"^command timed out after [0-9]+s$")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _count(items: Iterable[str]) -> dict[str, int]:
@@ -68,6 +71,20 @@ def _epoch(value: object) -> float | None:
 
 def _fixed(value: object, allowed: frozenset[str]) -> str:
     return value if isinstance(value, str) and value in allowed else "unrecognized"
+
+
+def _execution_detail(value: object) -> tuple[str, list[str]]:
+    """Convert known harness diagnostics to fixed report labels only."""
+    if not isinstance(value, str):
+        return "unrecognized", []
+    if value.startswith(_SOURCE_INTEGRITY_PREFIX):
+        reasons = value.removeprefix(_SOURCE_INTEGRITY_PREFIX).split(",")
+        return "source_repository_changed", [
+            reason for reason in reasons if reason in _SAFE_SOURCE_REASONS
+        ]
+    if _COMMAND_TIMEOUT.fullmatch(value):
+        return "command_timeout", []
+    return _fixed(value, _SAFE_EXECUTION_CODES), []
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -116,11 +133,15 @@ def _execution(root: Path | None, since: float) -> dict[str, Any]:
         buckets["provider"].append(_fixed(receipt.get("provider"), frozenset({"claude", "codex", "local"})))
         buckets["state"].append(_fixed(receipt.get("state"), frozenset({"queued", "running", "complete", "failed", "blocked"})))
         harness = receipt.get("harness") if isinstance(receipt.get("harness"), dict) else {}
-        buckets["harness_status"].append(_fixed(harness.get("harness_status"), frozenset({"complete", "failed", "aborted", "verification_failed"})))
+        buckets["harness_status"].append(_fixed(harness.get("harness_status"), frozenset({"complete", "failed", "aborted", "verification_failed", "no_patch"})))
         buckets["harness_verdict"].append(_fixed(harness.get("harness_verdict"), frozenset({"guest_receipt", "runtime_aborted", "receipt_absent", "receipt_not_an_object", "receipt_status_unknown", "receipt_unparseable", "read", "read_failure", "refused", "translation_refused"})))
         detail = receipt.get("error_detail", harness.get("error_detail"))
         if detail is not None:
-            buckets["error_detail"].append(_fixed(detail, _SAFE_EXECUTION_CODES))
+            code, reasons = _execution_detail(detail)
+            buckets["error_detail"].append(code)
+            buckets["source_integrity_reasons"].extend(reasons)
+        if receipt.get("error") is not None:
+            buckets["error_detail"].append(_fixed(receipt.get("error"), _SAFE_EXECUTION_CODES))
         reasons = receipt.get("source_integrity_reasons")
         if isinstance(reasons, list):
             buckets["source_integrity_reasons"].extend(_fixed(reason, _SAFE_SOURCE_REASONS) for reason in reasons)
@@ -161,7 +182,7 @@ def _consultations(root: Path, since: float) -> dict[str, Any]:
         directions.append(f"{caller}->{peer}" if caller in {"claude", "codex"} and peer in {"claude", "codex"} else "unrecognized")
         outcomes.append(_fixed(status.get("status"), frozenset({"queued", "running", "complete", "failed", "timed_out", "cancelled"})))
         category = status.get("error_category")
-        if category is not None:
+        if category is not None and category != "ok":
             categories.append(_fixed(category, known_categories))
     return {"present": True, "by_direction": _count(directions), "by_outcome": _count(outcomes), "by_error_category": _count(categories)}
 
@@ -207,78 +228,65 @@ def _stages(path: Path | None, since: float, now: float) -> dict[str, Any]:
             "blocked_over_24_hours": sum(1 for row in rows if isinstance(row[1], (int, float)) and now - row[1] > 86400)}
 
 
-def _gh(argv: list[str]) -> tuple[int | None, str, bool]:
-    """Run gh without a shell and retain at most one fixed-size capture.
-
-    Readers continue draining after the cap so a noisy child cannot deadlock
-    on a full pipe, but its output is neither retained nor emitted.
-    """
+def _gh(argv: list[str], *, cwd: Path) -> tuple[int | None, str, bool]:
+    """Run gh with the bounded, descendant-safe project process runner."""
     try:
-        process = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=False)
+        result = runner.run(
+            argv, cwd=str(cwd), env=os.environ.copy(), stdin_data="", timeout=15,
+            grace=1, stdout_cap=_GH_OUTPUT_LIMIT, stderr_cap=_GH_OUTPUT_LIMIT,
+        )
     except OSError:
         return None, "", False
-    captured = bytearray()
-    lock = threading.Lock()
-
-    def drain(stream: Any) -> None:
-        while True:
-            chunk = stream.read(65536)
-            if not chunk:
-                return
-            with lock:
-                if len(captured) < _GH_OUTPUT_LIMIT:
-                    captured.extend(chunk[:_GH_OUTPUT_LIMIT - len(captured)])
-
-    readers = [threading.Thread(target=drain, args=(stream,), daemon=True)
-               for stream in (process.stdout, process.stderr)]
-    for reader in readers: reader.start()
-    try:
-        code = process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        code = None
-    for reader in readers: reader.join()
-    for stream in (process.stdout, process.stderr):
-        stream.close()
-    with lock:
-        bounded = len(captured) < _GH_OUTPUT_LIMIT
-        text = bytes(captured).decode("utf-8", "replace")
-    return code, text, bounded
+    bounded = not (result.spawn_failed or result.timed_out or result.cap_exceeded
+                   or result.descendant_held_pipes)
+    return result.returncode, result.stdout.decode("utf-8", "replace"), bounded
 
 
-def _ci() -> dict[str, Any]:
+def _ci(repo: str | None = None) -> dict[str, Any]:
     gh = shutil.which("gh")
     if not gh:
         return {"note": "gh_unavailable", "failure_rate_by_job_name": {}, "frequent_failing_test_ids": {}}
     try:
-        code, output, bounded = _gh([gh, "run", "list", "--repo", "scotchua/agent-bridge", "--json", "databaseId", "--limit", "100"])
+        if repo is None:
+            code, output, bounded = _gh([gh, "repo", "view", "--json", "nameWithOwner"], cwd=_REPOSITORY_ROOT)
+            repository = json.loads(output).get("nameWithOwner") if code == 0 and bounded else None
+            if not isinstance(repository, str) or not repository:
+                raise ValueError
+        else:
+            repository = repo
+        code, output, bounded = _gh([gh, "run", "list", "--repo", repository, "--json", "databaseId", "--limit", "100"], cwd=_REPOSITORY_ROOT)
         runs = json.loads(output) if code == 0 and bounded else []
         if not isinstance(runs, list): raise ValueError
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, json.JSONDecodeError):
         return {"note": "gh_unavailable", "failure_rate_by_job_name": {}, "frequent_failing_test_ids": {}}
     totals: Counter[str] = Counter(); failed: Counter[str] = Counter(); tests: Counter[str] = Counter()
     for run in runs[:100]:
         run_id = run.get("databaseId") if isinstance(run, dict) else None
         if not isinstance(run_id, int): continue
         try:
-            code, output, bounded = _gh([gh, "run", "view", str(run_id), "--repo", "scotchua/agent-bridge", "--json", "jobs"])
+            code, output, bounded = _gh([gh, "run", "view", str(run_id), "--repo", repository, "--json", "jobs"], cwd=_REPOSITORY_ROOT)
             payload = json.loads(output) if code == 0 and bounded else {}
             jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
-            log_code, logs, logs_bounded = _gh([gh, "run", "view", str(run_id), "--repo", "scotchua/agent-bridge", "--log-failed"])
-        except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
         for job in jobs:
             if isinstance(job, dict) and isinstance(job.get("name"), str):
                 totals[job["name"]] += 1
                 if job.get("conclusion") == "failure": failed[job["name"]] += 1
+        if not any(isinstance(job, dict) and job.get("conclusion") == "failure" for job in jobs):
+            continue
+        try:
+            log_code, logs, logs_bounded = _gh([gh, "run", "view", str(run_id), "--repo", repository, "--log-failed"], cwd=_REPOSITORY_ROOT)
+        except OSError:
+            continue
         if logs_bounded and log_code in (0, 1):
             for test_id in re.findall(r"(?:FAILED|ERROR)\s+([A-Za-z0-9_./:-]+)", logs):
                 if _TEST_ID.fullmatch(test_id): tests[test_id] += 1
     return {"note": "ok", "failure_rate_by_job_name": {name: {"failed": failed[name], "total": total, "rate": round(failed[name] / total, 4)} for name, total in sorted(totals.items())}, "frequent_failing_test_ids": dict(tests.most_common(20))}
 
 
-def build_report(days: int = 7, *, ci: bool = False, now: float | None = None) -> dict[str, Any]:
+def build_report(days: int = 7, *, ci: bool = False, repo: str | None = None,
+                 now: float | None = None) -> dict[str, Any]:
     if isinstance(days, bool) or not isinstance(days, int) or days < 1:
         raise ValueError("days must be a positive integer")
     now = time.time() if now is None else now
@@ -296,7 +304,7 @@ def build_report(days: int = 7, *, ci: bool = False, now: float | None = None) -
     report = {"window_days": days, "execution": _execution(None if orchestration is None else orchestration.execution_queue_root, since),
               "consultations": _consultations(broker_root, since), "local_queue": _local_queue(None if orchestration is None else orchestration.local_queue_root, since),
               "stage_health": _stages(None if orchestration is None else orchestration.capacity_db, since, now)}
-    if ci: report["ci"] = _ci()
+    if ci: report["ci"] = _ci(repo)
     return report
 
 
@@ -313,8 +321,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--ci", action="store_true")
+    parser.add_argument("--repo", help="GitHub repository owner/name for --ci")
     args = parser.parse_args(argv)
-    try: report = build_report(args.days, ci=args.ci)
+    try: report = build_report(args.days, ci=args.ci, repo=args.repo)
     except ValueError as exc: parser.error(str(exc))
     print(json.dumps(report, sort_keys=True) if args.json else _markdown(report), end="")
     return 0
