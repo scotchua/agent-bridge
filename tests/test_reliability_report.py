@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent_bridge import reliability_report
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from agent_bridge import reliability_report  # noqa: E402
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "reliability_report"
