@@ -86,10 +86,10 @@ class OrchestrationServerTests(unittest.TestCase):
 
     def test_consultation_server_remains_unchanged_and_separate(self):
         self.assertEqual(set(build_consultation_tools("codex")), {
-            "claude_start", "claude_continue", "claude_poll", "claude_read", "claude_close",
+            "claude_start", "claude_continue", "claude_poll", "claude_read", "claude_close", "bridge_status",
         })
         self.assertEqual(set(build_consultation_tools("claude")), {
-            "codex_start", "codex_continue", "codex_poll", "codex_read", "codex_close",
+            "codex_start", "codex_continue", "codex_poll", "codex_read", "codex_close", "bridge_status",
         })
         self.assertFalse(set(build_consultation_tools("codex")) & {
             "work_route_local", "stage_claim", "orchestration_status",

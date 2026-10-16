@@ -18,7 +18,7 @@ import os
 import sys
 from typing import Any, Callable
 
-from . import broker, store
+from . import broker, revision, store
 from .config import Config, load as load_config
 from .errors import BrokerError, ErrorCategory, hint
 
@@ -185,7 +185,7 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
     continue_schema = _continue_schema(peer, allowed)
     start_schema["properties"]["prompt"]["maxLength"] = cfg.prompt_budget("start") if cfg else 32000
     continue_schema["properties"]["prompt"]["maxLength"] = cfg.prompt_budget("continue") if cfg else 16000
-    return {
+    tools = {
         f"{peer}_start": {
             "description": (
                 f"Ask {peer} for an independent second opinion on a bounded question, "
@@ -240,6 +240,12 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
             "handler": broker.close,
         },
     }
+    tools["bridge_status"] = {
+        "description": "Read this consultation server's revision status. Contains no consultation content.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+        "handler": lambda _cfg, _caller, _args: {"ok": True},
+    }
+    return tools
 
 
 class Server:
@@ -248,6 +254,12 @@ class Server:
             raise ValueError(f"--caller must be one of {broker.CALLERS}")
         self.caller = caller
         self.cfg = cfg
+        self._code_revision = revision.capture()
+        # Production startup always receives Config.  Keep the lightweight
+        # in-memory test doubles usable without treating an arbitrary object
+        # as a filesystem path.
+        if isinstance(cfg, Config):
+            revision.record(cfg.state(f"consultation-server-{caller}.json"), self._code_revision)
         self.tools = build_tools(caller, cfg)
 
     # ---- JSON-RPC plumbing ---------------------------------------------
@@ -315,6 +327,8 @@ class Server:
         handler: Callable[..., dict[str, Any]] = spec["handler"]
         try:
             payload = handler(self.cfg, self.caller, args)
+            if name == "bridge_status":
+                payload.update(revision.report(self._code_revision))
         except BrokerError as exc:
             payload = broker.error_response(exc.category)
         except Exception:  # noqa: BLE001

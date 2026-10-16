@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 from ..platform import platform as host_platform
+from .. import revision
+from .. import store
 from . import autoroute
 from .config import load
 from .execution_queue import (
@@ -172,6 +174,10 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     cfg = load(config_path)
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
+    try:
+        revision.record(str(cfg.execution_queue_root / "execution-worker-status.json"), revision.capture())
+    except OSError as exc:
+        raise ExecutionAdmissionError("execution_worker_status_unavailable") from exc
     return ExecutionQueue(
         cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
         model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
@@ -199,9 +205,27 @@ def run(config_path: str, *, once: bool, interval: float,
             # Recovery happens only after this process owns the global lock.
             # Any uncertain prior send becomes blocked and is never repeated.
             queue = _configured_queue(config_path)
-            def run_checked_once() -> dict | None:
+            restart_lock = str(cfg.execution_queue_root / ".execution-restart.lock")
+            restart_request = cfg.execution_queue_root / ".execution-restart-request.json"
+
+            def run_checked_once() -> tuple[dict | None, bool]:
+                # The restart command takes this lock while it scans durable
+                # state and writes its request. Holding it through run_once
+                # means it can never observe "idle" in the gap before this
+                # worker claims a job. A requested restart therefore exits at
+                # an idle boundary and never terminates a provider run.
+                with store.file_lock(restart_lock):
+                    if restart_request.is_file():
+                        try:
+                            restart_request.unlink()
+                        except OSError:
+                            raise ExecutionAdmissionError("execution_worker_restart_request_unavailable")
+                        return None, True
+                    return _run_checked_once(queue, identity, config_path), False
+
+            def _run_checked_once(queue: ExecutionQueue, worker: str, path: str) -> dict | None:
                 from .. import drift
-                status = drift.quick_check(config_path)
+                status = drift.quick_check(path)
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
                 holds: dict[str, str] = {}
@@ -210,14 +234,18 @@ def run(config_path: str, *, once: bool, interval: float,
                 if "claude" in changed:
                     holds["claude"] = "claude"
                 queue.hold_dependencies(holds)
-                return queue.run_once(identity)
+                return queue.run_once(worker)
             if once:
-                result = run_checked_once()
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is not None:
                     print(f"{result['job_id']} {result['state']}")
                 return 0
             while not stop:
-                result = run_checked_once()
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is None:
                     time.sleep(interval)
             return 0

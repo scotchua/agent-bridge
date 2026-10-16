@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
         print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
         return 2
     if not raw or raw[0] in {"-h", "--help"}:
-        print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor} ...")
+        print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor,restart-worker} ...")
         return 0
     command, rest = raw[0], raw[1:]
     if command == "onboard":
@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "doctor":
         from agent_bridge import drift
         return drift.main(rest)
+    if command == "restart-worker":
+        from agent_bridge import restart_worker
+        return restart_worker.main(rest)
     print(f"unknown command: {command}", file=sys.stderr)
     return 2
 

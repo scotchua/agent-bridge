@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from ..capacity_router import StageRouter
+from .. import revision
 from ..localq.intake import AutomaticIntake
 from ..localq.service import Service
 from . import autoroute, gate
@@ -42,9 +43,14 @@ class Server:
             raise ValueError("interval_invalid")
         self.caller, self.service, self.router = caller, service, router
         self.execution, self.interval = execution, interval
+        self._code_revision = revision.capture()
+        if state_root is not None:
+            revision.record(os.path.join(state_root, f"orchestration-server-{caller}.json"),
+                            self._code_revision)
         self.intake = AutomaticIntake(service.queue)
         self.tools = build_tools(caller, router, service.queue, self.intake, execution,
-                                 state_root=state_root, protected=protected)
+                                 state_root=state_root, protected=protected,
+                                 revision_status=lambda: revision.report(self._code_revision))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._dependency_check = dependency_check

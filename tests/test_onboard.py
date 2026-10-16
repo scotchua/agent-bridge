@@ -317,7 +317,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 messages = [json.loads(line) for line in proc.stdout.splitlines()]
                 names = {t["name"] for m in messages if m.get("id") == 2 for t in m["result"]["tools"]}
-                self.assertEqual(names, {peer + "_" + verb for verb in ("start", "continue", "poll", "read", "close")})
+                self.assertEqual(names, {peer + "_" + verb for verb in ("start", "continue", "poll", "read", "close")} | {"bridge_status"})
             proc = subprocess.run([sys.executable, str(ROOT / "setup_bridge.py"), "serve-local",
                                    "--endpoint", "http://127.0.0.1:11434", "--model", "synthetic-fixture"],
                                   input=requests, capture_output=True, text=True, encoding="utf-8", cwd=tmp, timeout=15)

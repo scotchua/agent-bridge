@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as bridge_config
+from . import revision
 from . import store
 
 CACHE_SECONDS = 600.0
@@ -124,6 +125,35 @@ def _bridge() -> Any | None:
         return bridge_config.load()
     except (OSError, ValueError):
         return None
+
+
+def runtime_revision_status(config_path: str | None = None, *, home: str | None = None) -> dict[str, Any]:
+    """Read long-running process revision markers without contacting clients."""
+    result: dict[str, Any] = {"worker": None, "stale_clients": []}
+    resolved = discover_config(config_path, home=home)
+    if resolved:
+        try:
+            from .orchestration.config import load as load_orchestration_config
+            cfg = load_orchestration_config(resolved)
+            if cfg.execution_queue_root is not None:
+                path = cfg.execution_queue_root / "execution-worker-status.json"
+                if path.is_file():
+                    result["worker"] = revision.read_record(str(path))
+            for caller, label in (("claude", "orchestration (Claude)"),
+                                  ("codex", "orchestration (Codex)")):
+                path = cfg.state_root / f"orchestration-server-{caller}.json"
+                if path.is_file() and revision.read_record(str(path))["code_stale"]:
+                    result["stale_clients"].append(label)
+        except (OSError, ValueError):
+            pass
+    bridge = _bridge()
+    if bridge is not None:
+        for caller, label in (("claude", "consultation (Claude)"),
+                              ("codex", "consultation (Codex)")):
+            path = bridge.state(f"consultation-server-{caller}.json")
+            if os.path.isfile(path) and revision.read_record(path)["code_stale"]:
+                result["stale_clients"].append(label)
+    return result
 
 
 def _executable(name: str, bridge: Any | None) -> str | None:
@@ -513,9 +543,17 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
            force_checks: bool = False, bridge: Any | None = None, runner: Any = _run,
            prequalified_codex: bool = False) -> dict[str, Any]:
     home = _home(home); current = inventory(config_path, home=home, bridge=bridge, runner=runner); baseline = _read_baseline(home)
+    runtime = runtime_revision_status(config_path, home=home)
     needs: list[str] = []; checked: dict[str, Any] = {}; passed: set[str] = set(); changed = changes(current, baseline)
     if not current["config_path"]:
         needs.append("No installed orchestration config was found; pass --config or install the gate, then run setup_bridge.py doctor.")
+    worker_revision = runtime.get("worker")
+    if isinstance(worker_revision, dict) and worker_revision.get("code_stale"):
+        needs.append("Execution worker is running stale code; run setup_bridge.py restart-worker after it is idle.")
+    stale_clients = runtime.get("stale_clients", [])
+    if stale_clients:
+        needs.append("Stale client-owned MCP servers: " + ", ".join(stale_clients)
+                     + ". Restart those sessions or run /reload-plugins.")
     for name, state in current["paths"].items():
         if not state["exists"]: needs.append(f"Configured path {name} is missing; repair the orchestration config and run setup_bridge.py doctor.")
     hooks = current["hooks"]
@@ -591,7 +629,7 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
-    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked}
+    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked, "runtime_revisions": runtime}
 
 
 def quick_check(config_path: str | None = None, *, home: str | None = None) -> dict[str, Any]:

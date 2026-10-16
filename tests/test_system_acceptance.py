@@ -143,8 +143,8 @@ class SystemAcceptanceTests(unittest.TestCase):
     def test_consultation_surfaces_remain_directional_and_unmodified(self):
         cfg = consultation_config(self.temp.name)
         expected = {
-            "codex": {"claude_start", "claude_continue", "claude_poll", "claude_read", "claude_close"},
-            "claude": {"codex_start", "codex_continue", "codex_poll", "codex_read", "codex_close"},
+            "codex": {"claude_start", "claude_continue", "claude_poll", "claude_read", "claude_close", "bridge_status"},
+            "claude": {"codex_start", "codex_continue", "codex_poll", "codex_read", "codex_close", "bridge_status"},
         }
         for caller, names in expected.items():
             with self.subTest(caller=caller):
