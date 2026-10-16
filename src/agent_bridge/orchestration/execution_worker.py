@@ -74,7 +74,9 @@ def _claude_ready(cfg: object) -> bool:
 def _codex_ready() -> bool:
     """Read the isolated Codex lane's ChatGPT login status without changing it."""
 
-    home = Path.home() / ".agent-bridge" / "codex-home"
+    # The same isolated home the harness defaults to, so the probe can never
+    # check a different login from the one the job will use.
+    home = codex_task.DEFAULT_CODEX_HOME
     if not home.is_dir():
         return False
     executable = _provider_executable("codex")
