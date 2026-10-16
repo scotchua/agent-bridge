@@ -495,15 +495,39 @@ class ExecutionQueue:
             receipt_path = directory / "receipt.json"
             if not receipt_path.is_file():
                 continue
-            receipt = _read_json(receipt_path)
+            receipt = self._receipt_for_scan(receipt_path)
+            if receipt is None:
+                # Keep the original bytes as evidence.  A later state report
+                # exposes the fixed queue-health code, but recovery must not
+                # let one damaged receipt prevent unrelated work recovering.
+                continue
             state = receipt.get("state")
             # A claim file is created before a request is marked running.  A
             # process death between those two durable writes is uncertain, so
             # it is reconciled rather than silently retried.
             if state == "running" or (state == "queued" and (directory / "claim.lock").exists()):
-                receipt.update(state="blocked", error="interrupted_requires_reconciliation",
-                               finished_at=self.clock())
-                _atomic_json(receipt_path, receipt)
+                self._block_for_reconciliation(receipt_path, receipt)
+
+    @staticmethod
+    def _receipt_for_scan(path: Path) -> dict[str, Any] | None:
+        """Read one receipt for a queue-wide scan without blocking its peers.
+
+        A receipt that cannot be read remains untouched, because changing it
+        would replace the evidence of why the queue cannot decide its state.
+        Callers that expose aggregate health account for it with a fixed code;
+        no receipt contents or parse error text leave the queue.
+        """
+        try:
+            return _read_json(path)
+        except ExecutionAdmissionError:
+            return None
+
+    def _block_for_reconciliation(self, receipt_path: Path,
+                                  receipt: dict[str, Any]) -> None:
+        """Hold a claimed job when its send outcome cannot be known."""
+        receipt.update(state="blocked", error="interrupted_requires_reconciliation",
+                       finished_at=self.clock())
+        _atomic_json(receipt_path, receipt)
 
     @staticmethod
     def _clean_text(value: Any, label: str, maximum: int = 256) -> str:
@@ -762,7 +786,9 @@ class ExecutionQueue:
                 path = directory / "receipt.json"
                 if not path.is_file():
                     continue
-                receipt = _read_json(path)
+                receipt = self._receipt_for_scan(path)
+                if receipt is None:
+                    continue
                 if receipt.get("state") != "queued":
                     continue
                 dependency = dependencies.get(receipt.get("provider"))
@@ -787,8 +813,16 @@ class ExecutionQueue:
             selected = None
             for directory in sorted(self.root.iterdir()):
                 receipt_path = directory / "receipt.json"
-                receipt = _read_json(receipt_path) if receipt_path.is_file() else {}
+                receipt = self._receipt_for_scan(receipt_path) if receipt_path.is_file() else {}
+                if receipt is None:
+                    continue
                 if receipt.get("state") == "queued" and not receipt.get("waiting_on_dependency"):
+                    # A claim is evidence that a previous worker may already
+                    # have sent this job.  Do not let it starve later jobs,
+                    # but never infer success or send it again.
+                    if (directory / "claim.lock").exists():
+                        self._block_for_reconciliation(receipt_path, receipt)
+                        continue
                     selected = directory
                     break
             if selected is None:
@@ -840,6 +874,12 @@ class ExecutionQueue:
         for directory in self.root.iterdir():
             path = directory / "receipt.json"
             if path.is_file():
-                state = _read_json(path).get("state", "unknown")
+                receipt = self._receipt_for_scan(path)
+                if receipt is None:
+                    # This is intentionally a fixed diagnostic rather than a
+                    # parse error or any untrusted receipt content.
+                    state = "queue_health_receipt_unreadable"
+                else:
+                    state = receipt.get("state", "unknown")
                 states[state] = states.get(state, 0) + 1
         return states
