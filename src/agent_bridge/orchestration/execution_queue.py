@@ -264,7 +264,8 @@ class SubprocessHarnessExecutor:
 
 
 #: The only harness status that means the work is done and verified. Every
-#: other value, including "verification_failed", is a task that did not pass.
+#: other value, including "verification_failed" and "no_patch", is a task
+#: that did not pass.
 HARNESS_COMPLETE = "complete"
 
 #: The complete outcome vocabulary, shared by every executor.
@@ -277,10 +278,11 @@ HARNESS_COMPLETE = "complete"
 #: vocabulary, enforced at the point the queue records a state, is what stops
 #: it becoming one again.
 HARNESS_VERIFICATION_FAILED = "verification_failed"
+HARNESS_NO_PATCH = "no_patch"
 HARNESS_FAILED = "failed"
 HARNESS_ABORTED = "aborted"
 HARNESS_STATUSES = frozenset({HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
-                              HARNESS_FAILED, HARNESS_ABORTED})
+                              HARNESS_NO_PATCH, HARNESS_FAILED, HARNESS_ABORTED})
 
 #: How an execution harness arrived at its status.  These are fixed queue and
 #: Windows-runtime diagnostics, not provider text.  Status reports expose

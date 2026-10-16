@@ -330,10 +330,20 @@ class CodexTaskTests(unittest.TestCase):
             self.run_default()
         self.assertEqual(str(ctx.exception), "Codex exited with status 1: synthetic failure")
 
-    def test_refuses_empty_patch(self):
+    def test_success_without_changes_records_no_patch_not_complete(self):
+        """A successful provider turn with no diff is review evidence only."""
+        requires_confinement(self)
         self._write_fake(mode="nochange")
-        with self.assertRaises(TaskError):
-            self.run_default()
+        result = self.run_default()
+        self.assertEqual(result["status"], "no_patch")
+        self.assertNotIn("patch", result)
+        receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
+        self.assertEqual(receipt["status"], "no_patch")
+        self.assertEqual(receipt["error_detail"],
+                         "provider reported success but produced no patch")
+        self.assertEqual(receipt["last_message_sha256"],
+                         hashlib.sha256(b"codex done\n").hexdigest())
+        self.assertNotEqual(receipt["status"], "complete")
 
     def test_environment_does_not_inherit_api_credentials_or_git_config(self):
         old = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "CODEX_HOME", "GIT_CONFIG_GLOBAL")}
@@ -520,6 +530,16 @@ class CodexExitStatusTests(CodexTaskTests):
         self.assertNotEqual(code, 0)
         self.assertFalse(payload["ok"], payload)
         self.assertEqual(payload["status"], "verification_failed", payload)
+
+    def test_a_successful_provider_turn_without_changes_reports_no_patch(self):
+        requires_confinement(self)
+        self._write_fake(mode="nochange")
+        code, payload = self._main(["git", "diff", "--check"])
+        self.assertEqual(code, 3, payload)
+        self.assertFalse(payload["ok"], payload)
+        self.assertEqual(payload["status"], "no_patch", payload)
+        self.assertEqual(payload["error_detail"],
+                         "provider reported success but produced no patch")
 
     def test_the_failing_check_is_recorded_in_the_receipt(self):
         requires_confinement(self)

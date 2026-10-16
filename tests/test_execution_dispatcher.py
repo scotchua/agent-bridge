@@ -232,6 +232,13 @@ class ExecutionDispatcherTests(unittest.TestCase):
                               "harness_verdict": "read",
                               "stdout": "Synthetic implementation brief"},
              {"harness_status": "verification_failed", "harness_verdict": "read"}),
+            ("no_patch", {"returncode": 3, "harness_ok": False,
+                          "harness_status": "no_patch", "harness_verdict": "read",
+                          "error": "NoPatchError",
+                          "error_detail": "provider reported success but produced no patch"},
+             {"error": "NoPatchError",
+              "error_detail": "provider reported success but produced no patch",
+              "harness_status": "no_patch", "harness_verdict": "read"}),
         )
         details = {}
         for label, outcome, expected in cases:
@@ -258,7 +265,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertNotIn("stdout", status)
         details["timeout"] = (status.get("error_detail"), status.get("harness_verdict"))
 
-        self.assertEqual(len(set(details.values())), 4)
+        self.assertEqual(len(set(details.values())), 5)
 
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")
@@ -542,6 +549,19 @@ class HarnessVerdictTests(unittest.TestCase):
     def test_a_verification_failure_that_exited_zero_is_not_a_success(self):
         self.assertFalse(outcome_is_success(self._made(
             harness_ok=False, harness_status="verification_failed")))
+
+    def test_a_no_patch_outcome_is_not_a_success(self):
+        self.assertFalse(outcome_is_success(self._made(
+            returncode=3, harness_ok=False, harness_status="no_patch")))
+
+    def test_a_no_patch_harness_line_is_a_distinct_non_success(self):
+        summary = _harness_summary(
+            b'{"ok": false, "status": "no_patch", "error": "NoPatchError", '
+            b'"error_detail": "provider reported success but produced no patch"}\n')
+        self.assertEqual(summary["harness_status"], "no_patch")
+        self.assertEqual(summary["harness_verdict"], "read")
+        self.assertFalse(summary["harness_ok"])
+        self.assertFalse(outcome_is_success({"returncode": 3, **summary}))
 
     def test_a_harness_that_said_ok_but_did_not_complete_is_not_a_success(self):
         self.assertFalse(outcome_is_success(self._made(
