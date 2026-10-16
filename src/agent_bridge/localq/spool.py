@@ -397,7 +397,12 @@ class LocalQueue:
         return None
 
     def _read_blob(self, digest: str) -> Any:
-        return json.loads((self.blobs / digest).read_text(encoding="utf-8"))
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("blob digest invalid")
+        raw = (self.blobs / digest).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError("blob content mismatch")
+        return json.loads(raw.decode("utf-8"))
 
     def _admit(self, priority: str) -> ResourceSnapshot:
         try:
@@ -610,6 +615,23 @@ class LocalQueue:
             (now, self._normalized({"outcome": "unknown", "reason": "executor_lease_lost"}), now))
         return cur.rowcount
 
+    def _fail_unreadable_payload(self, job_id: str) -> dict[str, Any]:
+        """Fail a claimed job whose stored input or parameters cannot be read.
+
+        This happens before the backend receives anything, so it is known not
+        to have executed.  Keep the diagnostic fixed: storage exceptions and
+        corrupt contents can include task material.
+        """
+        now = self.clock()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE jobs SET status='failed',updated_at=?,lease_owner=NULL,lease_until=NULL,
+                error='payload_unreadable',disposition_json=? WHERE job_id=?""",
+                       (now, self._normalized({"outcome": "failed", "reason": "payload_unreadable"}),
+                        job_id))
+            db.execute("COMMIT")
+        return self.result(job_id)
+
     def _acquire(self, db: sqlite3.Connection, owner: str, now: float) -> bool:
         until = now + self.caps.lease_seconds
         row = db.execute("SELECT owner,lease_until FROM executor_lock WHERE name='executor'").fetchone()
@@ -679,8 +701,15 @@ class LocalQueue:
                                 row["job_id"]))
                     db.execute("COMMIT")
                 return self.result(row["job_id"])
-        payload = {"task_type": row["task_type"], "input": self._read_blob(row["input_blob"]),
-                   "params": json.loads(row["params_json"]), "job_id": row["job_id"]}
+        try:
+            input_value = self._read_blob(row["input_blob"])
+            params = json.loads(row["params_json"])
+            if not isinstance(input_value, str) or not isinstance(params, dict):
+                raise ValueError("stored payload has an invalid shape")
+        except Exception:
+            return self._fail_unreadable_payload(row["job_id"])
+        payload = {"task_type": row["task_type"], "input": input_value,
+                   "params": params, "job_id": row["job_id"]}
         outcome, result, error = "complete", None, None
         try:
             result = self.backend.run(payload, self.caps.timeout_seconds)
