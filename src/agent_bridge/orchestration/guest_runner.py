@@ -254,8 +254,11 @@ HARNESS_COMPLETE = "complete"
 HARNESS_VERIFICATION_FAILED = "verification_failed"
 HARNESS_FAILED = "failed"
 HARNESS_ABORTED = "aborted"
+#: Shared with the POSIX harnesses: a provider that reports success without
+#: changing anything. It is never a success.
+HARNESS_NO_PATCH = "no_patch"
 HARNESS_STATUSES = (HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
-                    HARNESS_FAILED, HARNESS_ABORTED)
+                    HARNESS_NO_PATCH, HARNESS_FAILED, HARNESS_ABORTED)
 
 ALLOWED_WORKDIR_PREFIXES = ("/root/", "/home/", "/tmp/", "/workspace/")
 
