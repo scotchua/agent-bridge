@@ -459,6 +459,7 @@ class CodexTaskTests(unittest.TestCase):
             "error": "TaskError", "error_detail": "Codex did not report a thread id"})
 
     def test_refuses_ignored_untracked_model_output(self):
+        requires_confinement(self)
         (self.repo / ".gitignore").write_text("ignored.tmp\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "ignore fixture"], cwd=self.repo, check=True)
