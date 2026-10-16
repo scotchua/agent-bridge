@@ -88,9 +88,15 @@ ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=16_000_000
 # Both values are deterministic rather than inherited from the worker. They
-# prevent the two cache classes the narrow cleanup below otherwise handles,
-# and are safe for both Codex generation and confined verification.
+# prevent the two cache classes the narrow cleanup below otherwise handles.
 CACHE_PREVENTION_ENV={"PYTHONDONTWRITEBYTECODE":"1","PYTEST_ADDOPTS":"-p no:cacheprovider"}
+# Verification runs after the patch is captured, so its caches never reach the
+# delivered patch. Disabling pytest's cache plugin there would only break
+# verify commands that need it (`pytest --lf`, the `cache` fixture).
+VERIFICATION_ENV_EXCLUDED=frozenset({"PYTEST_ADDOPTS"})
+
+def _verification_env(env:dict[str,str])->dict[str,str]:
+    return {k:v for k,v in env.items() if k not in VERIFICATION_ENV_EXCLUDED}
 MAX_IGNORED_ARTIFACT_PATHS=20
 MAX_IGNORED_ARTIFACT_PATH_BYTES=512
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
@@ -711,7 +717,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
+            v=_sandboxed(c,fresh,scratch,_verification_env(env),verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,

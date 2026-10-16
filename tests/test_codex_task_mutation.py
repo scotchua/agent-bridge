@@ -97,6 +97,11 @@ class CachePreventionEnvironmentTests(unittest.TestCase):
         self.assertEqual({name: environment[name] for name in task.CACHE_PREVENTION_ENV},
                          task.CACHE_PREVENTION_ENV)
 
+    def test_verification_keeps_pytest_cache_plugin_available(self):
+        environment = task._verification_env(task._env())
+        self.assertNotIn("PYTEST_ADDOPTS", environment)
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
+
 
 class UnlinkBeneathTests(unittest.TestCase):
     def test_unlinks_regular_file_only(self):
