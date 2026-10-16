@@ -31,7 +31,10 @@ def _git(repo_root: str, *args: str) -> str | None:
 
 
 def source_hash(repo_root: str) -> tuple[str, int]:
-    """SHA-256 over the sorted (relpath, filehash) list of implementation files.
+    """SHA-256 over implementation files in top-down walk order.
+
+    Each directory's files are hashed in sorted name order before files in its
+    sorted subdirectories. Directories in _SKIP_DIRS are excluded.
 
     Independent of Git entirely, so it is meaningful on a dirty tree.
     """
