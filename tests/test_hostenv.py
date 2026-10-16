@@ -97,12 +97,19 @@ class ResolveGit(unittest.TestCase):
             candidate.chmod(0o600)
             with patch.dict(hostenv.GIT_CANDIDATES, {"InventedOS": (str(candidate),)}):
                 with self.assertRaises(hostenv.HostCapabilityError) as caught:
-                    hostenv.resolve_git({"PATH": "/no/invented/git"}, system="InventedOS")
+                    if os.name == "nt":
+                        # Windows does not use POSIX execute bits for os.access.
+                        with patch.object(hostenv.os, "access", return_value=False):
+                            hostenv.resolve_git({"PATH": "/no/invented/git"},
+                                                system="InventedOS")
+                    else:
+                        hostenv.resolve_git({"PATH": "/no/invented/git"},
+                                            system="InventedOS")
             self.assertIn(str(candidate), caught.exception.detail)
 
     def test_path_fallback_returns_the_found_executable(self):
         with tempfile.TemporaryDirectory() as temporary:
-            executable = Path(temporary) / "git"
+            executable = Path(temporary) / ("git.exe" if os.name == "nt" else "git")
             executable.write_text("invented program\n", encoding="utf-8")
             executable.chmod(0o700)
             self.assertEqual(hostenv.resolve_git({"PATH": temporary}, system="InventedOS"),
@@ -148,6 +155,7 @@ class HelperSource(unittest.TestCase):
         with self.assertRaises(OSError):
             mount(None, "/invented/tree", 1)
 
+    @unittest.skipIf(os.name == "nt", "Linux mountinfo ordering uses POSIX path separators")
     def test_mount_points_reads_valid_records(self):
         scope, mount_points = self.helper_function("mount_points")
         records = b"1 2 3 4 /invented 5\n2 3 4 5 /invented/deeper 6\n"
@@ -226,10 +234,11 @@ class ConfinementSelectionOffline(unittest.TestCase):
 
 class DescribeOffline(unittest.TestCase):
     def test_reports_git_path_or_its_refusal(self):
-        with patch.object(hostenv, "resolve_git", return_value=Path("/invented/git")), \
+        git_path = Path("/invented/git")
+        with patch.object(hostenv, "resolve_git", return_value=git_path), \
              patch.object(hostenv, "confinement", return_value=hostenv.MACOS_CONFINEMENT):
             self.assertEqual(hostenv.describe("synthetic", system="InventedOS")["git"],
-                             "/invented/git")
+                             str(git_path))
         with patch.object(hostenv, "resolve_git", side_effect=hostenv.HostCapabilityError(
                 "git_unavailable", "invented refusal")), \
              patch.object(hostenv, "confinement", return_value=hostenv.MACOS_CONFINEMENT):
