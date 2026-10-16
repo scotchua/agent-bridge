@@ -227,6 +227,14 @@ def _source_state(repo:Path,env):
             "config_sha256":_sha(repo/".git"/"config"),
             "content":_content_snapshot(repo,env)}
 
+def _source_integrity_reasons(before,after):
+    """Return the closed, operator-safe names of changed source components."""
+    return [code for key,code in (("config_sha256","git_config_changed"),
+                                  ("head","head_changed"),
+                                  ("status","status_changed"),
+                                  ("content","dirty_content_changed"))
+            if before.get(key)!=after.get(key)]
+
 def _require_confinement(classification:str)->hostenv.Confinement:
     """The verification confinement this host will apply, or a named refusal.
 
@@ -701,12 +709,20 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         source_after=_source_state(repo,env)
         source_match=source_after==source_before
         receipt["source_after"]=source_after
+        if not source_match:
+            receipt["source_integrity_reasons"]=_source_integrity_reasons(source_before,source_after)
     except Exception:
         source_match=False
+        receipt["source_integrity_reasons"]=["source_snapshot_unavailable"]
     receipt["source_integrity_match"]=source_match
     if not cleanup_ok:
         receipt.update(status="failed",error="WorktreeCleanupError",finished_at=time.time())
     elif not source_match:
+        if pending_exc is not None:
+            # Keep the first fixed harness diagnostic beside the authoritative
+            # integrity failure, rather than replacing it with a bare class.
+            receipt["prior_harness_failure"]={key:receipt[key] for key in ("error","error_detail")
+                                                if key in receipt}
         receipt.update(status="failed",error="SourceIntegrityError",finished_at=time.time())
     elif pending_exc is not None:
         receipt.update(status="failed",error=type(pending_exc).__name__,finished_at=time.time())
@@ -716,7 +732,7 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         receipt["status"]="verification_failed"
     _atomic_json(job/"receipt.json",receipt)
     if not cleanup_ok: raise TaskError("disposable worktree cleanup failed")
-    if not source_match: raise TaskError("source repository integrity changed during task")
+    if not source_match: raise TaskError("source repository integrity changed: "+",".join(receipt["source_integrity_reasons"]))
     if pending_exc is not None: raise pending_exc
     return {**receipt,"job_dir":str(job),"patch":str(job/"changes.patch")}
 

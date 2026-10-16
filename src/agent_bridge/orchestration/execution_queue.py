@@ -741,10 +741,20 @@ class ExecutionQueue:
         return directory
 
     def status(self, job_id: str) -> dict[str, Any]:
-        receipt = _read_json(self._directory(job_id) / "receipt.json")
+        directory = self._directory(job_id)
+        receipt = _read_json(directory / "receipt.json")
         answer = {"job_id": job_id, "state": receipt["state"],
                 "caller": receipt["caller"], "provider": receipt["provider"],
                 "classification": receipt["classification"]}
+        # A harness snapshots its source checkout for the full provider run.
+        # Naming that checkout while the job is running lets an operator avoid
+        # concurrent Git operations.  It is not task or model output, and it
+        # disappears from the status surface once the job is terminal.
+        if receipt["state"] == "running":
+            request = _read_json(directory / "request.json")
+            repo = request.get("repo")
+            if isinstance(repo, str):
+                answer["active_repository"] = repo
         # Keep status a deliberately small, safe projection of the private
         # receipt.  In particular, stdout, stderr, a brief, and arbitrary
         # executor fields never belong on this read-only polling surface.

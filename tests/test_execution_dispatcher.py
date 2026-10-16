@@ -358,6 +358,18 @@ class ExecutionDispatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionAdmissionError, "worker_not_configured"):
             status_only.run_once("mcp-process")
 
+    def test_running_status_names_the_active_repository_only_while_running(self):
+        job = self.submit()
+        directory = self.root / "queue" / job["job_id"]
+        receipt = json.loads((directory / "receipt.json").read_text())
+        receipt["state"] = "running"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
+                         str(self.repo.resolve()))
+        receipt["state"] = "failed"
+        (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertNotIn("active_repository", self.queue.status(job["job_id"]))
+
     def test_restart_blocks_claimed_but_not_yet_running_job(self):
         job = self.submit()
         directory = self.root / "queue" / job["job_id"]
@@ -397,9 +409,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(restarted.run_once("worker-1"),
                          {"job_id": valid["job_id"], "state": "complete",
                           "caller": "codex", "provider": "claude",
-                          "classification": "synthetic",
-                          "harness_status": "complete", "harness_verdict": "read",
-                          "finished_at": 101.0})
+                          "classification": "synthetic", "harness_status": "complete",
+                          "harness_verdict": "read", "finished_at": 101.0})
         self.assertEqual([request["job_id"] for request in self.fake.requests],
                          [valid["job_id"]])
         self.assertEqual(restarted.result(claimed["job_id"])["state"], "blocked")

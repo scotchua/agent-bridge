@@ -112,7 +112,7 @@ def event(obj):
     sys.stdout.flush()
 
 
-if MODE != "noeventid":
+if MODE not in ("noeventid", "corrupt_config_noevent"):
     event({{"type": "thread.started", "thread_id": "fake-thread-1"}})
 
 if MODE == "fail":
@@ -134,6 +134,13 @@ if MODE == "corrupt" and CORRUPT_TARGET:
     # the fake is a plain script with none of Codex's real OS confinement.
     with open(CORRUPT_TARGET, "w", encoding="utf-8") as handle:
         handle.write("corrupt\\n")
+
+if MODE == "corrupt_config_noevent" and CORRUPT_TARGET:
+    # A concurrent Git configuration write is source mutation too.  Pair it
+    # with a fixed harness failure so the receipt proves that diagnosis stays
+    # available after integrity becomes the authoritative failure.
+    with open(CORRUPT_TARGET, "w", encoding="utf-8") as handle:
+        handle.write("[core]\\n\\tbare = false\\n")
 
 if MODE != "nomessage" and last_message:
     with open(last_message, "w", encoding="utf-8") as handle:
@@ -437,6 +444,19 @@ class CodexTaskTests(unittest.TestCase):
         # Detection fails the job closed. The harness must not guess how to
         # restore an operator checkout after an external process changed it.
         self.assertEqual((self.repo / "value.txt").read_text(), "corrupt\n")
+
+    def test_git_config_change_has_a_reason_and_keeps_the_first_failure(self):
+        requires_confinement(self)
+        self._write_fake(mode="corrupt_config_noevent",
+                         corrupt_target=str(self.repo / ".git" / "config"))
+        with self.assertRaisesRegex(TaskError, "git_config_changed"):
+            self.run_default()
+        receipt_path = next((self.root / "tasks").glob("*/receipt.json"))
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["error"], "SourceIntegrityError")
+        self.assertEqual(receipt["source_integrity_reasons"], ["git_config_changed"])
+        self.assertEqual(receipt["prior_harness_failure"], {
+            "error": "TaskError", "error_detail": "Codex did not report a thread id"})
 
     def test_refuses_ignored_untracked_model_output(self):
         (self.repo / ".gitignore").write_text("ignored.tmp\n")
