@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping
 from agent_bridge.platform import platform as host_platform
 
 from ..execution import claude_config, verify_policy
+from ..capacity_router import RoutingError, StageRouter
 from . import windows_privacy as wpv
 
 
@@ -463,7 +464,9 @@ class ExecutionQueue:
                  recover_interrupted: bool = True,
                  platform: Any = None,
                  model_reserved: Callable[[str], str | None],
-                 client_derived_routes: frozenset[str] = frozenset()):
+                 client_derived_routes: frozenset[str] = frozenset(),
+                 stage_router: StageRouter | None = None,
+                 require_stage_binding: bool = False):
         # A matcher, not a list, and resolved per call rather than captured
         # here. Not a list because the one implementation of what counts as a
         # reserved name lives in ``autoroute``, and two layers enforcing the
@@ -474,6 +477,12 @@ class ExecutionQueue:
         #
         # Required, with no default. See ``reserve_nothing`` for why.
         self._model_reserved = model_reserved
+        # The standalone worker receives the same durable ledger the MCP
+        # dispatcher used. It is absent only from status-only MCP processes
+        # and reusable isolated queue fixtures; the configured worker always
+        # supplies it and therefore always performs the recheck below.
+        self._stage_router = stage_router
+        self._require_stage_binding = require_stage_binding
         self.client_derived_routes = client_derived_routes
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -569,6 +578,27 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("reservation_policy_check_failed") from exc
         if reserved is not None:
             raise ExecutionAdmissionError(f"model_reserved_to_operator:{reserved}")
+
+    def _require_live_stage_binding(self, request: Mapping[str, Any]) -> None:
+        """Re-read the ledger binding immediately before provider execution.
+
+        This read has no recovery side effects.  In particular, an expired
+        lease remains for an operator to reconcile; a worker must never renew
+        or reassign it merely to get a queued provider call underway.
+        """
+        if self._stage_router is None:
+            if self._require_stage_binding:
+                raise ExecutionAdmissionError("execution_stage_ledger_unavailable")
+            return
+        try:
+            self._stage_router.require_live_execution_binding(
+                request.get("item_id"), request.get("stage"),
+                owner_id=request.get("owner_id"), route=request.get("provider"),
+                revision=request.get("stage_revision"))
+        except RoutingError as exc:
+            raise ExecutionAdmissionError("execution_stage_binding_invalid") from exc
+        except Exception as exc:  # noqa: BLE001  an unreadable ledger denies
+            raise ExecutionAdmissionError("execution_stage_ledger_unavailable") from exc
 
     def submit(self, *, caller: str, provider: str, repo: str, brief: str,
                base: str, classification: str, model: str, effort: str,
@@ -858,6 +888,11 @@ class ExecutionQueue:
             # root, could have supplied. A cross-provider review found this
             # gap: the worker was handed the matcher and never called it.
             self._refuse_reserved_model(request.get("model"))
+            # A job can wait long enough for its stage to complete, be
+            # reconciled and reassigned, or lose its lease.  The dispatch-time
+            # check is therefore evidence only; this is the binding that may
+            # actually start a provider process.
+            self._require_live_stage_binding(request)
             outcome = self.executor(request, selected)
             validate_outcome(outcome)
             receipt.update(
@@ -869,7 +904,11 @@ class ExecutionQueue:
             # safe to record and both are what an operator needs first. Any
             # other exception's text is unvetted and is replaced by a fixed
             # marker, so a stray message can never reach the receipt.
-            receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())
+            blocked = (isinstance(exc, ExecutionAdmissionError)
+                       and str(exc) in {"execution_stage_binding_invalid",
+                                        "execution_stage_ledger_unavailable"})
+            receipt.update(state="blocked" if blocked else "failed",
+                           error=type(exc).__name__, finished_at=self.clock())
             if isinstance(exc, (ExecutionAdmissionError, OSError)):
                 detail = _clean_diagnostic(str(exc))
             else:

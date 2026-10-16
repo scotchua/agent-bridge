@@ -13,7 +13,8 @@ from agent_bridge.orchestration import config as orchestration_config
 from agent_bridge.orchestration.execution_queue import (
     ExecutionAdmissionError, SubprocessHarnessExecutor)
 from agent_bridge.orchestration.execution_worker import (
-    QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, run, select_executor)
+    QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, _configured_queue, run,
+    select_executor)
 import platform_support
 
 
@@ -75,6 +76,32 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(run(str(config), once=True, interval=0.01,
                              worker_id="test-worker"), 0)
         self._assert_owner_only(state / "execution", 0o700)
+
+    def test_configured_worker_requires_the_configured_stage_ledger(self):
+        executable = self.root / "python"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        codex = self.root / "codex_task.py"
+        claude = self.root / "claude_task.py"
+        codex.write_text("# fake\n", encoding="utf-8")
+        claude.write_text("# fake\n", encoding="utf-8")
+        state = self.root / "state"
+        config = self.root / "orchestration.json"
+        config.write_text(json.dumps({
+            "config_version": "1", "state_root": str(state),
+            "local_queue_root": str(state / "local"),
+            "capacity_db": str(state / "capacity.sqlite3"),
+            "worker_executable": str(executable),
+            "worker_state": str(state / "worker-state"),
+            "execution_queue_root": str(state / "execution"),
+            "codex_task_executable": str(codex),
+            "claude_task_executable": str(claude),
+            "python_executable": str(executable),
+            **(WINDOWS_PATHS if os.name == "nt" else {}),
+        }), encoding="utf-8")
+        queue = _configured_queue(str(config))
+        self.assertTrue(queue._require_stage_binding)
+        self.assertEqual(queue._stage_router.path, state / "capacity.sqlite3")
 
 
 WINDOWS_PATHS = {

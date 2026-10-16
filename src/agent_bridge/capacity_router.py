@@ -24,6 +24,7 @@ review found the original table was evidence in name only:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -351,6 +352,39 @@ class StageRouter:
         result["preferred_routes"] = json.loads(result["preferred_routes"])
         result["is_review"] = bool(result["is_review"])
         return result
+
+    def require_live_execution_binding(self, item_id: object, stage: object, *,
+                                       owner_id: object, route: object,
+                                       revision: object) -> dict:
+        """Return one current execution binding, or refuse without changing it.
+
+        A queued execution request is only an observation of a stage binding.
+        It cannot renew a lease, reconcile an expired owner, or otherwise
+        change stage ownership merely because a worker happened to reach it.
+        The execution worker calls this directly before it starts a provider.
+        """
+        if (not isinstance(item_id, str) or not item_id
+                or not isinstance(stage, str) or not stage
+                or not isinstance(owner_id, str) or not owner_id
+                or route not in ROUTES
+                or isinstance(revision, bool) or not isinstance(revision, int)
+                or revision < 0):
+            raise RoutingError("execution_stage_binding_invalid")
+        current = self.get(item_id, stage)
+        lease_until = current.get("lease_until")
+        now = self.clock()
+        if (current.get("item_id") != item_id or current.get("stage") != stage
+                or current.get("state") != "owned"
+                or current.get("owner_id") != owner_id
+                or current.get("owner_route") != route
+                or current.get("revision") != revision
+                or isinstance(lease_until, bool)
+                or not isinstance(lease_until, (int, float))
+                or not math.isfinite(lease_until)
+                or not isinstance(now, (int, float)) or isinstance(now, bool)
+                or not math.isfinite(now) or lease_until < now):
+            raise RoutingError("execution_stage_binding_invalid")
+        return current
 
     def report(self) -> dict:
         now = self.clock()

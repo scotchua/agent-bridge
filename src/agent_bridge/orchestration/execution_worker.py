@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from ..platform import platform as host_platform
+from ..capacity_router import StageRouter
 from . import autoroute
 from .config import load
 from .execution_queue import (
@@ -175,7 +176,8 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     return ExecutionQueue(
         cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
         model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
-        client_derived_routes=cfg.client_derived_routes)
+        client_derived_routes=cfg.client_derived_routes,
+        stage_router=StageRouter(cfg.capacity_db), require_stage_binding=True)
 
 
 def run(config_path: str, *, once: bool, interval: float,
