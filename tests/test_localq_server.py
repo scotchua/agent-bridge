@@ -5,8 +5,6 @@ import json
 import os
 import sys
 import tempfile
-import threading
-import time
 import unittest
 from unittest import mock
 
@@ -15,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_bridge.localq import server as server_module
 from agent_bridge.localq.server import INSTRUCTIONS, Server
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
+from sqlite_teardown import cleanup_temporary_directory
 
 
 class Sampler:
@@ -39,22 +38,8 @@ class ServerTests(unittest.TestCase):
         self.server = Server(self.service, interval=0.01)
 
     def tearDown(self):
-        self.server.stop()
-        # stop() waits only interval + 1 seconds. On a slow Windows runner the
-        # executor can still be inside a queue call holding localq.sqlite3, and
-        # Windows refuses to delete an open file. Wait for it, then retry the
-        # cleanup briefly rather than failing on a sharing violation.
-        for thread in threading.enumerate():
-            if thread.name == "localq-executor":
-                thread.join(timeout=30)
-        for attempt in range(50):
-            try:
-                self.temporary.cleanup()
-                return
-            except PermissionError:
-                if attempt == 49:
-                    raise
-                time.sleep(0.1)
+        cleanup_temporary_directory(
+            self.temporary, stop=(self.server.stop,), worker_names=("localq-executor",))
 
     def request(self, method, params=None, request_id=1):
         value = {"jsonrpc": "2.0", "id": request_id, "method": method}

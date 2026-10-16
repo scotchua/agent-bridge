@@ -19,6 +19,7 @@ from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
 from agent_bridge.localq.server import Server as LocalServer
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.mcp_server import Server as ConsultationServer
+from sqlite_teardown import cleanup_temporary_directory
 
 
 class Sampler:
@@ -60,8 +61,8 @@ class SystemAcceptanceTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        self.local_server.stop()
-        self.temp.cleanup()
+        cleanup_temporary_directory(
+            self.temp, stop=(self.local_server.stop,), worker_names=("localq-executor",))
 
     def route(self, caller, **changes):
         args = {
