@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import sysconfig
 import time
@@ -249,22 +250,28 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
     process = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env, shell=False)
-    capture = capture_process(
-        process,
-        stdout_path=receipt_root_path / f".delegate-{invocation_id}.stdout",
-        stderr_path=receipt_root_path / f".delegate-{invocation_id}.stderr",
-        limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=timeout,
-        stdin_data=input_bytes)
-    if capture.failure == "timeout":
-        raise GemmaRefusal("gemma_delegate_timeout")
-    if capture.failure == "output_overflow":
-        raise GemmaRefusal("gemma_delegate_output_overflow")
-    if capture.failure is not None:
-        raise GemmaRefusal("gemma_delegate_unavailable")
-    try:
-        output = (receipt_root_path / f".delegate-{invocation_id}.stdout").read_bytes()
-    except OSError as exc:
-        raise GemmaRefusal("gemma_delegate_unavailable") from exc
+    # The delegate's output is the draft itself and may be client-derived.
+    # Capture it in a private temporary directory that is removed on every
+    # path, so bounding memory never leaves draft content at rest beside the
+    # receipts.
+    with tempfile.TemporaryDirectory(prefix="agent-bridge-gemma-delegate-") as temporary:
+        capture_root = Path(temporary)
+        capture = capture_process(
+            process,
+            stdout_path=capture_root / "stdout",
+            stderr_path=capture_root / "stderr",
+            limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=timeout,
+            stdin_data=input_bytes)
+        if capture.failure == "timeout":
+            raise GemmaRefusal("gemma_delegate_timeout")
+        if capture.failure == "output_overflow":
+            raise GemmaRefusal("gemma_delegate_output_overflow")
+        if capture.failure is not None:
+            raise GemmaRefusal("gemma_delegate_unavailable")
+        try:
+            output = (capture_root / "stdout").read_bytes()
+        except OSError as exc:
+            raise GemmaRefusal("gemma_delegate_unavailable") from exc
     if capture.returncode != 0:
         raise GemmaRefusal("gemma_delegate_unavailable")
 

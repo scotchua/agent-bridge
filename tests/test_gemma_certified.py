@@ -314,9 +314,12 @@ class GemmaInvokeTests(unittest.TestCase):
             with self.assertRaisesRegex(gemma_child.GemmaRefusal,
                                         "gemma_delegate_output_overflow"):
                 self.invoke()
-        captures = list(self.fx["receipts"].glob(".delegate-*.stdout"))
-        self.assertEqual(len(captures), 1)
-        self.assertEqual(captures[0].stat().st_size, 1024)
+        # The capped draft is never left at rest beside the receipts.
+        self.assertEqual(list(self.fx["receipts"].glob(".delegate-*")), [])
+
+    def test_successful_delegate_leaves_no_captured_draft_beside_receipts(self):
+        self.invoke()
+        self.assertEqual(list(self.fx["receipts"].glob(".delegate-*")), [])
 
     def test_installed_sibling_import_succeeds_without_import_pollution(self):
         sibling = self.fx["install"] / "state_home.py"
