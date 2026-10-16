@@ -130,8 +130,10 @@ class ConfiguredQueueMutationTests(unittest.TestCase):
 
 
 class RunMutationTests(unittest.TestCase):
-    def _context(self, queue, changed=()):
-        cfg = SimpleNamespace(execution_queue_root=Path("invented-queue"))
+    def _context(self, queue, changed=(), **config_values):
+        cfg = SimpleNamespace(execution_queue_root=Path("invented-queue"),
+                              **config_values)
+        queue.queued_providers.return_value = set()
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(worker, "load", return_value=cfg))
@@ -191,6 +193,36 @@ class RunMutationTests(unittest.TestCase):
                          (worker.signal.SIGTERM, "previous"))
         self.assertEqual(signals.call_args_list[-1].args,
                          (worker.signal.SIGINT, "previous"))
+
+    def test_failed_auth_probe_makes_zero_generation_calls_and_restored_auth_runs_job(self):
+        """The same queued route is held before claim, then released on login."""
+
+        queue = mock.Mock()
+        queue.run_once.return_value = {"job_id": "same-job", "state": "complete"}
+        self._context(queue, claude_config_dir=Path("/invented/claude-home"))
+        queue.queued_providers.return_value = {"claude"}
+        signed_in = {"state": "signed_in", "authMethod": "claude.ai",
+                     "subscriptionType": "max"}
+        with (mock.patch.object(worker.claude_config, "is_ready", return_value=True),
+              mock.patch.object(worker, "_provider_executable", return_value="/fake/claude"),
+              mock.patch.object(worker.health, "auth_status",
+                                side_effect=[{"state": "not_signed_in"}, signed_in])):
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = worker.run("invented-config.json", once=True, interval=1,
+                                   worker_id="worker-invented")
+            self.assertEqual(first, 0)
+            # ``run_once`` is the only worker path that can invoke the
+            # provider harness. It was never reached while auth was absent.
+            queue.run_once.assert_not_called()
+            queue.hold_dependencies.assert_called_once_with(
+                {"claude": worker.READINESS_UNAVAILABLE})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                second = worker.run("invented-config.json", once=True, interval=1,
+                                    worker_id="worker-invented")
+        self.assertEqual(second, 0)
+        queue.run_once.assert_called_once_with("worker-invented")
+        self.assertEqual(queue.hold_dependencies.call_args_list[-1].args[0], {})
 
 
 class MainMutationTests(unittest.TestCase):

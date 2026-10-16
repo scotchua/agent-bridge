@@ -808,6 +808,28 @@ class ExecutionQueue:
                     receipt.pop("waiting_on_dependency", None)
                 _atomic_json(path, receipt)
 
+    def queued_providers(self) -> set[str]:
+        """Providers named by queued work, including work currently held.
+
+        The worker uses this read-only view to probe only routes that have
+        work waiting.  Held receipts stay in the view so a restored login can
+        release the same job without changing its ID or route.
+        """
+
+        providers: set[str] = set()
+        with self._lock:
+            for directory in self.root.iterdir():
+                path = directory / "receipt.json"
+                if not path.is_file():
+                    continue
+                receipt = self._receipt_for_scan(path)
+                if receipt is None or receipt.get("state") != "queued":
+                    continue
+                provider = receipt.get("provider")
+                if provider in PROVIDER_FOR_CALLER.values():
+                    providers.add(provider)
+        return providers
+
     def result(self, job_id: str) -> dict[str, Any]:
         directory = self._directory(job_id)
         receipt = _read_json(directory / "receipt.json")

@@ -123,6 +123,13 @@ class QueueMutationTests(unittest.TestCase):
         self.queue.hold_dependencies({})
         self.assertNotIn("waiting_on_dependency", self.queue.status(pending["job_id"]))
 
+    def test_queued_providers_keeps_a_held_route_visible_for_recovery(self):
+        job = self.submit()
+        self.queue.hold_dependencies({"codex": "provider_readiness_unavailable"})
+        self.assertEqual(self.queue.queued_providers(), {"codex"})
+        self.assertEqual(self.queue.status(job["job_id"])["waiting_on_dependency"],
+                         "waiting_on_dependency:provider_readiness_unavailable")
+
     def test_result_refuses_queued_job_by_name(self):
         job = self.submit()
         with self.assertRaisesRegex(eq.ExecutionAdmissionError, "execution_job_not_terminal"):

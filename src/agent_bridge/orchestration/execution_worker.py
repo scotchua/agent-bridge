@@ -11,11 +11,14 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import shutil
 import socket
 import sys
 import time
 from pathlib import Path
 
+from .. import health, preflight
+from ..execution import claude_config, claude_task, codex_task
 from ..platform import platform as host_platform
 from . import autoroute
 from .config import load
@@ -33,6 +36,81 @@ class WorkerAlreadyRunning(RuntimeError):
 
 class QueueNotPrivate(RuntimeError):
     """The queue root could not be confirmed readable only by its owner."""
+
+
+# This is deliberately one fixed, public-safe dependency annotation.  The
+# status endpoint adds its own ``waiting_on_dependency:`` prefix and exposes
+# no provider output, account details, task material, or inferred quota.
+READINESS_UNAVAILABLE = "provider_readiness_unavailable"
+
+
+def _provider_executable(provider: str) -> str | None:
+    """Find the same PATH-selected CLI the POSIX harness will use."""
+
+    executable = shutil.which(provider, path=os.environ.get("PATH"))
+    return executable if executable and os.path.isabs(executable) else None
+
+
+def _claude_ready(cfg: object) -> bool:
+    """Read the isolated Claude lane's login status without changing it."""
+
+    directory = getattr(cfg, "claude_config_dir", None)
+    if not claude_config.is_ready(directory):
+        return False
+    executable = _provider_executable("claude")
+    if executable is None:
+        return False
+    try:
+        report = health.auth_status("claude", executable,
+                                    claude_task._env(Path(directory)))
+    except Exception:
+        # A probe exception is unknown readiness, never permission to claim.
+        return False
+    return (report.get("state") == "signed_in"
+            and report.get("authMethod") == "claude.ai"
+            and report.get("subscriptionType") in claude_task.ALLOWED_SUBSCRIPTIONS)
+
+
+def _codex_ready() -> bool:
+    """Read the isolated Codex lane's ChatGPT login status without changing it."""
+
+    home = Path.home() / ".agent-bridge" / "codex-home"
+    if not home.is_dir():
+        return False
+    executable = _provider_executable("codex")
+    if executable is None:
+        return False
+    try:
+        # Match the harness's source-integrity guard before allowing the CLI
+        # to inspect its isolated home.  This probe must not read a local MCP
+        # configuration merely to decide whether to hold work.
+        preflight.assert_peer_home_has_no_config(str(home))
+        report = health.auth_status("codex", executable,
+                                    {**codex_task._env(), "CODEX_HOME": str(home)})
+    except Exception:
+        # A probe exception is unknown readiness, never permission to claim.
+        return False
+    return report.get("state") == "signed_in" and report.get("authMethod") == "chatgpt"
+
+
+def readiness_holds(cfg: object, providers: set[str]) -> dict[str, str]:
+    """Return fixed holds for queued providers whose login cannot be proved.
+
+    This is a login-status probe only.  It makes no generation request and
+    does not infer remaining subscription quota from a successful login.  The
+    Windows lane has no equivalent same-lane read-only status command: its
+    credentials live in the WSL guest capsule, so this function deliberately
+    holds nothing there rather than guessing from host-side credentials.
+    """
+
+    if os.name == "nt":
+        return {}
+    holds: dict[str, str] = {}
+    if "claude" in providers and not _claude_ready(cfg):
+        holds["claude"] = READINESS_UNAVAILABLE
+    if "codex" in providers and not _codex_ready():
+        holds["codex"] = READINESS_UNAVAILABLE
+    return holds
 
 
 class WorkerLock:
@@ -209,7 +287,18 @@ def run(config_path: str, *, once: bool, interval: float,
                     holds["codex"] = "codex"
                 if "claude" in changed:
                     holds["claude"] = "claude"
+                providers = queue.queued_providers()
+                for provider, reason in readiness_holds(cfg, providers).items():
+                    # Drift is the more specific dependency when both are
+                    # present.  Neither condition changes the requested
+                    # route, and the next pass rechecks both before release.
+                    holds.setdefault(provider, reason)
                 queue.hold_dependencies(holds)
+                # Do not even enter the claim path when every queued job is
+                # waiting on a dependency.  Apart from avoiding a needless
+                # scan, this makes the pre-claim guarantee explicit.
+                if providers and providers.issubset(holds):
+                    return None
                 return queue.run_once(identity)
             if once:
                 result = run_checked_once()
