@@ -1070,6 +1070,10 @@ def test_no_leak_of_peer_output() -> None:
             sb.cleanup()
 
 
+#: Every subprocess API that launches a process.
+_SUBPROCESS_LAUNCH_APIS = frozenset({"Popen", "run", "call", "check_call", "check_output"})
+
+
 def _subprocess_calls_missing_shell_false(path: str, source: str) -> list[str]:
     """Return direct subprocess process-launch calls without ``shell=False``.
 
@@ -1089,7 +1093,7 @@ def _subprocess_calls_missing_shell_false(path: str, source: str) -> list[str]:
                     modules.add(imported.asname or "subprocess")
         elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
             for imported in node.names:
-                if imported.name in {"Popen", "run"}:
+                if imported.name in _SUBPROCESS_LAUNCH_APIS:
                     functions.add(imported.asname or imported.name)
 
     missing: list[str] = []
@@ -1100,7 +1104,7 @@ def _subprocess_calls_missing_shell_false(path: str, source: str) -> list[str]:
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id in modules
-            and node.func.attr in {"Popen", "run"}
+            and node.func.attr in _SUBPROCESS_LAUNCH_APIS
         ) or (
             isinstance(node.func, ast.Name) and node.func.id in functions
         )
@@ -1120,6 +1124,12 @@ def test_shell_false_ast_check() -> None:
           _subprocess_calls_missing_shell_false("fixture.py", fixture)
           == ["fixture.py:2: subprocess call must pass shell=False"],
           str(_subprocess_calls_missing_shell_false("fixture.py", fixture)))
+    for api in ("call", "check_call", "check_output"):
+        launch = f"subprocess.{api}(['bad'])\n"
+        check(f"subprocess.{api} without shell=False is found",
+              _subprocess_calls_missing_shell_false("fixture.py", launch)
+              == ["fixture.py:1: subprocess call must pass shell=False"],
+              str(_subprocess_calls_missing_shell_false("fixture.py", launch)))
 
 
 def test_no_shell_execution() -> None:
