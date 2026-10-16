@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, drift, onboard, store
+from . import config, drift, onboard, python_runtime, store
 from .chat.grok import ALLOWED_COMMANDS, REQUIRED_MANIFEST_KEYS
 from .chat.windows_security import prepare_private_directory
 from .orchestration import autoroute, delegation, gate
@@ -379,12 +379,13 @@ def undo(home: str, *, out: Callable[[str], None] = print) -> int:
 
 
 def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], None] = print,
-        platform: str | None = None) -> int:
+    platform: str | None = None) -> int:
     platform = platform or sys.platform
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         out("Refusing to run as root. Run this upgrade as your normal user.")
         return 1
     home = os.path.abspath(home)
+    python_runtime.record(home=home)
     out("This checks first and changes nothing until you say yes at the end.")
     states = detect(home, platform=platform)
     if states["bridge_base"]["state"] == "available":

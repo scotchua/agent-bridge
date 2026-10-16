@@ -12,7 +12,11 @@
 set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(dirname -- "$HERE")
-PY=${AGENT_BRIDGE_PYTHON:-python3}
+. "$HERE/agent-bridge-python"
+python_available=true
+if ! agent_bridge_resolve_python; then
+  python_available=false
+fi
 export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
 # Both hosts emit raw UTF-8 and the gate decodes its payload as UTF-8
@@ -23,6 +27,10 @@ export PYTHONUTF8=1
 # meaningful and must be passed through rather than turned into a decision.
 case "${1:-}" in
   install|report|audit|-h|--help)
+    if [ "$python_available" = false ]; then
+      printf '%s\n' "$AGENT_BRIDGE_PYTHON_FAILURE" >&2
+      exit 2
+    fi
     exec "$PY" -P -m agent_bridge.orchestration.gate "$@"
     ;;
 esac
@@ -39,6 +47,15 @@ for word in "$@"; do
   fi
   previous=$word
 done
+
+if [ "$python_available" = false ]; then
+  if [ "$post_event" = true ]; then
+    printf '%s\n' "{}"
+    exit 0
+  fi
+  printf '%s\n' "{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"delegation-first gate: ${AGENT_BRIDGE_PYTHON_FAILURE}; nothing is implemented until the installation is repaired [gate_launcher_failed]\"}}"
+  exit 0
+fi
 
 # Do not let a child that has printed a decision make that decision visible
 # until it has exited cleanly.  A signal after stdout was written used to make

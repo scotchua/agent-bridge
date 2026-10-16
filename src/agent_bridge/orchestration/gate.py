@@ -2618,6 +2618,9 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
         report["backups"] = _commit_updates(updates, originals, shared_paths=host_owned)
         if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
+        if not remove:
+            from .. import python_runtime
+            report["python"] = python_runtime.record(home=home)
         report["applied"] = True
     report["codex_note"] = (
         "Codex runs a new or changed hook only after it is trusted once in its /hooks view "

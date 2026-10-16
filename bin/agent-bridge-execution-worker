@@ -3,7 +3,8 @@
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(dirname -- "$HERE")
-PY=${AGENT_BRIDGE_PYTHON:-python3}
+. "$HERE/agent-bridge-python"
+agent_bridge_resolve_python || { printf '%s\n' "$AGENT_BRIDGE_PYTHON_FAILURE" >&2; exit 2; }
 export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
 exec "$PY" -P -m agent_bridge.orchestration.execution_worker "$@"

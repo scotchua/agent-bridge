@@ -19,7 +19,7 @@ import tempfile
 import sys
 from typing import Any
 
-from . import config, preflight, store
+from . import config, preflight, python_runtime, store
 
 #: Places a Claude or Codex CLI commonly lands, beyond whatever is on PATH.
 EXTRA_LOOKUP = {
@@ -323,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex", help="Force a specific codex binary.")
     args = parser.parse_args(argv)
     store.set_umask()
+    python_runtime.record()
 
     if args.write:
         print("Direct --write activation is disabled. Emit a --candidate, run "

@@ -20,6 +20,12 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor} ...")
         return 0
     command, rest = raw[0], raw[1:]
+    # These commands are the durable setup and maintenance paths.  Preserve
+    # their working interpreter for desktop-launched hooks and MCP servers,
+    # whose PATH is often much smaller than an interactive shell's.
+    if command in {"onboard", "upgrade"}:
+        from agent_bridge import python_runtime
+        python_runtime.record()
     if command == "onboard":
         from agent_bridge import onboard
         return onboard.main(rest)

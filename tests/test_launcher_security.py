@@ -52,7 +52,7 @@ class LauncherSecurityTests(unittest.TestCase):
                 text = (ROOT / "bin" / name).read_text(encoding="utf-8")
                 self.assertIn('export PYTHONPATH="$REPO/src"', text)
                 self.assertNotIn("$PYTHONPATH", text)
-                self.assertIn('PY=${AGENT_BRIDGE_PYTHON:-python3}', text)
+                self.assertIn('. "$HERE/agent-bridge-python"', text)
                 self.assertIn('exec "$PY" -P -m ', text)
             with self.subTest(launcher=name, platform="windows"):
                 text = (ROOT / "bin" / f"{name}.cmd").read_text(encoding="utf-8")
