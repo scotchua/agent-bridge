@@ -4,10 +4,15 @@ import json
 import io
 import importlib.util
 import sys
+import time
 import unittest
-from unittest.mock import patch
+import uuid
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from test_chat_storage import StorageTests
+from agent_bridge import store
+from agent_bridge.chat import grok
 from agent_bridge.chat.grok import GrokAdapter, receive, respond, job_path
 from agent_bridge.chat.policy import RoomPolicy
 
@@ -153,3 +158,100 @@ class GrokTests(StorageTests):
         with self.assertRaisesRegex(SystemExit, '2'):
             with patch.object(sys, 'argv', ['grok_room.py', 'reply', '00000000-0000-0000-0000-000000000000', '--file', 'reply.txt']):
                 grok_room.main()
+
+    def test_job_path_rejects_noncanonical_uuid(self):
+        with self.assertRaises(ValueError):
+            job_path(Path(self.temp.name), 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA')
+
+    def test_load_record_accepts_maximum_reply_length(self):
+        adapter = self.adapter('maximum-reply')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works room history', 'synthetic')
+        receive(adapter.root, wait=0)
+        reply = 'R' * 100000
+        respond(adapter.root, job['job_id'], reply)
+        self.assertEqual(adapter.read(job['job_id'])['peer_response'], reply)
+
+    def test_cleanup_removes_old_valid_record(self):
+        root = Path(self.temp.name) / 'old-record'
+        root.mkdir()
+        job_id = str(uuid.uuid4())
+        path = job_path(root, job_id)
+        store.atomic_write_json(str(path), {'job_id': job_id, 'status': 'cancelled', 'expires': 1})
+        old = time.time() - grok.JOB_RETENTION_SECONDS - 10
+        os.utime(path, (old, old))
+        grok._cleanup(root)
+        self.assertFalse(path.exists())
+
+    def test_restart_preserves_completed_reply(self):
+        adapter = self.adapter('completed-restart')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works quarterly summary', 'synthetic')
+        receive(adapter.root, wait=0)
+        respond(adapter.root, job['job_id'], 'Approved draft reply')
+        GrokAdapter(adapter.root, RoomPolicy(False))
+        self.assertEqual(adapter.read(job['job_id'])['peer_response'], 'Approved draft reply')
+
+    def test_status_rejects_heartbeat_at_stale_boundary(self):
+        adapter = self.adapter('stale-boundary')
+        receive(adapter.root, wait=0)
+        (adapter.root / 'heartbeat.json').write_text('{"at": 10}', encoding='utf-8')
+        with patch.object(grok, 'time', SimpleNamespace(time=lambda: 100)):
+            self.assertEqual(adapter.status()['state'], 'connection_required')
+
+    def test_status_requires_private_directory_verification(self):
+        adapter = self.adapter('directory-check')
+        receive(adapter.root, wait=0)
+        with patch.object(grok, 'verify_private_directory', side_effect=ValueError('unsafe directory')):
+            self.assertEqual(adapter.status()['state'], 'connection_required')
+
+    def test_continue_rejects_empty_prompt(self):
+        adapter = self.adapter('empty-prompt')
+        receive(adapter.root, wait=0)
+        with self.assertRaises(ValueError):
+            adapter.continue_(str(uuid.uuid4()), '', 'synthetic')
+        self.assertEqual(set(adapter.root.glob('*.json')), {adapter.root / 'bot-manifest.json', adapter.root / 'heartbeat.json'})
+
+    def test_poll_times_out_at_exact_expiry(self):
+        adapter = self.adapter('exact-expiry')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works ledger review', 'synthetic')
+        expires = json.loads(job_path(adapter.root, job['job_id']).read_text(encoding='utf-8'))['expires']
+        with patch.object(grok, 'time', SimpleNamespace(time=lambda: expires)):
+            self.assertEqual(adapter.poll(job['job_id'])['status'], 'timed_out')
+
+    def test_cancel_removes_queued_record(self):
+        adapter = self.adapter('cancel-queued')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works draft', 'synthetic')
+        path = job_path(adapter.root, job['job_id'])
+        adapter.cancel(job['job_id'])
+        self.assertFalse(path.exists())
+
+    def test_receive_caps_wait_at_45_seconds(self):
+        adapter = self.adapter('wait-cap')
+        clock = SimpleNamespace(time=time.time, monotonic=Mock(side_effect=[0, 44.5, 45]), sleep=Mock())
+        with patch.object(grok, 'time', clock):
+            self.assertIsNone(receive(adapter.root, wait=100))
+        clock.sleep.assert_called_once_with(0.5)
+
+    def test_respond_rejects_blank_reply(self):
+        adapter = self.adapter('blank-reply')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works analysis', 'synthetic')
+        receive(adapter.root, wait=0)
+        with self.assertRaises(ValueError):
+            respond(adapter.root, job['job_id'], '   ')
+        self.assertEqual(adapter.poll(job['job_id'])['status'], 'running')
+
+    def test_respond_rejects_expired_running_record(self):
+        adapter = self.adapter('expired-reply')
+        receive(adapter.root, wait=0)
+        job = adapter.start('Orchid Works analysis', 'synthetic')
+        receive(adapter.root, wait=0)
+        path = job_path(adapter.root, job['job_id'])
+        record = json.loads(path.read_text(encoding='utf-8'))
+        record['expires'] = 1
+        store.atomic_write_json(str(path), record)
+        with self.assertRaises(ValueError):
+            respond(adapter.root, job['job_id'], 'Delayed reply')

@@ -1,9 +1,13 @@
 """Synthetic regressions for status, classification, and recovery diagnostics."""
 import json
+import io
 import os
 import sys
 import tempfile
 import unittest
+import uuid
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -99,6 +103,154 @@ class HealthTests(unittest.TestCase):
                 report = health.inspect_peer(sb.cfg, 'codex');auth.assert_not_called()
             self.assertEqual(report['preflight'], 'peer_home_config_present')
         finally:sb.cleanup()
+
+
+class HealthMutationAuthTests(unittest.TestCase):
+    def test_probe_limits_and_failure_reason(self):
+        failed = result(b'{"loggedIn":true}', spawn_failed=True)
+        with patch.object(runner, 'run', return_value=failed) as call:
+            report = health.auth_status('claude', '/synthetic/claude', {})
+        self.assertEqual(report['probe_error'], 'spawn_failed')
+        self.assertEqual(report['state'], 'unknown')
+        self.assertEqual({key: call.call_args.kwargs[key] for key in
+                          ('timeout', 'grace', 'stdout_cap', 'stderr_cap')},
+                         {'timeout': 20, 'grace': 1, 'stdout_cap': 32768,
+                          'stderr_cap': 32768})
+
+    def test_claude_allowlist_and_signout_codes(self):
+        data = {'loggedIn': False, 'authMethod': 'api_key',
+                'apiProvider': 'bedrock', 'subscriptionType': 'team',
+                'email': 'person@example.invalid'}
+        for code in (0, 1):
+            with self.subTest(code=code), patch.object(
+                    runner, 'run', return_value=result(json.dumps(data).encode(), code=code)):
+                report = health.auth_status('claude', '/synthetic/claude', {})
+            self.assertEqual(report['state'], 'not_signed_in')
+            self.assertEqual(report['authMethod'], 'api_key')
+            self.assertEqual(report['apiProvider'], 'bedrock')
+            self.assertEqual(report['subscriptionType'], 'team')
+            self.assertNotIn('email', report)
+        data['loggedIn'] = True
+        with patch.object(runner, 'run', return_value=result(json.dumps(data).encode(), code=1)):
+            self.assertEqual(health.auth_status('claude', '/synthetic/claude', {})['state'],
+                             'unknown')
+
+    def test_codex_status_needs_approved_text_and_exit(self):
+        cases = [(b'No credentials', 1, 'not_signed_in', None),
+                 (b'Not logged in', 1, 'not_signed_in', None),
+                 (b'Logged in using ChatGPT', 0, 'signed_in', 'chatgpt'),
+                 (b'Logged in using ChatGPT', 1, 'unknown', None),
+                 (b'Logged in using an API key', 0, 'signed_in', 'api_key')]
+        for output, code, state, method in cases:
+            with self.subTest(output=output, code=code), patch.object(
+                    runner, 'run', return_value=result(stderr=output, code=code)):
+                report = health.auth_status('codex', '/synthetic/codex', {})
+            self.assertEqual(report['state'], state)
+            self.assertEqual(report.get('authMethod'), method)
+
+
+class HealthMutationInspectTests(unittest.TestCase):
+    def inspect(self, peer, env, path_cli=None):
+        spec = {'executable': '/configured/' + peer, 'allowed_versions': ['approved']}
+        cfg = SimpleNamespace(peer=lambda name: spec)
+        validated = {'executable': spec['executable'], 'realpath': '/validated/' + peer,
+                     'observed_version': 'approved'}
+        with (patch.object(health, 'peer_env', return_value=env),
+              patch.object(health.preflight, 'discover_executable', return_value=path_cli),
+              patch.object(health.preflight, 'check_peer', return_value=validated),
+              patch.object(health.preflight, 'assert_peer_home_has_no_config'),
+              patch.object(runner, 'credential_context', return_value={'home': 'synthetic'}),
+              patch.object(health, 'auth_status', return_value={
+                  'state': 'signed_in', 'network_verified': False})):
+            return health.inspect_peer(cfg, peer)
+
+    def test_claude_storage_precedence_and_report_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            secure = os.path.join(root, 'secure')
+            legacy = os.path.join(root, 'legacy')
+            os.makedirs(secure)
+            os.makedirs(legacy)
+            with open(os.path.join(legacy, '.credentials.json'), 'w') as handle:
+                handle.write('{}')
+            env = {'HOME': root, 'CLAUDE_SECURESTORAGE_CONFIG_DIR': secure,
+                   'CLAUDE_CONFIG_DIR': legacy}
+            report = self.inspect('claude', env)
+            self.assertFalse(report['fallback_file_present'])
+            self.assertIn('Keychain', report['recovery'])
+            self.assertEqual(report['allowed_versions'], ['approved'])
+            self.assertFalse(report['path_differs'])
+            self.assertEqual(report['operator_login_argv'],
+                             ['/validated/claude', 'auth', 'login', '--claudeai'])
+            env.pop('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+            self.assertTrue(self.inspect('claude', env)['fallback_file_present'])
+
+    def test_codex_auth_file_and_recovery(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, 'auth.json'), 'w') as handle:
+                handle.write('{}')
+            report = self.inspect('codex', {'CODEX_HOME': home, 'HOME': home})
+            self.assertTrue(report['auth_file_present'])
+            self.assertIn('isolated CODEX_HOME', report['recovery'])
+            self.assertEqual(report['operator_login_argv'], ['/validated/codex', 'login'])
+
+
+class HealthMutationCommandTests(unittest.TestCase):
+    def run_health(self, rows, peer=None, json_output=False):
+        cfg = SimpleNamespace(raw={'company': 'Maple Ledger Works'})
+        args = SimpleNamespace(peer=peer, json=json_output)
+        with (patch.object(health, 'inspect_peer', side_effect=lambda cfg, name: rows[name]) as inspect,
+              patch.object(health.store, 'utc_now', return_value='2042-03-04T05:06:07Z'),
+              patch.object(health, 'effective_config_sha256', return_value='synthetic-hash')):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = health.cmd_health(cfg, args)
+        return code, output.getvalue(), [call.args[1] for call in inspect.call_args_list]
+
+    def rows(self):
+        return {peer: {'peer': peer, 'auth': {'state': 'signed_in'},
+                       'preflight': 'ok', 'executable': '/validated/' + peer,
+                       'observed_version': 'approved', 'path_differs': peer == 'claude',
+                       'path_executable': '/path/claude' if peer == 'claude' else None,
+                       'context': {'home': 'synthetic'},
+                       'recovery': 'Synthetic recovery steps.'}
+                for peer in ('claude', 'codex')}
+
+    def test_json_report_and_selected_peer(self):
+        rows = self.rows()
+        code, output, called = self.run_health(rows, peer='codex', json_output=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(called, ['codex'])
+        expected = {'checked_at': '2042-03-04T05:06:07Z',
+                    'effective_config_sha256': 'synthetic-hash',
+                    'scope': 'local credential visibility; no network or token-refresh test',
+                    'peers': [rows['codex']]}
+        self.assertEqual(output, json.dumps(expected, indent=2, sort_keys=True) + '\n')
+
+    def test_text_report_includes_diagnostics(self):
+        code, output, called = self.run_health(self.rows())
+        self.assertEqual(code, 0)
+        self.assertEqual(called, ['claude', 'codex'])
+        for text in ('Bridge health: local checks only',
+                     'claude: signed_in (preflight: ok)',
+                     'Bridge CLI: /validated/claude (approved)',
+                     'Different PATH CLI: /path/claude',
+                     'The bridge keeps its tested pin',
+                     'Credential context: {"home": "synthetic"}',
+                     'Synthetic recovery steps.',
+                     'No login or configuration changes were requested',
+                     'codex: signed_in (preflight: ok)'):
+            with self.subTest(text=text):
+                self.assertIn(text, output)
+        self.assertNotIn('Different PATH CLI: None', output)
+
+    def test_exit_status_requires_every_peer_to_pass(self):
+        rows = self.rows()
+        self.assertEqual(self.run_health(rows)[0], 0)
+        rows['codex']['auth']['state'] = 'unknown'
+        self.assertEqual(self.run_health(rows)[0], 1)
+        rows['codex']['auth']['state'] = 'signed_in'
+        rows['codex']['preflight'] = 'preflight_version_mismatch'
+        self.assertEqual(self.run_health(rows)[0], 1)
 
 
 class ClassificationTests(unittest.TestCase):
@@ -198,6 +350,123 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(self.claude(b'Not logged in',1).category,ErrorCategory.PEER_AUTH_FAILURE)
         out=self.codex([{'type':'error','message':'refresh_token_reused'}],1)
         self.assertEqual(out.notes['auth_failure_reason'],'oauth_refresh_rejected')
+
+
+class ClaudeExecutableMutationTests(unittest.TestCase):
+    class Config:
+        def __init__(self, spec=None, cap=4096):
+            self.spec = spec or {}
+            self.cap = cap
+
+        def peer(self, name):
+            return self.spec
+
+        def peer_reasoning_effort(self, name):
+            return None
+
+        def peer_extra_env(self, name):
+            return {}
+
+        def limit(self, name):
+            return self.cap
+
+    def test_executable_uses_pin_then_discovery_then_name(self):
+        with patch('agent_bridge.preflight.discover_executable', return_value='/synthetic/discovered'):
+            self.assertEqual(claude_backend._executable(self.Config({'executable': '/synthetic/pinned'})),
+                             '/synthetic/pinned')
+            self.assertEqual(claude_backend._executable(self.Config()), '/synthetic/discovered')
+        with patch('agent_bridge.preflight.discover_executable', return_value=None):
+            self.assertEqual(claude_backend._executable(self.Config()), 'claude')
+
+
+class ClaudeSessionMutationTests(unittest.TestCase):
+    def test_new_session_id_is_a_canonical_uuid(self):
+        session_id = claude_backend.new_session_id()
+        self.assertEqual(str(uuid.UUID(session_id)), session_id)
+
+
+class ClaudeArgvMutationTests(unittest.TestCase):
+    def test_resume_and_fresh_session_flags_are_distinct(self):
+        cfg = ClaudeExecutableMutationTests.Config({'executable': '/synthetic/claude'})
+        fresh = claude_backend.build_argv(cfg, {}, 'session', False)
+        resumed = claude_backend.build_argv(cfg, {}, 'session', True)
+        self.assertEqual(fresh[fresh.index('--session-id') + 1], 'session')
+        self.assertNotIn('--resume', fresh)
+        self.assertEqual(resumed[resumed.index('--resume') + 1], 'session')
+        self.assertNotIn('--session-id', resumed)
+
+    def test_model_and_zero_budget_are_passed(self):
+        cfg = ClaudeExecutableMutationTests.Config({
+            'executable': '/synthetic/claude', 'model': 'claude-fable', 'max_budget_usd': 0})
+        argv = claude_backend.build_argv(cfg, {}, 'session', False)
+        self.assertEqual(argv[argv.index('--model') + 1], 'claude-fable')
+        self.assertEqual(argv[argv.index('--max-budget-usd') + 1], '0')
+
+    def test_isolation_flags_are_present(self):
+        cfg = ClaudeExecutableMutationTests.Config({'executable': '/synthetic/claude'})
+        argv = claude_backend.build_argv(cfg, {}, 'session', False)
+        self.assertIn('--safe-mode', argv)
+        self.assertIn('--strict-mcp-config', argv)
+        self.assertEqual(argv[argv.index('--mcp-config') + 1], '{"mcpServers":{}}')
+        self.assertEqual(argv[argv.index('--tools') + 1], '')
+
+
+class ClaudePayloadMutationTests(unittest.TestCase):
+    def test_json_string_result_is_extracted(self):
+        self.assertEqual(claude_backend._extract_payload({'result': '{"account":"Maple Works"}'}),
+                         ({'account': 'Maple Works'}, 'envelope.result:json_string'))
+
+    def test_missing_payload_stays_missing(self):
+        self.assertEqual(claude_backend._extract_payload({}), (None, None))
+
+
+class ClaudeConsultationMutationTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = ClaudeExecutableMutationTests.Config({'executable': '/synthetic/claude'})
+
+    def consultation(self, envelope=None, *, stdout=None, cap=4096, **changes):
+        self.cfg.cap = cap
+        if stdout is None:
+            stdout = json.dumps(envelope).encode()
+        run_result = result(stdout, **changes)
+        with patch.object(runner, 'run', return_value=run_result) as call, \
+             patch.object(runner, 'scrubbed_env', return_value={}), \
+             patch.object(runner, 'credential_context', return_value={}):
+            outcome = claude_backend.run_consultation(
+                self.cfg, prompt='synthetic', schema={}, session_id='session',
+                resume=False, workspace='/synthetic/workspace')
+        self.last_run_call = call.call_args
+        return outcome
+
+    def test_default_timeout_and_grace_reach_runner(self):
+        self.consultation({'session_id': 'session', 'result': {'account': 'Maple Works'}})
+        self.assertEqual(self.last_run_call.kwargs['timeout'], 300.0)
+        self.assertEqual(self.last_run_call.kwargs['grace'], 5.0)
+
+    def test_cap_flag_and_exact_limit_reject_output(self):
+        self.assertEqual(self.consultation(stdout=b'{}', cap_exceeded=True).category,
+                         ErrorCategory.PEER_OUTPUT_TOO_LARGE)
+        self.assertEqual(self.consultation(stdout=b'x' * 32, cap=32).category,
+                         ErrorCategory.PEER_OUTPUT_TOO_LARGE)
+
+    def test_single_and_multiple_models_and_zero_cost_are_recorded(self):
+        envelope = {'session_id': 'session', 'result': {'account': 'Maple Works'},
+                    'modelUsage': {'claude-fable-1': {}}, 'total_cost_usd': 0.0}
+        outcome = self.consultation(envelope)
+        self.assertEqual(outcome.category, ErrorCategory.OK)
+        self.assertEqual(outcome.observed_model, 'claude-fable-1')
+        self.assertTrue(outcome.notes['total_cost_present'])
+        envelope['modelUsage']['claude-fable-2'] = {}
+        outcome = self.consultation(envelope)
+        self.assertEqual(outcome.observed_models, ['claude-fable-1', 'claude-fable-2'])
+        self.assertIsNone(outcome.observed_model)
+
+    def test_success_keeps_payload_and_extraction_path(self):
+        outcome = self.consultation({'session_id': 'session',
+                                     'structured_output': {'account': 'Maple Works'}})
+        self.assertEqual(outcome.category, ErrorCategory.OK)
+        self.assertEqual(outcome.payload, {'account': 'Maple Works'})
+        self.assertEqual(outcome.extraction_path, 'envelope.structured_output')
 
 
 if __name__ == '__main__':

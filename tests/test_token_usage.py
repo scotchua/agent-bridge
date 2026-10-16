@@ -27,6 +27,10 @@ class ClaudeUsageTests(unittest.TestCase):
         usage = token_usage.claude_model_usage(None)
         self.assertEqual(usage, {"usage_present": False, "usage": None})
 
+    def test_nonmapping_usage_is_absent(self):
+        self.assertEqual(token_usage.claude_model_usage("invalid usage"),
+                         {"usage_present": False, "usage": None})
+
     def test_partial_usage_has_nulls_and_no_total(self):
         usage = token_usage.claude_model_usage({"claude-a": {"inputTokens": 10}})["usage"]["models"][0]["usage"]
         self.assertEqual(usage["input"], 10)
@@ -36,6 +40,17 @@ class ClaudeUsageTests(unittest.TestCase):
         self.assertIsNone(usage["cost_usd"])
         self.assertIsNone(usage["thinking_subset_of_output"])
         self.assertIsNone(usage["total_reported"])
+
+    def test_nonmapping_model_usage_has_missing_fields(self):
+        recorded = token_usage.claude_model_usage({"claude-fixture": 42})
+        self.assertTrue(recorded["usage_present"])
+        model = recorded["usage"]["models"][0]
+        self.assertEqual(model["model"], "claude-fixture")
+        self.assertEqual(model["usage"], {
+            "input": None, "output": None, "cache_creation": None,
+            "cache_read": None, "cost_usd": None,
+            "thinking_subset_of_output": None, "total_reported": None,
+        })
 
 
 class CodexUsageTests(unittest.TestCase):

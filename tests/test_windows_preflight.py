@@ -36,6 +36,12 @@ def _completed(stdout: bytes, returncode: int = 0):
 
 
 class RunArgvTests(unittest.TestCase):
+    def test_timeout_is_ten_seconds(self):
+        self.assertEqual(wp.COMMAND_TIMEOUT_SECONDS, 10)
+
+    def test_output_limit_is_64_kib(self):
+        self.assertEqual(wp.MAX_COMMAND_OUTPUT_BYTES, 64 * 1024)
+
     def test_uses_shell_false_capture_timeout_and_scrubbed_env(self):
         with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run") as run:
             run.return_value = _completed(b"ok")
@@ -98,6 +104,44 @@ class RunArgvTests(unittest.TestCase):
             outcome = wp._run_argv(["systeminfo.exe"])
             self.assertFalse(outcome.ok)
             self.assertIn("exceeded bound", outcome.detail)
+
+    def test_output_at_limit_is_accepted(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run") as run:
+            run.return_value = _completed(b"x" * (64 * 1024))
+            outcome = wp._run_argv(["systeminfo.exe"])
+            self.assertTrue(outcome.ok)
+
+    def test_stderr_counts_toward_output_limit(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["x"], returncode=0, stdout=b"ok", stderr=b"x" * (64 * 1024)
+            )
+            outcome = wp._run_argv(["systeminfo.exe"])
+            self.assertFalse(outcome.ok)
+            self.assertIn("exceeded bound", outcome.detail)
+
+    def test_non_bytes_output_fails_with_one_argument(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run") as run:
+            run.return_value = _completed(None)
+            outcome = wp._run_argv(["cmd.exe"])
+            self.assertFalse(outcome.ok)
+            self.assertIn("could not decode", outcome.detail)
+
+    def test_utf16_le_without_bom_is_decoded(self):
+        with mock.patch("agent_bridge.orchestration.windows_preflight.subprocess.run") as run:
+            run.return_value = _completed("Enabled\n".encode("utf-16-le"))
+            outcome = wp._run_argv(["powershell.exe"])
+            self.assertTrue(outcome.ok)
+            self.assertEqual(outcome.stdout, "Enabled\n")
+
+    def test_timeout_with_one_argument_is_explicit_failure(self):
+        with mock.patch(
+            "agent_bridge.orchestration.windows_preflight.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="cmd.exe", timeout=10),
+        ):
+            outcome = wp._run_argv(["cmd.exe"])
+            self.assertFalse(outcome.ok)
+            self.assertIn("timed out", outcome.detail)
 
     def test_oserror_is_explicit_failure(self):
         with mock.patch(
@@ -181,7 +225,48 @@ class FeatureStateTests(unittest.TestCase):
             self.assertFalse(result.passed)
 
 
+class FeatureStateArgvTests(unittest.TestCase):
+    def test_non_string_name_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            wp.feature_state_argv(None)
+
+    def test_empty_name_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            wp.feature_state_argv("")
+
+
+class OptionalFeatureTests(unittest.TestCase):
+    def test_invalid_name_returns_failed_check(self):
+        result = wp.collect_optional_feature("")
+        self.assertFalse(result.passed)
+        self.assertIn("feature name", result.detail)
+
+
 class FirmwareVirtualizationTests(unittest.TestCase):
+    def test_nested_model_with_equals_sign_is_parsed(self):
+        output = (
+            "Manufacturer=Fable Systems\nModel=Virtual Machine=Generation 2\n"
+            "VirtualizationFirmwareEnabled=True\nVMMonitorModeExtensions=True\n"
+            "SecondLevelAddressTranslationExtensions=True\n"
+        )
+        with mock.patch.object(wp, "_run_argv", return_value=wp.CommandOutcome(True, "ok", output)):
+            result = wp._collect_nested_virtualization()
+        self.assertTrue(result.passed)
+
+    def test_firmware_line_without_colon_fails(self):
+        output = "Virtualization Enabled In Firmware Yes\n"
+        with mock.patch.object(wp, "_run_argv", return_value=wp.CommandOutcome(True, "ok", output)):
+            result = wp.collect_firmware_virtualization()
+        self.assertFalse(result.passed)
+        self.assertIn("could not parse", result.detail)
+
+    def test_firmware_value_with_extra_colon_fails(self):
+        output = "Virtualization Enabled In Firmware: Yes:unknown\n"
+        with mock.patch.object(wp, "_run_argv", return_value=wp.CommandOutcome(True, "ok", output)):
+            result = wp.collect_firmware_virtualization()
+        self.assertFalse(result.passed)
+        self.assertIn("unknown", result.detail)
+
     def test_nested_probe_uses_the_absolute_system_powershell(self):
         self.assertEqual(
             wp._NESTED_VIRT_ARGV[0],
@@ -297,6 +382,20 @@ class FirmwareVirtualizationTests(unittest.TestCase):
 
 
 class ManifestCheckTests(unittest.TestCase):
+    def test_empty_path_fails_before_loader(self):
+        loader = mock.Mock(return_value=VALID_MANIFEST_RAW)
+        result = wp.collect_manifest_check("", loader)
+        self.assertFalse(result.passed)
+        self.assertIn("no manifest path", result.detail)
+        loader.assert_not_called()
+
+    def test_non_string_expected_hash_fails_validation(self):
+        result = wp.collect_manifest_check(
+            "C:\\manifest.json", lambda p: VALID_MANIFEST_RAW, 42
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("invalid expected rootfs hash", result.detail)
+
     def test_missing_path_fails(self):
         result = wp.collect_manifest_check(None, lambda p: VALID_MANIFEST_RAW)
         self.assertFalse(result.passed)

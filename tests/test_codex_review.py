@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,54 @@ class CodexReviewTests(unittest.TestCase):
     def verify(self, receipt, dispositions, **extra):
         return codex_review.review_verify(repo=self.repo, base=self.base, head=self.head,
                                           receipt=receipt, dispositions=dispositions, **extra)
+
+    def test_json_sha_uses_canonical_json(self) -> None:
+        value = {"account": "Orion-17", "amount": 42}
+        expected = hashlib.sha256(b'{"account":"Orion-17","amount":42}').hexdigest()
+        self.assertEqual(codex_review._json_sha(value), expected)
+
+    def test_review_command_omits_unrequested_reasoning_effort(self) -> None:
+        argv = codex_review._review_command(Path("/tmp/codex"), None, None, self.repo,
+                                            Path(self.temp.name) / "output.json")
+        self.assertFalse(any("model_reasoning_effort" in part for part in argv))
+        selected = codex_review._review_command(Path("/tmp/codex"), None, "medium", self.repo,
+                                                Path(self.temp.name) / "output.json")
+        self.assertIn('model_reasoning_effort="medium"', selected)
+
+    def test_validate_findings_rejects_zero_line(self) -> None:
+        finding = {"severity": "low", "file": "one.txt", "line": 0, "claim": "note",
+                   "failure_scenario": "failure", "evidence": "evidence"}
+        with self.assertRaisesRegex(codex_review.TaskError, "line is invalid"):
+            codex_review.validate_findings({"verdict": "approve", "findings": [finding]}, {"one.txt"})
+
+    def test_observed_prefers_latest_nonempty_metadata(self) -> None:
+        events = [{"model": "model-cedar"}, {"response": {"model": "model-pine"}}]
+        self.assertEqual(codex_review._observed(events, "model"), "model-pine")
+        self.assertEqual(codex_review._observed([events[0]], "model"), "model-cedar")
+
+    def test_run_review_refuses_empty_brief_before_range_resolution(self) -> None:
+        brief = Path(self.temp.name) / "empty-brief.md"
+        brief.write_bytes(b"")
+        fake = Path(self.temp.name) / "fake-codex"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o700)
+        with mock.patch.object(codex_review, "compute_range", side_effect=AssertionError("range was resolved")):
+            with self.assertRaisesRegex(codex_review.TaskError, "brief empty or too large"):
+                codex_review.run_review(
+                    brief=brief, repo=self.repo, base=self.base, classification="synthetic",
+                    author_provider="claude", codex_bin=fake, task_root=Path(self.temp.name) / "jobs",
+                    codex_home=Path(self.temp.name) / "home")
+
+    def test_receipt_location_rejects_job_id_with_separator(self) -> None:
+        with self.assertRaisesRegex(codex_review.TaskError, "job id is invalid"):
+            codex_review._receipt_from_location(None, "../review-job", self.repo / "tasks")
+
+    def test_main_returns_success_for_verified_review(self) -> None:
+        argv = ["verify", "--repo", str(self.repo), "--base", self.base, "--head", self.head,
+                "--receipt-job-id", "review-job", "--dispositions", str(self.repo / "dispositions.json")]
+        with mock.patch.object(codex_review, "review_verify", return_value={"ok": True}), \
+                mock.patch("builtins.print"):
+            self.assertEqual(codex_review.main(argv), 0)
 
     def test_multi_commit_range_has_all_paths_and_blobs(self) -> None:
         review = codex_review.compute_range(self.repo, self.base, self.head)

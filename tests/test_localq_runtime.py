@@ -2,15 +2,17 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.localq.runtime import (MIN_MEMORY_FREE_PERCENT, MacSampler,
+                                         system_runner,
                                          foundation_thermal_state, thermal_level_name)
 from agent_bridge.localq.service import Service
 from agent_bridge.localq.spool import ResourceSnapshot
@@ -18,12 +20,62 @@ from agent_bridge.localq import worker_child
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_system_runner_returns_output_with_bounded_quiet_command(self):
+        with patch("agent_bridge.localq.runtime.subprocess.check_output",
+                   return_value="ready") as check_output:
+            self.assertEqual(system_runner(["/usr/bin/uptime"]), "ready")
+        check_output.assert_called_once_with(["/usr/bin/uptime"], text=True,
+                                             stderr=subprocess.DEVNULL, timeout=2)
+
+    def test_foundation_thermal_probe_rejects_missing_process_info(self):
+        objc = Mock()
+        objc.objc_getClass.return_value = 1
+        objc.sel_registerName.return_value = 2
+        objc.objc_msgSend.return_value = 0
+        with patch("agent_bridge.localq.runtime.ctypes.CDLL",
+                   side_effect=[object(), objc]):
+            with self.assertRaisesRegex(RuntimeError, "NSProcessInfo unavailable"):
+                foundation_thermal_state()
+
+    def test_sampler_initializes_empty_details(self):
+        sampler = MacSampler(runner=lambda _: "", thermal_probe=None,
+                             cores_probe=lambda: 4, clock=lambda: 100.0)
+        self.assertEqual(sampler.last_details, {})
+
     def test_memory_threshold_is_the_aggressive_local_first_floor(self):
         self.assertEqual(MIN_MEMORY_FREE_PERCENT, 10.0)
         self.assertEqual(MacSampler._memory("System-wide memory free percentage: 10%"),
                          "normal")
         self.assertEqual(MacSampler._memory("System-wide memory free percentage: 9.9%"),
                          "high")
+
+    def test_memory_rejects_unrecognized_output(self):
+        with self.assertRaisesRegex(ValueError, "memory_pressure output not recognized"):
+            MacSampler._memory("unrecognized memory status")
+
+    def test_idle_seconds_rejects_unrecognized_output(self):
+        with self.assertRaisesRegex(ValueError, "ioreg output not recognized"):
+            MacSampler._idle_seconds("unrecognized idle status")
+
+    @staticmethod
+    def _sampler_for_validation(thermal="normal", cores=4):
+        fixtures = {
+            "/usr/bin/memory_pressure": "System-wide memory free percentage: 42%",
+            "/usr/bin/pmset": "Now drawing from 'AC Power'",
+            "/usr/sbin/ioreg": '"HIDIdleTime" = 1000000000',
+            "/usr/bin/uptime": "load averages: 0.4 0.3 0.2",
+            "/usr/bin/top": "CPU usage: 10% user, 10% sys, 80% idle",
+        }
+        return MacSampler(lambda argv: fixtures[argv[0]], thermal_probe=lambda: thermal,
+                          cores_probe=lambda: cores, clock=lambda: 100.0)
+
+    def test_sample_rejects_invalid_thermal_state(self):
+        with self.assertRaisesRegex(ValueError, "thermal probe returned invalid state"):
+            self._sampler_for_validation(thermal="warming").sample()
+
+    def test_sample_rejects_zero_core_count(self):
+        with self.assertRaisesRegex(ValueError, "invalid core count"):
+            self._sampler_for_validation(cores=0).sample()
 
     def test_foundation_thermal_probe_returns_supported_state(self):
         self.assertIn(foundation_thermal_state(), {"normal", "high", "unknown"})

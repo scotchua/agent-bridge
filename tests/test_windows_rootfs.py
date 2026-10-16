@@ -807,5 +807,81 @@ class ManifestSignatureTests(unittest.TestCase):
         self.assertFalse(self._anchor(public_key="").signed)
 
 
+class MutationGapTests(unittest.TestCase):
+    def test_is_sha256_hex_rejects_non_strings(self):
+        for value in (None, 123, b"a" * 64):
+            self.assertIs(wrf.is_sha256_hex(value), False)
+
+    def test_validate_recipe_rejects_an_empty_base_image(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.validate_recipe(_recipe(base_image=""))
+
+    def test_base_reference_validates_the_recipe(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.base_reference(_recipe(base_digest="invalid"))
+
+    def test_build_argv_validates_the_recipe(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_argv(_recipe(base_digest="invalid"),
+                           context_dir="/build", image_tag="image")
+
+    def test_export_argv_rejects_an_unknown_engine(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.export_argv("image", engine="unknown")
+
+    def test_output_names_validates_the_recipe(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.output_names(_recipe(base_digest="invalid"))
+
+    def test_normalise_member_clears_pax_headers(self):
+        member = tarfile.TarInfo("invented/file")
+        member.pax_headers = {"comment": "build host"}
+        self.assertEqual(wrf.normalise_member(member).pax_headers, {})
+
+    def test_normalise_member_preserves_execute_permission(self):
+        member = tarfile.TarInfo("invented/tool")
+        member.mode = 0o755
+        self.assertEqual(wrf.normalise_member(member).mode, 0o755)
+
+    def test_sha256_path_hashes_the_whole_file(self):
+        content = b"invented rootfs bytes" * 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.tar"
+            path.write_bytes(content)
+            self.assertEqual(wrf.sha256_path(str(path), chunk_bytes=7),
+                             hashlib.sha256(content).hexdigest())
+
+    def test_build_manifest_validates_the_recipe(self):
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_manifest(_recipe(base_digest="invalid"),
+                               rootfs_sha256=ROOTFS_HASH)
+
+    def test_build_sidecar_validates_the_recipe_and_runner_hash(self):
+        fields = dict(rootfs_sha256=ROOTFS_HASH, guest_runner_sha256=RUNNER_HASH,
+                      built_at="2031-04-05T00:00:00+00:00", tool_hashes={})
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_sidecar(_recipe(base_digest="invalid"), **fields)
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_sidecar(_recipe(), **dict(fields, guest_runner_sha256="bad"))
+
+    def test_build_versions_file_validates_recipe_and_tool_hash(self):
+        tools = {name: wrf.ToolPin("1.2.3", "/usr/local/bin/" + name,
+                                   "a" * 64)
+                 for name in ("node", "claude", "codex")}
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_versions_file(_recipe(base_digest="invalid"), tools)
+        tools["node"] = wrf.ToolPin("1.2.3", "/usr/local/bin/node", "bad")
+        with self.assertRaises(wrf.RootfsRecipeError):
+            wrf.build_versions_file(_recipe(), tools)
+
+    def test_verify_manifest_trust_rejects_unknown_architecture(self):
+        anchor = wrf.TrustAnchor(release="invented-1", architecture="arm64",
+                                 manifest_sha256="a" * 64)
+        check = wrf.verify_manifest_trust({}, architecture="unknown",
+                                          anchors=(anchor,))
+        self.assertEqual(check, wrf.ImageCheck(False,
+                         "manifest_untrusted:architecture_invalid"))
+
+
 if __name__ == "__main__":
     unittest.main()

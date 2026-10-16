@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import signal
@@ -407,6 +408,126 @@ class ClientDataHealthTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "^client_data_health_timeout_seconds_invalid$"):
                     self.gate(timeout_seconds=timeout)
         self.assertEqual(self.gate(timeout_seconds=2.5).timeout_seconds, 2.5)
+
+    def test_is_sha256_rejects_nonstring_without_raising(self):
+        self.assertFalse(client_data_health._is_sha256(None))
+        self.assertFalse(client_data_health._is_sha256(17))
+
+    def test_from_config_default_and_partial_group(self):
+        self.assertIsNone(ClientDataHealthGate.from_config(
+            SimpleNamespace(client_data_health_timeout_seconds=30.0)))
+        partial = SimpleNamespace(
+            client_data_health_command=(sys.executable, "status", "--json"),
+            client_data_health_timeout_seconds=30.0)
+        with self.assertRaisesRegex(ValueError, "^client_data_health_configuration_incomplete$"):
+            ClientDataHealthGate.from_config(partial)
+
+    def test_from_config_rejects_each_malformed_field(self):
+        for changes, reason in (
+            ({"command": (sys.executable, 17, "status", "--json")}, "command_invalid"),
+            ({"path": 17}, "path_invalid"),
+            ({"path": ""}, "path_invalid"),
+            ({"timeout_seconds": 0}, "timeout_seconds_invalid"),
+            ({"record": "relative.json"}, "record_invalid"),
+            ({"record": Path("relative.json")}, "record_invalid"),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, "^client_data_health_" + reason + "$"):
+                    self.gate(**changes)
+
+    def test_kill_group_terminates_windows_process(self):
+        proc = mock.Mock()
+        with mock.patch.object(client_data_health.os, "name", "nt"):
+            ClientDataHealthGate._kill_group(proc)
+        proc.kill.assert_called_once_with()
+
+    def test_status_reaps_and_closes_on_reader_timeout(self):
+        proc = mock.Mock()
+        proc.stdout = io.BytesIO()
+        reader = mock.Mock()
+        reader.is_alive.return_value = True
+        with mock.patch.object(client_data_health.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(client_data_health.threading, "Thread", return_value=reader), \
+             mock.patch.object(ClientDataHealthGate, "_kill_group") as kill:
+            self.assertIsNone(self.gate()._status())
+        kill.assert_called_once_with(proc)
+        proc.wait.assert_called_once_with()
+        self.assertEqual(reader.join.call_count, 2)
+        self.assertTrue(proc.stdout.closed)
+
+    def test_status_reaps_and_closes_on_exact_output_limit(self):
+        proc = mock.Mock()
+        proc.stdout = io.BytesIO(b"x" * 4096)
+        with mock.patch.object(client_data_health.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(ClientDataHealthGate, "_kill_group") as kill:
+            self.assertIsNone(self.gate()._status())
+        kill.assert_called_once_with(proc)
+        proc.wait.assert_called_once_with()
+        self.assertTrue(proc.stdout.closed)
+
+    def test_status_wait_uses_remaining_time_and_closes_output(self):
+        proc = mock.Mock()
+        proc.stdout = io.BytesIO(b"{}")
+        proc.returncode = 0
+        readers = []
+        def thread(*, target, daemon):
+            reader = mock.Mock()
+            reader.start.side_effect = target
+            reader.is_alive.return_value = False
+            readers.append(reader)
+            return reader
+        with mock.patch.object(client_data_health.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(client_data_health.threading, "Thread", side_effect=thread), \
+             mock.patch.object(client_data_health.time, "monotonic", side_effect=(100.0, 100.5)):
+            self.assertEqual(self.gate()._status(), (0, b"{}"))
+        proc.wait.assert_called_once_with(timeout=.5)
+        readers[0].join.assert_called_once_with(1.0)
+        self.assertTrue(proc.stdout.closed)
+
+    def test_status_expired_budget_and_wait_timeout_cleanup(self):
+        proc = mock.Mock()
+        proc.stdout = io.BytesIO(b"{}")
+        proc.returncode = 0
+        def thread(*, target, daemon):
+            reader = mock.Mock()
+            reader.start.side_effect = target
+            reader.is_alive.return_value = False
+            return reader
+        with mock.patch.object(client_data_health.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(client_data_health.threading, "Thread", side_effect=thread), \
+             mock.patch.object(client_data_health.time, "monotonic", side_effect=(100.0, 102.0)):
+            self.assertEqual(self.gate()._status(), (0, b"{}"))
+        proc.wait.assert_called_once_with(timeout=0.0)
+        self.assertTrue(proc.stdout.closed)
+        timed_out = mock.Mock()
+        timed_out.stdout = io.BytesIO(b"{}")
+        timed_out.wait.side_effect = (client_data_health.subprocess.TimeoutExpired("health", 1), None)
+        with mock.patch.object(client_data_health.subprocess, "Popen", return_value=timed_out), \
+             mock.patch.object(client_data_health.threading, "Thread", side_effect=thread), \
+             mock.patch.object(ClientDataHealthGate, "_kill_group") as kill:
+            self.assertIsNone(self.gate()._status())
+        kill.assert_called_once_with(timed_out)
+        self.assertEqual(timed_out.wait.call_count, 2)
+        self.assertTrue(timed_out.stdout.closed)
+
+    def test_binding_reason_rejects_bad_record_shape_and_missing_wrapper(self):
+        for changes in ({"state": "failed"}, {"wrapper_hashes": {}},
+                        {"wrapper_hashes": {**self.hashes(), "extra.py": "0" * 64}}):
+            with self.subTest(changes=changes):
+                self.write_healthy_record(**changes)
+                self.assertEqual(self.gate().check(), "client_data_health_binding_mismatch")
+        self.write_healthy_record()
+        self.assertEqual(self.gate(gemma_delegate_executable=None).check(),
+                         "client_data_health_binding_mismatch")
+        gate = self.gate()
+        (self.delegate_dir / "local_endpoint.py").unlink()
+        self.assertEqual(gate.check(), "client_data_health_binding_mismatch")
+
+    def test_check_rejects_extra_status_field(self):
+        response = json.loads(self.response.read_text(encoding="utf-8"))
+        response["extra"] = "invented"
+        self.response.write_text(json.dumps(response), encoding="utf-8")
+        self.assertEqual(self.gate().check(), "client_data_health_unverified")
 
 
 if __name__ == "__main__":  # pragma: no cover

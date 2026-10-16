@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -521,6 +522,59 @@ class HonestyTests(unittest.TestCase):
         self.assertIn("provider lane", dr.DRIVER_LIMITATION)
 
 
+class StepResultMutationTests(unittest.TestCase):
+    def test_an_unknown_status_is_a_programming_error(self):
+        with self.assertRaises(ValueError):
+            dr._step("invented_stage", "unknown")
+
+
+class ProvenanceDictionaryMutationTests(unittest.TestCase):
+    def test_the_dictionary_preserves_each_image_fact(self):
+        image = dr.ImageProvenance(True, False, "invented_refusal", "a" * 64,
+                                   ("invented_blocker",))
+        self.assertEqual(image.as_dict(), {
+            "installed": True, "trusted": False, "reason": "invented_refusal",
+            "rootfs_sha256": "a" * 64,
+            "release_blockers": ["invented_blocker"]})
+
+
+class ImageAcquisitionMutationTests(DriverTestCase):
+    def test_new_image_directory_is_private(self):
+        target = self.root / "new-image-directory" / "rootfs.tar"
+        config = replace(self._config(), rootfs_path=str(target))
+        mkdir = Path.mkdir
+        modes = []
+
+        def capture_mode(path, *args, **kwargs):
+            if path == target.parent:
+                modes.append(kwargs.get("mode", args[0] if args else None))
+            return mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", capture_mode):
+            dr.acquire_guest_image(str(self.rootfs), config, consent=True,
+                                   platform=platform_support.owner_only_platform())
+        self.assertEqual(modes, [0o700])
+        if os.name != "nt":
+            self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+
+
+class ClockMutationTests(DriverTestCase):
+    def test_supplied_clock_is_used(self):
+        self.assertEqual(dr._now(self._context(clock=lambda: "2031-04-05T06:07:08Z")),
+                         "2031-04-05T06:07:08Z")
+
+
+class ImageStepMutationTests(DriverTestCase):
+    def test_missing_install_consent_is_reported_as_consent_required(self):
+        source = self.root / "invented-image.tar"
+        source.write_bytes(self.rootfs.read_bytes())
+        self.rootfs.unlink()
+        result = dr.step(self._context(image_source_path=str(source)))
+        self.assertEqual(result["step"], wp.STAGE_GUEST_IMAGE)
+        self.assertEqual(result["status"], dr.STEP_CONSENT_REQUIRED)
+        self.assertEqual(result["reason"], "image_install_consent_required")
+
+
 
 
 NT = platform_support.owner_only_platform()
@@ -844,6 +898,41 @@ class ResumeMachineTests(DriverTestCase):
             result = dr.finish_resume(context)
         self.assertEqual(result["status"], dr.STEP_FAILED)
         self.assertFalse(any("/Delete" in argv for argv in calls))
+
+
+    def test_exhausted_stage_reports_the_last_attempt_not_a_future_attempt(self):
+        context, calls = self._context_with()
+        stage = self._stage()
+        wp.write_resume_record(
+            wp.resume_record_path(str(self.runtime)),
+            wp.build_resume_record(stage=stage.stage, stage_completed=None,
+                                   awaiting_reboot=True, updated_at="2031-04-05T06:07:08Z",
+                                   attempts=wp.MAX_STAGE_ATTEMPTS))
+        result = dr.schedule_resume(context, stage, command=self.COMMAND)
+        self.assertEqual(result["status"], dr.STEP_BLOCKED)
+        self.assertEqual(result["attempts"], wp.MAX_STAGE_ATTEMPTS)
+        self.assertEqual(calls, [])
+
+
+class ActivationCommandMutationTests(DriverTestCase):
+    def test_failed_registration_command_is_reported(self):
+        outcome = dr.verify_boundary_live(
+            self._config(), run_job=lambda request: _JobResult())
+        dr.record_boundary(self._config(), outcome, wsl_version="2.0.0",
+                           recorded_at="2031-04-05T06:07:08Z",
+                           fingerprint=wev.host_fingerprint(), os_name="nt")
+        lane = wev.ProviderLane(verified=True, providers=("claude",),
+                                portability_observed=True,
+                                refresh_behaviour_observed=True)
+        dr.record_provider_lane(self._config(), lane, os_name="nt")
+        context = self._context(anchors=self._anchor(),
+                                verify_signature=lambda *args: True,
+                                run=lambda argv: _Result(7))
+        result = dr.activate_worker(
+            context, command=["C:\\Python\\python.exe", "-m", "agent_bridge.worker"],
+            consent=True)
+        self.assertEqual(result["status"], dr.STEP_FAILED)
+        self.assertEqual(result["reason"], "command_failed")
 
 
 if __name__ == "__main__":

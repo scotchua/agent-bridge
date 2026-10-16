@@ -8,7 +8,9 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -52,6 +54,12 @@ def _evidence(**extra) -> we.Evidence:
     }
     fields.update(extra)
     return we.Evidence(**fields)
+
+
+class EvidencePathTests(unittest.TestCase):
+    def test_path_uses_the_runtime_root(self):
+        self.assertEqual(we.evidence_path("invented-runtime"),
+                         os.path.join("invented-runtime", we.EVIDENCE_NAME))
 
 
 class ParseTests(unittest.TestCase):
@@ -226,6 +234,12 @@ class LoadTests(unittest.TestCase):
         self.assertIsNone(evidence)
         self.assertEqual(reason, "evidence_absent")
 
+    def test_failed_load_keeps_the_running_platform(self):
+        state, evidence, reason = self._load()
+        self.assertEqual(state.is_windows, os.name == "nt")
+        self.assertIsNone(evidence)
+        self.assertEqual(reason, "evidence_absent")
+
     def test_unparseable_json_is_not_ready(self):
         self._write(None, text="{")
         _, _, reason = self._load()
@@ -379,6 +393,46 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(reason, "evidence_acl_unenforceable")
 
 
+class ReadWithIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = str(Path(self.temp.name) / we.EVIDENCE_NAME)
+
+    def test_private_directory_is_required_before_reading(self):
+        with (mock.patch.object(we.wpv, "require_private_directory",
+                                side_effect=we.wpv.PrivacyError("directory_not_owner_only")),
+              mock.patch.object(we.wpv, "read_private_file") as read):
+            with self.assertRaisesRegex(we.EvidenceError,
+                                        "^evidence_root_not_owner_only$"):
+                we.read_evidence_with_identity(self.path)
+        read.assert_not_called()
+
+    def test_file_privacy_error_is_translated(self):
+        with (mock.patch.object(we.wpv, "require_private_directory"),
+              mock.patch.object(we.wpv, "read_private_file",
+                                side_effect=we.wpv.PrivacyError("file_absent"))):
+            with self.assertRaisesRegex(we.EvidenceError, "^evidence_absent$"):
+                we.read_evidence_with_identity(self.path)
+
+    def test_malformed_bytes_have_a_fixed_error(self):
+        with (mock.patch.object(we.wpv, "require_private_directory"),
+              mock.patch.object(we.wpv, "read_private_file",
+                                return_value=(b"{", object()))):
+            with self.assertRaisesRegex(we.EvidenceError, "^evidence_malformed$"):
+                we.read_evidence_with_identity(self.path)
+
+    def test_valid_record_returns_the_read_identity(self):
+        identity = object()
+        payload = json.dumps(_evidence().as_dict()).encode("utf-8")
+        with (mock.patch.object(we.wpv, "require_private_directory"),
+              mock.patch.object(we.wpv, "read_private_file",
+                                return_value=(payload, identity))):
+            evidence, returned_identity = we.read_evidence_with_identity(self.path)
+        self.assertEqual(evidence.rootfs_sha256, ROOTFS)
+        self.assertIs(returned_identity, identity)
+
+
 class RecordTests(unittest.TestCase):
     """The gate that keeps a development machine from marking Windows ready."""
 
@@ -450,6 +504,35 @@ class RecordTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(Path(self.path).stat().st_mode & 0o777, 0o600)
 
+    def test_new_directory_requests_owner_only_mode(self):
+        with (mock.patch.object(Path, "mkdir") as mkdir,
+              mock.patch.object(we.wpv, "require_private_directory"),
+              mock.patch.object(we.wpv, "atomic_private_write")):
+            we.record_verification(self.path, _evidence(), os_name="nt",
+                                   secure=lambda _fd: None)
+        self.assertEqual(mkdir.call_args.kwargs["mode"], 0o700)
+
+    def test_directory_creation_failure_has_a_fixed_reason(self):
+        with mock.patch.object(Path, "mkdir", side_effect=OSError("invented failure")):
+            with self.assertRaisesRegex(we.EvidenceError,
+                                        "^evidence_unwritable$"):
+                we.record_verification(self.path, _evidence(), os_name="nt")
+
+    def test_written_record_uses_canonical_indentation(self):
+        we.record_verification(self.path, _evidence(), os_name="nt")
+        expected = json.dumps(_evidence().as_dict(), indent=2,
+                              sort_keys=True) + "\n"
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), expected)
+
+    def test_directory_privacy_refusal_prevents_a_write(self):
+        with (mock.patch.object(we.wpv, "require_private_directory",
+                                side_effect=we.wpv.PrivacyError("acl_unverified")),
+              mock.patch.object(we.wpv, "atomic_private_write") as write):
+            with self.assertRaisesRegex(we.EvidenceError,
+                                        "^evidence_acl_unverified$"):
+                we.record_verification(self.path, _evidence(), os_name="nt")
+        write.assert_not_called()
+
 
 class FingerprintTests(unittest.TestCase):
     def test_a_fingerprint_is_a_sha256_and_not_the_raw_identity(self):
@@ -468,6 +551,20 @@ class FingerprintTests(unittest.TestCase):
     def test_a_missing_machine_guid_still_produces_a_fingerprint(self):
         self.assertRegex(we.host_fingerprint(machine_guid=None, node="a"),
                          r"^[0-9a-f]{64}$")
+
+    def test_node_name_changes_the_fingerprint(self):
+        self.assertNotEqual(we.host_fingerprint(machine_guid="GUID-3", node="host-a"),
+                            we.host_fingerprint(machine_guid="GUID-3", node="host-b"))
+
+    def test_windows_guid_is_read_with_the_registry_default_view(self):
+        registry = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=object(), KEY_READ=1, KEY_WOW64_64KEY=2,
+            OpenKey=mock.Mock(return_value=nullcontext(object())),
+            QueryValueEx=mock.Mock(return_value=("invented-guid", 1)))
+        with (mock.patch.object(we.os, "name", "nt"),
+              mock.patch.dict(sys.modules, {"winreg": registry})):
+            self.assertEqual(we._read_machine_guid(), "invented-guid")
+        self.assertEqual(registry.OpenKey.call_args.args[2], 0)
 
 
 class LimitationTests(unittest.TestCase):

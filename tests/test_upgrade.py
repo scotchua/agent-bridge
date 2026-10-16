@@ -56,6 +56,19 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(states["hermes"]["state"], "available")
             self.assertEqual(states["grok"]["state"], "uncertain")
 
+    def test_valid_manifest_accepts_exact_required_keys(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = self._manifest(home)
+            self.assertTrue(upgrade._valid_manifest(path))
+
+    def test_detect_certified_gemma_backend(self):
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.object(upgrade, "_delegation_document",
+                                   return_value=({"local_backend": "gemma_certified"}, None)), \
+                 mock.patch.object(upgrade.shutil, "which", return_value=None):
+                states = upgrade.detect(home, platform="linux")
+            self.assertEqual(states["gemma"]["state"], "on")
+
     def test_default_no_writes_nothing(self):
         with tempfile.TemporaryDirectory() as home:
             self._receipt(home)
@@ -247,6 +260,19 @@ class UpgradeTests(unittest.TestCase):
                 states = upgrade.detect(home, platform="win32")
             self.assertEqual(states["hermes"]["state"], "on")
 
+    def test_launcher_path_uses_mac_suffix(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(upgrade.launcher_path(home, "darwin"),
+                             os.path.join(home, ".agent-bridge", "start-agent-room.command"))
+
+    def test_launcher_companions_extracts_exact_hermes_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            launcher = upgrade.launcher_path(home, "linux")
+            store.atomic_write_bytes(launcher, upgrade.launcher_bytes(
+                home, "linux", hermes_path=os.path.join(home, "tools", "hermes"), grok=True))
+            self.assertEqual(upgrade._launcher_companions(home, "linux"),
+                             (os.path.join(home, "tools", "hermes"), True))
+
     def test_existing_grok_is_preserved_when_adding_hermes(self):
         with tempfile.TemporaryDirectory() as home:
             self._receipt(home)
@@ -282,6 +308,19 @@ class UpgradeTests(unittest.TestCase):
                 result, _ = self._run(home, ["n", "n", "y"])
             self.assertEqual(result, 0)
             self.assertEqual(self._outside_snapshot(home), before)
+
+    def test_card_prints_heading(self):
+        messages: list[str] = []
+        upgrade._card(messages.append, "Agent Room", upgrade.CARDS["agent_room"])
+        self.assertEqual(messages[0], "Agent Room")
+
+    def test_main_refuses_root(self):
+        with tempfile.TemporaryDirectory() as home:
+            messages: list[str] = []
+            with mock.patch.object(upgrade.os, "geteuid", return_value=0, create=True):
+                result = upgrade.main(["--undo"], home=home, out=messages.append)
+            self.assertEqual(result, 1)
+            self.assertEqual(messages, ["Refusing to run as root. Run this upgrade as your normal user."])
 
 
 if __name__ == "__main__":

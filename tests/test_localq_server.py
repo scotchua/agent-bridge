@@ -8,9 +8,11 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from agent_bridge.localq import server as server_module
 from agent_bridge.localq.server import INSTRUCTIONS, Server
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 
@@ -88,6 +90,119 @@ class ServerTests(unittest.TestCase):
         out = io.StringIO()
         self.server.serve(wire, out)
         self.assertEqual(json.loads(out.getvalue())["error"]["code"], -32700)
+
+    def test_init_rejects_nonpositive_interval_and_keeps_default(self):
+        self.assertEqual(Server(self.service).interval, 5.0)
+        for interval in (0, -0.25):
+            with self.subTest(interval=interval), self.assertRaisesRegex(ValueError, "interval must be positive"):
+                Server(self.service, interval=interval)
+
+    def test_executor_waits_after_each_poll(self):
+        server = object.__new__(Server)
+        server.service = mock.Mock()
+        server.interval = 0.25
+        server._stop = mock.Mock()
+        server._stop.is_set.side_effect = (False, True)
+        server._executor()
+        server.service.once.assert_called_once_with()
+        server._stop.wait.assert_called_once_with(0.25)
+
+    def test_stop_signals_and_joins_with_interval_grace(self):
+        server = object.__new__(Server)
+        server.interval = 0.25
+        server._stop = mock.Mock()
+        thread = mock.Mock()
+        server._thread = thread
+        server.stop()
+        server._stop.set.assert_called_once_with()
+        thread.join.assert_called_once_with(timeout=1.25)
+        self.assertIsNone(server._thread)
+
+    def test_valid_id_rejects_boolean_and_nonfinite_numbers(self):
+        for value in (True, False, float("nan"), float("inf"), -float("inf"), [], {}):
+            with self.subTest(value=value):
+                self.assertFalse(Server._valid_id(value))
+        for value in ("synthetic-request", 0, -2, 1.5):
+            with self.subTest(value=value):
+                self.assertTrue(Server._valid_id(value))
+
+    def test_handle_preserves_ids_and_distinguishes_invalid_tool_inputs(self):
+        for value in (True, float("nan"), []):
+            reply = self.server.handle({"jsonrpc": "2.0", "id": value, "method": "ping"})
+            self.assertEqual(reply, {"jsonrpc": "2.0", "id": None,
+                                     "error": {"code": -32600, "message": "invalid request"}})
+        cases = ((None, "invalid params"), ({}, "invalid params"),
+                 ({"name": "missing_tool"}, "unknown tool"),
+                 ({"name": "local_status", "arguments": []}, "invalid params"))
+        for params, message in cases:
+            with self.subTest(params=params):
+                reply = self.server.handle({"jsonrpc": "2.0", "id": "synthetic-request",
+                                            "method": "tools/call", "params": params})
+                self.assertEqual(reply, {"jsonrpc": "2.0", "id": "synthetic-request",
+                                         "error": {"code": -32602, "message": message}})
+
+    def test_serve_uses_default_streams_and_flushes_each_reply(self):
+        class Output(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushes = 0
+
+            def flush(self):
+                self.flushes += 1
+                super().flush()
+
+        output = Output()
+        source = io.StringIO('{"jsonrpc":"2.0","id":7,"method":"ping"}\n')
+        with mock.patch.object(server_module.sys, "stdin", source), \
+                mock.patch.object(server_module.sys, "stdout", output), \
+                mock.patch.object(self.server, "start"), mock.patch.object(self.server, "stop"):
+            result = self.server.serve()
+        self.assertIs(type(result), int)
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["id"], 7)
+        self.assertEqual(output.flushes, 1)
+
+    def test_main_passes_absolute_paths_and_interval_to_service(self):
+        root = os.path.join(self.temporary.name, "queue")
+        worker = os.path.join(self.temporary.name, "synthetic-worker")
+        state = os.path.join(self.temporary.name, "synthetic-state")
+        argv = ["--root", root, "--worker", worker, "--worker-state", state]
+        with mock.patch.object(server_module, "Service") as service, \
+                mock.patch.object(server_module, "Server") as server:
+            server.return_value.serve.return_value = 17
+            self.assertEqual(server_module.main(argv), 17)
+            service.assert_called_once_with(root, worker, state)
+            server.assert_called_once_with(service.return_value, interval=5.0)
+            server.reset_mock()
+            self.assertEqual(server_module.main(argv + ["--interval", "0.75"]), 17)
+            server.assert_called_once_with(service.return_value, interval=0.75)
+
+    def test_main_requires_each_path_argument(self):
+        root = os.path.join(self.temporary.name, "queue")
+        worker = os.path.join(self.temporary.name, "synthetic-worker")
+        state = os.path.join(self.temporary.name, "synthetic-state")
+        parts = (("--root", root), ("--worker", worker), ("--worker-state", state))
+        with mock.patch.object(server_module, "Service"), mock.patch.object(server_module, "Server"):
+            for omitted in range(len(parts)):
+                argv = [item for index, pair in enumerate(parts) if index != omitted for item in pair]
+                with self.subTest(omitted=parts[omitted][0]), \
+                        mock.patch.object(server_module.sys, "stderr", io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    server_module.main(argv)
+
+    def test_main_rejects_relative_paths_before_service_creation(self):
+        root = os.path.join(self.temporary.name, "queue")
+        worker = os.path.join(self.temporary.name, "synthetic-worker")
+        state = os.path.join(self.temporary.name, "synthetic-state")
+        with mock.patch.object(server_module, "Service") as service, \
+                mock.patch.object(server_module, "Server"), \
+                mock.patch.object(server_module.sys, "stderr", io.StringIO()):
+            for argv in (["--root", "relative-queue", "--worker", worker, "--worker-state", state],
+                         ["--root", root, "--worker", "relative-worker", "--worker-state", state],
+                         ["--root", root, "--worker", worker, "--worker-state", "relative-state"]):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    server_module.main(argv)
+            service.assert_not_called()
 
 
 if __name__ == "__main__":
