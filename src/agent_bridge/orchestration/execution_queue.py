@@ -32,6 +32,17 @@ CLIENT_DERIVED = "client_derived"
 PROVIDER_FOR_CALLER = {"claude": "codex", "codex": "claude"}
 TERMINAL = frozenset({"complete", "failed", "blocked"})
 
+# Execution is deliberately one finite job, not a generation call followed by
+# unaccounted-for verification and cleanup.  The generation limit remains the
+# public ``timeout_seconds`` field for compatibility with existing callers.
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 300
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 60
+DEFAULT_JOB_OVERHEAD_SECONDS = 300
+MAX_GENERATION_TIMEOUT_SECONDS = 7200
+MAX_VERIFY_TIMEOUT_SECONDS = 3600
+MAX_CLEANUP_TIMEOUT_SECONDS = 300
+MAX_TOTAL_TIMEOUT_SECONDS = 14_400
+
 
 class ExecutionAdmissionError(ValueError):
     """A dispatch request does not satisfy the execution-lane contract."""
@@ -112,6 +123,17 @@ class SubprocessHarnessExecutor:
         self.client_derived_routes = client_derived_routes
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
+        generation_timeout = request.get("timeout_seconds")
+        # A request queued before the deadline contract carries none of the
+        # three phase fields.  Give it the defaults it would have been admitted
+        # with rather than failing work that was valid when it was queued.
+        legacy = not any(key in request for key in (
+            "verify_timeout_seconds", "cleanup_timeout_seconds", "total_timeout_seconds"))
+        verify_timeout = request.get("verify_timeout_seconds",
+                                     DEFAULT_VERIFY_TIMEOUT_SECONDS if legacy else None)
+        cleanup_timeout = request.get("cleanup_timeout_seconds",
+                                      DEFAULT_CLEANUP_TIMEOUT_SECONDS if legacy else None)
+        total_timeout = request.get("total_timeout_seconds")
         provider = request["provider"]
         is_review = request.get("kind") == "review"
         if is_review and provider != "codex":
@@ -153,7 +175,9 @@ class SubprocessHarnessExecutor:
             harness = getattr(self.harnesses, provider)
             argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
                    "--repo", request["repo"], "--base", request["base"],
-                   "--timeout", str(request["timeout_seconds"])]
+                   "--timeout", str(generation_timeout),
+                   "--verify-timeout", str(verify_timeout),
+                   "--cleanup-timeout", str(cleanup_timeout)]
         if provider == "codex":
             if not is_review:
                 argv += ["--classification", request["classification"],
@@ -175,6 +199,26 @@ class SubprocessHarnessExecutor:
             argv += ["--client-derived-routes", "execution"]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
+        # Reject a stale or tampered durable request immediately before it can
+        # reach the process boundary.  Earlier configuration and runnable
+        # checks deliberately retain their more useful fixed refusals.
+        deadlines = ((generation_timeout, MAX_GENERATION_TIMEOUT_SECONDS),
+                     (verify_timeout, MAX_VERIFY_TIMEOUT_SECONDS),
+                     (cleanup_timeout, MAX_CLEANUP_TIMEOUT_SECONDS))
+        if not legacy:
+            deadlines += ((total_timeout, MAX_TOTAL_TIMEOUT_SECONDS),)
+        if any(isinstance(value, bool) or not isinstance(value, int)
+               or not 1 <= value <= maximum for value, maximum in deadlines):
+            raise ExecutionAdmissionError("execution_deadline_invalid")
+        checks = request.get("verify_argv")
+        if not isinstance(checks, list):
+            raise ExecutionAdmissionError("execution_deadline_invalid")
+        required_total = (generation_timeout + len(checks) * verify_timeout
+                          + 3 * cleanup_timeout + DEFAULT_JOB_OVERHEAD_SECONDS)
+        if legacy:
+            total_timeout = required_total
+        if total_timeout < required_total:
+            raise ExecutionAdmissionError("execution_deadline_invalid")
         account = pwd.getpwuid(os.getuid()).pw_name
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
@@ -184,7 +228,12 @@ class SubprocessHarnessExecutor:
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
         try:
-            stdout, stderr = process.communicate(timeout=request["timeout_seconds"] + 60)
+            # ``total_timeout_seconds`` is admitted from the complete phase
+            # budget, not guessed from generation.  The harness still owns
+            # each generation, verification and cleanup timeout; this outer
+            # deadline only guarantees that a wedged harness cannot outlive
+            # the finite job.  Keep the process-group kill for descendants.
+            stdout, stderr = process.communicate(timeout=total_timeout)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -502,6 +551,9 @@ class ExecutionQueue:
                item_id: str, stage: str, owner_id: str, stage_revision: int,
                verify_argv: list[list[str]] | None = None,
                timeout_seconds: int = 900, paid_fallback: bool = False,
+               verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
+               cleanup_timeout_seconds: int = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+               total_timeout_seconds: int | None = None,
                idempotency_key: str | None = None, kind: str = "execution",
                head: str | None = None, author_provider: str | None = None,
                client_derived_admitted: bool = False) -> dict[str, Any]:
@@ -571,8 +623,17 @@ class ExecutionQueue:
         owner_id = self._clean_text(owner_id, "owner_id")
         if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 0:
             raise ExecutionAdmissionError("stage_revision_invalid")
-        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 7200:
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int)
+                or not 1 <= timeout_seconds <= MAX_GENERATION_TIMEOUT_SECONDS):
             raise ExecutionAdmissionError("timeout_invalid")
+        if (isinstance(verify_timeout_seconds, bool)
+                or not isinstance(verify_timeout_seconds, int)
+                or not 1 <= verify_timeout_seconds <= MAX_VERIFY_TIMEOUT_SECONDS):
+            raise ExecutionAdmissionError("verify_timeout_invalid")
+        if (isinstance(cleanup_timeout_seconds, bool)
+                or not isinstance(cleanup_timeout_seconds, int)
+                or not 1 <= cleanup_timeout_seconds <= MAX_CLEANUP_TIMEOUT_SECONDS):
+            raise ExecutionAdmissionError("cleanup_timeout_invalid")
         checks = verify_argv or []
         if kind == "review" and checks:
             raise ExecutionAdmissionError("review_verify_argv_forbidden")
@@ -588,11 +649,30 @@ class ExecutionQueue:
             if str(exc) == verify_policy.MESSAGE_SHAPE:
                 raise ExecutionAdmissionError("verify_argv_invalid") from None
             raise ExecutionAdmissionError(f"verify_argv_rejected: {exc}") from None
+        # A generation worktree can be removed once before verification and
+        # retried during final cleanup if that first removal fails; the fresh
+        # verification worktree is then removed too.  Reserve all three
+        # bounded attempts in the parent deadline rather than letting a
+        # legitimate cleanup race an arbitrary grace period.
+        required_total = (timeout_seconds
+                          + len(checks) * verify_timeout_seconds
+                          + 3 * cleanup_timeout_seconds
+                          + DEFAULT_JOB_OVERHEAD_SECONDS)
+        if total_timeout_seconds is None:
+            total_timeout_seconds = required_total
+        if (isinstance(total_timeout_seconds, bool)
+                or not isinstance(total_timeout_seconds, int)
+                or total_timeout_seconds < required_total
+                or total_timeout_seconds > MAX_TOTAL_TIMEOUT_SECONDS):
+            raise ExecutionAdmissionError("total_timeout_invalid")
         key = self._clean_text(idempotency_key, "idempotency_key") if idempotency_key else None
         identity = {"caller": caller, "provider": provider, "repo": str(repo_path),
                     "brief": str(brief_path), "brief_sha256": hashlib.sha256(brief_bytes).hexdigest(),
                     "base": base, "classification": classification, "model": model,
                     "effort": effort, "verify_argv": checks, "timeout_seconds": timeout_seconds,
+                    "verify_timeout_seconds": verify_timeout_seconds,
+                    "cleanup_timeout_seconds": cleanup_timeout_seconds,
+                    "total_timeout_seconds": total_timeout_seconds,
                     "item_id": item_id, "stage": stage, "owner_id": owner_id,
                     "stage_revision": stage_revision, "kind": kind, "head": head,
                     "author_provider": author_provider,
