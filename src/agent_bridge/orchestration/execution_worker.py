@@ -179,7 +179,7 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
 
 
 def run(config_path: str, *, once: bool, interval: float,
-        worker_id: str | None = None) -> int:
+        worker_id: str | None = None, refresh: bool = False) -> int:
     if interval <= 0:
         raise ExecutionAdmissionError("interval_invalid")
     cfg = load(config_path)
@@ -199,9 +199,9 @@ def run(config_path: str, *, once: bool, interval: float,
             # Recovery happens only after this process owns the global lock.
             # Any uncertain prior send becomes blocked and is never repeated.
             queue = _configured_queue(config_path)
-            def run_checked_once() -> dict | None:
+            def run_checked_once(*, force_refresh: bool = False) -> dict | None:
                 from .. import drift
-                status = drift.quick_check(config_path)
+                status = drift.quick_check(config_path, force_refresh=force_refresh)
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
                 holds: dict[str, str] = {}
@@ -209,8 +209,20 @@ def run(config_path: str, *, once: bool, interval: float,
                     holds["codex"] = "codex"
                 if "claude" in changed:
                     holds["claude"] = "claude"
-                queue.hold_dependencies(holds)
+                queue.hold_dependencies(holds, drift_status=status)
                 return queue.run_once(identity)
+            if refresh:
+                # This is a status repair operation, not a dispatch command.
+                # It repeats the strict comparison but never accepts a new
+                # baseline and never sends a queued job.
+                from .. import drift
+                status = drift.quick_check(config_path, force_refresh=True)
+                changed = set(status["changed"])
+                drift.report_attention(None, status)
+                holds = {name: name for name in ("codex", "claude") if name in changed}
+                queue.hold_dependencies(holds, drift_status=status)
+                print("drift_refresh_complete")
+                return 0
             if once:
                 result = run_checked_once()
                 if result is not None:
@@ -230,14 +242,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Consume agent-bridge execution jobs outside desktop app sandboxes.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--once", action="store_true",
-                        help="Process at most one job in the foreground, then exit.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true",
+                      help="Process at most one job in the foreground, then exit.")
+    mode.add_argument("--refresh", action="store_true",
+                      help="Refresh drift evidence and queue holds without dispatching a job.")
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--worker-id")
     args = parser.parse_args(argv)
     try:
         return run(args.config, once=args.once, interval=args.interval,
-                   worker_id=args.worker_id)
+                   worker_id=args.worker_id, refresh=args.refresh)
     except (ExecutionAdmissionError, WorkerAlreadyRunning, QueueNotPrivate,
             ValueError) as exc:
         print(str(exc), file=sys.stderr)

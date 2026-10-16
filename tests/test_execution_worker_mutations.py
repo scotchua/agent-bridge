@@ -130,7 +130,7 @@ class ConfiguredQueueMutationTests(unittest.TestCase):
 
 
 class RunMutationTests(unittest.TestCase):
-    def _context(self, queue, changed=()):
+    def _context(self, queue, changed=(), status=None):
         cfg = SimpleNamespace(execution_queue_root=Path("invented-queue"))
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -138,7 +138,9 @@ class RunMutationTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(worker, "WorkerLock", return_value=contextlib.nullcontext()))
         stack.enter_context(mock.patch.object(worker, "_configured_queue", return_value=queue))
         quick = stack.enter_context(mock.patch.object(
-            drift, "quick_check", return_value={"changed": list(changed)}))
+            drift, "quick_check", return_value=status or {
+                "changed": list(changed), "checked_at": 100.0,
+                "cache_age_seconds": 0.0}))
         attention = stack.enter_context(mock.patch.object(drift, "report_attention"))
         signals = stack.enter_context(mock.patch.object(worker.signal, "signal",
                                                         return_value="previous"))
@@ -162,12 +164,29 @@ class RunMutationTests(unittest.TestCase):
                                 worker_id="worker-invented")
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "job-invented done\n")
-        quick.assert_called_once_with("invented-config.json")
+        quick.assert_called_once_with("invented-config.json", force_refresh=False)
         attention.assert_called_once()
         queue.hold_dependencies.assert_called_once_with(
-            {"codex": "codex", "claude": "claude"})
+            {"codex": "codex", "claude": "claude"}, drift_status={
+                "changed": ["codex", "claude"], "checked_at": 100.0,
+                "cache_age_seconds": 0.0})
         queue.run_once.assert_called_once_with("worker-invented")
         self.assertEqual(signals.call_count, 4)
+
+    def test_refresh_rechecks_and_clears_a_hold_without_dispatching(self):
+        queue = mock.Mock()
+        status = {"changed": [], "checked_at": 200.0, "cache_age_seconds": 0.0}
+        quick, attention, _ = self._context(queue, status=status)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = worker.run("invented-config.json", once=False, interval=1,
+                                worker_id="worker-invented", refresh=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "drift_refresh_complete\n")
+        quick.assert_called_once_with("invented-config.json", force_refresh=True)
+        attention.assert_called_once_with(None, status)
+        queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
+        queue.run_once.assert_not_called()
 
     def test_stop_signal_ends_loop_and_restores_handlers(self):
         queue = mock.Mock()
@@ -198,7 +217,7 @@ class MainMutationTests(unittest.TestCase):
         with mock.patch.object(worker, "run", return_value=7) as run:
             self.assertEqual(worker.main(["--config", "invented-config.json", "--once"]), 7)
         run.assert_called_once_with("invented-config.json", once=True,
-                                    interval=5.0, worker_id=None)
+                                    interval=5.0, worker_id=None, refresh=False)
 
     def test_main_returns_error_status(self):
         with mock.patch.object(worker, "run", side_effect=ExecutionAdmissionError("invalid")), \

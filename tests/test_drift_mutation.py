@@ -113,6 +113,22 @@ class DriftMutationTests(unittest.TestCase):
         inventory.assert_called_once()
         self.assertNotIn("cached", result)
 
+    def test_quick_check_force_refresh_bypasses_cache_without_baseline_write(self) -> None:
+        key = ("invented-config", str(self.home))
+        drift._quick_cache[key] = (100.0, {"cached": True})
+        self.addCleanup(drift._quick_cache.pop, key, None)
+        current = {"paths": {}, "gemma": {"delegate": {}, "validator": {}}}
+        with mock.patch.object(drift, "discover_config", return_value="invented-config"), \
+             mock.patch.object(drift, "inventory", return_value=current) as inventory, \
+             mock.patch.object(drift, "_read_baseline", return_value=None), \
+             mock.patch.object(drift, "_write_baseline") as baseline, \
+             mock.patch.object(drift.time, "monotonic", return_value=101.0):
+            result = drift.quick_check(home=str(self.home), force_refresh=True)
+        inventory.assert_called_once()
+        baseline.assert_not_called()
+        self.assertEqual(result["cache_age_seconds"], 0.0)
+        self.assertIn("checked_at", result)
+
     def test_eligible_release_accepts_cutoff(self) -> None:
         now = datetime.datetime(2034, 3, 5, 12, tzinfo=datetime.timezone.utc).timestamp()
         published = "2034-03-02T12:00:00Z"
