@@ -227,6 +227,19 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "unknown")
         self.assertEqual(terminal["error"], "execution_timeout")
 
+    def test_chatty_child_is_capped_and_records_only_a_fixed_failure(self):
+        self.queue.caps = dataclasses.replace(self.caps, timeout_seconds=5)
+        command = ("import sys; sys.stdout.write('private-output-' * 10000); "
+                   "sys.stdout.flush()")
+        self.queue.backend = SubprocessBackend([sys.executable, "-c", command],
+                                               capture_limit_bytes=1024)
+        self.submit(input="synthetic input")
+        terminal = self.queue.run_once("runner")
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"],
+                         "RuntimeError: child output exceeded bounded capture")
+        self.assertNotIn("private-output", json.dumps(terminal))
+
     def test_startup_recovery_marks_expired_lease_unknown(self):
         job = self.submit()
         with self.queue._db() as db:

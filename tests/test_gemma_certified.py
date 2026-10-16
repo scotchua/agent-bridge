@@ -308,6 +308,16 @@ class GemmaInvokeTests(unittest.TestCase):
         exact = self.fx["receipts"] / f"local-delegate-{result['invocation_id']}.json"
         self.assertTrue(exact.is_file())
 
+    def test_chatty_delegate_is_capped_before_receipt_validation(self):
+        self.mode("chatty")
+        with mock.patch.object(gemma_child, "GEMMA_DELEGATE_CAPTURE_MAX_BYTES", 1024):
+            with self.assertRaisesRegex(gemma_child.GemmaRefusal,
+                                        "gemma_delegate_output_overflow"):
+                self.invoke()
+        captures = list(self.fx["receipts"].glob(".delegate-*.stdout"))
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0].stat().st_size, 1024)
+
     def test_installed_sibling_import_succeeds_without_import_pollution(self):
         sibling = self.fx["install"] / "state_home.py"
         sibling.write_text("MARKER = 'configured-install'\n", encoding="utf-8")

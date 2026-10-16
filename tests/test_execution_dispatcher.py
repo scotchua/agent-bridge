@@ -1,7 +1,9 @@
 """Offline tests for durable cross-provider implementation dispatch."""
 
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -454,6 +456,8 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
             "a, _ = p.parse_known_args(); a.tasks_dir.mkdir(parents=True, exist_ok=True)\n"
             "(a.tasks_dir / 'observed-deadlines.json').write_text(json.dumps({'generation': a.timeout, 'verification': a.verify_timeout, 'cleanup': a.cleanup_timeout, 'checks': len(a.verify_json)}))\n"
             "time.sleep(a.timeout * 0.8)\n"
+            "if Path(a.brief).read_text(encoding='utf-8') == 'chatty':\n"
+            "    sys.stdout.write('x' * 8192); sys.stdout.flush(); raise SystemExit(0)\n"
             "if Path(a.brief).read_text(encoding='utf-8') == 'late':\n"
             "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], shell=False)\n"
             "    try: child.communicate(timeout=a.verify_timeout)\n"
@@ -518,6 +522,26 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["harness"]["harness_status"], "failed")
         self.assertEqual(result["harness"]["error_detail"], "verification command timed out")
+
+    def test_chatty_harness_is_file_capped_and_refused(self):
+        self.brief.write_text("chatty", encoding="utf-8")
+        self.queue.executor = SubprocessHarnessExecutor(Harnesses(
+            codex=self.harness, claude=self.harness, python=Path(sys.executable)),
+            capture_limit_bytes=1024)
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_detail"], "execution_harness_output_overflow")
+        job_dir = self.queue.root / queued["job_id"]
+        capture = json.loads((job_dir / "harness.capture.json").read_text())
+        self.assertTrue(capture["stdout_overflow"])
+        self.assertEqual(capture["stdout_bytes"], 1024)
+        stdout_path = job_dir / "harness.stdout"
+        self.assertEqual(len(stdout_path.read_bytes()), 1024)
+        self.assertEqual(stat.S_IMODE(stdout_path.stat().st_mode), 0o600)
+        self.assertEqual(capture["stdout_sha256"], hashlib.sha256(
+            stdout_path.read_bytes()).hexdigest())
 
 
 class HarnessVerdictTests(unittest.TestCase):

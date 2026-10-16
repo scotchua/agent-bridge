@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import threading
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from agent_bridge.platform import platform as host_platform
+from agent_bridge.bounded_capture import capture_process
 
 from ..execution import claude_config, verify_policy
 from . import windows_privacy as wpv
@@ -42,6 +42,13 @@ MAX_GENERATION_TIMEOUT_SECONDS = 7200
 MAX_VERIFY_TIMEOUT_SECONDS = 3600
 MAX_CLEANUP_TIMEOUT_SECONDS = 300
 MAX_TOTAL_TIMEOUT_SECONDS = 14_400
+# The harness's own commands retain their 16 MiB stream cap.  Its parent gets
+# a larger, still finite cap so verbose verification does not fail merely
+# because several bounded command transcripts were reported together.
+HARNESS_CAPTURE_MAX_BYTES = 64 * 1024 * 1024
+# Only the final JSON receipt line is interpreted by this parent.  Reading a
+# bounded tail preserves that protocol without loading the whole capture file.
+HARNESS_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
 
 
 class ExecutionAdmissionError(ValueError):
@@ -103,7 +110,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 class SubprocessHarnessExecutor:
     """Invoke only a configured bounded harness, with no shell or fallback."""
 
-    def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset()):
+    def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset(),
+                 capture_limit_bytes: int = HARNESS_CAPTURE_MAX_BYTES):
         # Construction stays portable so Windows MCP clients can submit and
         # inspect queue work. Actual execution is rejected in __call__ until a
         # Windows execution worker exists and has been tested.
@@ -121,6 +129,10 @@ class SubprocessHarnessExecutor:
             raise ExecutionAdmissionError("claude_config_dir_unavailable")
         self.harnesses = harnesses
         self.client_derived_routes = client_derived_routes
+        if isinstance(capture_limit_bytes, bool) or not isinstance(capture_limit_bytes, int) \
+                or capture_limit_bytes <= 0:
+            raise ExecutionAdmissionError("execution_capture_limit_invalid")
+        self.capture_limit_bytes = capture_limit_bytes
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
         generation_timeout = request.get("timeout_seconds")
@@ -227,25 +239,30 @@ class SubprocessHarnessExecutor:
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
-        try:
-            # ``total_timeout_seconds`` is admitted from the complete phase
-            # budget, not guessed from generation.  The harness still owns
-            # each generation, verification and cleanup timeout; this outer
-            # deadline only guarantees that a wedged harness cannot outlive
-            # the finite job.  Keep the process-group kill for descendants.
-            stdout, stderr = process.communicate(timeout=total_timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate()
+        # ``total_timeout_seconds`` is admitted from the complete phase
+        # budget, not guessed from generation.  The harness still owns each
+        # generation, verification and cleanup timeout; this outer deadline
+        # only guarantees that a wedged harness cannot outlive the finite job.
+        # Capture to private files as it runs: a chatty harness must not make
+        # the queue worker allocate unbounded memory.
+        capture = capture_process(
+            process, stdout_path=job_dir / "harness.stdout",
+            stderr_path=job_dir / "harness.stderr", limit=self.capture_limit_bytes,
+            timeout=total_timeout)
+        _atomic_json(job_dir / "harness.capture.json", {
+            "stdout_sha256": capture.stdout.sha256, "stderr_sha256": capture.stderr.sha256,
+            "stdout_bytes": capture.stdout.bytes, "stderr_bytes": capture.stderr.bytes,
+            "stdout_overflow": capture.stdout.overflowed,
+            "stderr_overflow": capture.stderr.overflowed,
+            "capture_failure": capture.failure,
+        })
+        if capture.failure == "timeout":
             raise ExecutionAdmissionError("execution_harness_timeout")
-        for name, payload in (("harness.stdout", stdout), ("harness.stderr", stderr)):
-            target = job_dir / name
-            target.write_bytes(payload)
-            os.chmod(target, 0o600)
-        summary = _harness_summary(stdout)
+        if capture.failure == "output_overflow":
+            raise ExecutionAdmissionError("execution_harness_output_overflow")
+        if capture.failure is not None:
+            raise ExecutionAdmissionError("execution_harness_capture_failed")
+        summary = _harness_summary_file(job_dir / "harness.stdout")
         if is_review and "review_receipt_path" in summary:
             # The worker records a review receipt only when the harness put it
             # inside this queue job's private harness directory.  A printed
@@ -256,10 +273,10 @@ class SubprocessHarnessExecutor:
                 receipt.relative_to((job_dir / "harness").resolve())
             except (OSError, ValueError):
                 raise ExecutionAdmissionError("review_receipt_outside_job") from None
-        return {"returncode": process.returncode,
-                "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+        return {"returncode": capture.returncode,
+                "stdout_sha256": capture.stdout.sha256,
+                "stderr_sha256": capture.stderr.sha256,
+                "stdout_bytes": capture.stdout.bytes, "stderr_bytes": capture.stderr.bytes,
                 **summary}
 
 
@@ -367,6 +384,17 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
                 "harness_status": status, "harness_verdict": "read", **diagnostics,
                 **review_receipt}
     return _unreadable("receipt_absent")
+
+
+def _harness_summary_file(path: Path) -> dict[str, Any]:
+    """Read only the final bounded diagnostic window from file-backed stdout."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - HARNESS_DIAGNOSTIC_TAIL_BYTES))
+            return _harness_summary(handle.read(HARNESS_DIAGNOSTIC_TAIL_BYTES))
+    except OSError:
+        return _unreadable("receipt_unparseable")
 
 
 #: Longest diagnostic text copied from a harness line into a receipt.

@@ -17,11 +17,14 @@ import sqlite3
 import subprocess
 import threading
 import time
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from ..bounded_capture import capture_process
 
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
@@ -97,7 +100,8 @@ class QueueCaps:
 
 _RUNTIME_REASONS = frozenset({
     "child payload lacks job id", "child did not return a JSON object",
-    "executor result must be an object",
+    "executor result must be an object", "child output exceeded bounded capture",
+    "child output capture failed",
 })
 _BACKEND_EXCEPTION_NAMES = frozenset({
     "RuntimeError", "ValueError", "TypeError", "OSError", "PermissionError",
@@ -129,7 +133,8 @@ _GEMMA_VALUE_REASONS = frozenset({
 _GEMMA_REFUSAL_REASONS = frozenset({
     "custom_instruction_unsupported", "delegate_source_changed",
     "receipt_validator_source_changed", "gemma_delegate_timeout",
-    "gemma_delegate_unavailable", "classify_line_count_mismatch",
+    "gemma_delegate_unavailable", "gemma_delegate_output_overflow",
+    "classify_line_count_mismatch",
 })
 _GEMMA_RECEIPT_REASONS = frozenset({
     "receipt_validator_unloadable", "receipt_validator_contract_missing",
@@ -145,6 +150,10 @@ _CHILD_REASONS = {
     "GemmaReceiptError": _GEMMA_RECEIPT_REASONS,
 }
 FAILURE_TEXT_LIMIT = 200
+# Local child protocols are JSON and normally tiny.  Four MiB leaves room for
+# a deliberately verbose, mechanically-scoped response while retaining a
+# hard refusal before a child can exhaust the queue worker's memory.
+LOCAL_CHILD_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _fixed_child_detail(error: str, detail: str) -> bool:
@@ -219,12 +228,16 @@ class SubprocessBackend:
     selection option.
     """
 
-    def __init__(self, command: list[str]):
+    def __init__(self, command: list[str], *, capture_limit_bytes: int = LOCAL_CHILD_CAPTURE_MAX_BYTES):
         if not command or not all(isinstance(part, str) and part for part in command):
             raise ValueError("command must be a non-empty argv list")
+        if isinstance(capture_limit_bytes, bool) or not isinstance(capture_limit_bytes, int) \
+                or capture_limit_bytes <= 0:
+            raise ValueError("capture_limit_bytes must be positive")
         self.command = tuple(command)
+        self.capture_limit_bytes = capture_limit_bytes
         self._lock = threading.Lock()
-        self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def run(self, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
         job_id = payload.get("job_id")
@@ -232,20 +245,34 @@ class SubprocessBackend:
             raise RuntimeError("child payload lacks job id")
         env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
         proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+                                stderr=subprocess.PIPE, start_new_session=True,
                                 env=env, shell=False)
         with self._lock:
             self._processes[job_id] = proc
         try:
-            output, _ = proc.communicate(json.dumps(payload), timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            self._terminate_group(proc)
-            proc.communicate()
-            raise TimeoutError("child exceeded local execution timeout") from exc
+            # The queue protocol has no per-job directory at this boundary,
+            # so a private temporary directory is the owner-only capture
+            # lifetime. The parsed result is still bounded by the cap.
+            with tempfile.TemporaryDirectory(prefix="agent-bridge-local-child-") as temporary:
+                root = Path(temporary)
+                capture = capture_process(
+                    proc, stdout_path=root / "stdout", stderr_path=root / "stderr",
+                    limit=self.capture_limit_bytes, timeout=timeout_seconds,
+                    stdin_data=json.dumps(payload).encode("utf-8"))
+                if capture.failure == "timeout":
+                    raise TimeoutError("child exceeded local execution timeout")
+                if capture.failure == "output_overflow":
+                    raise RuntimeError("child output exceeded bounded capture")
+                if capture.failure is not None:
+                    raise RuntimeError("child output capture failed")
+                try:
+                    output = (root / "stdout").read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as exc:
+                    raise RuntimeError("child output capture failed") from exc
         finally:
             with self._lock:
                 self._processes.pop(job_id, None)
-        if proc.returncode != 0:
+        if capture.returncode != 0:
             raise _ChildFailure(output)
         try:
             value = json.loads(output)
@@ -256,7 +283,7 @@ class SubprocessBackend:
         return value
 
     @staticmethod
-    def _terminate_group(proc: "subprocess.Popen[str]", sig: int = getattr(signal, "SIGKILL", signal.SIGTERM)) -> None:
+    def _terminate_group(proc: "subprocess.Popen[bytes]", sig: int = getattr(signal, "SIGKILL", signal.SIGTERM)) -> None:
         """Kill the whole isolated process group, not only the immediate child.
 
         ``start_new_session=True`` above makes this child its own
