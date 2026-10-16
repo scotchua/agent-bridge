@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.localq import server as server_module
-from agent_bridge.localq.server import INSTRUCTIONS, Server
+from agent_bridge.localq.server import INSTRUCTIONS, MAX_FRAME_CHARS, Server
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 
 
@@ -90,6 +90,37 @@ class ServerTests(unittest.TestCase):
         out = io.StringIO()
         self.server.serve(wire, out)
         self.assertEqual(json.loads(out.getvalue())["error"]["code"], -32700)
+
+    def test_oversized_frame_is_refused_before_intake_and_closes_transport(self):
+        output = io.StringIO()
+        status = self.server.serve(io.StringIO("x" * (MAX_FRAME_CHARS + 1)), output)
+        self.assertEqual(status, 1)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32600, "message": "request exceeds frame limit"},
+        })
+
+    def test_throwing_handler_returns_fixed_error_and_transport_serves_next_request(self):
+        self.server.tools["synthetic_throw"] = {
+            "description": "synthetic throwing handler",
+            "inputSchema": {"type": "object"},
+            "handler": mock.Mock(side_effect=RuntimeError("must not be exposed")),
+        }
+        wire = io.StringIO(
+            '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+            '"params":{"name":"synthetic_throw","arguments":{}}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+        output = io.StringIO()
+        with mock.patch.object(server_module._LOG, "error") as error_log:
+            self.assertEqual(self.server.serve(wire, output), 0)
+        failed, ping = (json.loads(line) for line in output.getvalue().splitlines())
+        self.assertEqual(failed["id"], 1)
+        self.assertEqual(failed["result"]["structuredContent"],
+                         {"ok": False, "error": "internal_error"})
+        self.assertTrue(failed["result"]["isError"])
+        self.assertNotIn("must not be exposed", output.getvalue())
+        self.assertEqual(ping, {"jsonrpc": "2.0", "id": 2, "result": {}})
+        error_log.assert_called_once_with("localq_transport_handler_error")
 
     def test_init_rejects_nonpositive_interval_and_keeps_default(self):
         self.assertEqual(Server(self.service).interval, 5.0)

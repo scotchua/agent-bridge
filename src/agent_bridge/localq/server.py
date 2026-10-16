@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import sys
 import threading
@@ -17,6 +18,12 @@ from .service import Service
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "agent-bridge-localq"
 SERVER_VERSION = "0.1.0"
+# Bound each pre-parse read.  Do not try to drain an oversized frame: a peer
+# that does not send a newline must not make this transport retain unbounded
+# input while looking for one.
+MAX_FRAME_CHARS = 2 * 1024 * 1024
+_HANDLER_ERROR_CODE = "localq_transport_handler_error"
+_LOG = logging.getLogger(__name__)
 INSTRUCTIONS = (
     "Local mechanical non-client work queue only. It accepts bounded text tasks, has no "
     "cloud fallback, and returns untrusted drafts for review. Confidential or "
@@ -94,7 +101,12 @@ class Server:
             arguments = params.get("arguments", {})
             if not isinstance(arguments, dict):
                 return self._error(request_id, -32602, "invalid params")
-            result = self._content(spec["handler"](arguments))
+            try:
+                result = self._content(spec["handler"](arguments))
+            except Exception:  # noqa: BLE001 - a tool fault must not end the MCP session
+                # Keep diagnostics content-free: never record exception text or request data.
+                _LOG.error(_HANDLER_ERROR_CODE)
+                result = self._content({"ok": False, "error": "internal_error"})
         else:
             return self._error(request_id, -32601, "method not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -103,10 +115,18 @@ class Server:
         stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
         self.start()
         try:
-            for line in stdin:
+            while True:
+                line = stdin.readline(MAX_FRAME_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > MAX_FRAME_CHARS:
+                    stdout.write(json.dumps(
+                        self._error(None, -32600, "request exceeds frame limit")) + "\n")
+                    stdout.flush()
+                    return 1
                 try:
                     request = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     reply = self._error(None, -32700, "parse error")
                 else:
                     reply = self.handle(request)
