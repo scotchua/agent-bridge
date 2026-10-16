@@ -397,7 +397,9 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertEqual(restarted.run_once("worker-1"),
                          {"job_id": valid["job_id"], "state": "complete",
                           "caller": "codex", "provider": "claude",
-                          "classification": "synthetic"})
+                          "classification": "synthetic",
+                          "harness_status": "complete", "harness_verdict": "read",
+                          "finished_at": 101.0})
         self.assertEqual([request["job_id"] for request in self.fake.requests],
                          [valid["job_id"]])
         self.assertEqual(restarted.result(claimed["job_id"])["state"], "blocked")
