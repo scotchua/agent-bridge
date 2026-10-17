@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import delegation_verify as dv
 from agent_bridge.orchestration.execution_queue import ExecutionQueue, reserve_nothing
+from git_fixture import make_git_repo
 
 
 def _git_available() -> bool:
@@ -55,9 +56,7 @@ class VerificationQueueIsolationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.production = self.root / "production-queue"
         self.executor = RecordingExecutor()
-        self.user_repo = self.root / "user-repo"
-        self.user_repo.mkdir()
-        subprocess.run(["git", "init", "--quiet", str(self.user_repo)], check=True)
+        self.user_repo = make_git_repo(self.root / "user-repo")
         self.user_brief = self.user_repo / "brief.txt"
         self.user_brief.write_text("the user's own queued work\n", encoding="utf-8")
         self.production.mkdir(mode=0o700)

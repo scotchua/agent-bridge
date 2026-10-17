@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import delegation, execution_queue as eq
 from agent_bridge.orchestration import windows_delegation as wdg
+from git_fixture import make_git_repo
 
 
 #: Outcomes that are not successes, each for a different reason, and each of
@@ -85,8 +86,7 @@ class QueuePathTests(unittest.TestCase):
 
     def _submit(self, queue, counter=[0]):
         counter[0] += 1
-        repo = Path(tempfile.mkdtemp())
-        (repo / ".git").mkdir()
+        repo = make_git_repo(Path(tempfile.mkdtemp()))
         brief = repo / "brief.txt"
         brief.write_text("synthetic brief", encoding="utf-8")
         return queue.submit(caller="codex", provider="claude", repo=str(repo),

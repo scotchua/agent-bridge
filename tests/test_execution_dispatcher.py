@@ -22,22 +22,7 @@ from agent_bridge.orchestration.execution_queue import (
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
-
-
-def make_git_repo(path: Path) -> None:
-    """Give POSIX execution-admission tests a real commit to pin."""
-    path.mkdir()
-    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-           "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "Queue Test",
-           "GIT_AUTHOR_EMAIL": "queue@example.invalid", "GIT_COMMITTER_NAME": "Queue Test",
-           "GIT_COMMITTER_EMAIL": "queue@example.invalid"}
-    for argv in (("git", "init", "--quiet"),):
-        subprocess.run(argv, cwd=path, check=True, env=env, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, shell=False)
-    (path / "tracked.txt").write_text("base\n", encoding="utf-8")
-    for argv in (("git", "add", "tracked.txt"), ("git", "commit", "--quiet", "-m", "base")):
-        subprocess.run(argv, cwd=path, check=True, env=env, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, shell=False)
+from git_fixture import make_git_repo
 
 
 class FakeExecutor:

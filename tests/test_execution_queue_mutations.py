@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import execution_queue as eq
+from git_fixture import make_git_repo
 
 
 class QueueMutationTests(unittest.TestCase):
@@ -22,19 +22,7 @@ class QueueMutationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.repo = self.root / "invented-repo"
-        self.repo.mkdir()
-        env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-               "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "Queue Test",
-               "GIT_AUTHOR_EMAIL": "queue@example.invalid", "GIT_COMMITTER_NAME": "Queue Test",
-               "GIT_COMMITTER_EMAIL": "queue@example.invalid"}
-        subprocess.run(["git", "init", "--quiet"], cwd=self.repo, check=True, env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
-        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "add", "tracked.txt"], cwd=self.repo, check=True, env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
-        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=self.repo, check=True,
-                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        self.repo = make_git_repo(self.root / "invented-repo")
         self.brief = self.root / "brief.md"
         self.brief.write_text("Implement a synthetic ledger report", encoding="utf-8")
         self.queue = eq.ExecutionQueue(self.root / "queue", lambda request, path: {

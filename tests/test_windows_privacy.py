@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import execution_queue as eq
 from agent_bridge.orchestration import windows_privacy as wpv
+from git_fixture import make_git_repo
 import platform_support
 
 
@@ -253,9 +254,7 @@ class QueuePrivacyAtCreationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "queue"
-        self.repo = Path(self.temp.name) / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        self.repo = make_git_repo(Path(self.temp.name) / "repo")
         self.brief = Path(self.temp.name) / "brief.txt"
         self.brief.write_text("do the thing\n", encoding="utf-8")
 
