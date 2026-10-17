@@ -121,6 +121,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_verify_runnable.py"
           python3 -m unittest discover -s tests -p "test_localq.py"
           python3 -m unittest discover -s tests -p "test_localq_intake.py"
+          python3 -m unittest discover -s tests -p "test_sqlite_teardown.py"
           python3 -m unittest discover -s tests -p "test_checkpoint.py"
           python3 -m unittest discover -s tests -p "test_local_vocabulary.py"
           python3 -m unittest discover -s tests -p "test_gemma_certified.py"

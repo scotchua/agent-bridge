@@ -23,6 +23,7 @@ from agent_bridge.orchestration.execution_queue import (
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
+from sqlite_teardown import cleanup_temporary_directory
 
 
 class FakeExecutor:
@@ -73,9 +74,12 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.fake = FakeExecutor()
         self.queue = ExecutionQueue(self.root / "queue", self.fake, clock=lambda: 100.0,
                                     model_reserved=reserve_nothing)
+        self.servers = []
 
     def tearDown(self):
-        self.temp.cleanup()
+        cleanup_temporary_directory(
+            self.temp, stop=(server.stop for server in self.servers),
+            worker_names=("orchestration-local-worker",))
 
     def submit(self, **changes):
         values = {"caller": "codex", "provider": "claude", "repo": str(self.repo),
@@ -330,6 +334,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         service = LocalService(self.root / "local")
         server = Server("codex", service, router, execution=self.queue, interval=0.01,
                         state_root=str(state_root))
+        self.servers.append(server)
         names = {tool["name"] for tool in server.handle({"jsonrpc": "2.0", "id": 1,
                  "method": "tools/list"})["result"]["tools"]}
         self.assertTrue({"execution_dispatch", "execution_status", "execution_result"} <= names)
@@ -711,7 +716,8 @@ class HarnessVerdictTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def tearDown(self):
-        self.temp.cleanup()
+        cleanup_temporary_directory(
+            self.temp, worker_names=("orchestration-local-worker",))
 
     def _made(self, **extra):
         outcome = {"returncode": 0, "harness_ok": True,
@@ -846,7 +852,8 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         self.state_root = self.root / "state"
 
     def tearDown(self):
-        self.temp.cleanup()
+        cleanup_temporary_directory(
+            self.temp, worker_names=("orchestration-local-worker",))
 
     def write_policy(self, **document):
         path = Path(autoroute.policy_path(str(self.state_root)))
