@@ -446,8 +446,7 @@ class StageBindingRecheckTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.now = [100.0]
