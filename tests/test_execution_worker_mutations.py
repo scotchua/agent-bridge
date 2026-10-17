@@ -124,6 +124,7 @@ class ConfiguredQueueMutationTests(unittest.TestCase):
         with mock.patch.object(worker, "load", return_value=cfg), \
              mock.patch.object(worker, "select_executor", return_value=object()), \
              mock.patch.object(worker.autoroute, "model_reserved_for", return_value=lambda _: False), \
+             mock.patch.object(worker.revision, "record"), \
              mock.patch.object(worker, "StageRouter") as router_type, \
              mock.patch.object(worker, "ExecutionQueue") as queue_type:
             self.assertIs(worker._configured_queue("invented-config.json"),
@@ -149,6 +150,7 @@ class RunMutationTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(worker, "load", return_value=cfg))
         stack.enter_context(mock.patch.object(worker, "WorkerLock", return_value=contextlib.nullcontext()))
+        stack.enter_context(mock.patch.object(worker.store, "file_lock", return_value=contextlib.nullcontext()))
         stack.enter_context(mock.patch.object(worker, "_configured_queue", return_value=queue))
         quick = stack.enter_context(mock.patch.object(
             drift, "quick_check", return_value=status or {

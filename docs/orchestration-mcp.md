@@ -156,6 +156,17 @@ is passed), and the job fails closed with `Codex executable unavailable` or
 Keep the filled-in plist out of the repository. Load it in the logged-in
 user's GUI launchd domain, not as root or a system daemon.
 
+## After updating the checkout
+
+After a merge, fast-forward the checkout first. Then run
+`python setup_bridge.py doctor`: it reports the revision loaded by the
+execution worker and lists any stale client-owned MCP servers. Run
+`python setup_bridge.py restart-worker` once the execution queue is idle; it
+refuses rather than interrupting a running job. Finally restart the sessions
+doctor lists, or use `/reload-plugins` where the client supports it. Stdio MCP
+servers belong to those clients and are only reported here, never restarted by
+the bridge.
+
 Before relying on the lane, submit a synthetic job from each configured caller.
 Confirm the terminal receipt identifies the opposite provider, source integrity
 matches, disposable worktrees were removed, and all permission-to-land fields

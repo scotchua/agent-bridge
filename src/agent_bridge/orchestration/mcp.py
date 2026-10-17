@@ -27,6 +27,7 @@ from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, Admission
 from . import autodecide, autoroute, gate, localfirst
 from .execution_queue import ExecutionAdmissionError, ExecutionQueue
 from ..execution import codex_review
+from .. import revision
 
 
 def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -120,7 +121,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 intake: AutomaticIntake,
                 execution: ExecutionQueue | None = None,
                 state_root: str | None = None,
-                protected: tuple[str, ...] = ()) -> dict[str, dict[str, Any]]:
+                protected: tuple[str, ...] = (),
+                revision_status: Callable[[], dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """Build one caller-bound tool set.
 
     Caller provenance is injected here and is intentionally absent from the
@@ -662,7 +664,11 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "handler": lambda args: {"ok": True, "caller": caller,
                                       "stages": router.report(),
                                       "local_queue": queue.state_report(),
-                                      "execution_queue": execution.state_report() if execution else {"disabled": 1}},
+                                      "execution_queue": execution.state_report() if execution else {"disabled": 1},
+                                      "execution_worker": revision.read_record(
+                                          str(execution.root / "execution-worker-status.json"))
+                                      if execution else {"code_revision": "unavailable", "code_stale": True},
+                                      **(revision_status() if revision_status is not None else {})},
         },
     }
     decide = _schema({

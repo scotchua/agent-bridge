@@ -21,6 +21,8 @@ from pathlib import Path
 from .. import health, preflight
 from ..execution import claude_config, claude_task, codex_promotion, codex_task
 from ..platform import platform as host_platform
+from .. import revision
+from .. import store
 from ..capacity_router import StageRouter
 from . import autoroute
 from .config import load
@@ -352,6 +354,11 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
     try:
+        revision.record(str(cfg.execution_queue_root / "execution-worker-status.json"), revision.capture(),
+                        pid=os.getpid(), started_at=store.utc_now())
+    except OSError as exc:
+        raise ExecutionAdmissionError("execution_worker_status_unavailable") from exc
+    try:
         stage_router = StageRouter(cfg.capacity_db)
     except (OSError, sqlite3.Error):
         # A configured worker may consume only after its independent live
@@ -387,7 +394,29 @@ def run(config_path: str, *, once: bool, interval: float,
             # Recovery happens only after this process owns the global lock.
             # Any uncertain prior send becomes blocked and is never repeated.
             queue = _configured_queue(config_path)
-            def run_checked_once(*, force_refresh: bool = False) -> dict | None:
+            restart_lock = str(cfg.execution_queue_root / ".execution-restart.lock")
+            restart_request = cfg.execution_queue_root / ".execution-restart-request.json"
+
+            def run_checked_once() -> tuple[dict | None, bool]:
+                # The restart command takes this lock while it scans durable
+                # state and writes its request.  It intentionally does not
+                # cover queue.run_once(): a provider run may last an hour and
+                # restart-worker needs a prompt, conservative answer while it
+                # does.  A request that lands after this check is consumed at
+                # the next idle pass; it never signals a provider run.
+                with store.file_lock(restart_lock):
+                    if restart_request.is_file():
+                        try:
+                            restart_request.unlink()
+                        except OSError:
+                            raise ExecutionAdmissionError("execution_worker_restart_request_unavailable")
+                        return None, True
+                # A drift refresh request is consumed only by a pass that
+                # will actually run the check, never by one that restarts.
+                force_refresh = _consume_drift_refresh_request(cfg.execution_queue_root)
+                return _run_checked_once(force_refresh=force_refresh), False
+
+            def _run_checked_once(*, force_refresh: bool = False) -> dict | None:
                 from .. import drift
                 status = drift.quick_check(config_path, force_refresh=force_refresh)
                 changed = set(status["changed"])
@@ -437,16 +466,16 @@ def run(config_path: str, *, once: bool, interval: float,
                 print("drift_refresh_complete")
                 return 0
             if once:
-                result = run_checked_once(
-                    force_refresh=_consume_drift_refresh_request(
-                        cfg.execution_queue_root))
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is not None:
                     print(f"{result['job_id']} {result['state']}")
                 return 0
             while not stop:
-                result = run_checked_once(
-                    force_refresh=_consume_drift_refresh_request(
-                        cfg.execution_queue_root))
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is None:
                     time.sleep(interval)
             return 0
