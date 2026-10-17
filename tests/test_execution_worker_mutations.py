@@ -202,6 +202,22 @@ class RunMutationTests(unittest.TestCase):
         queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
         queue.run_once.assert_not_called()
 
+    def test_refresh_keeps_a_readiness_hold_while_login_is_unproved(self):
+        queue = mock.Mock()
+        status = {"changed": [], "checked_at": 200.0, "cache_age_seconds": 0.0}
+        quick, _, _ = self._context(queue, status=status)
+        queue.queued_providers.return_value = {"claude"}
+        with mock.patch.object(worker, "readiness_holds",
+                               return_value={"claude": worker.READINESS_UNAVAILABLE}) as probe, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = worker.run("invented-config.json", once=False, interval=1,
+                                worker_id="worker-invented", refresh=True)
+        self.assertEqual(result, 0)
+        probe.assert_called_once_with(mock.ANY, {"claude"})
+        queue.hold_dependencies.assert_called_once_with(
+            {"claude": worker.READINESS_UNAVAILABLE}, drift_status=status)
+        queue.run_once.assert_not_called()
+
     def test_refresh_requests_running_worker_without_dispatching(self):
         queue = mock.Mock()
         queue_root = self.root / "queue"

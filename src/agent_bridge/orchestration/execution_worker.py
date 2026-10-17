@@ -428,6 +428,11 @@ def run(config_path: str, *, once: bool, interval: float,
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
                 holds = {name: name for name in ("codex", "claude") if name in changed}
+                # hold_dependencies replaces every queued job's hold, so a
+                # refresh rechecks readiness too; otherwise it would release a
+                # login hold while the login is still unproved.
+                for provider, reason in readiness_holds(cfg, queue.queued_providers()).items():
+                    holds.setdefault(provider, reason)
                 queue.hold_dependencies(holds, drift_status=status)
                 print("drift_refresh_complete")
                 return 0
