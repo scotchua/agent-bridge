@@ -50,21 +50,21 @@ stdin when given no prompt argument).
 """
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
     from .. import runner, preflight, store, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from ..errors import BrokerError
-    from . import codex_promotion, hostenv, verify_policy
+    from . import codex_promotion, hostenv, job_source, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.errors import BrokerError
-    from agent_bridge.execution import codex_promotion, hostenv, verify_policy
+    from agent_bridge.execution import codex_promotion, hostenv, job_source, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -90,6 +90,71 @@ MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=16_000_000
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
 _GIT_BIN:Path|None=None
+MAX_JOB_SOURCE_MANIFEST_BYTES=1024*1024
+
+def _pinned_source(job_source_root:Path|None,base:str):
+    """Read the fixed manifest without consulting the operator checkout."""
+    if job_source_root is None: return None,None,None
+    if os.name!="posix": raise TaskError("job_source_platform_unsupported")
+    if not job_source_root.is_absolute(): raise TaskError("job_source_path_invalid")
+    manifest_path=job_source_root/"job-source-manifest.json"
+    try:
+        info=os.lstat(manifest_path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_JOB_SOURCE_MANIFEST_BYTES:
+            raise OSError
+        raw=manifest_path.read_bytes()
+    except OSError as exc:
+        raise TaskError("job_source_manifest_missing") from exc
+    try: manifest=json.loads(raw)
+    except (UnicodeDecodeError,json.JSONDecodeError) as exc: raise TaskError("job_source_manifest_invalid") from exc
+    commit=manifest.get("commit") if isinstance(manifest,dict) else None
+    manifest_sha256=manifest.get("manifest_sha256") if isinstance(manifest,dict) else None
+    if not isinstance(manifest_sha256,str) or not re.fullmatch(r"[0-9a-f]{64}",manifest_sha256):
+        raise TaskError("job_source_manifest_invalid")
+    if (not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?",base)
+            or base!=commit):
+        raise TaskError("job_source_base_mismatch")
+    return manifest,manifest_sha256,job_source_root/job_source.JOB_SOURCE_DIRNAME
+
+def _source_checkpoint(root:Path,manifest:dict,checkpoint:str,checks:list[dict]):
+    reasons=[] if _manifest_matches(root,manifest) else ["manifest_mismatch"]
+    if not reasons: reasons=job_source.verify_job_source(root,manifest)
+    checks.append({"checkpoint":checkpoint,"reasons":reasons})
+    if reasons: raise TaskError("source repository integrity changed: "+",".join(reasons))
+
+def _source_reasons(root:Path,manifest:dict):
+    return ["manifest_mismatch"] if not _manifest_matches(root,manifest) else job_source.verify_job_source(root,manifest)
+
+def _manifest_matches(root:Path,manifest:dict)->bool:
+    path=root/"job-source-manifest.json"
+    try:
+        info=os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_JOB_SOURCE_MANIFEST_BYTES: return False
+        return json.loads(path.read_bytes())==manifest
+    except (OSError,UnicodeDecodeError,json.JSONDecodeError): return False
+
+def _worktree_checkpoint(tree:Path,git_dir:Path,commit:str,checkpoint:str,checks:list[dict],env):
+    reasons=[]
+    try:
+        marker=(tree/".git").read_text(encoding="utf-8").strip()
+        if not marker.startswith("gitdir: "): raise OSError
+        admin=Path(marker[8:]).resolve()
+        if admin.parent != (git_dir/"worktrees").resolve(): raise OSError
+        commondir=(admin/(admin/"commondir").read_text(encoding="utf-8").strip()).resolve()
+        if commondir != git_dir.resolve(): raise OSError
+    except OSError:
+        reasons.append("worktree_pointer_changed")
+    if not reasons:
+        try:
+            if _git(tree,"rev-parse","HEAD",env=env)!=commit: reasons.append("worktree_head_changed")
+        except TaskError: reasons.append("worktree_head_changed")
+    checks.append({"checkpoint":checkpoint,"reasons":reasons})
+    if reasons: raise TaskError("source repository integrity changed: "+",".join(reasons))
+
+def _add_pinned_worktree(git_dir:Path,tree:Path,commit:str,env):
+    result=_run(_git_argv(f"--git-dir={git_dir}","worktree","add","--detach",str(tree),commit),
+                cwd=git_dir.parent,env=env,timeout=120)
+    if result.returncode: raise TaskError("git prerequisite failed")
 
 def _git_bin()->Path:
     """The host's git, resolved once and named in the refusal when absent.
@@ -425,11 +490,12 @@ def _patch(tree:Path,base:str,env):
     if not r.stdout: raise TaskError("Codex produced an empty patch")
     return r.stdout
 
-def _remove(repo:Path,tree:Path,env,timeout:float=60):
+def _remove(repo:Path,tree:Path,env,timeout:float=60,*,git_dir:Path|None=None):
     if not tree.exists(): return True
     if timeout <= 0: return False
     try:
-        result=_run(_git_argv("worktree","remove","--force",str(tree)),cwd=repo,env=env,timeout=timeout)
+        args=(f"--git-dir={git_dir}","worktree","remove","--force",str(tree)) if git_dir else ("worktree","remove","--force",str(tree))
+        result=_run(_git_argv(*args),cwd=git_dir.parent if git_dir else repo,env=env,timeout=timeout)
     except (OSError,TaskError,subprocess.SubprocessError):
         return False
     # Never run repository-wide `worktree prune`: it can discard unrelated
@@ -449,16 +515,16 @@ def _pinned_python(command:list[str])->list[str]:
     return command
 
 def _sandboxed(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
-               backend:hostenv.Confinement|None=None):
+               backend:hostenv.Confinement|None=None,extra_canaries:tuple[str,...]=()):
     """Run one verification command under this host's confinement backend."""
     backend=backend or _require_confinement("synthetic")
     command=_pinned_python(command)
     if backend.name==hostenv.LINUX_USERNS:
-        return _netns_confined(command,tree,scratch,env,timeout,backend)
+        return _netns_confined(command,tree,scratch,env,timeout,backend,extra_canaries)
     return _sandbox_exec_confined(command,tree,scratch,env,timeout,backend)
 
 def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
-                    backend:hostenv.Confinement):
+                    backend:hostenv.Confinement,extra_canaries:tuple[str,...]=()):
     """Network denied and writes confined by a mount namespace. Reads are not.
 
     See the Claude lane for the full note. The boundary re-proves itself for this worktree on every command: the
@@ -472,7 +538,7 @@ def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],t
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
     result=_run(hostenv.confined_argv(command,tree=tree,scratch=scratch,
-                                      canaries=_confinement_canaries(tree)),
+                                      canaries=_confinement_canaries(tree,extra_canaries)),
                 cwd=tree,env=sandbox_env,timeout=timeout)
     if result.returncode==hostenv.CONFINEMENT_SELFTEST_EXIT:
         raise TaskError("verification confinement failed its own canary check on this host "
@@ -482,7 +548,7 @@ def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],t
     result.duration_seconds=time.monotonic()-started
     return result
 
-def _confinement_canaries(tree:Path)->list[str]:
+def _confinement_canaries(tree:Path,extra_canaries:tuple[str,...]=())->list[str]:
     """Paths a verification command must not be able to write.
 
     The source repository is first because a write there is the exact damage
@@ -507,6 +573,8 @@ def _confinement_canaries(tree:Path)->list[str]:
     for extra in (str(Path.home()),tempfile.gettempdir()):
         if extra not in canaries and os.path.isdir(extra):
             canaries.append(extra)
+    for extra in extra_canaries:
+        if extra not in canaries and os.path.isdir(extra): canaries.append(extra)
     return canaries
 
 def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],timeout:int,
@@ -571,7 +639,7 @@ def _assert_no_ancestor_contamination(job:Path):
     except BrokerError as exc:
         raise TaskError(f"ancestor instruction-file check failed: {exc.category.value}") from exc
 
-def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,**kwargs):
+def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,job_source:Path|None=None,**kwargs):
     """Run one task under codex-bridge's CLI promotion admission.
 
     Admission comes before everything else, including request validation,
@@ -583,7 +651,8 @@ def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,**kwargs):
     node_bin=shutil.which("node",path=_env()["PATH"])
     try:
         with codex_promotion.admit(codex_bin,promotion_dir=promotion_dir,node_bin=node_bin) as admission:
-            return _run_admitted(codex_bin=admission.exec_path,admission=admission,**kwargs)
+            return _run_admitted(codex_bin=admission.exec_path,admission=admission,
+                                 job_source=job_source,**kwargs)
     except codex_promotion.AdmissionRefused as exc:
         raise TaskError(f"Codex CLI admission refused: {exc}") from exc
 
@@ -592,21 +661,25 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
                   client_derived_routes: tuple[str, ...] = (),
                   verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,
-                  verify_timeout:int=300,cleanup_timeout:int=60):
+                  verify_timeout:int=300,cleanup_timeout:int=60,job_source:Path|None=None):
     if classification not in ALLOWED_CLASSIFICATIONS and not (
             classification == "client_derived" and "execution" in client_derived_routes):
         raise TaskError("execution lane refuses client-derived material")
     if (any(isinstance(value,bool) or not isinstance(value,int) or value < 1
             for value in (timeout,verify_timeout,cleanup_timeout))):
         raise TaskError("execution deadline invalid")
-    if any(not p.is_absolute() for p in (brief,repo,task_root,codex_bin,codex_home)): raise TaskError("all paths must be absolute")
-    if not repo.is_dir() or not (repo/".git").is_dir(): raise TaskError("repo must be a primary git checkout")
+    paths=(brief,repo,task_root,codex_bin,codex_home) + ((job_source,) if job_source is not None else ())
+    if any(not p.is_absolute() for p in paths): raise TaskError("all paths must be absolute")
+    if job_source is None and (not repo.is_dir() or not (repo/".git").is_dir()): raise TaskError("repo must be a primary git checkout")
     if not codex_bin.is_file() or not os.access(codex_bin,os.X_OK): raise TaskError("Codex executable unavailable")
     raw=brief.read_bytes()
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
     try: brief_text=raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
-    checks=_verify_argv(verify_argv or []); env=_env(); source_before=_source_state(repo,env)
+    checks=_verify_argv(verify_argv or []); env=_env()
+    manifest,manifest_sha256,pinned_git_dir=_pinned_source(job_source,base)
+    source_before=None if manifest is not None else _source_state(repo,env)
+    source_checks=[]
     # The host is probed only after the REQUEST has been validated. Ordering
     # matters for the message an operator sees: with the probe first, a
     # refused verification command on a host with no confinement backend
@@ -614,7 +687,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
     # pre-existing test and would have misdirected anybody reading the
     # receipt. Validate what was asked, then interrogate the machine.
     backend=_require_confinement(classification)
-    base_sha=_git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
+    base_sha=manifest["commit"] if manifest is not None else _git(repo,"rev-parse","--verify",f"{base}^{{commit}}",env=env)
     version=_run([str(codex_bin),"--version"],cwd=codex_bin.parent,env=env,timeout=30)
     if version.returncode: raise TaskError("could not identify Codex executable")
     admission.check_reported_version(version.stdout.decode("utf-8","replace"))
@@ -636,7 +709,12 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
              "confinement_denies_network":backend.denies_network,
              "confinement_confines_reads":backend.confines_reads,
              "confinement_confines_writes":backend.confines_writes,
-             "source_before":source_before}; _atomic_json(job/"receipt.json",receipt)
+             "source_mode":"pinned_job_source" if manifest is not None else "operator_checkout"}
+    if manifest is not None:
+        receipt.update(job_source_manifest_sha256=manifest_sha256,job_source_checks=source_checks)
+    else:
+        receipt["source_before"]=source_before
+    _atomic_json(job/"receipt.json",receipt)
     pending_exc=None
     try:
         _assert_no_ancestor_contamination(job)
@@ -647,7 +725,12 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
             raise TaskError(f"isolated CODEX_HOME carries unexpected config: {exc.category.value}") from exc
         receipt["auth"]=_auth(codex_bin,codex_home,env)
         receipt["codex_home_inventory"]=preflight.peer_home_inventory(str(codex_home))
-        _git(repo,"worktree","add","--detach",str(gen),base_sha,timeout=120,env=env); marker=(gen/".git").read_bytes()
+        if manifest is not None:
+            _source_checkpoint(job_source,manifest,"before_generation_worktree",source_checks)
+            _add_pinned_worktree(pinned_git_dir,gen,base_sha,env)
+        else:
+            _git(repo,"worktree","add","--detach",str(gen),base_sha,timeout=120,env=env)
+        marker=(gen/".git").read_bytes()
         last_message_file=job/"codex-last-message.txt"
         argv=_command(codex_bin,model,reasoning_effort,gen,last_message_file)
         codex_env={**env,"CODEX_HOME":str(codex_home)}
@@ -668,9 +751,16 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         last_message=last_message_file.read_bytes() if last_message_file.is_file() else b""
         if not last_message.strip(): raise TaskError("Codex produced no final message")
         receipt["last_message_sha256"]=hashlib.sha256(last_message).hexdigest()
-        if (gen/".git").read_bytes()!=marker: raise TaskError("Codex altered git metadata")
-        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env,cleanup_timeout)
-        _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
+        if manifest is not None:
+            _worktree_checkpoint(gen,pinned_git_dir,base_sha,"generation_worktree_before_patch",source_checks,env)
+        elif (gen/".git").read_bytes()!=marker: raise TaskError("Codex altered git metadata")
+        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600)
+        _remove(repo,gen,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
+        if manifest is not None:
+            _source_checkpoint(job_source,manifest,"before_verification_worktree",source_checks)
+            _add_pinned_worktree(pinned_git_dir,fresh,base_sha,env)
+        else:
+            _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
         applied=_patch(fresh,base_sha,env)
@@ -678,12 +768,16 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
+            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend,
+                         (str(repo),) if manifest is not None else ())
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+        if manifest is not None:
+            _worktree_checkpoint(fresh,pinned_git_dir,base_sha,"verification_worktree_after_verification",source_checks,env)
+            _source_checkpoint(job_source,manifest,"after_verification",source_checks)
         # The delivered patch is a file path, and verification ran between
         # writing it and returning it. Confinement is what stops a verify
         # command reaching the job directory, and this is the check that does
@@ -705,20 +799,30 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         receipt.update(status="failed_pending_integrity",error=type(exc).__name__,
                        error_detail=detail,finished_at=time.time())
     finally:
-        generation_removed=_remove(repo,gen,env,cleanup_timeout)
-        verification_removed=_remove(repo,fresh,env,cleanup_timeout)
+        generation_removed=_remove(repo,gen,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
+        verification_removed=_remove(repo,fresh,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
         cleanup_ok=generation_removed and verification_removed
         receipt["cleanup"]={"generation_worktree":str(gen),"generation_removed":generation_removed,
                             "verification_worktree":str(fresh),"verification_removed":verification_removed}
-    try:
-        source_after=_source_state(repo,env)
-        source_match=source_after==source_before
-        receipt["source_after"]=source_after
-        if not source_match:
-            receipt["source_integrity_reasons"]=_source_integrity_reasons(source_before,source_after)
-    except Exception:
-        source_match=False
-        receipt["source_integrity_reasons"]=["source_snapshot_unavailable"]
+    if manifest is not None:
+        reasons=_source_reasons(job_source,manifest)
+        source_checks.append({"checkpoint":"after_cleanup","reasons":reasons})
+        source_reasons=[]
+        for check in source_checks:
+            for reason in check["reasons"]:
+                if reason not in source_reasons: source_reasons.append(reason)
+        source_match=not source_reasons
+        receipt["source_integrity_reasons"]=source_reasons
+    else:
+        try:
+            source_after=_source_state(repo,env)
+            source_match=source_after==source_before
+            receipt["source_after"]=source_after
+            if not source_match:
+                receipt["source_integrity_reasons"]=_source_integrity_reasons(source_before,source_after)
+        except Exception:
+            source_match=False
+            receipt["source_integrity_reasons"]=["source_snapshot_unavailable"]
     receipt["source_integrity_match"]=source_match
     if not cleanup_ok:
         receipt.update(status="failed",error="WorktreeCleanupError",finished_at=time.time())
@@ -745,6 +849,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
 
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
+    p.add_argument("--job-source",type=Path,default=None)
     p.add_argument("--codex-bin",type=Path,default=Path(shutil.which("codex") or "codex"),dest="codex_bin")
     p.add_argument("--codex-home",type=Path,default=DEFAULT_CODEX_HOME,dest="codex_home")
     p.add_argument("--classification",required=True,
