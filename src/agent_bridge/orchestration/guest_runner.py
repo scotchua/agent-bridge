@@ -1632,6 +1632,29 @@ def capture_diff(workdir: str) -> bytes:
     return patch
 
 
+def _workspace_changed(workdir: str) -> bool:
+    """Whether the provider changed anything, without touching the index.
+
+    capture_diff stages everything (``add -A``) to build the patch. Calling it
+    before verification would hand the checks a different index than the
+    provider left, so a check such as ``git diff --exit-code`` would pass on a
+    changed tree. A lock-free status answers the same question read-only:
+    tracked, staged and untracked non-ignored changes, as ``add -A`` sees them.
+    """
+
+    try:
+        returncode, status, _stderr = _bounded_git(
+            ["--no-optional-locks", "status", "--porcelain", "-z",
+             "--untracked-files=all"], workdir, limit=MAX_DIFF_BYTES)
+    except _OutputTooLarge:
+        return True
+    except TimeoutError:
+        raise GuestRunnerError("diff_timed_out") from None
+    if returncode != 0:
+        raise GuestRunnerError("diff_failed")
+    return bool(status)
+
+
 class _OutputTooLarge(Exception):
     """A child produced more than the caller was willing to hold."""
 
@@ -2277,9 +2300,10 @@ def _execute_provider_job(request: dict[str, object], call: object,
             duration_seconds=time.monotonic() - started)
     # A provider that exits cleanly but changes nothing is no_patch, never a
     # completion, as in the POSIX lanes. Decided before verification, whose
-    # own artifacts could otherwise read as a change. "aborted" because the
-    # host refuses "completed" with any status but complete or a failure.
-    if not capture_diff(workdir):
+    # own artifacts could otherwise read as a change, and without staging
+    # anything the checks would then see. "aborted" because the host refuses
+    # "completed" with any status but complete or a failure.
+    if not _workspace_changed(workdir):
         return build_response(
             status="aborted", harness_status=HARNESS_NO_PATCH,
             reason="no_patch", exit_code=returncode,

@@ -1083,7 +1083,7 @@ class ProviderJobExecutionTests(unittest.TestCase):
 
     def _execute(self, request=None, responses=None, resolve=None,
                  egress=lambda: "verify-egress-denied:test", diff=b"PATCH\n",
-                 baseline=True):
+                 baseline=True, changed=None):
         """``egress`` stands in for the nftables deny policy.
 
         There is no nft on this machine and no kernel to load a table into, so
@@ -1099,6 +1099,9 @@ class ProviderJobExecutionTests(unittest.TestCase):
              mock.patch.object(gr, "capture_diff",
                                diff if callable(diff) else (lambda workdir: diff)), \
              mock.patch.object(gr, "_has_baseline", lambda workdir: baseline), \
+             mock.patch.object(gr, "_workspace_changed",
+                               lambda workdir: changed if changed is not None
+                               else callable(diff) or bool(diff)), \
              mock.patch.object(gr, "enforce_verification_egress", egress), \
              mock.patch.object(gr, "verify_program_path", resolve):
             return gr.execute(gr.validate_request(request or _provider_request()),
@@ -1145,8 +1148,10 @@ class ProviderJobExecutionTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_verification_that_undoes_the_change_is_no_patch_not_complete(self):
-        diffs = [b"PATCH\n", b""]
-        response = self._execute(diff=lambda workdir: diffs.pop(0))
+        # The provider changed the tree; the patch captured after the checks
+        # is empty because a check put it back.
+        diffs = [b""]
+        response = self._execute(diff=lambda workdir: diffs.pop(0), changed=True)
         self.assertEqual(response["status"], "aborted")
         self.assertEqual(response["harness_status"], gr.HARNESS_NO_PATCH)
         self.assertEqual(response["diff_b64"], "")
