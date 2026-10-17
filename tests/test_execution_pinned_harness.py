@@ -295,8 +295,9 @@ class PinnedHarnessEndToEndTests(unittest.TestCase):
                 self._apply_check(source, manifest["commit"], Path(result["patch"]),
                                   self.root / (lane.__name__ + "-apply"))
                 worktrees = git(operator, "worktree", "list", "--porcelain")
+                # Git reports realpaths (/private/var on macOS, not /var).
                 self.assertEqual([line for line in worktrees.splitlines() if line.startswith("worktree ")],
-                                 ["worktree " + str(operator)])
+                                 ["worktree " + str(operator.resolve())])
                 registered = operator / ".git" / "worktrees"
                 self.assertFalse(registered.exists() and any(registered.iterdir()))
                 _, receipt = self._receipt(task_name)
@@ -349,12 +350,19 @@ class PinnedHarnessEndToEndTests(unittest.TestCase):
                                 "commit", "--allow-empty", "--quiet", "-m", "tampered")
                         else:
                             (tree / ".git").write_text("gitdir: /not-the-pinned-source\n", encoding="utf-8")
-                    with self.assertRaisesRegex(lane.TaskError, reason):
+                    # Git cannot remove a worktree whose marker no longer
+                    # points back at its registration, so a rewritten
+                    # pointer also fails cleanup. Either way the job fails
+                    # closed; the receipt names the tamper.
+                    raised = reason if mode == "head" else "cleanup failed"
+                    with self.assertRaisesRegex(lane.TaskError, raised):
                         self._run(lane, operator, source, fake, task_name, mutate=tamper)
                     _, receipt = self._receipt(task_name)
                     check = next(item for item in receipt["job_source_checks"]
                                  if item["checkpoint"] == "generation_worktree_before_patch")
                     self.assertIn(reason, check["reasons"])
+                    self.assertIn(reason, receipt["source_integrity_reasons"])
+                    self.assertEqual(receipt["status"], "failed")
 
     def test_pinned_cleanup_refusal_is_a_harness_failure(self) -> None:
         self._require_confinement()
