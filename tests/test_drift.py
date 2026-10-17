@@ -186,6 +186,15 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertIn("pins 1.0; update that pin to 2.0 first", " ".join(report["needs_you"]))
         self.assertEqual(report["consumers"][0]["version"], "1.0")
 
+    def test_doctor_reports_a_launcher_record_failure_without_aborting(self) -> None:
+        current = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        with mock.patch.object(drift, "inventory", return_value=current), \
+             mock.patch.object(drift.python_runtime, "record", return_value=None):
+            report = drift.doctor(str(self.config), home=str(self.home),
+                                  bridge=self.bridge(self.home / "codex"),
+                                  runner=lambda *_args, **_kwargs: completed())
+        self.assertIn("launcher_python_record_failed", report["needs_you"])
+
     def test_model_check_and_paid_check_order(self) -> None:
         missing = drift._model_check("/ignored", configured_model="missing", configured_effort="low", default_model=None, runner=lambda *a, **k: completed('{"models": []}'))
         unsupported = drift._model_check("/ignored", configured_model="good", configured_effort="high", default_model=None, runner=lambda *a, **k: completed('{"models":[{"slug":"good","supported_reasoning_levels":[{"effort":"low"}]}]}'))

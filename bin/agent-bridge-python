@@ -1,0 +1,74 @@
+#!/bin/sh
+# Shared Python selection for agent-bridge POSIX launchers.  This file is
+# sourced, never executed directly.
+
+# An explicit setting is trusted. The installer record is trusted only after
+# its owner-only boundary is checked. In particular, do not probe a valid
+# recorded choice on a hook call: hooks run for every covered tool invocation.
+agent_bridge_resolve_python() {
+  if [ "${AGENT_BRIDGE_PYTHON+x}" = x ] && [ -n "${AGENT_BRIDGE_PYTHON}" ]; then
+    PY=$AGENT_BRIDGE_PYTHON
+    return 0
+  fi
+
+  agent_bridge_python_file="${HOME:-}/.agent-bridge/launcher-python"
+  agent_bridge_python_dir="${HOME:-}/.agent-bridge"
+  if [ -n "${HOME:-}" ] && [ -f "$agent_bridge_python_file" ] \
+      && [ ! -L "$agent_bridge_python_file" ] && [ -d "$agent_bridge_python_dir" ]; then
+    # One id and one find process check both the record and its parent. Keep
+    # these as the only added processes on the hook's ordinary path.
+    agent_bridge_record_owner=$(id -u 2>/dev/null || true)
+    agent_bridge_safe_record_paths=$(find "$agent_bridge_python_file" "$agent_bridge_python_dir" -prune \
+      -user "$agent_bridge_record_owner" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)
+    if [ "$agent_bridge_safe_record_paths" = "$agent_bridge_python_file
+$agent_bridge_python_dir" ]; then
+      IFS= read -r agent_bridge_recorded < "$agent_bridge_python_file" || true
+      case "${agent_bridge_recorded:-}" in
+        /*)
+          if [ -f "$agent_bridge_recorded" ] && [ -x "$agent_bridge_recorded" ]; then
+            PY=$agent_bridge_recorded
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  # A versioned name makes a newer supported interpreter win even when an old
+  # system python3 appears first on PATH.  -P is both the launch option every
+  # bridge entry point requires and a cheap compatibility probe for 3.11+.
+  for agent_bridge_candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    agent_bridge_path=$(command -v "$agent_bridge_candidate" 2>/dev/null || true)
+    if [ -n "$agent_bridge_path" ] && "$agent_bridge_path" -P -c \
+      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+      >/dev/null 2>&1; then
+      PY=$agent_bridge_path
+      return 0
+    fi
+  done
+
+  agent_bridge_python_version=""
+  agent_bridge_python3=$(command -v python3 2>/dev/null || true)
+  if [ -n "$agent_bridge_python3" ]; then
+    agent_bridge_python_version=$("$agent_bridge_python3" --version 2>&1 || true)
+    case "$agent_bridge_python_version" in
+      Python\ *)
+        agent_bridge_python_version=${agent_bridge_python_version#Python }
+        ;;
+      *)
+        agent_bridge_python_version=""
+        ;;
+    esac
+    # Keep the hook's JSON fallback fixed and safe even if a PATH executable
+    # prints something surprising for --version.
+    case "$agent_bridge_python_version" in
+      ""|.*|*.|*[!0-9.]*) agent_bridge_python_version="" ;;
+    esac
+  fi
+  if [ -n "$agent_bridge_python_version" ]; then
+    AGENT_BRIDGE_PYTHON_FAILURE="no Python 3.11 or newer found; python3 is $agent_bridge_python_version"
+  else
+    AGENT_BRIDGE_PYTHON_FAILURE="no Python 3.11 or newer found"
+  fi
+  return 1
+}

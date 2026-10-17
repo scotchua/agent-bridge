@@ -323,10 +323,12 @@ class JudgmentTests(GateCase):
         forged = gate.receipt_path(str(self.state), str(self.repo))
         settings = os.path.join(str(home), ".claude", "settings.json")
         hooks = os.path.join(str(home), ".codex", "hooks.json")
-        for root in (str(self.state), str(self.base / "cfg.json"), settings, hooks, database, database + "-wal"):
+        record = os.path.join(str(home), ".agent-bridge", "launcher-python")
+        for root in (str(self.state), str(self.base / "cfg.json"), settings, hooks, record, database, database + "-wal"):
             self.assertIn(os.path.realpath(root), protected)
         cases = [("claude", "Write", {"file_path": forged}),
                  ("claude", "Edit", {"file_path": settings}),
+                 ("claude", "Write", {"file_path": record}),
                  ("claude", "Bash", {"command": f"echo '{{}}' > {forged}"}),
                  ("claude", "Bash", {"command": f"cp {self.base / 'mine.sqlite3'} {database}"}),
                  ("claude", "Write", {"file_path": database + "-wal"}),
@@ -670,6 +672,12 @@ class InstallTests(GateCase):
         again = self.install(apply=True)
         self.assertEqual(again["planned_files"], [])
         self.assertIn("Claude Desktop", " ".join(report["not_covered"]))
+
+    def test_install_keeps_applied_hooks_when_the_python_record_cannot_be_written(self):
+        with mock.patch.object(gate.python_runtime, "record", return_value=None):
+            report = self.install(apply=True)
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["notes"], ["launcher_python_record_failed"])
 
     def test_an_edited_entry_is_preserved_not_overwritten(self):
         self.install(apply=True)

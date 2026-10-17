@@ -3844,10 +3844,13 @@ def test_candidate_verification_path() -> None:
     print("\n[candidate verification path]")
     import importlib.util
     from unittest import mock
-    from agent_bridge import setup_cmd
+    from agent_bridge import python_runtime, setup_cmd
 
     peer_fixture = Sandbox()
     root = tempfile.mkdtemp(prefix=".candidate-test-", dir=REPO)
+    real_launcher_record = python_runtime.record_path()
+    real_launcher_before = (open(real_launcher_record, "rb").read()
+                            if os.path.isfile(real_launcher_record) else None)
     local_path = config_module.local_config_path()
     local_existed = os.path.isfile(local_path)
     local_before = open(local_path, "rb").read() if local_existed else None
@@ -3903,7 +3906,8 @@ def test_candidate_verification_path() -> None:
                                                 "directory_mode": "test",
                                                 "file_mode": "test"}), \
                 mock.patch.object(setup_cmd, "claude_signed_in", return_value=True), \
-                mock.patch.object(setup_cmd, "codex_signed_in", return_value=True):
+                mock.patch.object(setup_cmd, "codex_signed_in", return_value=True), \
+                mock.patch.dict(os.environ, {"HOME": root}, clear=False):
             result = setup_cmd.main([
                 "--candidate", candidate_path,
                 "--claude", candidate_claude,
@@ -4025,12 +4029,16 @@ def test_candidate_verification_path() -> None:
         destination = os.path.join(root, "promoted-local.json")
         store.atomic_write_json(destination, {"sentinel": "unchanged"})
         refused_before = open(destination, "rb").read()
-        direct = setup_cmd.main(["--write"])
+        with mock.patch.dict(os.environ, {"HOME": root}, clear=False):
+            direct = setup_cmd.main(["--write"])
         direct_after = (open(local_path, "rb").read()
                         if os.path.isfile(local_path) else None)
         check("VP4: legacy direct activation is refused without PASS evidence",
               direct == 2 and os.path.isfile(local_path) == local_existed
               and direct_after == local_before)
+        check("VP4: setup candidate checks leave the operator launcher record untouched",
+              (open(real_launcher_record, "rb").read()
+               if os.path.isfile(real_launcher_record) else None) == real_launcher_before)
         store.atomic_write_json(results_path, incomplete)
         try:
             setup_cmd.promote_candidate(candidate_path, results_path, destination)

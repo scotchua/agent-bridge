@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as bridge_config
-from . import revision
+from . import python_runtime, revision
 from . import store
 from .platform import platform as host_platform
 
@@ -578,9 +578,16 @@ def _audit(home: str, **entry: Any) -> None:
 def doctor(config_path: str | None = None, *, home: str | None = None, accept_requalified: bool = False,
            force_checks: bool = False, bridge: Any | None = None, runner: Any = _run,
            prequalified_codex: bool = False) -> dict[str, Any]:
-    home = _home(home); current = inventory(config_path, home=home, bridge=bridge, runner=runner); baseline = _read_baseline(home)
+    home = _home(home)
+    # Inspect the previous record before refreshing it.  Doctor is a repair
+    # path, but hiding the stale record it repaired would defeat its warning.
+    launcher_python = python_runtime.doctor(home)
+    record_failed = python_runtime.record(home=home) is None
+    current = inventory(config_path, home=home, bridge=bridge, runner=runner); baseline = _read_baseline(home)
     runtime = runtime_revision_status(config_path, home=home)
     needs: list[str] = []; checked: dict[str, Any] = {}; passed: set[str] = set(); changed = changes(current, baseline)
+    if record_failed:
+        needs.append("launcher_python_record_failed")
     if not current["config_path"]:
         needs.append("No installed orchestration config was found; pass --config or install the gate, then run setup_bridge.py doctor.")
     worker_revision = runtime.get("worker")
@@ -665,7 +672,8 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
-    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked, "runtime_revisions": runtime}
+    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked,
+            "launcher_python": launcher_python, "runtime_revisions": runtime}
 
 
 def quick_check(config_path: str | None = None, *, home: str | None = None,
@@ -1027,5 +1035,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.json: print(json.dumps(report, sort_keys=True))
     elif not args.quiet:
         for line in report["needs_you"]: print(line)
+        runtime = report.get("launcher_python", {})
+        issue = runtime.get("recorded_issue") if isinstance(runtime, dict) else None
+        if issue:
+            print(f"Launcher Python: {issue} ({runtime.get('recorded')}).")
+        for name, detail in (runtime.get("launchers", {}) if isinstance(runtime, dict) else {}).items():
+            print(f"{name}: {detail.get('interpreter') or 'no supported Python found'} "
+                  f"({detail.get('source')})")
         if report["ok"] and not report["changed"]: print("Dependencies are unchanged.")
     return 0 if report["ok"] else 1

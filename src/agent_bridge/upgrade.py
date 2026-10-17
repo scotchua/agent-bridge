@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, drift, onboard, store
+from . import config, drift, onboard, python_runtime, store
 from . import restart_worker
 from .chat.grok import ALLOWED_COMMANDS, REQUIRED_MANIFEST_KEYS
 from .chat.windows_security import prepare_private_directory
@@ -386,6 +386,8 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
         out("Refusing to run as root. Run this upgrade as your normal user.")
         return 1
     home = os.path.abspath(home)
+    if python_runtime.record(home=home) is None:
+        out("launcher_python_record_failed")
     out("This checks first and changes nothing until you say yes at the end.")
     states = detect(home, platform=platform)
     if states["bridge_base"]["state"] == "available":

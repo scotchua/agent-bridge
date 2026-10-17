@@ -64,7 +64,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .. import store
+from .. import python_runtime, store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
@@ -840,6 +840,7 @@ def protected_paths(state_root: str, config_path: str | None, home: str,
             paths.extend(full + suffix for suffix in _SQLITE_SIDECARS)
         paths.append(os.path.join(local_queue_root, "runtime-state.json"))
     paths.extend(install_paths(home).values())
+    paths.append(python_runtime.record_path(home))
     return tuple(sorted({os.path.realpath(path) for path in paths}))
 
 
@@ -2618,6 +2619,10 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
         report["backups"] = _commit_updates(updates, originals, shared_paths=host_owned)
         if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
+        if not remove:
+            report["python"] = python_runtime.record(home=home)
+            if report["python"] is None:
+                report.setdefault("notes", []).append("launcher_python_record_failed")
         report["applied"] = True
     report["codex_note"] = (
         "Codex runs a new or changed hook only after it is trusted once in its /hooks view "
