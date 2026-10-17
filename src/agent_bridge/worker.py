@@ -196,6 +196,7 @@ def execute(job_dir: str) -> int:
     peer_info: dict[str, Any] = {}
     final: PeerOutcome | None = None
     category = ErrorCategory.INTERNAL_ERROR
+    size_details: dict[str, int | str] = {}
     validated: dict[str, Any] | None = None
     violations: list[str] = []
 
@@ -228,8 +229,10 @@ def execute(job_dir: str) -> int:
             else envelope.build_initial(request["prompt"], schema, cfg.contract_version)
         )
         operation = "continue" if resume else "start"
-        if len(request["prompt"]) > cfg.prompt_budget(operation):
-            raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+        limit_chars = cfg.prompt_budget(operation)
+        if len(request["prompt"]) > limit_chars:
+            raise BrokerError(ErrorCategory.INPUT_TOO_LARGE, limit_chars=limit_chars,
+                              actual_chars=len(request["prompt"]), operation=operation)
         stages.append({"stage": "preparation", "elapsed_seconds": round(
             time.monotonic() - stage_started, 3)})
         stage_started = time.monotonic()
@@ -247,6 +250,11 @@ def execute(job_dir: str) -> int:
                     retries_exhausted = True
                 else:
                     category = ErrorCategory.INPUT_TOO_LARGE
+                    size_details = {
+                        "limit_chars": cfg.limit("prompt_max_chars"),
+                        "actual_chars": len(prompt_text),
+                        "operation": operation,
+                    }
                 break
             attempt_dir = store.secure_mkdir(os.path.join(job_dir, "attempts", str(attempt)))
             send_prompt = prompt_text
@@ -357,6 +365,7 @@ def execute(job_dir: str) -> int:
 
     except BrokerError as exc:
         category = exc.category
+        size_details = exc.size_details()
     except Exception:  # noqa: BLE001 - worker must always land somewhere
         category = ErrorCategory.INTERNAL_ERROR
         store.atomic_write_bytes(
@@ -508,6 +517,7 @@ def execute(job_dir: str) -> int:
         conversation_id=conversation_id, peer=peer, caller=caller,
         worker_pid=None,
         receipt=receipt,
+        **size_details,
     )
     return 0 if status == "complete" else 1
 
