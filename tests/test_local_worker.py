@@ -11,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_bridge.local_worker import (MAX_MCP_LINE_BYTES, MAX_OUTPUT_CHARS,
                                        LocalWorkerServer, validate_endpoint)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification_capabilities
 
 
 class _Ollama(BaseHTTPRequestHandler):
@@ -44,6 +46,7 @@ class _Ollama(BaseHTTPRequestHandler):
 
 class LocalWorkerTests(unittest.TestCase):
     def setUp(self):
+        verification_capabilities.requires_loopback(self)
         _Ollama.received = None
         _Ollama.show_response = {"details": {"format": "gguf", "family": "synthetic"}}
         _Ollama.generate_response = {"model": "actual-model", "response": "local draft", "done": True}

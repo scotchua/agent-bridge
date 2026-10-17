@@ -14,11 +14,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task, codex_task  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification_capabilities  # noqa: E402
 
 LANES = (codex_task, claude_task)
 
@@ -36,6 +40,32 @@ class PinnedPythonTests(unittest.TestCase):
             for command in (["git", "status"], ["npm", "test"], ["/usr/bin/python3", "-m", "pytest"], []):
                 with self.subTest(lane=lane.__name__, command=command):
                     self.assertEqual(lane._pinned_python(list(command)), list(command))
+
+
+class VerificationEnvironmentTests(unittest.TestCase):
+    def test_only_the_harness_adds_the_verification_marker(self):
+        marker = verification_capabilities.diagnostics.JOB_VERIFICATION_MARKER
+        record = verification_capabilities.diagnostics.SKIP_RECORD_PATH
+        with tempfile.TemporaryDirectory() as temp, \
+             mock.patch.dict(os.environ, {marker: "brief-or-argv-cannot-set-this"}):
+            tree = Path(temp) / "tree"
+            tree.mkdir()
+            for lane in LANES:
+                captured = {}
+
+                def capture(command, *, cwd, env, timeout, input_bytes=None):
+                    captured.update(env)
+                    return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+                with self.subTest(lane=lane.__name__), \
+                     mock.patch.object(lane, "_run", side_effect=capture):
+                    lane._sandboxed(["git", "status"], tree, Path(temp) / lane.__name__,
+                                    lane._env(), 60,
+                                    lane.hostenv.MACOS_CONFINEMENT)
+                self.assertNotIn(marker, lane._env())
+                self.assertEqual(captured[marker], "1")
+                self.assertTrue(captured[record].endswith(
+                    verification_capabilities.diagnostics.SKIP_RECORD_NAME))
 
 
 class CacheDropTests(unittest.TestCase):
@@ -150,6 +180,7 @@ class CacheDropTests(unittest.TestCase):
                      "macOS sandbox-exec backend")
 class SandboxedPythonEndToEndTests(unittest.TestCase):
     def test_bare_python_runs_the_worker_interpreter_inside_the_sandbox(self):
+        verification_capabilities.requires_nested_confinement(self)
         for lane in LANES:
             with self.subTest(lane=lane.__name__), tempfile.TemporaryDirectory() as temp:
                 tree = Path(temp) / "tree"
