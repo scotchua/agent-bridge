@@ -665,6 +665,9 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                                       "stages": router.report(),
                                       "local_queue": queue.state_report(),
                                       "execution_queue": execution.state_report() if execution else {"disabled": 1},
+                                      "execution_worker": revision.read_record(
+                                          str(execution.root / "execution-worker-status.json"))
+                                      if execution else {"code_revision": "unavailable", "code_stale": True},
                                       **(revision_status() if revision_status is not None else {})},
         },
     }
@@ -853,12 +856,6 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             return result
 
         tools.update({
-            "execution_worker_status": {
-                "description": "Read execution-worker health without task content or provider output.",
-                "inputSchema": empty,
-                "handler": lambda args: {"ok": True,
-                                          **revision.read_record(str(execution.root / "execution-worker-status.json"))},
-            },
             "execution_dispatch": {
                 "description": "Queue implementation on the opposite provider's bounded subscription harness. "
                                "No paid fallback, apply, commit, push or merge. The classification dispatched "

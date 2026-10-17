@@ -539,6 +539,8 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
         if _yes(ask("Restart the idle execution worker now? [y/N] ")):
             outcome = restart_worker.restart(config_path, home=home)
             out("Execution worker restarted." if outcome == "restart_worker_restarted" else
+                "Execution worker restart requested; it will complete at the next idle pass."
+                if outcome == "restart_worker_requested" else
                 "Execution worker was not restarted: " + outcome + ".")
         else:
             out("Execution worker may still run older code; run setup_bridge.py restart-worker after it is idle.")

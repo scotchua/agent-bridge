@@ -175,7 +175,8 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
     try:
-        revision.record(str(cfg.execution_queue_root / "execution-worker-status.json"), revision.capture())
+        revision.record(str(cfg.execution_queue_root / "execution-worker-status.json"), revision.capture(),
+                        pid=os.getpid(), started_at=store.utc_now())
     except OSError as exc:
         raise ExecutionAdmissionError("execution_worker_status_unavailable") from exc
     return ExecutionQueue(
@@ -210,10 +211,11 @@ def run(config_path: str, *, once: bool, interval: float,
 
             def run_checked_once() -> tuple[dict | None, bool]:
                 # The restart command takes this lock while it scans durable
-                # state and writes its request. Holding it through run_once
-                # means it can never observe "idle" in the gap before this
-                # worker claims a job. A requested restart therefore exits at
-                # an idle boundary and never terminates a provider run.
+                # state and writes its request.  It intentionally does not
+                # cover queue.run_once(): a provider run may last an hour and
+                # restart-worker needs a prompt, conservative answer while it
+                # does.  A request that lands after this check is consumed at
+                # the next idle pass; it never signals a provider run.
                 with store.file_lock(restart_lock):
                     if restart_request.is_file():
                         try:
@@ -221,7 +223,7 @@ def run(config_path: str, *, once: bool, interval: float,
                         except OSError:
                             raise ExecutionAdmissionError("execution_worker_restart_request_unavailable")
                         return None, True
-                    return _run_checked_once(queue, identity, config_path), False
+                return _run_checked_once(queue, identity, config_path), False
 
             def _run_checked_once(queue: ExecutionQueue, worker: str, path: str) -> dict | None:
                 from .. import drift

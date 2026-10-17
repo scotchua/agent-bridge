@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -34,20 +35,52 @@ class RestartWorkerTests(unittest.TestCase):
         self.assertEqual(result, "restart_worker_refused:execution_running")
         launchctl.assert_not_called()
 
-    def test_waits_for_idle_then_restarts_with_fake_launchctl(self):
+    def test_lock_contention_refuses_promptly_without_queue_error(self):
         with tempfile.TemporaryDirectory() as root:
             patches = self._patches(root)
             now = [0.0]
-            def sleep(seconds): now[0] += seconds
             with patches[0], patches[1], patches[2], \
-                 mock.patch.object(restart_worker, "_running_jobs", side_effect=[1, 0]), \
-                 mock.patch.object(restart_worker.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as launchctl:
-                result = restart_worker.restart(home=root, wait=2, sleep=sleep, clock=lambda: now[0])
+                 mock.patch.object(restart_worker.store, "file_lock", side_effect=TimeoutError):
+                result = restart_worker.restart(home=root, clock=lambda: now[0])
+        self.assertEqual(result, "restart_worker_refused:execution_running")
+
+    def test_wait_retries_lock_then_confirms_new_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            patches = self._patches(root)
+            now = [0.0]
+
+            def sleep(seconds):
+                now[0] += seconds
+
+            old = {"pid": 10, "started_at": "2026-01-01T00:00:00+00:00"}
+            new = {"pid": 11, "started_at": "2026-01-01T00:00:01+00:00"}
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(restart_worker.store, "file_lock",
+                                   side_effect=[TimeoutError(), contextlib.nullcontext()]), \
+                 mock.patch.object(restart_worker, "_running_jobs", return_value=0), \
+                 mock.patch.object(restart_worker, "_worker_status", side_effect=[old, new]), \
+                 mock.patch.object(restart_worker.subprocess, "run") as launchctl:
+                result = restart_worker.restart(home=root, wait=2, sleep=sleep,
+                                                clock=lambda: now[0])
         self.assertEqual(result, "restart_worker_restarted")
-        launchctl.assert_called_once_with(
-            ["launchctl", "kickstart", "gui/501/com.agent-bridge.execution-worker"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=20, check=False, shell=False)
+        launchctl.assert_not_called()
+
+    def test_request_is_not_reported_as_a_restart_without_new_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            patches = self._patches(root)
+            now = [0.0]
+
+            def sleep(seconds):
+                now[0] += seconds
+
+            old = {"pid": 10, "started_at": "2026-01-01T00:00:00+00:00"}
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(restart_worker, "_running_jobs", return_value=0), \
+                 mock.patch.object(restart_worker, "_worker_status", return_value=old), \
+                 mock.patch.object(restart_worker.subprocess, "run") as launchctl:
+                result = restart_worker.restart(home=root, sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(result, "restart_worker_requested")
+        launchctl.assert_not_called()
 
     def test_not_installed_is_a_clear_noop(self):
         with tempfile.TemporaryDirectory() as root:

@@ -24,6 +24,7 @@ from typing import Any
 from . import config as bridge_config
 from . import revision
 from . import store
+from .platform import platform as host_platform
 
 CACHE_SECONDS = 600.0
 QUICK_CHECK_TIMEOUT = 2
@@ -127,6 +128,43 @@ def _bridge() -> Any | None:
         return None
 
 
+def _server_revision_status(state_root: str, kind: str, caller: str) -> tuple[int, int]:
+    """Count live, stale fixed-name process markers and sweep dead processes."""
+    pattern = re.compile(rf"^{re.escape(kind)}-{caller}-(\d+)\.json$")
+    total = stale = 0
+    try:
+        entries = list(os.scandir(state_root))
+    except OSError:
+        return total, stale
+    for entry in entries:
+        match = pattern.fullmatch(entry.name)
+        try:
+            is_file = entry.is_file(follow_symlinks=False)
+        except OSError:
+            continue
+        if match is None or not is_file:
+            continue
+        pid = int(match.group(1))
+        if not host_platform.process_alive(pid):
+            try:
+                # entry came only from the fixed pattern in this state root.
+                os.unlink(entry.path)
+            except OSError:
+                pass
+            continue
+        total += 1
+        if revision.read_record(entry.path)["code_stale"]:
+            stale += 1
+    return total, stale
+
+
+def _append_stale_sessions(result: dict[str, Any], state_root: str, kind: str,
+                           label: str, caller: str) -> None:
+    total, stale = _server_revision_status(state_root, kind, caller)
+    if stale:
+        result["stale_clients"].append(f"{label}: {stale} of {total} sessions stale")
+
+
 def runtime_revision_status(config_path: str | None = None, *, home: str | None = None) -> dict[str, Any]:
     """Read long-running process revision markers without contacting clients."""
     result: dict[str, Any] = {"worker": None, "stale_clients": []}
@@ -141,18 +179,16 @@ def runtime_revision_status(config_path: str | None = None, *, home: str | None 
                     result["worker"] = revision.read_record(str(path))
             for caller, label in (("claude", "orchestration (Claude)"),
                                   ("codex", "orchestration (Codex)")):
-                path = cfg.state_root / f"orchestration-server-{caller}.json"
-                if path.is_file() and revision.read_record(str(path))["code_stale"]:
-                    result["stale_clients"].append(label)
+                _append_stale_sessions(result, str(cfg.state_root), "orchestration-server",
+                                       label, caller)
         except (OSError, ValueError):
             pass
     bridge = _bridge()
     if bridge is not None:
         for caller, label in (("claude", "consultation (Claude)"),
                               ("codex", "consultation (Codex)")):
-            path = bridge.state(f"consultation-server-{caller}.json")
-            if os.path.isfile(path) and revision.read_record(path)["code_stale"]:
-                result["stale_clients"].append(label)
+            _append_stale_sessions(result, bridge.state_root, "consultation-server",
+                                   label, caller)
     return result
 
 

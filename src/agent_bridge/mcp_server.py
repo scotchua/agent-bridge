@@ -240,11 +240,6 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
             "handler": broker.close,
         },
     }
-    tools["bridge_status"] = {
-        "description": "Read this consultation server's revision status. Contains no consultation content.",
-        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
-        "handler": lambda _cfg, _caller, _args: {"ok": True},
-    }
     return tools
 
 
@@ -255,11 +250,18 @@ class Server:
         self.caller = caller
         self.cfg = cfg
         self._code_revision = revision.capture()
+        self._revision_record_path: str | None = None
         # Production startup always receives Config.  Keep the lightweight
         # in-memory test doubles usable without treating an arbitrary object
         # as a filesystem path.
         if isinstance(cfg, Config):
-            revision.record(cfg.state(f"consultation-server-{caller}.json"), self._code_revision)
+            self._revision_record_path = revision.process_record_path(
+                cfg.state_root, "consultation-server", caller)
+            try:
+                revision.record(self._revision_record_path, self._code_revision,
+                                pid=os.getpid(), started_at=store.utc_now())
+            except OSError:
+                sys.stderr.write("agent-bridge: revision marker unavailable\n")
         self.tools = build_tools(caller, cfg)
 
     # ---- JSON-RPC plumbing ---------------------------------------------
@@ -327,8 +329,6 @@ class Server:
         handler: Callable[..., dict[str, Any]] = spec["handler"]
         try:
             payload = handler(self.cfg, self.caller, args)
-            if name == "bridge_status":
-                payload.update(revision.report(self._code_revision))
         except BrokerError as exc:
             payload = broker.error_response(exc.category)
         except Exception:  # noqa: BLE001
@@ -361,55 +361,62 @@ class Server:
     def serve(self, stdin: Any = None, stdout: Any = None) -> int:
         stdin = stdin or sys.stdin
         stdout = stdout or sys.stdout
-        while True:
-            line = stdin.readline(MAX_MCP_FRAME_CHARS + 1)
-            if not line:
-                break
-            if len(line) > MAX_MCP_FRAME_CHARS:
-                stdout.write(json.dumps(
-                    self._error(None, -32600, "request exceeds frame limit")) + "\n")
-                stdout.flush()
-                return 1
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except (ValueError, RecursionError):
-                stdout.write(json.dumps(self._error(None, -32700, "parse error")) + "\n")
-                stdout.flush()
-                continue
-            if isinstance(message, list):
-                if not message:
+        try:
+            while True:
+                line = stdin.readline(MAX_MCP_FRAME_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > MAX_MCP_FRAME_CHARS:
+                    stdout.write(json.dumps(
+                        self._error(None, -32600, "request exceeds frame limit")) + "\n")
+                    stdout.flush()
+                    return 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except (ValueError, RecursionError):
+                    stdout.write(json.dumps(self._error(None, -32700, "parse error")) + "\n")
+                    stdout.flush()
+                    continue
+                if isinstance(message, list):
+                    if not message:
+                        stdout.write(json.dumps(
+                            self._error(None, -32600, "invalid request")) + "\n")
+                        stdout.flush()
+                        continue
+                    responses = []
+                    for element in message:
+                        try:
+                            response = self.handle(element)
+                        except Exception:  # noqa: BLE001 - one bad frame, not the server
+                            response = self._error(None, -32603, "internal error")
+                        if response:
+                            responses.append(response)
+                    if responses:
+                        stdout.write(json.dumps(responses) + "\n")
+                        stdout.flush()
+                    continue
+                if not isinstance(message, dict):
                     stdout.write(json.dumps(
                         self._error(None, -32600, "invalid request")) + "\n")
                     stdout.flush()
                     continue
-                responses = []
-                for element in message:
-                    try:
-                        response = self.handle(element)
-                    except Exception:  # noqa: BLE001 - one bad frame, not the server
-                        response = self._error(None, -32603, "internal error")
-                    if response:
-                        responses.append(response)
-                if responses:
-                    stdout.write(json.dumps(responses) + "\n")
+                try:
+                    response = self.handle(message)
+                except Exception:  # noqa: BLE001 - the transport must survive
+                    response = self._error(message.get("id"), -32603, "internal error")
+                if response is not None:
+                    stdout.write(json.dumps(response) + "\n")
                     stdout.flush()
-                continue
-            if not isinstance(message, dict):
-                stdout.write(json.dumps(
-                    self._error(None, -32600, "invalid request")) + "\n")
-                stdout.flush()
-                continue
-            try:
-                response = self.handle(message)
-            except Exception:  # noqa: BLE001 - the transport must survive
-                response = self._error(message.get("id"), -32603, "internal error")
-            if response is not None:
-                stdout.write(json.dumps(response) + "\n")
-                stdout.flush()
-        return 0
+            return 0
+        finally:
+            if self._revision_record_path is not None:
+                try:
+                    revision.remove_record(self._revision_record_path)
+                except OSError:
+                    pass
 
 
 def main(argv: list[str] | None = None) -> int:
