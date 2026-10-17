@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 from collections import Counter
 from pathlib import Path
@@ -36,6 +37,9 @@ _QUEUE_PRIVACY_REASONS = (
     "path_traverses_a_link", "path_unreadable", "replace_failed",
     "replace_identity_changed", "secure_writer_required",
 )
+_HARNESS_NAMES = ("codex", "claude", "python")
+_CLEAN_TEXT_LABELS = ("base", "effort", "head", "idempotency_key", "item_id",
+                      "model", "owner_id", "stage", "worker_id")
 _SAFE_EXECUTION_CODES = frozenset({
     # Written by the queue or the report itself, not raised.
     "interrupted_requires_reconciliation", "command_timeout",
@@ -70,6 +74,10 @@ _SAFE_EXECUTION_CODES = frozenset({
     "execution_stage_binding_invalid", "execution_stage_ledger_unavailable",
     "stage_assignment_invalid",
     *(f"queue_{reason}" for reason in _QUEUE_PRIVACY_REASONS),
+    # The two dynamic sites: SubprocessHarnessExecutor's harness check and
+    # ExecutionQueue._clean_text.  The sync test pins both.
+    *(f"{name}_harness_unavailable" for name in _HARNESS_NAMES),
+    *(f"{label}_invalid" for label in _CLEAN_TEXT_LABELS),
 })
 # Exception class names the queue records in a receipt's top-level "error".
 _SAFE_ERROR_CLASSES = frozenset({
@@ -99,7 +107,11 @@ _SAFE_STAGE_REASONS = frozenset({
     "interrupted_requires_reconciliation", "liveness_reconciliation_required",
     "lease_expired", "no_fresh_eligible_route", "unreadable",
 })
-_TEST_ID = re.compile(r"^[A-Za-z0-9_./:-]{1,240}$")
+# CI names and ids come from logs, so only identifier-shaped values are kept:
+# a dotted unittest id, or a relative pytest node id without parameters.
+_UNITTEST_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+_PYTEST_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_/-]*(?:\.[A-Za-z0-9_-]+)*\.py(?:::[A-Za-z_][A-Za-z0-9_]*)+$")
+_JOB_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.,()-]{0,99}$")
 _CODE = re.compile(r"[a-z][a-z0-9_]*")
 _CLASS_NAME = re.compile(r"[A-Z][A-Za-z0-9]*")
 # pytest prints "FAILED path::test"; unittest prints "FAIL: name (dotted.id)"
@@ -379,8 +391,9 @@ def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
             continue
         for job in jobs:
             if isinstance(job, dict) and isinstance(job.get("name"), str):
-                totals[job["name"]] += 1
-                if job.get("conclusion") == "failure": failed[job["name"]] += 1
+                name = job["name"] if _JOB_NAME.fullmatch(job["name"]) else "unrecognized"
+                totals[name] += 1
+                if job.get("conclusion") == "failure": failed[name] += 1
         if not any(isinstance(job, dict) and job.get("conclusion") == "failure" for job in jobs):
             continue
         try:
@@ -388,9 +401,32 @@ def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
         except OSError:
             continue
         if logs_bounded and log_code in (0, 1):
-            for test_id in (*_PYTEST_FAILURE.findall(logs), *_UNITTEST_FAILURE.findall(logs)):
-                if _TEST_ID.fullmatch(test_id): tests[test_id] += 1
+            for test_id in _PYTEST_FAILURE.findall(logs):
+                if len(test_id) <= 240 and ".." not in test_id and _PYTEST_ID.fullmatch(test_id):
+                    tests[test_id] += 1
+            for test_id in _UNITTEST_FAILURE.findall(logs):
+                if len(test_id) <= 240 and _UNITTEST_ID.fullmatch(test_id):
+                    tests[test_id] += 1
     return {"note": "ok", "failure_rate_by_job_name": {name: {"failed": failed[name], "total": total, "rate": round(failed[name] / total, 4)} for name, total in sorted(totals.items())}, "frequent_failing_test_ids": dict(tests.most_common(20))}
+
+
+def _orchestration_config() -> tuple[str | None, str]:
+    """The installed orchestration config and whether it could be reached.
+
+    drift.discover_config treats a path it cannot stat as missing, so a
+    config below a directory this process cannot traverse would read as
+    absent.  Probe the same candidates and keep that case apart.
+    """
+    for candidate in drift._config_candidates(drift._home()):
+        try:
+            mode = os.stat(candidate).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return None, "unreadable"
+        if stat.S_ISREG(mode):
+            return candidate, "ok"
+    return None, "absent"
 
 
 def build_report(days: int = 7, *, ci: bool = False, repo: str | None = None,
@@ -408,12 +444,11 @@ def build_report(days: int = 7, *, ci: bool = False, repo: str | None = None,
     orchestration = None
     orchestration_state = "absent"
     try:
-        orchestration_path = drift.discover_config()
+        orchestration_path, orchestration_state = _orchestration_config()
         if orchestration_path:
             orchestration = orchestration_config.load(orchestration_path)
-            orchestration_state = "ok"
     except Exception:
-        orchestration_state = "unreadable"
+        orchestration, orchestration_state = None, "unreadable"
     if broker_root is None:
         consultations = _config_unreadable(
             {"by_direction": {}, "by_outcome": {}, "by_error_category": {}}, "by_outcome")

@@ -44,7 +44,7 @@ class ReliabilityReportTests(unittest.TestCase):
     def _report(self, *, ci=False):
         with mock.patch.object(reliability_report.broker_config, "load",
                                return_value=SimpleNamespace(state_root=str(self.broker))), \
-             mock.patch.object(reliability_report.drift, "discover_config", return_value="/private/config"), \
+             mock.patch.object(reliability_report, "_orchestration_config", return_value=("/private/config", "ok")), \
              mock.patch.object(reliability_report.orchestration_config, "load", return_value=self.cfg):
             return reliability_report.build_report(7, ci=ci, now=NOW)
 
@@ -158,7 +158,7 @@ class ReliabilityReportTests(unittest.TestCase):
 
     def test_unreadable_config_is_never_reported_as_absent(self):
         with mock.patch.object(reliability_report.broker_config, "load", side_effect=ValueError), \
-             mock.patch.object(reliability_report.drift, "discover_config", return_value="/private/config"), \
+             mock.patch.object(reliability_report, "_orchestration_config", return_value=("/private/config", "ok")), \
              mock.patch.object(reliability_report.orchestration_config, "load", side_effect=OSError):
             report = reliability_report.build_report(7, now=NOW)
         self.assertEqual(report["config"], {"broker": "unreadable", "orchestration": "unreadable"})
@@ -169,10 +169,25 @@ class ReliabilityReportTests(unittest.TestCase):
                 self.assertEqual(report[section]["config"], "unreadable")
                 self.assertEqual(report[section][key], {"unreadable": 1})
 
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "needs POSIX permissions and a non-root user")
+    def test_config_below_an_untraversable_directory_is_unreadable(self):
+        locked = self.root / "locked"; locked.mkdir()
+        (locked / "orchestration.json").write_text("{}")
+        locked.chmod(0)
+        try:
+            with mock.patch.object(reliability_report.drift, "_config_candidates",
+                                   return_value=[str(locked / "orchestration.json")]):
+                self.assertEqual(reliability_report._orchestration_config(),
+                                 (None, "unreadable"))
+        finally:
+            locked.chmod(0o700)
+
     def test_absent_orchestration_config_is_reported_absent(self):
         with mock.patch.object(reliability_report.broker_config, "load",
                                return_value=SimpleNamespace(state_root=str(self.broker))), \
-             mock.patch.object(reliability_report.drift, "discover_config", return_value=None):
+             mock.patch.object(reliability_report.drift, "_config_candidates",
+                               return_value=[str(self.root / "not-installed.json")]):
             report = reliability_report.build_report(7, now=NOW)
         self.assertEqual(report["config"]["orchestration"], "absent")
         self.assertFalse(report["execution"]["present"])
@@ -196,8 +211,11 @@ class ReliabilityReportTests(unittest.TestCase):
             "#!/usr/bin/env python3\nimport json,sys\na=sys.argv\n"
             "if 'repo' in a: print(json.dumps({'nameWithOwner':'example/bridge'}))\n"
             f"elif 'list' in a: print(json.dumps({runs!r}))\n"
-            "elif '--json' in a: print(json.dumps({'jobs':[{'name':'offline','conclusion':'failure'}]}))\n"
+            "elif '--json' in a: print(json.dumps({'jobs':[{'name':'offline','conclusion':'failure'},"
+            "{'name':'deploy to /home/RELIABILITY_REPORT_SECRET_SENTINEL','conclusion':'success'}]}))\n"
             "else: print('2026-10-16T00:00:00.0Z FAILED tests/test_report.py::test_failure\\n'"
+            "'2026-10-16T00:00:00.0Z FAILED /home/RELIABILITY_REPORT_SECRET_SENTINEL/t.py::test_a\\n'"
+            "'2026-10-16T00:00:00.0Z FAILED tests/t.py::test_b[RELIABILITY_REPORT_SECRET_SENTINEL]\\n'"
             "'2026-10-16T00:00:00.0Z FAIL: test_x (test_mod.Case.test_x)\\n'"
             "'2026-10-16T00:00:00.0Z ERROR: test_y (test_mod.Case.test_y)\\n'"
             "'2026-10-16T00:00:00.0Z FAILED (failures=1, errors=1)')\n")
@@ -215,8 +233,10 @@ class ReliabilityReportTests(unittest.TestCase):
         self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline"],
                          {"failed": 1, "total": 1, "rate": 1.0})
         self.assertEqual(report["ci"]["frequent_failing_test_ids"], {
-            "tests/test_report.py::test_failure": 1,
+            "tests/test_report.py::test_failure": 1, "tests/t.py::test_b": 1,
             "test_mod.Case.test_x": 1, "test_mod.Case.test_y": 1})
+        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["unrecognized"]["total"], 1)
+        self.assertNotIn("RELIABILITY_REPORT_SECRET_SENTINEL", json.dumps(report))
 
     def test_ci_does_not_fetch_logs_for_a_green_run(self):
         calls = []
@@ -256,6 +276,22 @@ class VocabularySyncTests(unittest.TestCase):
         prefixes = {code for code in raised if code.endswith("_")}
         self.assertEqual(prefixes, {"queue_"})
         self.assertEqual(raised - prefixes - reliability_report._SAFE_EXECUTION_CODES, set())
+
+    def test_the_dynamic_execution_codes_are_pinned(self):
+        queue = (SRC / "orchestration" / "execution_queue.py").read_text(encoding="utf-8")
+        dynamic = set()
+        for path in SRC.rglob("*.py"):
+            dynamic.update(re.findall(r'ExecutionAdmissionError\(\s*f"(\{[a-z_]+\}[a-z_]*)"',
+                                      path.read_text(encoding="utf-8")))
+        # A new f-string code with a leading placeholder must be added here
+        # and to the report's allowlist.
+        self.assertEqual(dynamic, {"{name}_harness_unavailable", "{label}_invalid"})
+        names = re.search(r'for name in \(([^)]*)\):\s*\n\s*path = getattr\(harnesses', queue)
+        self.assertIsNotNone(names)
+        self.assertEqual(tuple(re.findall(r'"([a-z_]+)"', names.group(1))),
+                         reliability_report._HARNESS_NAMES)
+        labels = set(re.findall(r'_clean_text\([^,()]+,\s*"([a-z_]+)"', queue))
+        self.assertEqual(labels, set(reliability_report._CLEAN_TEXT_LABELS))
 
     def test_every_local_failure_code_is_reportable(self):
         from agent_bridge.localq import spool
