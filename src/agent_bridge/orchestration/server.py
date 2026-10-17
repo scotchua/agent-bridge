@@ -67,8 +67,16 @@ class Server:
                         continue
                 self.service.once()
             except Exception:
-                pass
+                self._record_loop_error()
             self._stop.wait(self.interval)
+
+    def _record_loop_error(self) -> None:
+        reporter = getattr(self.service, "record_loop_error", None)
+        if callable(reporter):
+            try:
+                reporter()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         self._stop.set()
