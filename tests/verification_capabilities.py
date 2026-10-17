@@ -65,7 +65,9 @@ def _loopback_denied() -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
     except OSError as exc:
-        return exc.errno in {errno.EACCES, errno.EPERM}
+        # macOS sandbox-exec refuses with EACCES or EPERM.  Under Linux
+        # unshare --net, lo is down and the bind fails with EADDRNOTAVAIL.
+        return exc.errno in {errno.EACCES, errno.EPERM, errno.EADDRNOTAVAIL}
     return False
 
 

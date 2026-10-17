@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
+import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
-from tests import verification_capabilities as capabilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification_capabilities as capabilities
 from agent_bridge.execution import verification_diagnostics as diagnostics
 
 
@@ -52,16 +56,58 @@ class CapabilitySkipTests(unittest.TestCase):
             self.assertEqual(diagnostics.skip_counts(record), {
                 diagnostics.NESTED_CONFINEMENT_UNAVAILABLE: 1})
 
-    def test_only_permission_errors_make_the_loopback_probe_a_skip_condition(self):
-        denied = OSError(1, "Operation not permitted")
-        unavailable = OSError(99, "Cannot assign requested address")
+    def test_only_sandbox_denials_make_the_loopback_probe_a_skip_condition(self):
+        # sandbox-exec refuses with EPERM or EACCES; Linux unshare --net
+        # leaves lo down, so the bind fails with EADDRNOTAVAIL.
         probe = mock.MagicMock()
-        probe.__enter__.return_value.bind.side_effect = denied
-        with mock.patch.object(capabilities.socket, "socket", return_value=probe):
-            self.assertTrue(capabilities._loopback_denied())
-        probe.__enter__.return_value.bind.side_effect = unavailable
+        for code in (errno.EPERM, errno.EACCES, errno.EADDRNOTAVAIL):
+            probe.__enter__.return_value.bind.side_effect = OSError(code, "denied")
+            with mock.patch.object(capabilities.socket, "socket", return_value=probe):
+                self.assertTrue(capabilities._loopback_denied(), code)
+        probe.__enter__.return_value.bind.side_effect = OSError(errno.EADDRINUSE, "in use")
         with mock.patch.object(capabilities.socket, "socket", return_value=probe):
             self.assertFalse(capabilities._loopback_denied())
+
+
+
+class SkipRecordReaderTests(unittest.TestCase):
+    """The record lives in a scratch directory the verify command can write."""
+
+    def _counts_within(self, path: Path, seconds: float = 5.0) -> dict:
+        answer: list[dict] = []
+        reader = threading.Thread(target=lambda: answer.append(diagnostics.skip_counts(path)),
+                                  daemon=True)
+        reader.start()
+        reader.join(seconds)
+        self.assertFalse(reader.is_alive(), "skip_counts blocked")
+        return answer[0]
+
+    def test_regular_record_is_counted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            record = Path(temp) / diagnostics.SKIP_RECORD_NAME
+            record.write_bytes(b"loopback_unavailable\nunknown\nloopback_unavailable\n")
+            self.assertEqual(self._counts_within(record),
+                             {diagnostics.LOOPBACK_UNAVAILABLE: 2})
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX only")
+    def test_fifo_with_no_writer_is_ignored_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            record = Path(temp) / diagnostics.SKIP_RECORD_NAME
+            os.mkfifo(record)
+            self.assertEqual(self._counts_within(record), {})
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX only")
+    def test_symlink_to_fifo_or_file_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fifo = Path(temp) / "fifo"
+            os.mkfifo(fifo)
+            regular = Path(temp) / "regular"
+            regular.write_bytes(b"loopback_unavailable\n")
+            record = Path(temp) / diagnostics.SKIP_RECORD_NAME
+            for target in (fifo, regular):
+                record.symlink_to(target)
+                self.assertEqual(self._counts_within(record), {})
+                record.unlink()
 
 
 if __name__ == "__main__":

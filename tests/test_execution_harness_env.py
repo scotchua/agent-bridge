@@ -21,7 +21,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task, codex_task  # noqa: E402
-from tests import verification_capabilities  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification_capabilities  # noqa: E402
 
 LANES = (codex_task, claude_task)
 
