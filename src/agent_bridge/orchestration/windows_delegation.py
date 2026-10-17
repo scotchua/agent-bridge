@@ -871,6 +871,10 @@ def parse_guest_response(raw: bytes) -> dict[str, Any]:
     if harness_status == guest_runner.HARNESS_VERIFICATION_FAILED and not any(
             item["returncode"] != 0 for item in verification):
         raise DelegationRefused("guest_response_inconsistent", "failure_without_evidence")
+    # no_patch means the provider changed nothing. A diff beside it is a
+    # contradiction, and writing it out would report a patch the status denies.
+    if harness_status == guest_runner.HARNESS_NO_PATCH and diff:
+        raise DelegationRefused("guest_response_inconsistent", "no_patch_with_diff")
 
     return {
         "status": status,
