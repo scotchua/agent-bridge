@@ -334,7 +334,7 @@ class Server:
         try:
             payload = handler(self.cfg, self.caller, args)
         except BrokerError as exc:
-            payload = broker.error_response(exc.category)
+            payload = broker.error_response(exc.category, **exc.size_details())
         except Exception:  # noqa: BLE001
             payload = broker.error_response(ErrorCategory.INTERNAL_ERROR)
         return self._content(payload, is_error=not payload.get("ok", False))
