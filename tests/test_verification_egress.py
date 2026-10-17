@@ -33,6 +33,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge.orchestration import guest_runner as gr
 
 
+
+# A provider that changed nothing now ends as no_patch before verification,
+# so the wiring tests need a real-looking change to reach the checks.
+CHANGED = b"diff --git a/x b/x\n"
+
 class RulesetShapeTests(unittest.TestCase):
     def test_the_verification_policy_is_deny_by_default(self):
         """An accept-policy chain with drop rules denies only what it lists.
@@ -212,7 +217,9 @@ class JobWiringTests(unittest.TestCase):
                                return_value=self.versions["tools"]), \
              mock.patch.object(gr, "_AuthCapsule", self.capsule), \
              mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
-             mock.patch.object(gr, "capture_diff", lambda workdir: b""), \
+             mock.patch.object(gr, "_has_baseline", lambda workdir: True), \
+             mock.patch.object(gr, "_workspace_changed", lambda workdir: True), \
+             mock.patch.object(gr, "capture_diff", lambda workdir: CHANGED), \
              mock.patch.object(gr, "enforce_verification_egress", egress), \
              mock.patch.object(gr, "verify_program_path",
                                lambda name: "/usr/bin/" + name):
@@ -236,7 +243,9 @@ class JobWiringTests(unittest.TestCase):
                                return_value=self.versions["tools"]), \
              mock.patch.object(gr, "_AuthCapsule", self.capsule), \
              mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
-             mock.patch.object(gr, "capture_diff", lambda workdir: b""), \
+             mock.patch.object(gr, "_has_baseline", lambda workdir: True), \
+             mock.patch.object(gr, "_workspace_changed", lambda workdir: True), \
+             mock.patch.object(gr, "capture_diff", lambda workdir: CHANGED), \
              mock.patch.object(gr, "enforce_verification_egress", egress), \
              mock.patch.object(gr, "verify_program_path",
                                lambda name: "/usr/bin/" + name):
@@ -266,7 +275,9 @@ class JobWiringTests(unittest.TestCase):
                                return_value=self.versions["tools"]), \
              mock.patch.object(gr, "_AuthCapsule", TrackingCapsule), \
              mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
-             mock.patch.object(gr, "capture_diff", lambda workdir: b""), \
+             mock.patch.object(gr, "_has_baseline", lambda workdir: True), \
+             mock.patch.object(gr, "_workspace_changed", lambda workdir: True), \
+             mock.patch.object(gr, "capture_diff", lambda workdir: CHANGED), \
              mock.patch.object(gr, "enforce_verification_egress", egress), \
              mock.patch.object(gr, "verify_program_path",
                                lambda name: "/usr/bin/" + name):
@@ -322,7 +333,9 @@ class JobWiringTests(unittest.TestCase):
                                return_value=self.versions["tools"]), \
              mock.patch.object(gr, "_AuthCapsule", self.capsule), \
              mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
-             mock.patch.object(gr, "capture_diff", lambda workdir: b""), \
+             mock.patch.object(gr, "_has_baseline", lambda workdir: True), \
+             mock.patch.object(gr, "_workspace_changed", lambda workdir: True), \
+             mock.patch.object(gr, "capture_diff", lambda workdir: CHANGED), \
              mock.patch.object(gr, "enforce_verification_egress", failing), \
              mock.patch.object(gr, "verify_program_path",
                                lambda name: "/usr/bin/" + name):
@@ -331,6 +344,7 @@ class JobWiringTests(unittest.TestCase):
 
     def test_the_receipt_records_which_posture_each_check_ran_under(self):
         response = self._execute(egress=lambda: "verify-egress-denied:abc")
+        self.assertTrue(response["verification"])
         for record in response["verification"]:
             self.assertEqual(record["egress"], "verify-egress-denied:abc")
 

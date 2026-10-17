@@ -1,0 +1,8 @@
+{
+  "caller": "codex",
+  "error_category": "peer_timeout",
+  "label": "RELIABILITY_REPORT_SECRET_SENTINEL",
+  "peer": "claude",
+  "status": "failed",
+  "updated_at": "2023-11-14T22:13:30+00:00"
+}

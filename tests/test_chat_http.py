@@ -57,7 +57,17 @@ class HTTPTests(StorageTests):
 
     def test_bad_paths_and_oversized_body(self):
         self.assertEqual(self.request('GET', '/../../config/broker.json')[0], 404)
-        self.assertEqual(self.request('POST', '/api/rooms', {'title': 'x' * 70000})[0], 413)
+        # Declared, not sent: the server refuses on Content-Length alone and
+        # closes without reading the body, so a client still writing one can
+        # be reset before it reads the 413 (seen on macOS CI runners).
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=10)
+        conn.putrequest('POST', '/api/rooms')
+        for name, value in {'Authorization': 'Bearer test-token', 'Origin': self.origin,
+                            'Content-Type': 'application/json', 'Content-Length': '65537'}.items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
 
     def test_unavailable_recipient_is_rejected_before_save(self):
         body = {'request_id': 'x', 'text': 'hello', 'recipients': ['codex'], 'classification': 'public'}

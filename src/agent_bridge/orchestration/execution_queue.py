@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import threading
@@ -22,8 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from agent_bridge.platform import platform as host_platform
+from agent_bridge.bounded_capture import capture_process
 
 from ..execution import claude_config, verify_policy
+from ..capacity_router import RoutingError, StageRouter
 from . import windows_privacy as wpv
 
 
@@ -42,6 +43,14 @@ MAX_GENERATION_TIMEOUT_SECONDS = 7200
 MAX_VERIFY_TIMEOUT_SECONDS = 3600
 MAX_CLEANUP_TIMEOUT_SECONDS = 300
 MAX_TOTAL_TIMEOUT_SECONDS = 14_400
+# The harness's own commands retain their 16 MiB stream cap.  Its parent gets
+# a larger, still finite cap so verbose verification does not fail merely
+# because several bounded command transcripts were reported together.
+HARNESS_CAPTURE_MAX_BYTES = 64 * 1024 * 1024
+# Only the final JSON receipt line is interpreted by this parent.  Its maximum
+# size is the bounded harness capture, not an arbitrary diagnostic tail: a
+# receipt includes the complete before/after porcelain snapshots and can
+# legitimately exceed 64 KiB in a dirty checkout.
 
 
 class ExecutionAdmissionError(ValueError):
@@ -103,7 +112,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 class SubprocessHarnessExecutor:
     """Invoke only a configured bounded harness, with no shell or fallback."""
 
-    def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset()):
+    def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset(),
+                 capture_limit_bytes: int = HARNESS_CAPTURE_MAX_BYTES):
         # Construction stays portable so Windows MCP clients can submit and
         # inspect queue work. Actual execution is rejected in __call__ until a
         # Windows execution worker exists and has been tested.
@@ -121,6 +131,10 @@ class SubprocessHarnessExecutor:
             raise ExecutionAdmissionError("claude_config_dir_unavailable")
         self.harnesses = harnesses
         self.client_derived_routes = client_derived_routes
+        if isinstance(capture_limit_bytes, bool) or not isinstance(capture_limit_bytes, int) \
+                or capture_limit_bytes <= 0:
+            raise ExecutionAdmissionError("execution_capture_limit_invalid")
+        self.capture_limit_bytes = capture_limit_bytes
 
     def __call__(self, request: dict[str, Any], job_dir: Path) -> dict[str, Any]:
         generation_timeout = request.get("timeout_seconds")
@@ -227,25 +241,31 @@ class SubprocessHarnessExecutor:
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
-        try:
-            # ``total_timeout_seconds`` is admitted from the complete phase
-            # budget, not guessed from generation.  The harness still owns
-            # each generation, verification and cleanup timeout; this outer
-            # deadline only guarantees that a wedged harness cannot outlive
-            # the finite job.  Keep the process-group kill for descendants.
-            stdout, stderr = process.communicate(timeout=total_timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate()
+        # ``total_timeout_seconds`` is admitted from the complete phase
+        # budget, not guessed from generation.  The harness still owns each
+        # generation, verification and cleanup timeout; this outer deadline
+        # only guarantees that a wedged harness cannot outlive the finite job.
+        # Capture to private files as it runs: a chatty harness must not make
+        # the queue worker allocate unbounded memory.
+        capture = capture_process(
+            process, stdout_path=job_dir / "harness.stdout",
+            stderr_path=job_dir / "harness.stderr", limit=self.capture_limit_bytes,
+            timeout=total_timeout)
+        _atomic_json(job_dir / "harness.capture.json", {
+            "stdout_sha256": capture.stdout.sha256, "stderr_sha256": capture.stderr.sha256,
+            "stdout_bytes": capture.stdout.bytes, "stderr_bytes": capture.stderr.bytes,
+            "stdout_overflow": capture.stdout.overflowed,
+            "stderr_overflow": capture.stderr.overflowed,
+            "capture_failure": capture.failure,
+        })
+        if capture.failure == "timeout":
             raise ExecutionAdmissionError("execution_harness_timeout")
-        for name, payload in (("harness.stdout", stdout), ("harness.stderr", stderr)):
-            target = job_dir / name
-            target.write_bytes(payload)
-            os.chmod(target, 0o600)
-        summary = _harness_summary(stdout)
+        if capture.failure == "output_overflow":
+            raise ExecutionAdmissionError("execution_harness_output_overflow")
+        if capture.failure is not None:
+            raise ExecutionAdmissionError("execution_harness_capture_failed")
+        summary = _harness_summary_file(job_dir / "harness.stdout",
+                                        limit=self.capture_limit_bytes)
         if is_review and "review_receipt_path" in summary:
             # The worker records a review receipt only when the harness put it
             # inside this queue job's private harness directory.  A printed
@@ -256,15 +276,16 @@ class SubprocessHarnessExecutor:
                 receipt.relative_to((job_dir / "harness").resolve())
             except (OSError, ValueError):
                 raise ExecutionAdmissionError("review_receipt_outside_job") from None
-        return {"returncode": process.returncode,
-                "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-                "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+        return {"returncode": capture.returncode,
+                "stdout_sha256": capture.stdout.sha256,
+                "stderr_sha256": capture.stderr.sha256,
+                "stdout_bytes": capture.stdout.bytes, "stderr_bytes": capture.stderr.bytes,
                 **summary}
 
 
 #: The only harness status that means the work is done and verified. Every
-#: other value, including "verification_failed", is a task that did not pass.
+#: other value, including "verification_failed" and "no_patch", is a task
+#: that did not pass.
 HARNESS_COMPLETE = "complete"
 
 #: The complete outcome vocabulary, shared by every executor.
@@ -277,10 +298,11 @@ HARNESS_COMPLETE = "complete"
 #: vocabulary, enforced at the point the queue records a state, is what stops
 #: it becoming one again.
 HARNESS_VERIFICATION_FAILED = "verification_failed"
+HARNESS_NO_PATCH = "no_patch"
 HARNESS_FAILED = "failed"
 HARNESS_ABORTED = "aborted"
 HARNESS_STATUSES = frozenset({HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
-                              HARNESS_FAILED, HARNESS_ABORTED})
+                              HARNESS_NO_PATCH, HARNESS_FAILED, HARNESS_ABORTED})
 
 #: How an execution harness arrived at its status.  These are fixed queue and
 #: Windows-runtime diagnostics, not provider text.  Status reports expose
@@ -367,6 +389,41 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
                 "harness_status": status, "harness_verdict": "read", **diagnostics,
                 **review_receipt}
     return _unreadable("receipt_absent")
+
+
+def _harness_summary_file(path: Path, *, limit: int = HARNESS_CAPTURE_MAX_BYTES) -> dict[str, Any]:
+    """Read the complete final receipt line without loading an unbounded file.
+
+    The capture limit is also the largest permissible receipt line.  Search
+    within that bounded suffix for the line's leading newline; never hand a
+    partial line to the JSON parser.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            start = max(0, end - limit)
+            handle.seek(start)
+            suffix = handle.read(limit)
+    except OSError:
+        return _unreadable("receipt_unparseable")
+    final_end = len(suffix.rstrip(b"\r\n"))
+    if final_end == 0:
+        return _unreadable("receipt_absent")
+    line_start = suffix.rfind(b"\n", 0, final_end)
+    if line_start < 0:
+        if start:
+            # A line exactly as large as the cap begins at the suffix
+            # boundary.  Anything else began before it and is partial.
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(start - 1)
+                    if handle.read(1) != b"\n":
+                        return _unreadable("receipt_unparseable")
+            except OSError:
+                return _unreadable("receipt_unparseable")
+        line_start = -1
+    return _harness_summary(suffix[line_start + 1:final_end])
 
 
 #: Longest diagnostic text copied from a harness line into a receipt.
@@ -463,7 +520,9 @@ class ExecutionQueue:
                  recover_interrupted: bool = True,
                  platform: Any = None,
                  model_reserved: Callable[[str], str | None],
-                 client_derived_routes: frozenset[str] = frozenset()):
+                 client_derived_routes: frozenset[str] = frozenset(),
+                 stage_router: StageRouter | None = None,
+                 require_stage_binding: bool = False):
         # A matcher, not a list, and resolved per call rather than captured
         # here. Not a list because the one implementation of what counts as a
         # reserved name lives in ``autoroute``, and two layers enforcing the
@@ -474,6 +533,12 @@ class ExecutionQueue:
         #
         # Required, with no default. See ``reserve_nothing`` for why.
         self._model_reserved = model_reserved
+        # The standalone worker receives the same durable ledger the MCP
+        # dispatcher used. It is absent only from status-only MCP processes
+        # and reusable isolated queue fixtures; the configured worker always
+        # supplies it and therefore always performs the recheck below.
+        self._stage_router = stage_router
+        self._require_stage_binding = require_stage_binding
         self.client_derived_routes = client_derived_routes
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -570,9 +635,32 @@ class ExecutionQueue:
         if reserved is not None:
             raise ExecutionAdmissionError(f"model_reserved_to_operator:{reserved}")
 
+    def _require_live_stage_binding(self, request: Mapping[str, Any]) -> None:
+        """Re-read the ledger binding immediately before provider execution.
+
+        This read has no recovery side effects.  In particular, an expired
+        lease remains for an operator to reconcile; a worker must never renew
+        or reassign it merely to get a queued provider call underway.
+        """
+        if self._stage_router is None:
+            if self._require_stage_binding:
+                raise ExecutionAdmissionError("execution_stage_ledger_unavailable")
+            return
+        try:
+            self._stage_router.require_live_execution_binding(
+                request.get("item_id"), request.get("stage"),
+                owner_id=request.get("owner_id"), route=request.get("provider"),
+                revision=request.get("stage_revision"),
+                assignment=request.get("stage_assignment"))
+        except RoutingError as exc:
+            raise ExecutionAdmissionError("execution_stage_binding_invalid") from exc
+        except Exception as exc:  # noqa: BLE001  an unreadable ledger denies
+            raise ExecutionAdmissionError("execution_stage_ledger_unavailable") from exc
+
     def submit(self, *, caller: str, provider: str, repo: str, brief: str,
                base: str, classification: str, model: str, effort: str,
                item_id: str, stage: str, owner_id: str, stage_revision: int,
+               stage_assignment: int | None = None,
                verify_argv: list[list[str]] | None = None,
                timeout_seconds: int = 900, paid_fallback: bool = False,
                verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
@@ -647,6 +735,11 @@ class ExecutionQueue:
         owner_id = self._clean_text(owner_id, "owner_id")
         if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 0:
             raise ExecutionAdmissionError("stage_revision_invalid")
+        if (stage_assignment is not None
+                and (isinstance(stage_assignment, bool)
+                     or not isinstance(stage_assignment, int)
+                     or stage_assignment < 0)):
+            raise ExecutionAdmissionError("stage_assignment_invalid")
         if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int)
                 or not 1 <= timeout_seconds <= MAX_GENERATION_TIMEOUT_SECONDS):
             raise ExecutionAdmissionError("timeout_invalid")
@@ -698,7 +791,8 @@ class ExecutionQueue:
                     "cleanup_timeout_seconds": cleanup_timeout_seconds,
                     "total_timeout_seconds": total_timeout_seconds,
                     "item_id": item_id, "stage": stage, "owner_id": owner_id,
-                    "stage_revision": stage_revision, "kind": kind, "head": head,
+                    "stage_revision": stage_revision,
+                    "stage_assignment": stage_assignment, "kind": kind, "head": head,
                     "author_provider": author_provider,
                     "client_derived_admitted": client_derived_admitted}
         with self._lock:
@@ -783,9 +877,23 @@ class ExecutionQueue:
             answer["finished_at"] = finished_at
         if receipt.get("waiting_on_dependency"):
             answer["waiting_on_dependency"] = "waiting_on_dependency:" + str(receipt["waiting_on_dependency"])
+            # Drift holds are written only by the worker from its fixed
+            # metadata comparison.  Show its timing and closed reason, never
+            # a probe's raw output or inventory details.
+            checked_at = receipt.get("drift_checked_at")
+            cache_age = receipt.get("drift_cache_age_seconds")
+            dependency = receipt.get("waiting_on_dependency")
+            if (dependency in {"codex", "claude"}
+                    and isinstance(checked_at, (int, float)) and not isinstance(checked_at, bool)
+                    and isinstance(cache_age, (int, float)) and not isinstance(cache_age, bool)
+                    and checked_at >= 0 and cache_age >= 0):
+                answer["drift_checked_at"] = checked_at
+                answer["drift_cache_age_seconds"] = cache_age
+                answer["drift_hold_reason"] = "provider_changed:" + dependency
         return answer
 
-    def hold_dependencies(self, dependencies: dict[str, str]) -> None:
+    def hold_dependencies(self, dependencies: dict[str, str], *,
+                          drift_status: Mapping[str, Any] | None = None) -> None:
         """Keep matching queued work queued and make the reason visible.
 
         This is deliberately an in-place receipt annotation, not an admission
@@ -804,8 +912,18 @@ class ExecutionQueue:
                 dependency = dependencies.get(receipt.get("provider"))
                 if dependency:
                     receipt["waiting_on_dependency"] = dependency
+                    if drift_status is not None:
+                        checked_at = drift_status.get("checked_at")
+                        cache_age = drift_status.get("cache_age_seconds")
+                        if (isinstance(checked_at, (int, float)) and not isinstance(checked_at, bool)
+                                and isinstance(cache_age, (int, float)) and not isinstance(cache_age, bool)
+                                and checked_at >= 0 and cache_age >= 0):
+                            receipt["drift_checked_at"] = checked_at
+                            receipt["drift_cache_age_seconds"] = cache_age
                 else:
                     receipt.pop("waiting_on_dependency", None)
+                    receipt.pop("drift_checked_at", None)
+                    receipt.pop("drift_cache_age_seconds", None)
                 _atomic_json(path, receipt)
 
     def queued_providers(self) -> set[str]:
@@ -892,6 +1010,11 @@ class ExecutionQueue:
             # root, could have supplied. A cross-provider review found this
             # gap: the worker was handed the matcher and never called it.
             self._refuse_reserved_model(request.get("model"))
+            # A job can wait long enough for its stage to complete, be
+            # reconciled and reassigned, or lose its lease.  The dispatch-time
+            # check is therefore evidence only; this is the binding that may
+            # actually start a provider process.
+            self._require_live_stage_binding(request)
             outcome = self.executor(request, selected)
             validate_outcome(outcome)
             receipt.update(
@@ -903,7 +1026,11 @@ class ExecutionQueue:
             # safe to record and both are what an operator needs first. Any
             # other exception's text is unvetted and is replaced by a fixed
             # marker, so a stray message can never reach the receipt.
-            receipt.update(state="failed", error=type(exc).__name__, finished_at=self.clock())
+            blocked = (isinstance(exc, ExecutionAdmissionError)
+                       and str(exc) in {"execution_stage_binding_invalid",
+                                        "execution_stage_ledger_unavailable"})
+            receipt.update(state="blocked" if blocked else "failed",
+                           error=type(exc).__name__, finished_at=self.clock())
             if isinstance(exc, (ExecutionAdmissionError, OSError)):
                 detail = _clean_diagnostic(str(exc))
             else:
