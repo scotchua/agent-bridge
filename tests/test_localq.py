@@ -182,6 +182,27 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "failed")
         self.assertNotIn(sentinel, json.dumps(terminal))
 
+    def test_corrupt_selected_input_blob_fails_and_later_job_runs(self):
+        missing = self.submit(input="INVENTED_MISSING_BLOB_319")
+        later = self.submit(input="later valid input")
+        with self.queue._db() as db:
+            digest = db.execute("SELECT input_blob FROM jobs WHERE job_id=?",
+                                (missing["job_id"],)).fetchone()[0]
+        (self.queue.blobs / digest).write_text('"corrupt but valid JSON"', encoding="utf-8")
+
+        failed = self.queue.run_once("runner")
+        self.assertEqual(failed["job_id"], missing["job_id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error"], "payload_unreadable")
+        self.assertEqual(failed["disposition"],
+                         {"outcome": "failed", "reason": "payload_unreadable"})
+        self.assertNotIn("INVENTED_MISSING_BLOB_319", json.dumps(failed))
+        self.assertEqual(self.backend.calls, [])
+
+        completed = self.queue.run_once("runner")
+        self.assertEqual(completed["job_id"], later["job_id"])
+        self.assertEqual(completed["status"], "complete")
+
     def test_child_failure_does_not_store_client_text(self):
         import dataclasses
         sentinel = "INVENTED_CHILD_SENTINEL_842"

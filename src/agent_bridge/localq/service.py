@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import tempfile
 import time
@@ -14,6 +15,9 @@ from typing import Any
 from .runtime import MacSampler
 from .spool import Backend, LocalQueue, QueueCaps, SubprocessBackend
 from . import worker_child
+
+
+LOOP_ERROR_CODE = "local_worker_loop_error"
 
 
 def atomic_state(path: Path, value: dict) -> None:
@@ -58,6 +62,29 @@ class Service:
                                 caps=caps or QueueCaps(), allowed_task_types=allowed_task_types,
                                 backend_id=backend_id, client_data_health_gate=client_data_health_gate)
         self.state_path = self.root / "runtime-state.json"
+        self._last_loop_error = self._load_last_loop_error()
+
+    def _load_last_loop_error(self) -> dict[str, float | str] | None:
+        """Retain only the fixed loop diagnostic from a prior service process."""
+        try:
+            value = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        error = value.get("loop_error") if isinstance(value, dict) else None
+        recorded_at = error.get("recorded_at") if isinstance(error, dict) else None
+        if (isinstance(error, dict) and error.get("code") == LOOP_ERROR_CODE
+                and isinstance(recorded_at, (int, float)) and not isinstance(recorded_at, bool)
+                and math.isfinite(recorded_at)):
+            return {"code": LOOP_ERROR_CODE, "recorded_at": recorded_at}
+        return None
+
+    def record_loop_error(self) -> None:
+        """Persist a fixed, content-free worker-loop failure diagnostic."""
+        recorded_at = time.time()
+        self._last_loop_error = {"code": LOOP_ERROR_CODE, "recorded_at": recorded_at}
+        atomic_state(self.state_path, {"version": 1, "updated_at": recorded_at,
+                                       "backend_id": self.backend_id, "last_result": None,
+                                       "loop_error": self._last_loop_error})
 
     @classmethod
     def for_config(cls, cfg: Any, *, root: str | None = None,
@@ -85,7 +112,8 @@ class Service:
         result = self.queue.run_once("localq-service")
         state = {"version": 1, "updated_at": time.time(), "backend_id": self.backend_id,
                  "last_result": result,
-                 "queue": self.queue.state_report(), "sampler": getattr(self.sampler, "last_details", {})}
+                 "queue": self.queue.state_report(), "sampler": getattr(self.sampler, "last_details", {}),
+                 "loop_error": self._last_loop_error}
         atomic_state(self.state_path, state)
         return state
 
