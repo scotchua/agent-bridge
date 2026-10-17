@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -141,8 +142,12 @@ class ExecutionWorkerTests(unittest.TestCase):
             item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1)
         (state / "capacity.sqlite3").write_bytes(b"not a sqlite ledger")
 
-        self.assertEqual(run(str(config), once=True, interval=0.01,
-                             worker_id="test-worker"), 0)
+        # Prove the provider ready so the job reaches the ledger check; the
+        # readiness hold that would otherwise keep it queued is tested on its own.
+        with mock.patch("agent_bridge.orchestration.execution_worker.readiness_holds",
+                        return_value={}):
+            self.assertEqual(run(str(config), once=True, interval=0.01,
+                                 worker_id="test-worker"), 0)
         status = staging.result(job["job_id"])
         self.assertEqual(status["state"], "blocked")
         self.assertEqual(status["error_detail"], "execution_stage_ledger_unavailable")

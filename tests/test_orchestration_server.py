@@ -5,17 +5,18 @@ import json
 import os
 import sys
 import tempfile
-import threading
-import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.capacity_router import CapacityObservation, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.mcp_server import build_tools as build_consultation_tools
+from agent_bridge import revision
 from agent_bridge.orchestration.config import OrchestrationConfigError, load
 from agent_bridge.orchestration.server import Server
+from sqlite_teardown import cleanup_temporary_directory
 
 
 class Sampler:
@@ -40,23 +41,8 @@ class OrchestrationServerTests(unittest.TestCase):
         self.router = StageRouter(os.path.join(self.temp.name, "capacity.sqlite3"), clock=lambda: 100.0)
 
     def tearDown(self):
-        # Server.stop() waits only interval + 1 seconds, then drops its thread
-        # reference. On a slow Windows runner the worker can still be inside a
-        # queue call holding queue/localq.sqlite3, and Windows refuses to
-        # delete an open file. Wait for it, then retry the cleanup briefly
-        # rather than failing on a sharing violation (same fix as the localq
-        # server tests).
-        for thread in threading.enumerate():
-            if thread.name == "orchestration-local-worker":
-                thread.join(timeout=30)
-        for attempt in range(50):
-            try:
-                self.temp.cleanup()
-                return
-            except PermissionError:
-                if attempt == 49:
-                    raise
-                time.sleep(0.1)
+        cleanup_temporary_directory(
+            self.temp, worker_names=("orchestration-local-worker",))
 
     @staticmethod
     def request(server, name, arguments):
@@ -94,6 +80,13 @@ class OrchestrationServerTests(unittest.TestCase):
         self.assertFalse(set(build_consultation_tools("codex")) & {
             "work_route_local", "stage_claim", "orchestration_status",
         })
+
+    def test_marker_write_failure_does_not_stop_orchestration_server(self):
+        with mock.patch.object(revision, "record", side_effect=OSError), \
+             mock.patch.object(revision, "capture", return_value="a" * 40):
+            server = Server("codex", self.service, self.router, interval=0.01,
+                            state_root=self.temp.name)
+        self.assertIn("orchestration_status", server.tools)
 
     def test_caller_provenance_cannot_be_spoofed(self):
         server = Server("codex", self.service, self.router, interval=0.01)

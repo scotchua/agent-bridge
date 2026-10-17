@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.execution import claude_task as module
 from agent_bridge.execution import hostenv
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification_capabilities
 
 
 def requires_confinement(case):
@@ -37,6 +39,9 @@ def requires_confinement(case):
     must pass everywhere, which is why ``run_task`` validates the request
     before it probes the host.
     """
+    # Under a job, a denied nested backend is a recorded skip, so probe it
+    # before hostenv.confinement can skip without a record.
+    verification_capabilities.requires_nested_confinement(case)
     try:
         hostenv.confinement("synthetic")
     except hostenv.HostCapabilityError as exc:

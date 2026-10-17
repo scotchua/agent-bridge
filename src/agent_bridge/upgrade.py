@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config, drift, onboard, python_runtime, store
+from . import restart_worker
 from .chat.grok import ALLOWED_COMMANDS, REQUIRED_MANIFEST_KEYS
 from .chat.windows_security import prepare_private_directory
 from .orchestration import autoroute, delegation, gate
@@ -535,6 +536,16 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
             out("Nightly doctor schedule installed.")
         except (OSError, ValueError, PermissionError) as exc:
             out(f"Nightly doctor schedule could not be installed: {exc}.")
+    runtime = drift.runtime_revision_status(config_path, home=home)
+    if isinstance(runtime.get("worker"), dict) and runtime["worker"].get("code_stale"):
+        if _yes(ask("Restart the idle execution worker now? [y/N] ")):
+            outcome = restart_worker.restart(config_path, home=home)
+            out("Execution worker restarted." if outcome == "restart_worker_restarted" else
+                "Execution worker restart requested; it will complete at the next idle pass."
+                if outcome == "restart_worker_requested" else
+                "Execution worker was not restarted: " + outcome + ".")
+        else:
+            out("Execution worker may still run older code; run setup_bridge.py restart-worker after it is idle.")
     out("To undo files created by this upgrade: python setup_bridge.py upgrade --undo")
     return 0
 
