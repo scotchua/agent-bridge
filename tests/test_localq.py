@@ -5,10 +5,13 @@ import dataclasses
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -16,6 +19,7 @@ from agent_bridge.localq import (AdmissionError, FakeBackend, LocalQueue, QueueC
                                  ResourceSnapshot)
 from agent_bridge.localq import mcp
 from agent_bridge.localq.spool import SubprocessBackend
+from agent_bridge.bounded_capture import capture_process
 
 
 class Clock:
@@ -239,6 +243,41 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(terminal["error"],
                          "RuntimeError: child output exceeded bounded capture")
         self.assertNotIn("private-output", json.dumps(terminal))
+
+    def test_slow_named_capture_fsync_after_eof_is_not_stream_unclosed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = subprocess.Popen(
+                [sys.executable, "-c", "print('ok')"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+
+            def slow_fsync(_fd):
+                time.sleep(1)
+
+            with mock.patch("agent_bridge.bounded_capture.os.fsync", side_effect=slow_fsync):
+                capture = capture_process(
+                    process, stdout_path=Path(temporary) / "stdout",
+                    stderr_path=Path(temporary) / "stderr", limit=1024, timeout=2)
+        self.assertIsNone(capture.failure)
+
+    def test_anonymous_capture_failure_does_not_start_a_local_child(self):
+        backend = SubprocessBackend([sys.executable, "-c", "raise SystemExit(0)"])
+        with mock.patch("agent_bridge.localq.spool.tempfile.TemporaryFile",
+                        side_effect=OSError("capture unavailable")), \
+             mock.patch("agent_bridge.localq.spool.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(OSError, "capture unavailable"):
+                backend.run({"job_id": "capture-setup"}, 1)
+        popen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "descendant pipe inheritance is POSIX-only")
+    def test_blocked_stdin_writer_does_not_extend_the_capture_deadline(self):
+        child = ("import os,time\n"
+                 "if os.fork(): os._exit(0)\n"
+                 "time.sleep(5)\n")
+        backend = SubprocessBackend([sys.executable, "-c", child])
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "child output capture failed"):
+            backend.run({"job_id": "stdin-hang", "input": "x" * (2 * 1024 * 1024)}, .5)
+        self.assertLess(time.monotonic() - started, 2.5)
 
     def test_startup_recovery_marks_expired_lease_unknown(self):
         job = self.submit()

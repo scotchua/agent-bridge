@@ -247,19 +247,16 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
 
     # The outer SubprocessBackend creates the process group. Keeping the
     # delegate in that group lets an outer timeout/cancel terminate both.
-    process = subprocess.Popen(
-        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, env=env, shell=False)
     # The delegate's output is the draft itself and may be client-derived.
-    # Capture it in a private temporary directory that is removed on every
-    # path, so bounding memory never leaves draft content at rest beside the
-    # receipts.
-    with tempfile.TemporaryDirectory(prefix="agent-bridge-gemma-delegate-") as temporary:
-        capture_root = Path(temporary)
+    # Create an anonymous capture before starting it: POSIX unlinks this file
+    # immediately, and Windows deletes it on close.  Thus SIGTERM/SIGKILL of
+    # this adapter cannot leave a draft path behind.
+    with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-") as output_file:
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, shell=False)
         capture = capture_process(
-            process,
-            stdout_path=capture_root / "stdout",
-            stderr_path=capture_root / "stderr",
+            process, stdout_file=output_file,
             limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=timeout,
             stdin_data=input_bytes)
         if capture.failure == "timeout":
@@ -269,7 +266,8 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
         if capture.failure is not None:
             raise GemmaRefusal("gemma_delegate_unavailable")
         try:
-            output = (capture_root / "stdout").read_bytes()
+            output_file.seek(0)
+            output = output_file.read()
         except OSError as exc:
             raise GemmaRefusal("gemma_delegate_unavailable") from exc
     if capture.returncode != 0:

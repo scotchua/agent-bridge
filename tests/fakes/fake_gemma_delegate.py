@@ -43,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.buffer.write(b"x" * 8192)
         sys.stdout.buffer.flush()
         return 0
+    if mode == "stderr-chatty":
+        sys.stderr.buffer.write(b"x" * (5 * 1024 * 1024))
+        sys.stderr.buffer.flush()
 
     if args.task == "extract":
         fields = {name: None for name in ("party", "date", "doc_type", "reference",

@@ -19,7 +19,7 @@ from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
 from agent_bridge.orchestration import autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
-    _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
+    _harness_summary, _harness_summary_file, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
@@ -593,6 +593,17 @@ class HarnessVerdictTests(unittest.TestCase):
         summary = _harness_summary(stdout)
         self.assertEqual(summary["harness_status"], "verification_failed")
         self.assertFalse(summary["harness_ok"])
+
+    def test_a_final_receipt_larger_than_the_old_diagnostic_tail_is_read_whole(self):
+        receipt = json.dumps({"ok": True, "status": "complete",
+                              "source_before": "? dirty-file\n" * 6000,
+                              "source_after": "? more-dirty-file\n" * 6000}).encode()
+        self.assertGreater(len(receipt), 64 * 1024)
+        path = self.root / "large-harness.stdout"
+        path.write_bytes(b"progress\n" + receipt + b"\n")
+        summary = _harness_summary_file(path)
+        self.assertEqual(summary["harness_status"], "complete")
+        self.assertTrue(summary["harness_ok"])
 
     def test_a_json_array_is_refused_rather_than_indexed(self):
         self.assertEqual(_harness_summary(b'["complete"]')["harness_verdict"],

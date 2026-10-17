@@ -30,7 +30,7 @@ POST_EXIT_DRAIN_SECONDS = 0.5
 class CapturedStream:
     """Metadata for the exact prefix durably captured for one stream."""
 
-    path: Path
+    path: Path | None
     bytes: int
     sha256: str
     overflowed: bool
@@ -49,14 +49,22 @@ class CaptureResult:
 class _FilePump:
     """Copy one pipe into an owner-only file without accumulating it in RAM."""
 
-    def __init__(self, stream: BinaryIO, path: Path, limit: int) -> None:
+    def __init__(self, stream: BinaryIO, *, path: Path | None,
+                 output_file: BinaryIO | None, limit: int) -> None:
+        if (path is None) == (output_file is None):
+            raise ValueError("provide exactly one capture destination")
         self.stream = stream
         self.path = path
+        self.output_file = output_file
         self.limit = limit
         self.bytes = 0
         self.digest = hashlib.sha256()
         self.overflowed = False
         self.unavailable = False
+        # EOF is the pipe-lifecycle fact.  A durable named file may still be
+        # in fsync after EOF, which must not turn a clean child exit into a
+        # false stream_unclosed failure.
+        self.eof_reached = False
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -68,21 +76,31 @@ class _FilePump:
     def _run(self) -> None:
         fd = -1
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            host_platform.enforce_owner_only_file(fd)
-            with os.fdopen(fd, "wb", closefd=True) as output:
+            if self.output_file is None:
+                assert self.path is not None
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                host_platform.enforce_owner_only_file(fd)
+                output = os.fdopen(fd, "wb", closefd=True)
                 fd = -1
+                close_output = True
+            else:
+                output = self.output_file
+                close_output = False
+            try:
                 while True:
                     chunk = self.stream.read(READ_CHUNK_BYTES)
                     if not chunk:
+                        self.eof_reached = True
                         output.flush()
-                        os.fsync(output.fileno())
+                        # Anonymous TemporaryFiles have no evidence path to
+                        # make durable.  More importantly, avoid a costly
+                        # fsync after EOF keeping their pump thread alive.
+                        if close_output:
+                            os.fsync(output.fileno())
                         return
                     room = self.limit - self.bytes
                     if room <= 0:
                         self.overflowed = True
-                        output.flush()
-                        os.fsync(output.fileno())
                         return
                     captured = chunk[:room]
                     output.write(captured)
@@ -90,9 +108,10 @@ class _FilePump:
                     self.bytes += len(captured)
                     if len(captured) != len(chunk):
                         self.overflowed = True
-                        output.flush()
-                        os.fsync(output.fileno())
                         return
+            finally:
+                if close_output:
+                    output.close()
         except BaseException:
             self.unavailable = True
             if fd >= 0:
@@ -132,8 +151,12 @@ def _write_stdin(process: subprocess.Popen[bytes], payload: bytes) -> None:
         pass
 
 
-def capture_process(process: subprocess.Popen[bytes], *, stdout_path: Path,
-                    stderr_path: Path, limit: int, timeout: float,
+def capture_process(process: subprocess.Popen[bytes], *,
+                    stdout_path: Path | None = None,
+                    stderr_path: Path | None = None,
+                    stdout_file: BinaryIO | None = None,
+                    stderr_file: BinaryIO | None = None,
+                    limit: int, timeout: float,
                     stdin_data: bytes | None = None) -> CaptureResult:
     """Capture an already-isolated process with one cap per stream.
 
@@ -143,22 +166,28 @@ def capture_process(process: subprocess.Popen[bytes], *, stdout_path: Path,
     """
     if limit <= 0:
         raise ValueError("capture limit must be positive")
-    if process.stdout is None or process.stderr is None:
-        raise ValueError("process must provide stdout and stderr pipes")
-    stdout = _FilePump(process.stdout, stdout_path, limit)
-    stderr = _FilePump(process.stderr, stderr_path, limit)
+    if process.stdout is None:
+        raise ValueError("process must provide a stdout pipe")
+    if process.stderr is None and (stderr_path is not None or stderr_file is not None):
+        raise ValueError("stderr destination requires a stderr pipe")
+    stdout = _FilePump(process.stdout, path=stdout_path, output_file=stdout_file, limit=limit)
+    stderr = (_FilePump(process.stderr, path=stderr_path, output_file=stderr_file, limit=limit)
+              if process.stderr is not None else None)
     stdout.start()
-    stderr.start()
+    if stderr is not None:
+        stderr.start()
+    stdin_writer: threading.Thread | None = None
     if stdin_data is not None:
-        threading.Thread(target=_write_stdin, args=(process, stdin_data), daemon=True).start()
+        stdin_writer = threading.Thread(target=_write_stdin, args=(process, stdin_data), daemon=True)
+        stdin_writer.start()
 
     deadline = time.monotonic() + timeout
     failure: str | None = None
     while process.poll() is None:
-        if stdout.unavailable or stderr.unavailable:
+        if stdout.unavailable or (stderr is not None and stderr.unavailable):
             failure = "capture_unavailable"
             break
-        if stdout.overflowed or stderr.overflowed:
+        if stdout.overflowed or (stderr is not None and stderr.overflowed):
             failure = "output_overflow"
             break
         remaining = deadline - time.monotonic()
@@ -175,12 +204,13 @@ def capture_process(process: subprocess.Popen[bytes], *, stdout_path: Path,
         # stderr descriptor.  Bound that drain as well; otherwise EOF is an
         # unbounded wait under a different name.
         stdout.thread.join(POST_EXIT_DRAIN_SECONDS)
-        stderr.thread.join(POST_EXIT_DRAIN_SECONDS)
-        if stdout.unavailable or stderr.unavailable:
+        if stderr is not None:
+            stderr.thread.join(POST_EXIT_DRAIN_SECONDS)
+        if stdout.unavailable or (stderr is not None and stderr.unavailable):
             failure = "capture_unavailable"
-        elif stdout.overflowed or stderr.overflowed:
+        elif stdout.overflowed or (stderr is not None and stderr.overflowed):
             failure = "output_overflow"
-        elif stdout.thread.is_alive() or stderr.thread.is_alive():
+        elif not stdout.eof_reached or (stderr is not None and not stderr.eof_reached):
             failure = "stream_unclosed"
 
     if failure is not None:
@@ -194,7 +224,8 @@ def capture_process(process: subprocess.Popen[bytes], *, stdout_path: Path,
         except subprocess.TimeoutExpired:
             pass
     stdout.thread.join(POST_EXIT_DRAIN_SECONDS)
-    stderr.thread.join(POST_EXIT_DRAIN_SECONDS)
+    if stderr is not None:
+        stderr.thread.join(POST_EXIT_DRAIN_SECONDS)
     if process.poll() is None and failure is None:
         failure = "stream_unclosed"
     for stream, reader in ((process.stdin, None), (process.stdout, stdout),
@@ -203,10 +234,14 @@ def capture_process(process: subprocess.Popen[bytes], *, stdout_path: Path,
             # Buffered ``close`` can wait on the same lock a reader holds
             # while blocked in ``read``. A daemon reader is safer than
             # violating the parent deadline after a child escaped EOF.
-            if reader is not None and reader.thread.is_alive():
+            if ((reader is not None and reader.thread.is_alive())
+                    or (reader is None and stdin_writer is not None
+                        and stdin_writer.is_alive())):
                 continue
             try:
                 stream.close()
             except (OSError, ValueError):
                 pass
-    return CaptureResult(process.poll(), stdout.result(), stderr.result(), failure)
+    empty_stderr = CapturedStream(None, 0, hashlib.sha256().hexdigest(), False)
+    return CaptureResult(process.poll(), stdout.result(),
+                         stderr.result() if stderr is not None else empty_stderr, failure)

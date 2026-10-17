@@ -244,19 +244,18 @@ class SubprocessBackend:
         if not isinstance(job_id, str):
             raise RuntimeError("child payload lacks job id")
         env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
-        proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, start_new_session=True,
-                                env=env, shell=False)
-        with self._lock:
-            self._processes[job_id] = proc
-        try:
-            # The queue protocol has no per-job directory at this boundary,
-            # so a private temporary directory is the owner-only capture
-            # lifetime. The parsed result is still bounded by the cap.
-            with tempfile.TemporaryDirectory(prefix="agent-bridge-local-child-") as temporary:
-                root = Path(temporary)
+        # Child stdout can be client-derived.  Allocate its anonymous capture
+        # before the child starts so an allocation failure cannot orphan it;
+        # a forced termination closes the descriptor without leaving a path.
+        with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-local-child-") as output_file:
+            proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, start_new_session=True,
+                                    env=env, shell=False)
+            with self._lock:
+                self._processes[job_id] = proc
+            try:
                 capture = capture_process(
-                    proc, stdout_path=root / "stdout", stderr_path=root / "stderr",
+                    proc, stdout_file=output_file,
                     limit=self.capture_limit_bytes, timeout=timeout_seconds,
                     stdin_data=json.dumps(payload).encode("utf-8"))
                 if capture.failure == "timeout":
@@ -266,12 +265,13 @@ class SubprocessBackend:
                 if capture.failure is not None:
                     raise RuntimeError("child output capture failed")
                 try:
-                    output = (root / "stdout").read_text(encoding="utf-8")
+                    output_file.seek(0)
+                    output = output_file.read().decode("utf-8")
                 except (OSError, UnicodeError) as exc:
                     raise RuntimeError("child output capture failed") from exc
-        finally:
-            with self._lock:
-                self._processes.pop(job_id, None)
+            finally:
+                with self._lock:
+                    self._processes.pop(job_id, None)
         if capture.returncode != 0:
             raise _ChildFailure(output)
         try:

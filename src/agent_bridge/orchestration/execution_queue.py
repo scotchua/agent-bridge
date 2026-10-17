@@ -46,9 +46,10 @@ MAX_TOTAL_TIMEOUT_SECONDS = 14_400
 # a larger, still finite cap so verbose verification does not fail merely
 # because several bounded command transcripts were reported together.
 HARNESS_CAPTURE_MAX_BYTES = 64 * 1024 * 1024
-# Only the final JSON receipt line is interpreted by this parent.  Reading a
-# bounded tail preserves that protocol without loading the whole capture file.
-HARNESS_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+# Only the final JSON receipt line is interpreted by this parent.  Its maximum
+# size is the bounded harness capture, not an arbitrary diagnostic tail: a
+# receipt includes the complete before/after porcelain snapshots and can
+# legitimately exceed 64 KiB in a dirty checkout.
 
 
 class ExecutionAdmissionError(ValueError):
@@ -262,7 +263,8 @@ class SubprocessHarnessExecutor:
             raise ExecutionAdmissionError("execution_harness_output_overflow")
         if capture.failure is not None:
             raise ExecutionAdmissionError("execution_harness_capture_failed")
-        summary = _harness_summary_file(job_dir / "harness.stdout")
+        summary = _harness_summary_file(job_dir / "harness.stdout",
+                                        limit=self.capture_limit_bytes)
         if is_review and "review_receipt_path" in summary:
             # The worker records a review receipt only when the harness put it
             # inside this queue job's private harness directory.  A printed
@@ -386,15 +388,39 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
     return _unreadable("receipt_absent")
 
 
-def _harness_summary_file(path: Path) -> dict[str, Any]:
-    """Read only the final bounded diagnostic window from file-backed stdout."""
+def _harness_summary_file(path: Path, *, limit: int = HARNESS_CAPTURE_MAX_BYTES) -> dict[str, Any]:
+    """Read the complete final receipt line without loading an unbounded file.
+
+    The capture limit is also the largest permissible receipt line.  Search
+    within that bounded suffix for the line's leading newline; never hand a
+    partial line to the JSON parser.
+    """
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - HARNESS_DIAGNOSTIC_TAIL_BYTES))
-            return _harness_summary(handle.read(HARNESS_DIAGNOSTIC_TAIL_BYTES))
+            end = handle.tell()
+            start = max(0, end - limit)
+            handle.seek(start)
+            suffix = handle.read(limit)
     except OSError:
         return _unreadable("receipt_unparseable")
+    final_end = len(suffix.rstrip(b"\r\n"))
+    if final_end == 0:
+        return _unreadable("receipt_absent")
+    line_start = suffix.rfind(b"\n", 0, final_end)
+    if line_start < 0:
+        if start:
+            # A line exactly as large as the cap begins at the suffix
+            # boundary.  Anything else began before it and is partial.
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(start - 1)
+                    if handle.read(1) != b"\n":
+                        return _unreadable("receipt_unparseable")
+            except OSError:
+                return _unreadable("receipt_unparseable")
+        line_start = -1
+    return _harness_summary(suffix[line_start + 1:final_end])
 
 
 #: Longest diagnostic text copied from a harness line into a receipt.

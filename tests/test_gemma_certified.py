@@ -317,6 +317,10 @@ class GemmaInvokeTests(unittest.TestCase):
         # The capped draft is never left at rest beside the receipts.
         self.assertEqual(list(self.fx["receipts"].glob(".delegate-*")), [])
 
+    def test_delegate_stderr_does_not_compete_with_bounded_stdout(self):
+        self.mode("stderr-chatty")
+        self.assertEqual(self.invoke()["provider"], "gemma_certified")
+
     def test_successful_delegate_leaves_no_captured_draft_beside_receipts(self):
         self.invoke()
         self.assertEqual(list(self.fx["receipts"].glob(".delegate-*")), [])
