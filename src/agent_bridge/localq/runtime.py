@@ -21,7 +21,7 @@ MIN_MEMORY_FREE_PERCENT = 10.0
 
 
 def system_runner(argv: list[str]) -> str:
-    return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL, timeout=2)
+    return subprocess.check_output(argv, text=True, stderr=subprocess.DEVNULL, timeout=2, shell=False)
 
 
 def foundation_thermal_state() -> str:
