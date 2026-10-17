@@ -218,6 +218,21 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(restarted["queue"]["state"], "local_queue")
             self.assertEqual(saved["sampler"], {"fixture": True})
 
+    def test_service_persists_only_fixed_loop_error_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "spool"
+            worker, state = Path(temporary) / "worker.py", Path(temporary) / "worker-state"
+            worker.write_text("# fixture", encoding="utf-8")
+            state.mkdir()
+            instance = Service(str(root), str(worker), str(state))
+            with patch("agent_bridge.localq.service.time.time", return_value=321.5):
+                instance.record_loop_error()
+            saved = json.loads((root / "runtime-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["loop_error"],
+                             {"code": "local_worker_loop_error", "recorded_at": 321.5})
+            restarted = Service(str(root), str(worker), str(state))
+            self.assertEqual(restarted._last_loop_error, saved["loop_error"])
+
 
 if __name__ == "__main__":
     unittest.main()
