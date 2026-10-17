@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -26,6 +27,11 @@ class LauncherSecurityTests(unittest.TestCase):
             environment = dict(os.environ)
             environment["PYTHONPATH"] = str(hostile)
             environment["LAUNCHER_SECURITY_MARKER"] = str(marker)
+            # This test is about the import path, not interpreter discovery
+            # (test_python_launchers.py covers that). A job's verification
+            # sandbox may have no Python 3.11+ on PATH and an isolated HOME.
+            if os.name != "nt":
+                environment.setdefault("AGENT_BRIDGE_PYTHON", sys.executable)
 
             for name in ("agent-bridge-mcp", "agent-bridge-admin", "agent-bridge-setup",
                          "agent-bridge-gate-hook"):

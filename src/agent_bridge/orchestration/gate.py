@@ -1645,14 +1645,13 @@ def _worktree_prune_decision(command: str, cwd: str, config_path: str | None,
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
-                 config_path: str | None = None, monotonic: Any | None = None) -> Decision:
+                 config_path: str | None = None, monotonic: Any = time.monotonic) -> Decision:
     """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
     classification: protected paths, then routing receipts. Split out of
     ``judge`` so a Codex shell command that both writes and reads a file
     whole (``cat a.log > b.log``) can be judged on both counts -- see
     ``judge``'s own overlay of ``judge_read`` for a whole-file read hiding
     behind a write-shaped command."""
-    monotonic = time.monotonic if monotonic is None else monotonic
     if kind == "edit":
         hit = [path for path in paths if any(_under(path, root) for root in protected)]
     else:

@@ -53,14 +53,16 @@ def _recorded_value(home: str | None = None) -> tuple[str | None, str | None]:
     except OSError:
         return None, "record_not_owner_only"
     uid = os.getuid() if hasattr(os, "getuid") else None
-    owner_only = (
-        stat.S_ISREG(record_status.st_mode)
-        and (uid is None or record_status.st_uid == uid)
-        and not (record_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-        and stat.S_ISDIR(parent_status.st_mode)
-        and (uid is None or parent_status.st_uid == uid)
-        and not (parent_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-    )
+    owner_only = stat.S_ISREG(record_status.st_mode) and stat.S_ISDIR(parent_status.st_mode)
+    # Mode bits and st_uid carry no ownership meaning on Windows, where every
+    # writable file reports group and other write.  Only the POSIX launcher
+    # reads this record, and it applies the same checks.
+    if os.name == "posix":
+        owner_only = owner_only and (
+            (uid is None or record_status.st_uid == uid)
+            and not (record_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            and (uid is None or parent_status.st_uid == uid)
+            and not (parent_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)))
     if not owner_only:
         return None, "record_not_owner_only"
     try:

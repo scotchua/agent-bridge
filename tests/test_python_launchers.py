@@ -17,8 +17,16 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge import python_runtime  # noqa: E402
 
 
+@unittest.skipIf(os.name == "nt", "the shared resolver is the POSIX sh launcher")
 class PythonLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
+        # doctor() reads the caller's environment in process. An operator's
+        # own AGENT_BRIDGE_PYTHON (set for agent sessions) would override
+        # every record these tests write.
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+        os.environ.pop("AGENT_BRIDGE_PYTHON", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
