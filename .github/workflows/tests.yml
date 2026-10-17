@@ -129,6 +129,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
           python3 -m unittest discover -s tests -p "test_job_source.py"
+          python3 -m unittest discover -s tests -p "test_execution_job_source_admission.py"
 
       - name: Automatic routing, the gate that applies it, and its audit
         run: |
