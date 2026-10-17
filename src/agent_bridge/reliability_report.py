@@ -70,9 +70,15 @@ _SAFE_EXECUTION_CODES = frozenset({
     "total_timeout_invalid", "verify_argv_invalid", "verify_argv_rejected",
     "verify_not_runnable", "verify_timeout_invalid",
     "windows_wsl_configuration_missing",
+    # Worker status and restart requests in PR #69 (I2).
+    "execution_worker_restart_request_unavailable",
+    "execution_worker_status_unavailable",
     # The stage-binding recheck in PR #61 (R5).
     "execution_stage_binding_invalid", "execution_stage_ledger_unavailable",
     "stage_assignment_invalid",
+    # Bounded harness capture in PR #62 (R6).
+    "execution_capture_limit_invalid", "execution_harness_capture_failed",
+    "execution_harness_output_overflow",
     *(f"queue_{reason}" for reason in _QUEUE_PRIVACY_REASONS),
     # The two dynamic sites: SubprocessHarnessExecutor's harness check and
     # ExecutionQueue._clean_text.  The sync test pins both.
