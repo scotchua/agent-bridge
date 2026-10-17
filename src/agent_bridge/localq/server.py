@@ -46,9 +46,16 @@ class Server:
             try:
                 self.service.once()
             except Exception:
-                # Queue state remains durable; the next interval can retry polling.
-                pass
+                self._record_loop_error()
             self._stop.wait(self.interval)
+
+    def _record_loop_error(self) -> None:
+        reporter = getattr(self.service, "record_loop_error", None)
+        if callable(reporter):
+            try:
+                reporter()
+            except Exception:
+                pass
 
     def start(self) -> None:
         if self._thread is None:
