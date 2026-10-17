@@ -17,6 +17,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent_bridge.execution import codex_task, claude_task, hostenv, job_source
 from agent_bridge.orchestration.execution_queue import Harnesses, SubprocessHarnessExecutor
 
+def recording_popen(stdout: bytes) -> mock.Mock:
+    """Record the harness argv and kwargs, then run a real child that prints
+    ``stdout``, so the executor's bounded capture reads a real pipe."""
+    real = subprocess.Popen
+
+    def launch(argv, **kwargs):
+        return real([sys.executable, "-c",
+                     "import sys; sys.stdout.buffer.write(%r)" % stdout], **kwargs)
+    return mock.Mock(side_effect=launch)
+
+
 
 def git(repo: Path, *args: str) -> str:
     env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -104,18 +115,12 @@ class PinnedHarnessTests(unittest.TestCase):
         executor = SubprocessHarnessExecutor(Harnesses(
             codex=harness, claude=harness, python=Path(sys.executable)))
 
-        class Process:
-            returncode = 0
-
-            def communicate(self, *, timeout: int):
-                return b'{"status":"complete"}\n', b""
-
         request = {"provider": "codex", "brief": str(self.root / "brief"),
                    "repo": str(self.operator), "base_commit": self.commit,
                    "classification": "synthetic", "model": "test", "effort": "low",
                    "timeout_seconds": 1, "verify_argv": []}
         with mock.patch("agent_bridge.orchestration.execution_queue.subprocess.Popen",
-                        return_value=Process()) as popen:
+                        new=recording_popen(b'{"status":"complete"}\n')) as popen:
             executor(request, self.job)
         argv = popen.call_args.args[0]
         self.assertIn("--job-source", argv)
@@ -125,8 +130,11 @@ class PinnedHarnessTests(unittest.TestCase):
         request.pop("base_commit")
         request["base"] = "HEAD"
         with mock.patch("agent_bridge.orchestration.execution_queue.subprocess.Popen",
-                        return_value=Process()) as legacy_popen:
-            executor(request, self.job)
+                        new=recording_popen(b'{"status":"complete"}\n')) as legacy_popen:
+            # Capture files are created exclusively, so each run gets its own job dir.
+            legacy_job = self.root / "legacy-job"
+            legacy_job.mkdir(mode=0o700)
+            executor(request, legacy_job)
         self.assertNotIn("--job-source", legacy_popen.call_args.args[0])
         self.assertEqual(legacy_popen.call_args.kwargs["cwd"], str(self.operator))
 

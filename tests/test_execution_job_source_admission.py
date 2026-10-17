@@ -25,6 +25,17 @@ def git_env() -> dict[str, str]:
             "GIT_COMMITTER_NAME": "Admission Test",
             "GIT_COMMITTER_EMAIL": "admission@example.invalid"}
 
+def recording_popen(stdout: bytes) -> mock.Mock:
+    """Record the harness argv and kwargs, then run a real child that prints
+    ``stdout``, so the executor's bounded capture reads a real pipe."""
+    real = subprocess.Popen
+
+    def launch(argv, **kwargs):
+        return real([sys.executable, "-c",
+                     "import sys; sys.stdout.buffer.write(%r)" % stdout], **kwargs)
+    return mock.Mock(side_effect=launch)
+
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=repo, check=True, env=git_env(), shell=False,
@@ -210,26 +221,27 @@ class ExecutionJobSourceAdmissionTests(unittest.TestCase):
         executor = eq.SubprocessHarnessExecutor(eq.Harnesses(
             codex=self.brief, claude=self.brief, python=Path(sys.executable)))
 
-        class Process:
-            returncode = 0
-
-            def communicate(self, timeout: int) -> tuple[bytes, bytes]:
-                return b'{"ok":true,"status":"complete"}\n', b""
-
         request: dict[str, object] = {
             "provider": "codex", "kind": "execution", "brief": str(self.brief),
             "repo": str(self.repo), "base": "HEAD", "base_commit": self.base_commit,
             "timeout_seconds": 1, "verify_argv": [], "classification": "synthetic",
             "model": "test-model", "effort": "low",
         }
-        with mock.patch.object(eq.subprocess, "Popen", return_value=Process()) as popen:
-            executor(request, self.root)
+        with mock.patch.object(eq.subprocess, "Popen",
+                               new=recording_popen(b'{"ok":true,"status":"complete"}\n')) as popen:
+            pinned_job = self.root / "pinned-job"
+            pinned_job.mkdir(mode=0o700)
+            executor(request, pinned_job)
         argv = popen.call_args.args[0]
         self.assertEqual(argv[argv.index("--base") + 1], self.base_commit)
 
         request.pop("base_commit")
-        with mock.patch.object(eq.subprocess, "Popen", return_value=Process()) as popen:
-            executor(request, self.root)
+        with mock.patch.object(eq.subprocess, "Popen",
+                               new=recording_popen(b'{"ok":true,"status":"complete"}\n')) as popen:
+            # Capture files are created exclusively, so each run gets its own job dir.
+            legacy_job = self.root / "legacy-job"
+            legacy_job.mkdir(mode=0o700)
+            executor(request, legacy_job)
         argv = popen.call_args.args[0]
         self.assertEqual(argv[argv.index("--base") + 1], "HEAD")
 
