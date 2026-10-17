@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -21,6 +22,22 @@ from agent_bridge.orchestration.execution_queue import (
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
+
+
+def make_git_repo(path: Path) -> None:
+    """Give POSIX execution-admission tests a real commit to pin."""
+    path.mkdir()
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "Queue Test",
+           "GIT_AUTHOR_EMAIL": "queue@example.invalid", "GIT_COMMITTER_NAME": "Queue Test",
+           "GIT_COMMITTER_EMAIL": "queue@example.invalid"}
+    for argv in (("git", "init", "--quiet"),):
+        subprocess.run(argv, cwd=path, check=True, env=env, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, shell=False)
+    (path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for argv in (("git", "add", "tracked.txt"), ("git", "commit", "--quiet", "-m", "base")):
+        subprocess.run(argv, cwd=path, check=True, env=env, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, shell=False)
 
 
 class FakeExecutor:
@@ -64,8 +81,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
@@ -383,7 +399,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
 
     def test_damaged_and_claimed_entries_do_not_block_a_later_job(self):
         """Unreadable and uncertain jobs remain held while healthy work runs."""
-        identifiers = iter(("0" * 31 + "1", "0" * 31 + "2", "0" * 31 + "3"))
+        # Each admission also uses one UUID while streaming its private source.
+        identifiers = iter(tuple("0" * 31 + str(number) for number in range(1, 7)))
         with mock.patch(
                 "agent_bridge.orchestration.execution_queue.uuid.uuid4",
                 side_effect=lambda: SimpleNamespace(hex=next(identifiers))):
@@ -437,8 +454,7 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.txt"
         self.brief.write_text("complete", encoding="utf-8")
         self.harness = self.root / "fake_harness.py"
@@ -629,8 +645,7 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
