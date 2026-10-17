@@ -122,14 +122,17 @@ def inspect_peer(cfg: Config, peer: str) -> dict[str, Any]:
             "macOS Keychain access before changing the login. If it works there, "
             "investigate the launching process's Keychain access. If it fails there too, "
             "an operator can authorize login using the pinned executable and the context above. "
-            "Repeated refresh failures need investigation; restarting desktop apps is not a repair."
+            "Repeated refresh failures need investigation; restarting desktop apps is not a repair. "
+            "Sign in within this config directory; never copy a login from another home, "
+            "because two homes holding one refresh grant can invalidate each other."
         )
     else:
         report["auth_file_present"] = os.path.isfile(os.path.join(env["CODEX_HOME"], "auth.json"))
         report["recovery"] = (
             "Use the isolated CODEX_HOME shown above when checking or authorizing login. "
             "The desktop/default-home login is separate. File presence alone does not "
-            "prove a usable token. Do not copy credentials between homes."
+            "prove a usable token. Do not copy credentials between homes: two homes "
+            "holding one refresh grant can invalidate each other."
         )
     return report
 

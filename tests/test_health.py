@@ -193,6 +193,7 @@ class HealthMutationInspectTests(unittest.TestCase):
             report = self.inspect('claude', env)
             self.assertFalse(report['fallback_file_present'])
             self.assertIn('Keychain', report['recovery'])
+            self.assertIn('never copy a login from another home', report['recovery'])
             self.assertEqual(report['allowed_versions'], ['approved'])
             self.assertFalse(report['path_differs'])
             self.assertEqual(report['operator_login_argv'],
@@ -207,6 +208,7 @@ class HealthMutationInspectTests(unittest.TestCase):
             report = self.inspect('codex', {'CODEX_HOME': home, 'HOME': home})
             self.assertTrue(report['auth_file_present'])
             self.assertIn('isolated CODEX_HOME', report['recovery'])
+            self.assertIn('Do not copy credentials between homes', report['recovery'])
             self.assertEqual(report['operator_login_argv'], ['/validated/codex', 'login'])
 
 
