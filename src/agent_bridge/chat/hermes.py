@@ -96,7 +96,7 @@ class HermesAdapter:
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False, timeout=5)
+                           check=False, timeout=5, shell=False)
         else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)

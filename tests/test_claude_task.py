@@ -269,15 +269,47 @@ class ClaudeTaskTests(unittest.TestCase):
         self.assertTrue(receipt["cleanup"]["verification_removed"])
         self.assertTrue(receipt["source_integrity_match"])
 
-    def test_refuses_invalid_json_and_empty_patch(self):
-        for output in ("not-json", '{\"result\":\"done\",\"is_error\":false}'):
-            with self.subTest(output=output):
-                self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf '%s\\n' '" + output + "'\n")
-                with self.assertRaises(TaskError):
-                    run_task(brief=self.brief, repo=self.repo, task_root=self.root / ("tasks-" + str(len(output))),
-                             claude_bin=self.fake, claude_config_dir=self.store,
-                         classification="synthetic", model="fake",
-                             effort="low", verify_argv=[["git", "diff", "--check"]])
+    def test_refuses_invalid_json(self):
+        output = "not-json"
+        self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf '%s\\n' '" + output + "'\n")
+        with self.assertRaises(TaskError):
+            run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks-invalid-json",
+                     claude_bin=self.fake, claude_config_dir=self.store,
+                     classification="synthetic", model="fake", effort="low",
+                     verify_argv=[["git", "diff", "--check"]])
+
+    def test_a_lone_surrogate_in_the_result_never_decides_the_outcome(self):
+        requires_confinement(self)
+        output = '{\"result\":\"half \\ud800\",\"is_error\":false}'
+        self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf '%s\\n' '" + output + "'\n")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IXUSR)
+        result = run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks-surrogate",
+                          claude_bin=self.fake, claude_config_dir=self.store,
+                          classification="synthetic", model="fake", effort="low",
+                          verify_argv=[["git", "diff", "--check"]])
+        self.assertEqual(result["status"], "no_patch")
+        receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
+        self.assertEqual(receipt["last_message_sha256"],
+                         hashlib.sha256("half \ud800".encode("utf-8", "surrogatepass")).hexdigest())
+
+    def test_success_without_changes_records_no_patch_not_complete(self):
+        requires_confinement(self)
+        output = '{\"result\":\"done\",\"is_error\":false}'
+        self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf '%s\\n' '" + output + "'\n")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IXUSR)
+        result = run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks-no-patch",
+                          claude_bin=self.fake, claude_config_dir=self.store,
+                          classification="synthetic", model="fake", effort="low",
+                          verify_argv=[["git", "diff", "--check"]])
+        self.assertEqual(result["status"], "no_patch")
+        self.assertNotIn("patch", result)
+        receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
+        self.assertEqual(receipt["status"], "no_patch")
+        self.assertEqual(receipt["error_detail"],
+                         "provider reported success but produced no patch")
+        self.assertEqual(receipt["last_message_sha256"],
+                         hashlib.sha256(b"done").hexdigest())
+        self.assertNotEqual(receipt["status"], "complete")
 
     def test_environment_does_not_inherit_api_credentials_or_git_config(self):
         old = {k: os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_CONFIG_GLOBAL")}

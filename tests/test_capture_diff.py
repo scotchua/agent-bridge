@@ -69,6 +69,25 @@ class CaptureDiffTests(unittest.TestCase):
         Path(self.workdir, "new.txt").write_bytes(b"added\n")
         self.assertIn(b"new.txt", gr.capture_diff(self.workdir))
 
+    def test_the_change_check_reads_without_staging(self):
+        self._repo(**{"a.txt": b"one\n", ".gitignore": b"ignored.txt\n"})
+        self.assertFalse(gr._workspace_changed(self.workdir))
+        Path(self.workdir, "ignored.txt").write_bytes(b"x\n")
+        self.assertFalse(gr._workspace_changed(self.workdir))
+        Path(self.workdir, "a.txt").write_bytes(b"two\n")
+        index = Path(self.workdir, ".git", "index").read_bytes()
+        self.assertTrue(gr._workspace_changed(self.workdir))
+        self.assertEqual(Path(self.workdir, ".git", "index").read_bytes(), index)
+        # A verification check such as `git diff --exit-code` still sees it.
+        check = subprocess.run([GIT, "diff", "--quiet"], cwd=self.workdir,
+                               env=gr._git_env(), shell=False, check=False)
+        self.assertEqual(check.returncode, 1)
+
+    def test_the_change_check_sees_an_untracked_file(self):
+        self._repo(**{"a.txt": b"one\n"})
+        Path(self.workdir, "new.txt").write_bytes(b"added\n")
+        self.assertTrue(gr._workspace_changed(self.workdir))
+
     def test_a_tree_with_no_git_directory_produces_nothing(self):
         self.assertEqual(gr.capture_diff(self.workdir), b"")
 
