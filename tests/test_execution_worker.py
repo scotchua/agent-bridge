@@ -18,6 +18,7 @@ from agent_bridge.orchestration.execution_worker import (
     QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, _configured_queue, run,
     select_executor)
 import platform_support
+from git_fixture import make_git_repo
 
 
 class ExecutionWorkerTests(unittest.TestCase):
@@ -113,9 +114,7 @@ class ExecutionWorkerTests(unittest.TestCase):
         claude = self.root / "claude_task.py"
         codex.write_text("# fake\n", encoding="utf-8")
         claude.write_text("# fake\n", encoding="utf-8")
-        repo = self.root / "repo"
-        repo.mkdir()
-        (repo / ".git").mkdir()
+        repo = make_git_repo(self.root / "repo")
         brief = self.root / "brief.md"
         brief.write_text("Synthetic brief", encoding="utf-8")
         state = self.root / "state"

@@ -216,7 +216,10 @@ more than consultation. It can:
   the full output.
 
 Cross-provider implementation runs in disposable Git worktrees and returns an
-unapplied patch. It never grants permission to apply, commit, push or merge.
+unapplied patch. On POSIX, an admitted queue job creates those worktrees from
+its private pinned job source rather than the operator checkout, so the
+operator may change the checkout while it runs. It never grants permission to
+apply, commit, push or merge.
 On macOS, a separate per-user execution worker runs outside the desktop-app MCP
 sandboxes so the provider CLIs can use their existing subscription logins. A
 crash after a possible provider send blocks the job for reconciliation instead

@@ -24,6 +24,7 @@ from agent_bridge.platform import platform as host_platform
 from agent_bridge.bounded_capture import capture_process
 
 from ..execution import claude_config, verify_policy
+from ..execution import job_source
 from ..capacity_router import RoutingError, StageRouter
 from . import windows_privacy as wpv
 
@@ -51,6 +52,11 @@ HARNESS_CAPTURE_MAX_BYTES = 64 * 1024 * 1024
 # size is the bounded harness capture, not an arbitrary diagnostic tail: a
 # receipt includes the complete before/after porcelain snapshots and can
 # legitimately exceed 64 KiB in a dirty checkout.
+
+
+def _posix_job_sources_enabled() -> bool:
+    """Keep source admission deliberately unavailable outside POSIX."""
+    return os.name == "posix"
 
 
 class ExecutionAdmissionError(ValueError):
@@ -174,12 +180,14 @@ class SubprocessHarnessExecutor:
         # Imported only at execution time so the queue/status MCP remains
         # importable on Windows, where the persistent worker is not supported.
         import pwd
+        base = request["base_commit"] if "base_commit" in request else request["base"]
+        pinned_job_source = not is_review and "base_commit" in request
         if is_review:
             harness = self.harnesses.codex_review
             if harness is None or not harness.is_absolute() or not harness.is_file():
                 raise ExecutionAdmissionError("review_harness_unavailable")
             argv = [str(self.harnesses.python), "-P", str(harness), "run", request["brief"],
-                   "--repo", request["repo"], "--base", request["base"], "--head", request["head"],
+                   "--repo", request["repo"], "--base", base, "--head", request["head"],
                    "--classification", request["classification"], "--author-provider", request["author_provider"],
                    "--reviewer-provider", request["provider"], "--model", request["model"],
                    "--reasoning-effort", request["effort"], "--tasks-dir", str(job_dir / "harness"),
@@ -188,7 +196,7 @@ class SubprocessHarnessExecutor:
         else:
             harness = getattr(self.harnesses, provider)
             argv = [str(self.harnesses.python), "-P", str(harness), request["brief"],
-                   "--repo", request["repo"], "--base", request["base"],
+                   "--repo", request["repo"], "--base", base,
                    "--timeout", str(generation_timeout),
                    "--verify-timeout", str(verify_timeout),
                    "--cleanup-timeout", str(cleanup_timeout)]
@@ -211,6 +219,8 @@ class SubprocessHarnessExecutor:
                      "--claude-config-dir", str(directory)]
         if "execution" in self.client_derived_routes and not is_review:
             argv += ["--client-derived-routes", "execution"]
+        if pinned_job_source:
+            argv += ["--job-source", str(job_dir)]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         # Reject a stale or tampered durable request immediately before it can
@@ -237,7 +247,7 @@ class SubprocessHarnessExecutor:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
                "USER": account, "LOGNAME": account}
-        process = subprocess.Popen(argv, cwd=request["repo"], env=env,
+        process = subprocess.Popen(argv, cwd=job_dir if pinned_job_source else request["repo"], env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
@@ -551,6 +561,12 @@ class ExecutionQueue:
         require_private_queue(self.root, platform=platform)
         self.executor, self.clock = executor, clock
         self._lock = threading.Lock()
+        # Preparing a private source can take long enough that it must not
+        # serialize unrelated admissions.  This small in-memory reservation
+        # preserves the old first-admission-wins idempotency rule while the
+        # first caller prepares outside the queue lock.
+        self._admission_condition = threading.Condition(self._lock)
+        self._admitting: dict[tuple[str, str], dict[str, Any]] = {}
         if recover_interrupted:
             self._recover_interrupted()
 
@@ -634,6 +650,36 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("reservation_policy_check_failed") from exc
         if reserved is not None:
             raise ExecutionAdmissionError(f"model_reserved_to_operator:{reserved}")
+
+    def _idempotent_job(self, caller: str, key: str,
+                         identity: Mapping[str, Any]) -> str | None:
+        """Return the admitted matching job, or refuse a conflicting key.
+
+        The caller holds ``_lock``.  Pending source preparations are tracked
+        separately by ``submit`` because they intentionally do not have a
+        request file yet.
+        """
+        for directory in self.root.iterdir():
+            request_path = directory / "request.json"
+            if request_path.is_file():
+                previous = _read_json(request_path)
+                if previous.get("caller") == caller and previous.get("idempotency_key") == key:
+                    if any(previous.get(name) != value for name, value in identity.items()):
+                        raise ExecutionAdmissionError("idempotency_conflict")
+                    return directory.name
+        return None
+
+    @staticmethod
+    def _discard_unadmitted_source(directory: Path) -> None:
+        """Best-effort cleanup for a source that never became a queue job."""
+        try:
+            job_source.remove_job_source(directory)
+        except job_source.JobSourceError:
+            pass
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
     def _require_live_stage_binding(self, request: Mapping[str, Any]) -> None:
         """Re-read the ledger binding immediately before provider execution.
@@ -795,16 +841,75 @@ class ExecutionQueue:
                     "stage_assignment": stage_assignment, "kind": kind, "head": head,
                     "author_provider": author_provider,
                     "client_derived_admitted": client_derived_admitted}
+
+        # Reviews and non-POSIX workers keep their existing admission shape;
+        # only POSIX execution jobs receive a private pinned source here.
+        pin_source = kind == "execution" and _posix_job_sources_enabled()
+        if pin_source:
+            reservation = (caller, key) if key else None
+            directory: Path | None = None
+            try:
+                with self._admission_condition:
+                    if reservation is not None:
+                        while True:
+                            existing = self._idempotent_job(caller, key, identity)
+                            if existing is not None:
+                                return self.status(existing)
+                            pending = self._admitting.get(reservation)
+                            if pending is None:
+                                self._admitting[reservation] = dict(identity)
+                                break
+                            if pending != identity:
+                                raise ExecutionAdmissionError("idempotency_conflict")
+                            self._admission_condition.wait()
+                    job_id = uuid.uuid4().hex
+                    directory = self.root / job_id
+                    directory.mkdir(mode=0o700)
+                    # Before the source or request, never after either.
+                    require_private_queue(directory, platform=self._platform,
+                                          root=self.root)
+
+                # Keep the queue lock free while Git packs the source.  A
+                # directory without request.json is deliberately not a job.
+                manifest = job_source.prepare_job_source(repo_path, base, directory)
+                request = {"schema": 1, "job_id": job_id, **identity,
+                           "base_commit": manifest["commit"],
+                           "job_source_manifest_sha256": manifest["manifest_sha256"],
+                           "paid_fallback": False, "idempotency_key": key,
+                           "submitted_at": self.clock()}
+                with self._admission_condition:
+                    _atomic_json(directory / "job-source-manifest.json", manifest)
+                    _atomic_json(directory / "request.json", request)
+                    _atomic_json(directory / "receipt.json", {
+                        "schema": 1, "job_id": job_id, "state": "queued", "caller": caller,
+                        "provider": provider, "classification": classification,
+                        "permission_to_apply": False, "permission_to_commit": False,
+                        "permission_to_push": False, "permission_to_merge": False,
+                        "submitted_at": request["submitted_at"]})
+                    if reservation is not None:
+                        self._admitting.pop(reservation, None)
+                        self._admission_condition.notify_all()
+            except job_source.JobSourceError as exc:
+                if directory is not None:
+                    self._discard_unadmitted_source(directory)
+                raise ExecutionAdmissionError(f"job_source_refused:{exc.reason}") from None
+            except Exception:
+                if directory is not None:
+                    self._discard_unadmitted_source(directory)
+                raise
+            finally:
+                if reservation is not None:
+                    with self._admission_condition:
+                        if self._admitting.get(reservation) == identity:
+                            self._admitting.pop(reservation, None)
+                            self._admission_condition.notify_all()
+            return self.status(job_id)
+
         with self._lock:
             if key:
-                for directory in self.root.iterdir():
-                    request_path = directory / "request.json"
-                    if request_path.is_file():
-                        previous = _read_json(request_path)
-                        if previous.get("caller") == caller and previous.get("idempotency_key") == key:
-                            if any(previous.get(name) != value for name, value in identity.items()):
-                                raise ExecutionAdmissionError("idempotency_conflict")
-                            return self.status(directory.name)
+                existing = self._idempotent_job(caller, key, identity)
+                if existing is not None:
+                    return self.status(existing)
             job_id = uuid.uuid4().hex
             directory = self.root / job_id
             directory.mkdir(mode=0o700)
@@ -847,7 +952,9 @@ class ExecutionQueue:
         if receipt["state"] == "running":
             request = _read_json(directory / "request.json")
             repo = request.get("repo")
-            if isinstance(repo, str):
+            if "base_commit" in request:
+                answer["operator_checkout"] = "free_to_change"
+            elif isinstance(repo, str):
                 answer["active_repository"] = repo
         # Keep status a deliberately small, safe projection of the private
         # receipt.  In particular, stdout, stderr, a brief, and arbitrary
@@ -1003,6 +1110,18 @@ class ExecutionQueue:
             current = Path(request["brief"]).read_bytes()
             if hashlib.sha256(current).hexdigest() != request["brief_sha256"]:
                 raise ExecutionAdmissionError("brief_changed_after_admission")
+            if "base_commit" in request:
+                manifest_path = selected / "job-source-manifest.json"
+                try:
+                    manifest = _read_json(manifest_path)
+                except ExecutionAdmissionError:
+                    raise ExecutionAdmissionError("job_source_manifest_missing") from None
+                if (manifest.get("manifest_sha256") != request.get("job_source_manifest_sha256")
+                        or manifest.get("commit") != request.get("base_commit")):
+                    raise ExecutionAdmissionError("job_source_integrity:manifest_mismatch")
+                reasons = job_source.verify_job_source(selected, manifest)
+                if reasons:
+                    raise ExecutionAdmissionError(f"job_source_integrity:{reasons[0]}")
             # The authoritative one. Admission checked the caller's argument;
             # this checks the value that is about to become ``--model`` on the
             # harness command line, read back from a file that a queued job
@@ -1043,6 +1162,9 @@ class ExecutionQueue:
     def state_report(self) -> dict[str, int]:
         states: dict[str, int] = {}
         for directory in self.root.iterdir():
+            if (directory.is_dir() and not (directory / "request.json").is_file()
+                    and (directory / job_source.JOB_SOURCE_DIRNAME).exists()):
+                states["orphan_job_source"] = states.get("orphan_job_source", 0) + 1
             path = directory / "receipt.json"
             if path.is_file():
                 receipt = self._receipt_for_scan(path)

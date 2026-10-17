@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import execution_queue as eq
+from git_fixture import make_git_repo
 
 
 class QueueMutationTests(unittest.TestCase):
@@ -21,9 +22,7 @@ class QueueMutationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.repo = self.root / "invented-repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        self.repo = make_git_repo(self.root / "invented-repo")
         self.brief = self.root / "brief.md"
         self.brief.write_text("Implement a synthetic ledger report", encoding="utf-8")
         self.queue = eq.ExecutionQueue(self.root / "queue", lambda request, path: {

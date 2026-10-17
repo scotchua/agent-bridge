@@ -46,6 +46,9 @@ _SAFE_EXECUTION_CODES = frozenset({
     "source_snapshot_unavailable", "source_repository_changed", "model_reserved",
     "unreadable",
     # Raised as ExecutionAdmissionError.
+    # The pinned job source in PR #70 (D5): job_source_refused:<reason>,
+    # job_source_integrity:<reason> and a missing manifest.
+    "job_source_integrity", "job_source_manifest_missing", "job_source_refused",
     "brief_changed_after_admission", "brief_invalid", "brief_not_utf8",
     "brief_size_invalid", "classification_not_eligible",
     "claude_config_dir_unavailable", "claude_verification_required",

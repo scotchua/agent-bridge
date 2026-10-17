@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from agent_bridge.orchestration.execution_queue import (
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
+from git_fixture import make_git_repo
 from sqlite_teardown import cleanup_temporary_directory
 
 
@@ -67,8 +69,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
@@ -381,11 +382,23 @@ class ExecutionDispatcherTests(unittest.TestCase):
         receipt = json.loads((directory / "receipt.json").read_text())
         receipt["state"] = "running"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        request = json.loads((directory / "request.json").read_text())
+        if "base_commit" not in request:
+            # Windows admission does not pin a job source yet; the status
+            # projection is the same code on every platform, so pin by hand.
+            request["base_commit"] = "0" * 40
+            (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
+        pinned = self.queue.status(job["job_id"])
+        self.assertEqual(pinned["operator_checkout"], "free_to_change")
+        self.assertNotIn("active_repository", pinned)
+        request.pop("base_commit")
+        (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
         self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
                          str(self.repo.resolve()))
         receipt["state"] = "failed"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
         self.assertNotIn("active_repository", self.queue.status(job["job_id"]))
+        self.assertNotIn("operator_checkout", self.queue.status(job["job_id"]))
 
     def test_restart_blocks_claimed_but_not_yet_running_job(self):
         job = self.submit()
@@ -400,7 +413,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
 
     def test_damaged_and_claimed_entries_do_not_block_a_later_job(self):
         """Unreadable and uncertain jobs remain held while healthy work runs."""
-        identifiers = iter(("0" * 31 + "1", "0" * 31 + "2", "0" * 31 + "3"))
+        # Each admission also uses one UUID while streaming its private source.
+        identifiers = iter(tuple("0" * 31 + str(number) for number in range(1, 7)))
         with mock.patch(
                 "agent_bridge.orchestration.execution_queue.uuid.uuid4",
                 side_effect=lambda: SimpleNamespace(hex=next(identifiers))):
@@ -451,8 +465,7 @@ class StageBindingRecheckTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.now = [100.0]
@@ -603,8 +616,7 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.txt"
         self.brief.write_text("complete", encoding="utf-8")
         self.harness = self.root / "fake_harness.py"
@@ -842,8 +854,7 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
