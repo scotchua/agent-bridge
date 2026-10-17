@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import sysconfig
 import time
@@ -32,6 +33,12 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+try:
+    from ..bounded_capture import capture_process
+except ImportError:  # The local queue invokes this adapter as a script.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from agent_bridge.bounded_capture import capture_process
 
 
 RECEIPT_CONTRACT = "local-delegate/v2"
@@ -42,6 +49,10 @@ EXTRACT_FIELDS = ("party", "date", "doc_type", "reference", "description",
                   "amount", "terms", "due_date", "account")
 MAX_EXTRACT_DOCUMENTS = 16
 MAX_EXTRACT_DOCUMENT_BYTES = 24_000
+# Certified delegate output is normally a short draft. This leaves ample
+# bounded room for verbose extraction/classification while refusing output
+# that cannot be receipt-bound without unlimited parent memory.
+GEMMA_DELEGATE_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class GemmaRefusal(RuntimeError):
@@ -236,16 +247,31 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
 
     # The outer SubprocessBackend creates the process group. Keeping the
     # delegate in that group lets an outer timeout/cancel terminate both.
-    try:
-        completed = subprocess.run(
-            argv, input=input_bytes, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=env, timeout=timeout,
-            check=False, shell=False)
-    except subprocess.TimeoutExpired as exc:
-        raise GemmaRefusal("gemma_delegate_timeout") from exc
-    if completed.returncode != 0:
+    # The delegate's output is the draft itself and may be client-derived.
+    # Create an anonymous capture before starting it: POSIX unlinks this file
+    # immediately, and Windows deletes it on close.  Thus SIGTERM/SIGKILL of
+    # this adapter cannot leave a draft path behind.
+    with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-") as output_file:
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, shell=False)
+        capture = capture_process(
+            process, stdout_file=output_file,
+            limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=timeout,
+            stdin_data=input_bytes)
+        if capture.failure == "timeout":
+            raise GemmaRefusal("gemma_delegate_timeout")
+        if capture.failure == "output_overflow":
+            raise GemmaRefusal("gemma_delegate_output_overflow")
+        if capture.failure is not None:
+            raise GemmaRefusal("gemma_delegate_unavailable")
+        try:
+            output_file.seek(0)
+            output = output_file.read()
+        except OSError as exc:
+            raise GemmaRefusal("gemma_delegate_unavailable") from exc
+    if capture.returncode != 0:
         raise GemmaRefusal("gemma_delegate_unavailable")
-    output = completed.stdout
 
     receipt_path = receipt_root_path / f"local-delegate-{invocation_id}.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():

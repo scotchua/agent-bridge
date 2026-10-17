@@ -602,10 +602,19 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
             "launcher_python": launcher_python}
 
 
-def quick_check(config_path: str | None = None, *, home: str | None = None) -> dict[str, Any]:
+def quick_check(config_path: str | None = None, *, home: str | None = None,
+                force_refresh: bool = False) -> dict[str, Any]:
+    """Return the metadata-only drift check, optionally bypassing its cache.
+
+    A refresh deliberately only repeats the quick comparison.  In particular,
+    it does not call ``doctor`` or write a baseline, so a repaired dependency
+    cannot become trusted merely because an operator asked the worker to look
+    again.
+    """
     home = _home(home); resolved = discover_config(config_path, home=home); key = (resolved, home)
     cached = _quick_cache.get(key)
-    if cached and time.monotonic() - cached[0] < CACHE_SECONDS: return cached[1]
+    if cached and not force_refresh and time.monotonic() - cached[0] < CACHE_SECONDS:
+        return {**cached[1], "cache_age_seconds": max(0.0, time.monotonic() - cached[0])}
     # This is called from executor loops.  It is intentionally limited to
     # version probes whose per-process timeout is shorter than one interval.
     current, baseline = inventory(resolved, home=home, runner=_quick_run), _read_baseline(home)
@@ -624,9 +633,9 @@ def quick_check(config_path: str | None = None, *, home: str | None = None) -> d
                  if baseline is None else [])
     result = {"ok": not names, "changed": sorted(set(names)), "inventory": current,
               "baseline": "missing" if baseline is None else "recorded",
-              "attention": attention}
+              "attention": attention, "checked_at": time.time()}
     _quick_cache[key] = (time.monotonic(), result)
-    return result
+    return {**result, "cache_age_seconds": 0.0}
 
 
 def scheduled_baseline(config_path: str | None = None, *, home: str | None = None,

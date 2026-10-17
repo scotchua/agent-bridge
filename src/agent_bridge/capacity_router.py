@@ -24,6 +24,7 @@ review found the original table was evidence in name only:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -117,6 +118,15 @@ class StageRouter:
                 author_owner TEXT, author_route TEXT, is_review INTEGER NOT NULL,
                 blocked_reason TEXT, revision INTEGER NOT NULL,
                 updated_at REAL NOT NULL, PRIMARY KEY(item_id, stage))""")
+            # A lease revision is intentionally not an assignment identity:
+            # the current owner may renew a lease without changing who owns
+            # the work.  Existing ledgers get assignment zero.  Requests
+            # written before this column existed have no assignment field and
+            # continue to use their exact revision check below.
+            if "assignment" not in {row["name"] for row in
+                                    db.execute("PRAGMA table_info(stages)")}:
+                db.execute("ALTER TABLE stages ADD COLUMN "
+                           "assignment INTEGER NOT NULL DEFAULT 0")
             db.execute("""CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
                 stage TEXT NOT NULL, at REAL NOT NULL, event TEXT NOT NULL,
@@ -162,8 +172,8 @@ class StageRouter:
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute("""INSERT INTO stages(item_id,stage,state,allowed_routes,
-                    preferred_routes,author_owner,author_route,is_review,revision,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,0,?)""",
+                    preferred_routes,author_owner,author_route,is_review,revision,assignment,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,0,0,?)""",
                            (item_id, stage, "pending", json.dumps(allowed),
                             json.dumps(preferred), author_owner, author_route,
                             int(is_review), now))
@@ -245,6 +255,7 @@ class StageRouter:
             if row["state"] == "owned":
                 if row["lease_until"] is not None and row["lease_until"] < now:
                     db.execute("""UPDATE stages SET state='reconcile_required',revision=revision+1,
+                        assignment=assignment+1,
                         updated_at=? WHERE item_id=? AND stage=?""", (now, item_id, stage))
                     self._event(db, item_id, stage, "lease_expired_reconcile_required",
                                 owner_id, {"previous_owner": row["owner_id"]})
@@ -264,7 +275,7 @@ class StageRouter:
             if not eligible:
                 reason = "no_fresh_eligible_route"
                 db.execute("""UPDATE stages SET state='blocked',blocked_reason=?,
-                    revision=revision+1,updated_at=? WHERE item_id=? AND stage=?""",
+                    revision=revision+1,assignment=assignment+1,updated_at=? WHERE item_id=? AND stage=?""",
                            (reason, now, item_id, stage))
                 self._event(db, item_id, stage, "blocked", owner_id, {"reason": reason})
                 db.execute("COMMIT")
@@ -274,7 +285,7 @@ class StageRouter:
                 db.execute("ROLLBACK")
                 raise RoutingError("review_independence_required")
             db.execute("""UPDATE stages SET state='owned',owner_id=?,owner_route=?,lease_until=?,
-                revision=revision+1,updated_at=? WHERE item_id=? AND stage=?""",
+                revision=revision+1,assignment=assignment+1,updated_at=? WHERE item_id=? AND stage=?""",
                        (owner_id, route, now + lease_seconds, now, item_id, stage))
             self._event(db, item_id, stage, "assigned", owner_id, {"route": route})
             db.execute("COMMIT")
@@ -318,7 +329,8 @@ class StageRouter:
             previous = {"owner_id": row["owner_id"], "owner_route": row["owner_route"],
                         "liveness_evidence": liveness_evidence}
             db.execute("""UPDATE stages SET state='pending',owner_id=NULL,owner_route=NULL,
-                lease_until=NULL,revision=revision+1,updated_at=? WHERE item_id=? AND stage=?""",
+                lease_until=NULL,revision=revision+1,assignment=assignment+1,
+                updated_at=? WHERE item_id=? AND stage=?""",
                        (now, item_id, stage))
             self._event(db, item_id, stage, "reconciled_release", actor, previous)
             db.execute("COMMIT")
@@ -337,7 +349,7 @@ class StageRouter:
                 db.execute("ROLLBACK")
                 raise RoutingError("not_owner")
             db.execute("""UPDATE stages SET state='complete',lease_until=NULL,
-                revision=revision+1,updated_at=? WHERE item_id=? AND stage=?""",
+                revision=revision+1,assignment=assignment+1,updated_at=? WHERE item_id=? AND stage=?""",
                        (now, item_id, stage))
             self._event(db, item_id, stage, "completed", owner_id, {})
             db.execute("COMMIT")
@@ -351,6 +363,48 @@ class StageRouter:
         result["preferred_routes"] = json.loads(result["preferred_routes"])
         result["is_review"] = bool(result["is_review"])
         return result
+
+    def require_live_execution_binding(self, item_id: object, stage: object, *,
+                                       owner_id: object, route: object,
+                                       revision: object,
+                                       assignment: object | None = None) -> dict:
+        """Return one current execution binding, or refuse without changing it.
+
+        A queued execution request is only an observation of a stage binding.
+        It cannot renew a lease, reconcile an expired owner, or otherwise
+        change stage ownership merely because a worker happened to reach it.
+        The execution worker calls this directly before it starts a provider.
+        """
+        if (not isinstance(item_id, str) or not item_id
+                or not isinstance(stage, str) or not stage
+                or not isinstance(owner_id, str) or not owner_id
+                or route not in ROUTES
+                or isinstance(revision, bool) or not isinstance(revision, int)
+                or revision < 0
+                or (assignment is not None and
+                    (isinstance(assignment, bool) or not isinstance(assignment, int)
+                     or assignment < 0))):
+            raise RoutingError("execution_stage_binding_invalid")
+        current = self.get(item_id, stage)
+        lease_until = current.get("lease_until")
+        now = self.clock()
+        if (current.get("item_id") != item_id or current.get("stage") != stage
+                or current.get("state") != "owned"
+                or current.get("owner_id") != owner_id
+                or current.get("owner_route") != route
+                # Old queued requests lack an assignment generation.  They
+                # fail closed with the original exact-revision rule.  New
+                # requests bind to the assignment, so same-owner renewals do
+                # not invalidate them while every ownership transition does.
+                or (current.get("revision") != revision if assignment is None
+                    else current.get("assignment") != assignment)
+                or isinstance(lease_until, bool)
+                or not isinstance(lease_until, (int, float))
+                or not math.isfinite(lease_until)
+                or not isinstance(now, (int, float)) or isinstance(now, bool)
+                or not math.isfinite(now) or lease_until < now):
+            raise RoutingError("execution_stage_binding_invalid")
+        return current
 
     def report(self) -> dict:
         now = self.clock()

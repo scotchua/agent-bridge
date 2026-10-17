@@ -1,7 +1,9 @@
 """Offline tests for durable cross-provider implementation dispatch."""
 
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -12,12 +14,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import platform_support
-from agent_bridge.capacity_router import CapacityObservation, StageRouter
+from agent_bridge.capacity_router import CapacityObservation, RoutingError, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration import autoroute
+from agent_bridge.orchestration import autodecide, autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
-    _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
+    _harness_summary, _harness_summary_file, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
@@ -167,6 +169,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.queue.run_once("worker-1")
         self.assertEqual(self.fake.requests[0]["repo"], str(approved.resolve()))
 
+
     def test_a_command_the_harness_would_refuse_is_refused_at_admission(self):
         # Live jobs d8e5763d, 7a79ae7f and 19869b0e were admitted with commands
         # the harness refuses, ran, and failed as a bare "TaskError".
@@ -232,6 +235,13 @@ class ExecutionDispatcherTests(unittest.TestCase):
                               "harness_verdict": "read",
                               "stdout": "Synthetic implementation brief"},
              {"harness_status": "verification_failed", "harness_verdict": "read"}),
+            ("no_patch", {"returncode": 3, "harness_ok": False,
+                          "harness_status": "no_patch", "harness_verdict": "read",
+                          "error": "NoPatchError",
+                          "error_detail": "provider reported success but produced no patch"},
+             {"error": "NoPatchError",
+              "error_detail": "provider reported success but produced no patch",
+              "harness_status": "no_patch", "harness_verdict": "read"}),
         )
         details = {}
         for label, outcome, expected in cases:
@@ -258,7 +268,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.assertNotIn("stdout", status)
         details["timeout"] = (status.get("error_detail"), status.get("harness_verdict"))
 
-        self.assertEqual(len(set(details.values())), 4)
+        self.assertEqual(len(set(details.values())), 5)
 
     def test_job_is_durable_and_fake_executor_completes_with_nonlanding_receipt(self):
         queued = self.submit(idempotency_key="same-task")
@@ -330,6 +340,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
             "stage": "implement", "owner_id": "owner-1", "stage_revision": owned["revision"]})
         self.assertTrue(response["ok"])
         self.assertEqual(response["state"], "queued")
+        request = json.loads((self.queue.root / response["job_id"] / "request.json").read_text())
+        self.assertEqual(request["stage_assignment"], owned["assignment"])
         spoof = server.tools["execution_dispatch"]["handler"]({
             "caller": "claude", "provider": "codex", "repo": str(self.repo),
             "brief": str(self.brief), "base": "HEAD", "classification": "synthetic",
@@ -426,6 +438,155 @@ class ExecutionDispatcherTests(unittest.TestCase):
             "blocked": 1, "complete": 1, "queue_health_receipt_unreadable": 1})
         self.assertNotIn("private brief text", json.dumps(report))
 
+class StageBindingRecheckTests(unittest.TestCase):
+    """The worker, not only dispatch, proves stage ownership at spawn time."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = self.root / "brief.md"
+        self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
+        self.now = [100.0]
+        self.router = StageRouter(self.root / "capacity.sqlite3",
+                                  clock=lambda: self.now[0])
+        self.router.observe_capacity(CapacityObservation(
+            route="claude", observed_at=100.0, fresh_until=1000.0,
+            available=True, source="fixture"), trusted=True)
+        self.fake = FakeExecutor()
+        self.queue = ExecutionQueue(
+            self.root / "queue", self.fake, clock=lambda: self.now[0],
+            model_reserved=reserve_nothing, stage_router=self.router,
+            require_stage_binding=True)
+
+    def _owned_stage(self, stage, *, owner="owner-1", lease_seconds=20):
+        registered = self.router.register("item-1", stage,
+                                          allowed_routes=["claude"])
+        return self.router.assign("item-1", stage, owner_id=owner,
+                                  lease_seconds=lease_seconds,
+                                  expected_revision=registered["revision"])
+
+    def _submit(self, binding):
+        return self.queue.submit(
+            caller="codex", provider="claude", repo=str(self.repo),
+            brief=str(self.brief), base="HEAD", classification="synthetic",
+            model="sonnet", effort="medium", verify_argv=[["pytest", "-q"]],
+            timeout_seconds=90, item_id=binding["item_id"], stage=binding["stage"],
+            owner_id=binding["owner_id"], stage_revision=binding["revision"],
+            stage_assignment=binding["assignment"])
+
+    def _assert_blocked_before_execution(self, job):
+        status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["error"], "ExecutionAdmissionError")
+        self.assertEqual(status["error_detail"], "execution_stage_binding_invalid")
+        self.assertEqual(self.fake.requests, [])
+        self.assertEqual(self.queue.result(job["job_id"])["state"], "blocked")
+
+    def test_assignment_changes_block_queued_jobs(self):
+        completed = self._owned_stage("complete")
+        job = self._submit(completed)
+        self.router.complete("item-1", "complete", owner_id="owner-1",
+                             expected_revision=completed["revision"])
+        self._assert_blocked_before_execution(job)
+
+        reassigned = self._owned_stage("reassign", lease_seconds=5)
+        job = self._submit(reassigned)
+        self.now[0] = 106.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "reassign", owner_id="owner-2",
+                               lease_seconds=20,
+                               expected_revision=reassigned["revision"])
+        reconciliation = self.router.get("item-1", "reassign")
+        released = self.router.reconcile_release(
+            "item-1", "reassign", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self.router.assign("item-1", "reassign", owner_id="owner-2",
+                           lease_seconds=20, expected_revision=released["revision"])
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 200.0
+        expires_to_reconcile = self._owned_stage("expires-to-reconcile", lease_seconds=5)
+        job = self._submit(expires_to_reconcile)
+        self.now[0] = 206.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "expires-to-reconcile", owner_id="owner-2",
+                               lease_seconds=20,
+                               expected_revision=expires_to_reconcile["revision"])
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 250.0
+        released_only = self._owned_stage("released-only", lease_seconds=5)
+        job = self._submit(released_only)
+        self.now[0] = 256.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "released-only", owner_id="owner-2",
+                               lease_seconds=20, expected_revision=released_only["revision"])
+        reconciliation = self.router.get("item-1", "released-only")
+        self.router.reconcile_release(
+            "item-1", "released-only", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 300.0
+        same_owner = self._owned_stage("same-owner", lease_seconds=5)
+        job = self._submit(same_owner)
+        self.now[0] = 306.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                               lease_seconds=20, expected_revision=same_owner["revision"])
+        reconciliation = self.router.get("item-1", "same-owner")
+        released = self.router.reconcile_release(
+            "item-1", "same-owner", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                           lease_seconds=20, expected_revision=released["revision"])
+        self._assert_blocked_before_execution(job)
+
+    def test_direct_and_decider_renewals_keep_the_assignment_binding_live(self):
+        direct = self._owned_stage("direct-renew")
+        direct_job = self._submit(direct)
+        self.router.renew("item-1", "direct-renew", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=direct["revision"])
+        self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
+        self.assertEqual(self.queue.result(direct_job["job_id"])["state"], "complete")
+
+        decider = self._owned_stage("decider-renew")
+        decider_job = self._submit(decider)
+        autodecide._own_stage(self.router, item_id="item-1", stage="decider-renew",
+                              route="claude", owner_id="owner-1", lease_seconds=20)
+        self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
+        self.assertEqual(self.queue.result(decider_job["job_id"])["state"], "complete")
+        self.assertEqual(len(self.fake.requests), 2)
+
+    def test_preupgrade_queued_request_retains_exact_revision_rule(self):
+        binding = self._owned_stage("legacy-request")
+        job = self._submit(binding)
+        request_path = self.queue.root / job["job_id"] / "request.json"
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        del request["stage_assignment"]
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        self.router.renew("item-1", "legacy-request", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=binding["revision"])
+        self._assert_blocked_before_execution(job)
+
+    def test_unreadable_ledger_blocks_with_a_fixed_reason(self):
+        binding = self._owned_stage("unreadable")
+        job = self._submit(binding)
+        with mock.patch.object(self.router, "require_live_execution_binding",
+                               side_effect=OSError("private ledger text")):
+            status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["error_detail"], "execution_stage_ledger_unavailable")
+        self.assertEqual(self.fake.requests, [])
+        self.assertNotIn("private ledger text",
+                         json.dumps(self.queue.result(job["job_id"])))
 
 
 @unittest.skipIf(os.name != "posix", "the subprocess harness executor is POSIX only")
@@ -454,6 +615,8 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
             "a, _ = p.parse_known_args(); a.tasks_dir.mkdir(parents=True, exist_ok=True)\n"
             "(a.tasks_dir / 'observed-deadlines.json').write_text(json.dumps({'generation': a.timeout, 'verification': a.verify_timeout, 'cleanup': a.cleanup_timeout, 'checks': len(a.verify_json)}))\n"
             "time.sleep(a.timeout * 0.8)\n"
+            "if Path(a.brief).read_text(encoding='utf-8') == 'chatty':\n"
+            "    sys.stdout.write('x' * 8192); sys.stdout.flush(); raise SystemExit(0)\n"
             "if Path(a.brief).read_text(encoding='utf-8') == 'late':\n"
             "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], shell=False)\n"
             "    try: child.communicate(timeout=a.verify_timeout)\n"
@@ -519,6 +682,26 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.assertEqual(result["harness"]["harness_status"], "failed")
         self.assertEqual(result["harness"]["error_detail"], "verification command timed out")
 
+    def test_chatty_harness_is_file_capped_and_refused(self):
+        self.brief.write_text("chatty", encoding="utf-8")
+        self.queue.executor = SubprocessHarnessExecutor(Harnesses(
+            codex=self.harness, claude=self.harness, python=Path(sys.executable)),
+            capture_limit_bytes=1024)
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_detail"], "execution_harness_output_overflow")
+        job_dir = self.queue.root / queued["job_id"]
+        capture = json.loads((job_dir / "harness.capture.json").read_text())
+        self.assertTrue(capture["stdout_overflow"])
+        self.assertEqual(capture["stdout_bytes"], 1024)
+        stdout_path = job_dir / "harness.stdout"
+        self.assertEqual(len(stdout_path.read_bytes()), 1024)
+        self.assertEqual(stat.S_IMODE(stdout_path.stat().st_mode), 0o600)
+        self.assertEqual(capture["stdout_sha256"], hashlib.sha256(
+            stdout_path.read_bytes()).hexdigest())
+
 
 class HarnessVerdictTests(unittest.TestCase):
     """A zero exit code is not a verified task."""
@@ -542,6 +725,19 @@ class HarnessVerdictTests(unittest.TestCase):
     def test_a_verification_failure_that_exited_zero_is_not_a_success(self):
         self.assertFalse(outcome_is_success(self._made(
             harness_ok=False, harness_status="verification_failed")))
+
+    def test_a_no_patch_outcome_is_not_a_success(self):
+        self.assertFalse(outcome_is_success(self._made(
+            returncode=3, harness_ok=False, harness_status="no_patch")))
+
+    def test_a_no_patch_harness_line_is_a_distinct_non_success(self):
+        summary = _harness_summary(
+            b'{"ok": false, "status": "no_patch", "error": "NoPatchError", '
+            b'"error_detail": "provider reported success but produced no patch"}\n')
+        self.assertEqual(summary["harness_status"], "no_patch")
+        self.assertEqual(summary["harness_verdict"], "read")
+        self.assertFalse(summary["harness_ok"])
+        self.assertFalse(outcome_is_success({"returncode": 3, **summary}))
 
     def test_a_harness_that_said_ok_but_did_not_complete_is_not_a_success(self):
         self.assertFalse(outcome_is_success(self._made(
@@ -569,6 +765,17 @@ class HarnessVerdictTests(unittest.TestCase):
         summary = _harness_summary(stdout)
         self.assertEqual(summary["harness_status"], "verification_failed")
         self.assertFalse(summary["harness_ok"])
+
+    def test_a_final_receipt_larger_than_the_old_diagnostic_tail_is_read_whole(self):
+        receipt = json.dumps({"ok": True, "status": "complete",
+                              "source_before": "? dirty-file\n" * 6000,
+                              "source_after": "? more-dirty-file\n" * 6000}).encode()
+        self.assertGreater(len(receipt), 64 * 1024)
+        path = self.root / "large-harness.stdout"
+        path.write_bytes(b"progress\n" + receipt + b"\n")
+        summary = _harness_summary_file(path)
+        self.assertEqual(summary["harness_status"], "complete")
+        self.assertTrue(summary["harness_ok"])
 
     def test_a_json_array_is_refused_rather_than_indexed(self):
         self.assertEqual(_harness_summary(b'["complete"]')["harness_verdict"],

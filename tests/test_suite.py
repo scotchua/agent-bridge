@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import inspect
 import json
 import os
@@ -1069,6 +1070,68 @@ def test_no_leak_of_peer_output() -> None:
             sb.cleanup()
 
 
+#: Every subprocess API that launches a process.
+_SUBPROCESS_LAUNCH_APIS = frozenset({"Popen", "run", "call", "check_call", "check_output"})
+
+
+def _subprocess_calls_missing_shell_false(path: str, source: str) -> list[str]:
+    """Return direct subprocess process-launch calls without ``shell=False``.
+
+    ``runner.run`` and platform launch methods are approved wrappers, rather
+    than subprocess APIs, so they are deliberately outside this direct-call
+    check. Imports and aliases of subprocess itself are resolved here so an
+    alias cannot bypass the hygiene rule. Dynamic ``**kwargs`` cannot prove
+    the required value and therefore fails closed.
+    """
+    tree = ast.parse(source, filename=path)
+    modules = {"subprocess"}
+    functions: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == "subprocess":
+                    modules.add(imported.asname or "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for imported in node.names:
+                if imported.name in _SUBPROCESS_LAUNCH_APIS:
+                    functions.add(imported.asname or imported.name)
+
+    missing: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_process_call = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in modules
+            and node.func.attr in _SUBPROCESS_LAUNCH_APIS
+        ) or (
+            isinstance(node.func, ast.Name) and node.func.id in functions
+        )
+        if not is_process_call:
+            continue
+        shell = next((keyword.value for keyword in node.keywords
+                      if keyword.arg == "shell"), None)
+        if not isinstance(shell, ast.Constant) or shell.value is not False:
+            missing.append(f"{path}:{node.lineno}: subprocess call must pass shell=False")
+    return missing
+
+
+def test_shell_false_ast_check() -> None:
+    print("\n[shell=False AST hygiene]")
+    fixture = "subprocess.run(['ok'], shell=False)\nsubprocess.Popen(['bad'])\n"
+    check("a noncompliant call is found even beside a compliant call",
+          _subprocess_calls_missing_shell_false("fixture.py", fixture)
+          == ["fixture.py:2: subprocess call must pass shell=False"],
+          str(_subprocess_calls_missing_shell_false("fixture.py", fixture)))
+    for api in ("call", "check_call", "check_output"):
+        launch = f"subprocess.{api}(['bad'])\n"
+        check(f"subprocess.{api} without shell=False is found",
+              _subprocess_calls_missing_shell_false("fixture.py", launch)
+              == ["fixture.py:1: subprocess call must pass shell=False"],
+              str(_subprocess_calls_missing_shell_false("fixture.py", launch)))
+
+
 def test_no_shell_execution() -> None:
     print("\n[no shell execution]")
     src_root = os.path.join(REPO, "src")
@@ -1085,16 +1148,16 @@ def test_no_shell_execution() -> None:
     check("no shell=True / os.system / os.popen anywhere in the implementation",
           not offenders, str(offenders))
 
-    # Every Popen call site must pass shell=False explicitly.
-    popen_files = []
+    # Every direct subprocess process-launch call must pass shell=False
+    # explicitly. The AST check is per call, rather than per file.
+    bad: list[str] = []
     for dirpath, _, filenames in os.walk(src_root):
         for name in filenames:
             if name.endswith(".py"):
-                text = open(os.path.join(dirpath, name), encoding="utf-8").read()
-                if "Popen(" in text or "subprocess.run(" in text:
-                    popen_files.append((os.path.join(dirpath, name), text))
-    bad = [os.path.basename(p) for p, t in popen_files if "shell=False" not in t]
-    check("every module that spawns a process passes shell=False explicitly",
+                path = os.path.join(dirpath, name)
+                bad.extend(_subprocess_calls_missing_shell_false(
+                    os.path.relpath(path, REPO), open(path, encoding="utf-8").read()))
+    check("every subprocess launch call passes shell=False explicitly",
           not bad, str(bad))
 
     try:
@@ -4790,6 +4853,7 @@ def main() -> int:
     test_version_mismatch_and_missing_executable()
     test_timeout_and_process_group_cleanup()
     test_no_leak_of_peer_output()
+    test_shell_false_ast_check()
     test_no_shell_execution()
     test_atomic_and_restart_safe()
     test_close_semantics()
