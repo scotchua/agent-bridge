@@ -31,7 +31,7 @@ class LauncherSecurityTests(unittest.TestCase):
             # (test_python_launchers.py covers that). A job's verification
             # sandbox may have no Python 3.11+ on PATH and an isolated HOME.
             if os.name != "nt":
-                environment.setdefault("AGENT_BRIDGE_PYTHON", sys.executable)
+                environment["AGENT_BRIDGE_PYTHON"] = sys.executable
 
             for name in ("agent-bridge-mcp", "agent-bridge-admin", "agent-bridge-setup",
                          "agent-bridge-gate-hook"):

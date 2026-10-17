@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,14 @@ class PythonLauncherTests(unittest.TestCase):
         self.bin = self.base / "bin"
         self.home.mkdir()
         self.bin.mkdir()
+        # The launchers need only these tools. Linking them alone keeps a
+        # runner's own python3.x in /usr/bin (Ubuntu ships 3.12) off PATH.
+        self.tools = self.base / "tools"
+        self.tools.mkdir()
+        for tool in ("dirname", "id", "find", "mktemp", "rm", "cat"):
+            found = shutil.which(tool)
+            self.assertIsNotNone(found, tool)
+            (self.tools / tool).symlink_to(found)
 
     def test_every_posix_launcher_uses_the_shared_resolver(self) -> None:
         for name in python_runtime.LAUNCHERS:
@@ -63,7 +72,7 @@ class PythonLauncherTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         return {
             "HOME": str(self.home), "TMPDIR": str(self.base),
-            "PATH": str(self.bin) + ":/usr/bin:/bin", **extra,
+            "PATH": str(self.bin) + os.pathsep + str(self.tools), **extra,
         }
 
     def write_record(self, value: str) -> Path:
