@@ -107,11 +107,13 @@ _SAFE_STAGE_REASONS = frozenset({
     "interrupted_requires_reconciliation", "liveness_reconciliation_required",
     "lease_expired", "no_fresh_eligible_route", "unreadable",
 })
-# CI names and ids come from logs, so only identifier-shaped values are kept:
-# a dotted unittest id, or a relative pytest node id without parameters.
-_UNITTEST_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
-_PYTEST_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_/-]*(?:\.[A-Za-z0-9_-]+)*\.py(?:::[A-Za-z_][A-Za-z0-9_]*)+$")
-_JOB_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.,()-]{0,99}$")
+# CI names and ids come from GitHub, so a shape check is not enough: any
+# identifier can carry content.  Only names this checkout itself defines
+# reach the report (a job key and matrix values from its own workflows, a test
+# that exists in its own tests/ directory).  Everything else is unrecognized
+# or dropped.
+_UNITTEST_ID = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$")
+_PYTEST_ID = re.compile(r"^(tests/[A-Za-z0-9_/]+\.py)((?:::[A-Za-z_][A-Za-z0-9_]*)+)$")
 _CODE = re.compile(r"[a-z][a-z0-9_]*")
 _CLASS_NAME = re.compile(r"[A-Z][A-Za-z0-9]*")
 # pytest prints "FAILED path::test"; unittest prints "FAIL: name (dotted.id)"
@@ -359,6 +361,73 @@ def _gh(argv: list[str], *, cwd: Path) -> tuple[int | None, str, bool]:
     return result.returncode, result.stdout.decode("utf-8", "replace"), bounded
 
 
+def _workflow_vocabulary(root: Path) -> tuple[frozenset[str], frozenset[str]]:
+    """Job keys and inline matrix values from this checkout's workflows."""
+    jobs: set[str] = set(); values: set[str] = set()
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        in_jobs = False
+        for line in text.splitlines():
+            if re.match(r"\S", line):
+                in_jobs = line.rstrip() == "jobs:"
+                continue
+            key = re.match(r"  ([A-Za-z0-9_-]+):\s*$", line)
+            if in_jobs and key:
+                jobs.add(key.group(1))
+            listed = re.match(r"\s+[A-Za-z0-9_-]+:\s*\[(.*)\]\s*$", line)
+            if listed:
+                values.update(item.strip().strip("'\"") for item in listed.group(1).split(","))
+    return frozenset(jobs), frozenset(values - {""})
+
+
+def _known_job(name: str, jobs: frozenset[str], values: frozenset[str]) -> bool:
+    base, separator, rest = name.partition(" (")
+    if base not in jobs:
+        return False
+    if not separator:
+        return True
+    return rest.endswith(")") and all(token in values for token in rest[:-1].split(", "))
+
+
+class _LocalTests:
+    """Answers whether a failing test id names a test in this checkout."""
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self._sources: dict[Path, str | None] = {}
+
+    def _source(self, path: Path) -> str | None:
+        path = path.resolve()
+        if path not in self._sources:
+            try:
+                inside = path.is_relative_to(self.root / "tests") and path.is_file()
+                self._sources[path] = path.read_text(encoding="utf-8") if inside else None
+            except (OSError, ValueError):
+                self._sources[path] = None
+        return self._sources[path]
+
+    def _defines(self, path: Path, names: list[str]) -> bool:
+        source = self._source(path)
+        if source is None:
+            return False
+        *classes, function = names
+        return (all(re.search(rf"^\s*class {re.escape(c)}\b", source, re.M) for c in classes)
+                and re.search(rf"^\s*def {re.escape(function)}\b", source, re.M) is not None)
+
+    def unittest(self, test_id: str) -> bool:
+        match = _UNITTEST_ID.fullmatch(test_id)
+        return bool(match) and self._defines(
+            self.root / "tests" / f"{match.group(1)}.py", [match.group(2), match.group(3)])
+
+    def pytest(self, test_id: str) -> bool:
+        match = _PYTEST_ID.fullmatch(test_id)
+        return (bool(match) and ".." not in test_id
+                and self._defines(self.root / match.group(1), match.group(2).split("::")[1:]))
+
+
 def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
     gh = shutil.which("gh")
     if not gh:
@@ -377,6 +446,8 @@ def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
     except (OSError, ValueError, json.JSONDecodeError):
         return {"note": "gh_unavailable", "failure_rate_by_job_name": {}, "frequent_failing_test_ids": {}}
     totals: Counter[str] = Counter(); failed: Counter[str] = Counter(); tests: Counter[str] = Counter()
+    jobs_known, matrix_values = _workflow_vocabulary(_REPOSITORY_ROOT)
+    local_tests = _LocalTests(_REPOSITORY_ROOT)
     for run in runs[:100]:
         run_id = run.get("databaseId") if isinstance(run, dict) else None
         if not isinstance(run_id, int): continue
@@ -391,7 +462,7 @@ def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
             continue
         for job in jobs:
             if isinstance(job, dict) and isinstance(job.get("name"), str):
-                name = job["name"] if _JOB_NAME.fullmatch(job["name"]) else "unrecognized"
+                name = job["name"] if _known_job(job["name"], jobs_known, matrix_values) else "unrecognized"
                 totals[name] += 1
                 if job.get("conclusion") == "failure": failed[name] += 1
         if not any(isinstance(job, dict) and job.get("conclusion") == "failure" for job in jobs):
@@ -402,10 +473,10 @@ def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
             continue
         if logs_bounded and log_code in (0, 1):
             for test_id in _PYTEST_FAILURE.findall(logs):
-                if len(test_id) <= 240 and ".." not in test_id and _PYTEST_ID.fullmatch(test_id):
+                if len(test_id) <= 240 and local_tests.pytest(test_id):
                     tests[test_id] += 1
             for test_id in _UNITTEST_FAILURE.findall(logs):
-                if len(test_id) <= 240 and _UNITTEST_ID.fullmatch(test_id):
+                if len(test_id) <= 240 and local_tests.unittest(test_id):
                     tests[test_id] += 1
     return {"note": "ok", "failure_rate_by_job_name": {name: {"failed": failed[name], "total": total, "rate": round(failed[name] / total, 4)} for name, total in sorted(totals.items())}, "frequent_failing_test_ids": dict(tests.most_common(20))}
 

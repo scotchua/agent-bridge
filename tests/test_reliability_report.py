@@ -211,13 +211,14 @@ class ReliabilityReportTests(unittest.TestCase):
             "#!/usr/bin/env python3\nimport json,sys\na=sys.argv\n"
             "if 'repo' in a: print(json.dumps({'nameWithOwner':'example/bridge'}))\n"
             f"elif 'list' in a: print(json.dumps({runs!r}))\n"
-            "elif '--json' in a: print(json.dumps({'jobs':[{'name':'offline','conclusion':'failure'},"
-            "{'name':'deploy to /home/RELIABILITY_REPORT_SECRET_SENTINEL','conclusion':'success'}]}))\n"
-            "else: print('2026-10-16T00:00:00.0Z FAILED tests/test_report.py::test_failure\\n'"
+            "elif '--json' in a: print(json.dumps({'jobs':[{'name':'offline-suite (ubuntu-latest, 3.11)','conclusion':'failure'},"
+            "{'name':'Client RELIABILITY_REPORT_SECRET_SENTINEL payroll 12345','conclusion':'success'},"
+            "{'name':'offline-suite (RELIABILITY_REPORT_SECRET_SENTINEL, 3.11)','conclusion':'success'}]}))\n"
+            "else: print('2026-10-16T00:00:00.0Z FAILED tests/test_reliability_report.py::ReliabilityReportTests::test_ci_notes_missing_gh\\n'"
             "'2026-10-16T00:00:00.0Z FAILED /home/RELIABILITY_REPORT_SECRET_SENTINEL/t.py::test_a\\n'"
-            "'2026-10-16T00:00:00.0Z FAILED tests/t.py::test_b[RELIABILITY_REPORT_SECRET_SENTINEL]\\n'"
-            "'2026-10-16T00:00:00.0Z FAIL: test_x (test_mod.Case.test_x)\\n'"
-            "'2026-10-16T00:00:00.0Z ERROR: test_y (test_mod.Case.test_y)\\n'"
+            "'2026-10-16T00:00:00.0Z FAILED tests/client_RELIABILITY_REPORT_SECRET_SENTINEL.py::test_balance\\n'"
+            "'2026-10-16T00:00:00.0Z FAIL: test_ok_is_not_an_error_category (test_reliability_report.ReliabilityReportTests.test_ok_is_not_an_error_category)\\n'"
+            "'2026-10-16T00:00:00.0Z ERROR: test_x (test_RELIABILITY_REPORT_SECRET_SENTINEL.Case.test_x)\\n'"
             "'2026-10-16T00:00:00.0Z FAILED (failures=1, errors=1)')\n")
         script.chmod(0o700)
         if os.name != "nt":
@@ -230,12 +231,13 @@ class ReliabilityReportTests(unittest.TestCase):
         with mock.patch.object(reliability_report.shutil, "which", return_value=self._fake_gh()):
             report = self._report(ci=True)
         # Run 8 is older than the 7-day window and is not counted.
-        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline"],
+        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline-suite (ubuntu-latest, 3.11)"],
                          {"failed": 1, "total": 1, "rate": 1.0})
+        # Only tests that exist in this checkout are named.
         self.assertEqual(report["ci"]["frequent_failing_test_ids"], {
-            "tests/test_report.py::test_failure": 1, "tests/t.py::test_b": 1,
-            "test_mod.Case.test_x": 1, "test_mod.Case.test_y": 1})
-        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["unrecognized"]["total"], 1)
+            "tests/test_reliability_report.py::ReliabilityReportTests::test_ci_notes_missing_gh": 1,
+            "test_reliability_report.ReliabilityReportTests.test_ok_is_not_an_error_category": 1})
+        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["unrecognized"]["total"], 2)
         self.assertNotIn("RELIABILITY_REPORT_SECRET_SENTINEL", json.dumps(report))
 
     def test_ci_does_not_fetch_logs_for_a_green_run(self):
@@ -247,12 +249,12 @@ class ReliabilityReportTests(unittest.TestCase):
                 return 0, json.dumps({"nameWithOwner": "example/bridge"}), True
             if "list" in argv:
                 return 0, json.dumps([{"databaseId": 7, "createdAt": iso(NOW - 60)}]), True
-            return 0, json.dumps({"jobs": [{"name": "offline", "conclusion": "success"}]}), True
+            return 0, json.dumps({"jobs": [{"name": "offline-suite", "conclusion": "success"}]}), True
 
         with mock.patch.object(reliability_report.shutil, "which", return_value="gh"), \
              mock.patch.object(reliability_report, "_gh", side_effect=fake_gh):
             report = self._report(ci=True)
-        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline"]["rate"], 0.0)
+        self.assertEqual(report["ci"]["failure_rate_by_job_name"]["offline-suite"]["rate"], 0.0)
         self.assertFalse(any("--log-failed" in call for call in calls))
 
     def test_ci_notes_missing_gh(self):
