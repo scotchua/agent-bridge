@@ -136,15 +136,22 @@ class ConfiguredQueueMutationTests(unittest.TestCase):
 
 
 class RunMutationTests(unittest.TestCase):
-    def _context(self, queue, changed=()):
-        cfg = SimpleNamespace(execution_queue_root=Path("invented-queue"))
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def _context(self, queue, changed=(), status=None, queue_root=None):
+        cfg = SimpleNamespace(execution_queue_root=queue_root or Path("invented-queue"))
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(worker, "load", return_value=cfg))
         stack.enter_context(mock.patch.object(worker, "WorkerLock", return_value=contextlib.nullcontext()))
         stack.enter_context(mock.patch.object(worker, "_configured_queue", return_value=queue))
         quick = stack.enter_context(mock.patch.object(
-            drift, "quick_check", return_value={"changed": list(changed)}))
+            drift, "quick_check", return_value=status or {
+                "changed": list(changed), "checked_at": 100.0,
+                "cache_age_seconds": 0.0}))
         attention = stack.enter_context(mock.patch.object(drift, "report_attention"))
         signals = stack.enter_context(mock.patch.object(worker.signal, "signal",
                                                         return_value="previous"))
@@ -168,12 +175,90 @@ class RunMutationTests(unittest.TestCase):
                                 worker_id="worker-invented")
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "job-invented done\n")
-        quick.assert_called_once_with("invented-config.json")
+        quick.assert_called_once_with("invented-config.json", force_refresh=False)
         attention.assert_called_once()
         queue.hold_dependencies.assert_called_once_with(
-            {"codex": "codex", "claude": "claude"})
+            {"codex": "codex", "claude": "claude"}, drift_status={
+                "changed": ["codex", "claude"], "checked_at": 100.0,
+                "cache_age_seconds": 0.0})
         queue.run_once.assert_called_once_with("worker-invented")
         self.assertEqual(signals.call_count, 4)
+
+    def test_refresh_rechecks_and_clears_a_hold_without_dispatching(self):
+        queue = mock.Mock()
+        status = {"changed": [], "checked_at": 200.0, "cache_age_seconds": 0.0}
+        quick, attention, _ = self._context(queue, status=status)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = worker.run("invented-config.json", once=False, interval=1,
+                                worker_id="worker-invented", refresh=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "drift_refresh_complete\n")
+        quick.assert_called_once_with("invented-config.json", force_refresh=True)
+        attention.assert_called_once_with(None, status)
+        queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
+        queue.run_once.assert_not_called()
+
+    def test_refresh_requests_running_worker_without_dispatching(self):
+        queue = mock.Mock()
+        queue_root = self.root / "queue"
+        queue_root.mkdir(mode=0o700)
+        real_lock = worker.WorkerLock
+        self._context(queue, queue_root=queue_root)
+        output = io.StringIO()
+        with real_lock(queue_root), \
+             mock.patch.object(worker, "WorkerLock", real_lock), \
+             contextlib.redirect_stdout(output):
+            result = worker.run("invented-config.json", once=False, interval=1,
+                                refresh=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "drift_refresh_requested\n")
+        marker = queue_root / worker.REFRESH_REQUEST_NAME
+        self.assertTrue(marker.is_file())
+        self.assertEqual(os.stat(marker).st_mode & 0o777, 0o600)
+        queue.run_once.assert_not_called()
+
+    def test_marker_forces_refresh_and_clears_hold_in_one_worker_pass(self):
+        queue = mock.Mock()
+        queue.run_once.return_value = None
+        queue_root = self.root / "queue"
+        queue_root.mkdir(mode=0o700)
+        marker = queue_root / worker.REFRESH_REQUEST_NAME
+        marker.write_bytes(b"")
+        marker.chmod(0o600)
+        status = {"changed": [], "checked_at": 200.0, "cache_age_seconds": 0.0}
+        quick, _, _ = self._context(queue, status=status, queue_root=queue_root)
+        self.assertEqual(worker.run("invented-config.json", once=True,
+                                    interval=1, worker_id="worker-invented"), 0)
+        quick.assert_called_once_with("invented-config.json", force_refresh=True)
+        queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
+        self.assertFalse(marker.exists())
+
+    def test_symlinked_refresh_marker_is_not_followed(self):
+        queue_root = self.root / "queue"
+        queue_root.mkdir(mode=0o700)
+        target = self.root / "target"
+        target.write_text("do not read", encoding="utf-8")
+        marker = queue_root / worker.REFRESH_REQUEST_NAME
+        marker.symlink_to(target)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertFalse(worker._consume_drift_refresh_request(queue_root))
+        self.assertEqual(stderr.getvalue(), worker.REFRESH_REQUEST_INVALID + "\n")
+        self.assertFalse(marker.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), "do not read")
+
+    def test_foreign_owned_refresh_marker_is_removed_without_use(self):
+        queue_root = self.root / "queue"
+        queue_root.mkdir(mode=0o700)
+        marker = queue_root / worker.REFRESH_REQUEST_NAME
+        marker.write_bytes(b"")
+        with mock.patch.object(worker, "require_private_file",
+                               side_effect=worker.PrivacyError(
+                                   "file_owned_by_another_account")), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(worker._consume_drift_refresh_request(queue_root))
+        self.assertFalse(marker.exists())
 
     def test_stop_signal_ends_loop_and_restores_handlers(self):
         queue = mock.Mock()
@@ -204,7 +289,7 @@ class MainMutationTests(unittest.TestCase):
         with mock.patch.object(worker, "run", return_value=7) as run:
             self.assertEqual(worker.main(["--config", "invented-config.json", "--once"]), 7)
         run.assert_called_once_with("invented-config.json", once=True,
-                                    interval=5.0, worker_id=None)
+                                    interval=5.0, worker_id=None, refresh=False)
 
     def test_main_returns_error_status(self):
         with mock.patch.object(worker, "run", side_effect=ExecutionAdmissionError("invalid")), \

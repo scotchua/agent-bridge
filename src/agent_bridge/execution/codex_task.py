@@ -91,6 +91,18 @@ def _with_error_detail(message:str,error_messages:list[str])->str:
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
 MAX_BRIEF_BYTES=100_000; MAX_STREAM_BYTES=16_000_000
+# Both values are deterministic rather than inherited from the worker. They
+# prevent the two cache classes the narrow cleanup below otherwise handles.
+CACHE_PREVENTION_ENV={"PYTHONDONTWRITEBYTECODE":"1","PYTEST_ADDOPTS":"-p no:cacheprovider"}
+# Verification runs after the patch is captured, so its caches never reach the
+# delivered patch. Disabling pytest's cache plugin there would only break
+# verify commands that need it (`pytest --lf`, the `cache` fixture).
+VERIFICATION_ENV_EXCLUDED=frozenset({"PYTEST_ADDOPTS"})
+
+def _verification_env(env:dict[str,str])->dict[str,str]:
+    return {k:v for k,v in env.items() if k not in VERIFICATION_ENV_EXCLUDED}
+MAX_IGNORED_ARTIFACT_PATHS=20
+MAX_IGNORED_ARTIFACT_PATH_BYTES=512
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
 DEFAULT_CODEX_HOME=Path.home()/".agent-bridge"/"codex-home"
 _GIT_BIN:Path|None=None
@@ -198,7 +210,8 @@ def _spawn_detail(argv:list[str])->str:
 
 def _env():
     e={"PATH":os.environ.get("PATH","/usr/bin:/bin"),"HOME":str(Path.home()),"LANG":"C.UTF-8",
-       "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0"}
+       "GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_TERMINAL_PROMPT":"0",
+       **CACHE_PREVENTION_ENV}
     for k in ("USER","LOGNAME"):
         if os.environ.get(k): e[k]=os.environ[k]
     if os.name=="nt":
@@ -487,10 +500,36 @@ def _drop_caches(tree:Path,env)->None:
         try: _unlink_beneath(tree,rel)
         except OSError: continue
 
+def _ignored_artifact_paths(tree:Path,env)->list[str]:
+    """Return a bounded, private-receipt-safe list of ignored relative paths.
+
+    Git supplies only repository-relative names. Preserve ordinary names so
+    an owner can identify the unexpected generator output, while bounding raw
+    bytes before decoding so a malicious filename cannot grow a receipt.
+    """
+    r=_run(_git_argv("ls-files","-z","--others","--ignored","--exclude-standard"),cwd=tree,env=env,timeout=30)
+    if r.returncode: raise TaskError("git prerequisite failed")
+    paths=[]
+    for raw in r.stdout.split(b"\0"):
+        if not raw: continue
+        if len(paths)>=MAX_IGNORED_ARTIFACT_PATHS: break
+        clipped=raw[:MAX_IGNORED_ARTIFACT_PATH_BYTES]
+        decoded=clipped.decode("utf-8","backslashreplace")
+        sanitized="".join(char if char.isprintable() else f"\\u{ord(char):04x}"
+                          for char in decoded)
+        paths.append(sanitized + ("..." if len(raw)>len(clipped) else ""))
+    return paths
+
+def _ignored_artifacts_error(paths:list[str])->TaskError:
+    """Keep the established fixed refusal while attaching private metadata."""
+    error=TaskError("Codex produced ignored untracked files")
+    error.ignored_artifact_paths=paths
+    return error
+
 def _patch(tree:Path,base:str,env):
     _drop_caches(tree,env)
-    ignored=_git(tree,"ls-files","--others","--ignored","--exclude-standard",env=env)
-    if ignored: raise TaskError("Codex produced ignored untracked files")
+    ignored=_ignored_artifact_paths(tree,env)
+    if ignored: raise _ignored_artifacts_error(ignored)
     add=_run(_git_argv("add","-N","--","."),cwd=tree,env=env,timeout=30)
     if add.returncode: raise TaskError("could not stage intent-to-add entries")
     r=_run(_git_argv("diff","--binary","--no-ext-diff","--no-textconv",base),cwd=tree,env=env,timeout=60)
@@ -781,10 +820,10 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
             if manifest is not None:
-                v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend,
+                v=_sandboxed(c,fresh,scratch,_verification_env(env),verify_timeout,backend,
                              extra_canaries=(str(repo),))
             else:
-                v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
+                v=_sandboxed(c,fresh,scratch,_verification_env(env),verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
@@ -814,6 +853,9 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         detail=str(exc) if isinstance(exc,TaskError) else None
         receipt.update(status="failed_pending_integrity",error=type(exc).__name__,
                        error_detail=detail,finished_at=time.time())
+        paths=getattr(exc,"ignored_artifact_paths",None)
+        if isinstance(paths,list):
+            receipt["ignored_artifact_paths"]=paths
     finally:
         generation_removed=_remove(repo,gen,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
         verification_removed=_remove(repo,fresh,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
