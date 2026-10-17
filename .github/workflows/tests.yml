@@ -126,11 +126,11 @@ jobs:
           python3 -m unittest discover -s tests -p "test_gemma_certified.py"
           python3 -m unittest discover -s tests -p "test_localq_server.py"
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
+          python3 -m unittest discover -s tests -p "test_runtime_revision.py"
+          python3 -m unittest discover -s tests -p "test_restart_worker.py"
           python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
           python3 -m unittest discover -s tests -p "test_reliability_report.py"
-          python3 -m unittest discover -s tests -p "test_runtime_revision.py"
-          python3 -m unittest discover -s tests -p "test_restart_worker.py"
 
       - name: Automatic routing, the gate that applies it, and its audit
         run: |
