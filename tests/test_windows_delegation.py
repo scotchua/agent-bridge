@@ -949,6 +949,22 @@ class VerificationEvidenceTests(unittest.TestCase):
             self.assertEqual(caught.exception.detail, detail)
 
 
+    def test_no_patch_with_a_diff_is_refused(self):
+        with self.assertRaises(wd.DelegationRefused) as caught:
+            wd.parse_guest_response(_guest_response(
+                status="aborted", harness_status=gr.HARNESS_NO_PATCH,
+                reason="no_patch", exit_code=0,
+                diff_b64=base64.b64encode(b"diff --git a/x b/x\n").decode("ascii")))
+        self.assertEqual(caught.exception.detail, "no_patch_with_diff")
+
+    def test_no_patch_without_a_diff_is_accepted_and_never_success(self):
+        parsed = wd.parse_guest_response(_guest_response(
+            status="aborted", harness_status=gr.HARNESS_NO_PATCH,
+            reason="no_patch", exit_code=0))
+        self.assertEqual(parsed["harness_status"], gr.HARNESS_NO_PATCH)
+        self.assertFalse(parsed["diff"])
+
+
 class DocumentedLimitationTests(unittest.TestCase):
     def test_no_live_validation_is_claimed(self):
         self.assertIn("no job has been dispatched through this executor on a live",

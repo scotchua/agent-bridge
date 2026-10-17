@@ -17,6 +17,10 @@ except ImportError:  # The orchestration worker invokes this file directly.
 
 class TaskError(RuntimeError): pass
 
+
+class NoPatchError(TaskError):
+    """The provider finished successfully but changed no tracked content."""
+
 ALLOWED_CLASSIFICATIONS={"synthetic","public","internal_nonclient"}
 ALLOWED_SUBSCRIPTIONS={"pro","max","team","enterprise","business"}
 ALLOWED_VERIFY_PROGRAMS=verify_policy.ALLOWED_VERIFY_PROGRAMS
@@ -384,7 +388,7 @@ def _patch(tree:Path,base:str,env):
     if add.returncode: raise TaskError("could not stage intent-to-add entries")
     r=_run(_git_argv("diff","--binary","--no-ext-diff","--no-textconv",base),cwd=tree,env=env,timeout=60)
     if r.returncode: raise TaskError("could not capture patch")
-    if not r.stdout: raise TaskError("Claude produced an empty patch")
+    if not r.stdout: raise NoPatchError("provider reported success but produced no patch")
     return r.stdout
 
 def _remove(repo:Path,tree:Path,env,timeout:float=60):
@@ -663,12 +667,17 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         if response is None: response=_json(r.stdout,"Claude output")
         if response.get("is_error") is not False or not isinstance(response.get("result"),str):
             raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
+        # The response itself stays in the private output log.  Its digest is
+        # enough to bind a no-patch outcome to the provider's final message.
+        receipt["last_message_sha256"]=hashlib.sha256(response["result"].encode("utf-8","surrogatepass")).hexdigest()
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
         patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env,cleanup_timeout)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
-        applied=_patch(fresh,base_sha,env)
+        # An empty replay of a nonempty patch is an integrity failure, never no_patch.
+        try: applied=_patch(fresh,base_sha,env)
+        except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
         evidence=[]
         for i,c in enumerate(checks,1):
@@ -724,6 +733,11 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
             receipt["prior_harness_failure"]={key:receipt[key] for key in ("error","error_detail")
                                                 if key in receipt}
         receipt.update(status="failed",error="SourceIntegrityError",finished_at=time.time())
+    elif isinstance(pending_exc, NoPatchError):
+        # A provider may say it is done without changing anything.  That is
+        # useful review evidence, but it is never an approval or completion.
+        receipt.update(status="no_patch", error=type(pending_exc).__name__,
+                       finished_at=time.time())
     elif pending_exc is not None:
         receipt.update(status="failed",error=type(pending_exc).__name__,finished_at=time.time())
     elif receipt["status"]=="verification_passed_pending_integrity":
@@ -733,8 +747,10 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     _atomic_json(job/"receipt.json",receipt)
     if not cleanup_ok: raise TaskError("disposable worktree cleanup failed")
     if not source_match: raise TaskError("source repository integrity changed: "+",".join(receipt["source_integrity_reasons"]))
-    if pending_exc is not None: raise pending_exc
-    return {**receipt,"job_dir":str(job),"patch":str(job/"changes.patch")}
+    if pending_exc is not None and not isinstance(pending_exc, NoPatchError): raise pending_exc
+    result={**receipt,"job_dir":str(job)}
+    if receipt["status"] != "no_patch": result["patch"]=str(job/"changes.patch")
+    return result
 
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
