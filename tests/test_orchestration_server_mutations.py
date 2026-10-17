@@ -64,6 +64,16 @@ class WorkerMutationTests(unittest.TestCase):
         server.service.once.assert_not_called()
         server._stop.wait.assert_called_once_with(server.interval)
 
+    def test_executor_records_fixed_runtime_state_error_when_work_fails(self):
+        server = make_server()
+        server.service.once.side_effect = RuntimeError("INVENTED_PRIVATE_LOOP_DETAIL")
+        server.service.record_loop_error = mock.Mock()
+        server._stop = mock.Mock()
+        server._stop.is_set.side_effect = [False, True]
+        server._executor()
+        server.service.record_loop_error.assert_called_once_with()
+        server._stop.wait.assert_called_once_with(server.interval)
+
     def test_stop_sets_event_without_worker(self):
         server = make_server()
         server.stop()
