@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import platform_support
 from agent_bridge.capacity_router import CapacityObservation, RoutingError, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration import autoroute
+from agent_bridge.orchestration import autodecide, autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
     _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
@@ -331,6 +331,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
             "stage": "implement", "owner_id": "owner-1", "stage_revision": owned["revision"]})
         self.assertTrue(response["ok"])
         self.assertEqual(response["state"], "queued")
+        request = json.loads((self.queue.root / response["job_id"] / "request.json").read_text())
+        self.assertEqual(request["stage_assignment"], owned["assignment"])
         spoof = server.tools["execution_dispatch"]["handler"]({
             "caller": "claude", "provider": "codex", "repo": str(self.repo),
             "brief": str(self.brief), "base": "HEAD", "classification": "synthetic",
@@ -464,7 +466,8 @@ class StageBindingRecheckTests(unittest.TestCase):
             brief=str(self.brief), base="HEAD", classification="synthetic",
             model="sonnet", effort="medium", verify_argv=[["pytest", "-q"]],
             timeout_seconds=90, item_id=binding["item_id"], stage=binding["stage"],
-            owner_id=binding["owner_id"], stage_revision=binding["revision"])
+            owner_id=binding["owner_id"], stage_revision=binding["revision"],
+            stage_assignment=binding["assignment"])
 
     def _assert_blocked_before_execution(self, job):
         status = self.queue.run_once("worker-1")
@@ -474,7 +477,7 @@ class StageBindingRecheckTests(unittest.TestCase):
         self.assertEqual(self.fake.requests, [])
         self.assertEqual(self.queue.result(job["job_id"])["state"], "blocked")
 
-    def test_complete_reassign_expire_and_renew_block_stale_jobs_but_a_live_binding_runs(self):
+    def test_assignment_changes_block_queued_jobs(self):
         completed = self._owned_stage("complete")
         job = self._submit(completed)
         self.router.complete("item-1", "complete", owner_id="owner-1",
@@ -498,22 +501,71 @@ class StageBindingRecheckTests(unittest.TestCase):
         self._assert_blocked_before_execution(job)
 
         self.now[0] = 200.0
-        expired = self._owned_stage("expired", lease_seconds=5)
-        job = self._submit(expired)
+        expires_to_reconcile = self._owned_stage("expires-to-reconcile", lease_seconds=5)
+        job = self._submit(expires_to_reconcile)
         self.now[0] = 206.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "expires-to-reconcile", owner_id="owner-2",
+                               lease_seconds=20,
+                               expected_revision=expires_to_reconcile["revision"])
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 250.0
+        released_only = self._owned_stage("released-only", lease_seconds=5)
+        job = self._submit(released_only)
+        self.now[0] = 256.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "released-only", owner_id="owner-2",
+                               lease_seconds=20, expected_revision=released_only["revision"])
+        reconciliation = self.router.get("item-1", "released-only")
+        self.router.reconcile_release(
+            "item-1", "released-only", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
         self._assert_blocked_before_execution(job)
 
         self.now[0] = 300.0
-        renewed = self._owned_stage("renewed")
-        stale = self._submit(renewed)
-        live = self.router.renew("item-1", "renewed", owner_id="owner-1",
-                                 lease_seconds=20,
-                                 expected_revision=renewed["revision"])
-        self._assert_blocked_before_execution(stale)
-        current = self._submit(live)
+        same_owner = self._owned_stage("same-owner", lease_seconds=5)
+        job = self._submit(same_owner)
+        self.now[0] = 306.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                               lease_seconds=20, expected_revision=same_owner["revision"])
+        reconciliation = self.router.get("item-1", "same-owner")
+        released = self.router.reconcile_release(
+            "item-1", "same-owner", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                           lease_seconds=20, expected_revision=released["revision"])
+        self._assert_blocked_before_execution(job)
+
+    def test_direct_and_decider_renewals_keep_the_assignment_binding_live(self):
+        direct = self._owned_stage("direct-renew")
+        direct_job = self._submit(direct)
+        self.router.renew("item-1", "direct-renew", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=direct["revision"])
         self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
-        self.assertEqual(self.queue.result(current["job_id"])["state"], "complete")
-        self.assertEqual(len(self.fake.requests), 1)
+        self.assertEqual(self.queue.result(direct_job["job_id"])["state"], "complete")
+
+        decider = self._owned_stage("decider-renew")
+        decider_job = self._submit(decider)
+        autodecide._own_stage(self.router, item_id="item-1", stage="decider-renew",
+                              route="claude", owner_id="owner-1", lease_seconds=20)
+        self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
+        self.assertEqual(self.queue.result(decider_job["job_id"])["state"], "complete")
+        self.assertEqual(len(self.fake.requests), 2)
+
+    def test_preupgrade_queued_request_retains_exact_revision_rule(self):
+        binding = self._owned_stage("legacy-request")
+        job = self._submit(binding)
+        request_path = self.queue.root / job["job_id"] / "request.json"
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        del request["stage_assignment"]
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        self.router.renew("item-1", "legacy-request", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=binding["revision"])
+        self._assert_blocked_before_execution(job)
 
     def test_unreadable_ledger_blocks_with_a_fixed_reason(self):
         binding = self._owned_stage("unreadable")

@@ -819,6 +819,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                     "verify_timeout_seconds": 300, "cleanup_timeout_seconds": 60,
                     "total_timeout_seconds": None,
                     "paid_fallback": False, "idempotency_key": None,
+                    "stage_assignment": current.get("assignment"),
                     **args, "classification": repo_policy.classification, "caller": caller,
                     "client_derived_admitted": repo_policy.classification == "client_derived"})
             except (RoutingError, TypeError, ValueError) as exc:

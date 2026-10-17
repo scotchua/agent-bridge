@@ -594,7 +594,8 @@ class ExecutionQueue:
             self._stage_router.require_live_execution_binding(
                 request.get("item_id"), request.get("stage"),
                 owner_id=request.get("owner_id"), route=request.get("provider"),
-                revision=request.get("stage_revision"))
+                revision=request.get("stage_revision"),
+                assignment=request.get("stage_assignment"))
         except RoutingError as exc:
             raise ExecutionAdmissionError("execution_stage_binding_invalid") from exc
         except Exception as exc:  # noqa: BLE001  an unreadable ledger denies
@@ -603,6 +604,7 @@ class ExecutionQueue:
     def submit(self, *, caller: str, provider: str, repo: str, brief: str,
                base: str, classification: str, model: str, effort: str,
                item_id: str, stage: str, owner_id: str, stage_revision: int,
+               stage_assignment: int | None = None,
                verify_argv: list[list[str]] | None = None,
                timeout_seconds: int = 900, paid_fallback: bool = False,
                verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
@@ -677,6 +679,11 @@ class ExecutionQueue:
         owner_id = self._clean_text(owner_id, "owner_id")
         if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 0:
             raise ExecutionAdmissionError("stage_revision_invalid")
+        if (stage_assignment is not None
+                and (isinstance(stage_assignment, bool)
+                     or not isinstance(stage_assignment, int)
+                     or stage_assignment < 0)):
+            raise ExecutionAdmissionError("stage_assignment_invalid")
         if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int)
                 or not 1 <= timeout_seconds <= MAX_GENERATION_TIMEOUT_SECONDS):
             raise ExecutionAdmissionError("timeout_invalid")
@@ -728,7 +735,8 @@ class ExecutionQueue:
                     "cleanup_timeout_seconds": cleanup_timeout_seconds,
                     "total_timeout_seconds": total_timeout_seconds,
                     "item_id": item_id, "stage": stage, "owner_id": owner_id,
-                    "stage_revision": stage_revision, "kind": kind, "head": head,
+                    "stage_revision": stage_revision,
+                    "stage_assignment": stage_assignment, "kind": kind, "head": head,
                     "author_provider": author_provider,
                     "client_derived_admitted": client_derived_admitted}
         with self._lock:

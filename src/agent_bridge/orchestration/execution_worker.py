@@ -12,6 +12,7 @@ import argparse
 import os
 import signal
 import socket
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -173,11 +174,19 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     cfg = load(config_path)
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
+    try:
+        stage_router = StageRouter(cfg.capacity_db)
+    except (OSError, sqlite3.Error):
+        # A configured worker may consume only after its independent live
+        # ledger check.  Preserve that requirement when opening the ledger
+        # itself fails so queued jobs become fixed-reason blocks, not an
+        # unguarded provider invocation or a worker crash.
+        stage_router = None
     return ExecutionQueue(
         cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
         model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
         client_derived_routes=cfg.client_derived_routes,
-        stage_router=StageRouter(cfg.capacity_db), require_stage_binding=True)
+        stage_router=stage_router, require_stage_binding=True)
 
 
 def run(config_path: str, *, once: bool, interval: float,
