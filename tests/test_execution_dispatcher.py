@@ -365,11 +365,18 @@ class ExecutionDispatcherTests(unittest.TestCase):
         receipt = json.loads((directory / "receipt.json").read_text())
         receipt["state"] = "running"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        pinned = self.queue.status(job["job_id"])
+        self.assertEqual(pinned["operator_checkout"], "free_to_change")
+        self.assertNotIn("active_repository", pinned)
+        request = json.loads((directory / "request.json").read_text())
+        request.pop("base_commit")
+        (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
         self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
                          str(self.repo.resolve()))
         receipt["state"] = "failed"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
         self.assertNotIn("active_repository", self.queue.status(job["job_id"]))
+        self.assertNotIn("operator_checkout", self.queue.status(job["job_id"]))
 
     def test_restart_blocks_claimed_but_not_yet_running_job(self):
         job = self.submit()
