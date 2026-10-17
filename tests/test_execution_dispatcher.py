@@ -12,9 +12,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import platform_support
-from agent_bridge.capacity_router import CapacityObservation, StageRouter
+from agent_bridge.capacity_router import CapacityObservation, RoutingError, StageRouter
 from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
-from agent_bridge.orchestration import autoroute
+from agent_bridge.orchestration import autodecide, autoroute
 from agent_bridge.orchestration.execution_queue import (
     UNEXPECTED_FAILURE_DETAIL, ExecutionAdmissionError, ExecutionQueue, _atomic_json,
     _harness_summary, outcome_is_success, Harnesses, SubprocessHarnessExecutor,
@@ -166,6 +166,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         link.symlink_to(other, target_is_directory=True)
         self.queue.run_once("worker-1")
         self.assertEqual(self.fake.requests[0]["repo"], str(approved.resolve()))
+
 
     def test_a_command_the_harness_would_refuse_is_refused_at_admission(self):
         # Live jobs d8e5763d, 7a79ae7f and 19869b0e were admitted with commands
@@ -330,6 +331,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
             "stage": "implement", "owner_id": "owner-1", "stage_revision": owned["revision"]})
         self.assertTrue(response["ok"])
         self.assertEqual(response["state"], "queued")
+        request = json.loads((self.queue.root / response["job_id"] / "request.json").read_text())
+        self.assertEqual(request["stage_assignment"], owned["assignment"])
         spoof = server.tools["execution_dispatch"]["handler"]({
             "caller": "claude", "provider": "codex", "repo": str(self.repo),
             "brief": str(self.brief), "base": "HEAD", "classification": "synthetic",
@@ -426,6 +429,155 @@ class ExecutionDispatcherTests(unittest.TestCase):
             "blocked": 1, "complete": 1, "queue_health_receipt_unreadable": 1})
         self.assertNotIn("private brief text", json.dumps(report))
 
+class StageBindingRecheckTests(unittest.TestCase):
+    """The worker, not only dispatch, proves stage ownership at spawn time."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        (self.repo / ".git").mkdir()
+        self.brief = self.root / "brief.md"
+        self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
+        self.now = [100.0]
+        self.router = StageRouter(self.root / "capacity.sqlite3",
+                                  clock=lambda: self.now[0])
+        self.router.observe_capacity(CapacityObservation(
+            route="claude", observed_at=100.0, fresh_until=1000.0,
+            available=True, source="fixture"), trusted=True)
+        self.fake = FakeExecutor()
+        self.queue = ExecutionQueue(
+            self.root / "queue", self.fake, clock=lambda: self.now[0],
+            model_reserved=reserve_nothing, stage_router=self.router,
+            require_stage_binding=True)
+
+    def _owned_stage(self, stage, *, owner="owner-1", lease_seconds=20):
+        registered = self.router.register("item-1", stage,
+                                          allowed_routes=["claude"])
+        return self.router.assign("item-1", stage, owner_id=owner,
+                                  lease_seconds=lease_seconds,
+                                  expected_revision=registered["revision"])
+
+    def _submit(self, binding):
+        return self.queue.submit(
+            caller="codex", provider="claude", repo=str(self.repo),
+            brief=str(self.brief), base="HEAD", classification="synthetic",
+            model="sonnet", effort="medium", verify_argv=[["pytest", "-q"]],
+            timeout_seconds=90, item_id=binding["item_id"], stage=binding["stage"],
+            owner_id=binding["owner_id"], stage_revision=binding["revision"],
+            stage_assignment=binding["assignment"])
+
+    def _assert_blocked_before_execution(self, job):
+        status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["error"], "ExecutionAdmissionError")
+        self.assertEqual(status["error_detail"], "execution_stage_binding_invalid")
+        self.assertEqual(self.fake.requests, [])
+        self.assertEqual(self.queue.result(job["job_id"])["state"], "blocked")
+
+    def test_assignment_changes_block_queued_jobs(self):
+        completed = self._owned_stage("complete")
+        job = self._submit(completed)
+        self.router.complete("item-1", "complete", owner_id="owner-1",
+                             expected_revision=completed["revision"])
+        self._assert_blocked_before_execution(job)
+
+        reassigned = self._owned_stage("reassign", lease_seconds=5)
+        job = self._submit(reassigned)
+        self.now[0] = 106.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "reassign", owner_id="owner-2",
+                               lease_seconds=20,
+                               expected_revision=reassigned["revision"])
+        reconciliation = self.router.get("item-1", "reassign")
+        released = self.router.reconcile_release(
+            "item-1", "reassign", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self.router.assign("item-1", "reassign", owner_id="owner-2",
+                           lease_seconds=20, expected_revision=released["revision"])
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 200.0
+        expires_to_reconcile = self._owned_stage("expires-to-reconcile", lease_seconds=5)
+        job = self._submit(expires_to_reconcile)
+        self.now[0] = 206.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "expires-to-reconcile", owner_id="owner-2",
+                               lease_seconds=20,
+                               expected_revision=expires_to_reconcile["revision"])
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 250.0
+        released_only = self._owned_stage("released-only", lease_seconds=5)
+        job = self._submit(released_only)
+        self.now[0] = 256.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "released-only", owner_id="owner-2",
+                               lease_seconds=20, expected_revision=released_only["revision"])
+        reconciliation = self.router.get("item-1", "released-only")
+        self.router.reconcile_release(
+            "item-1", "released-only", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self._assert_blocked_before_execution(job)
+
+        self.now[0] = 300.0
+        same_owner = self._owned_stage("same-owner", lease_seconds=5)
+        job = self._submit(same_owner)
+        self.now[0] = 306.0
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                               lease_seconds=20, expected_revision=same_owner["revision"])
+        reconciliation = self.router.get("item-1", "same-owner")
+        released = self.router.reconcile_release(
+            "item-1", "same-owner", actor="operator",
+            expected_revision=reconciliation["revision"],
+            owner_checked_inactive=True, liveness_evidence="fixture")
+        self.router.assign("item-1", "same-owner", owner_id="owner-1",
+                           lease_seconds=20, expected_revision=released["revision"])
+        self._assert_blocked_before_execution(job)
+
+    def test_direct_and_decider_renewals_keep_the_assignment_binding_live(self):
+        direct = self._owned_stage("direct-renew")
+        direct_job = self._submit(direct)
+        self.router.renew("item-1", "direct-renew", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=direct["revision"])
+        self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
+        self.assertEqual(self.queue.result(direct_job["job_id"])["state"], "complete")
+
+        decider = self._owned_stage("decider-renew")
+        decider_job = self._submit(decider)
+        autodecide._own_stage(self.router, item_id="item-1", stage="decider-renew",
+                              route="claude", owner_id="owner-1", lease_seconds=20)
+        self.assertEqual(self.queue.run_once("worker-1")["state"], "complete")
+        self.assertEqual(self.queue.result(decider_job["job_id"])["state"], "complete")
+        self.assertEqual(len(self.fake.requests), 2)
+
+    def test_preupgrade_queued_request_retains_exact_revision_rule(self):
+        binding = self._owned_stage("legacy-request")
+        job = self._submit(binding)
+        request_path = self.queue.root / job["job_id"] / "request.json"
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        del request["stage_assignment"]
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        self.router.renew("item-1", "legacy-request", owner_id="owner-1",
+                          lease_seconds=20, expected_revision=binding["revision"])
+        self._assert_blocked_before_execution(job)
+
+    def test_unreadable_ledger_blocks_with_a_fixed_reason(self):
+        binding = self._owned_stage("unreadable")
+        job = self._submit(binding)
+        with mock.patch.object(self.router, "require_live_execution_binding",
+                               side_effect=OSError("private ledger text")):
+            status = self.queue.run_once("worker-1")
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["error_detail"], "execution_stage_ledger_unavailable")
+        self.assertEqual(self.fake.requests, [])
+        self.assertNotIn("private ledger text",
+                         json.dumps(self.queue.result(job["job_id"])))
 
 
 @unittest.skipIf(os.name != "posix", "the subprocess harness executor is POSIX only")

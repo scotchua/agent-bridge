@@ -12,6 +12,7 @@ import argparse
 import os
 import signal
 import socket
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 from ..platform import platform as host_platform
 from .. import revision
 from .. import store
+from ..capacity_router import StageRouter
 from . import autoroute
 from .config import load
 from .execution_queue import (
@@ -179,10 +181,19 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
                         pid=os.getpid(), started_at=store.utc_now())
     except OSError as exc:
         raise ExecutionAdmissionError("execution_worker_status_unavailable") from exc
+    try:
+        stage_router = StageRouter(cfg.capacity_db)
+    except (OSError, sqlite3.Error):
+        # A configured worker may consume only after its independent live
+        # ledger check.  Preserve that requirement when opening the ledger
+        # itself fails so queued jobs become fixed-reason blocks, not an
+        # unguarded provider invocation or a worker crash.
+        stage_router = None
     return ExecutionQueue(
         cfg.execution_queue_root, select_executor(cfg), recover_interrupted=True,
         model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
-        client_derived_routes=cfg.client_derived_routes)
+        client_derived_routes=cfg.client_derived_routes,
+        stage_router=stage_router, require_stage_binding=True)
 
 
 def run(config_path: str, *, once: bool, interval: float,

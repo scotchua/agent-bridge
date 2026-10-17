@@ -133,6 +133,70 @@ class CapacityRouterTests(unittest.TestCase):
                                     expected_revision=renewed["revision"])
         self.assertEqual(done["state"], "complete")
 
+    def test_assignment_advances_for_every_nonrenewal_transition(self):
+        self.capacity("claude")
+        registered = self.router.register("a", "build", allowed_routes=["claude"])
+        self.assertEqual(registered["assignment"], 0)
+        assigned = self.router.assign("a", "build", owner_id="owner",
+                                      lease_seconds=10, expected_revision=0)
+        self.assertEqual(assigned["assignment"], 1)
+        renewed = self.router.renew("a", "build", owner_id="owner",
+                                    lease_seconds=10, expected_revision=assigned["revision"])
+        self.assertEqual(renewed["assignment"], assigned["assignment"])
+        done = self.router.complete("a", "build", owner_id="owner",
+                                    expected_revision=renewed["revision"])
+        self.assertEqual(done["assignment"], 2)
+
+        blocked = self.router.register("blocked", "build", allowed_routes=["codex"])
+        blocked = self.router.assign("blocked", "build", owner_id="owner",
+                                     lease_seconds=10,
+                                     expected_revision=blocked["revision"])
+        self.assertEqual((blocked["state"], blocked["assignment"]), ("blocked", 1))
+
+        expiring = self.router.register("expiring", "build", allowed_routes=["claude"])
+        expiring = self.router.assign("expiring", "build", owner_id="owner",
+                                      lease_seconds=1,
+                                      expected_revision=expiring["revision"])
+        self.clock.now += 2
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("expiring", "build", owner_id="other", lease_seconds=10,
+                               expected_revision=expiring["revision"])
+        reconciliation = self.router.get("expiring", "build")
+        self.assertEqual(reconciliation["assignment"], 2)
+        released = self.router.reconcile_release(
+            "expiring", "build", actor="operator",
+            expected_revision=reconciliation["revision"], owner_checked_inactive=True,
+            liveness_evidence="fixture")
+        self.assertEqual(released["assignment"], 3)
+
+    def test_stage_assignment_migration_preserves_legacy_revision_binding(self):
+        legacy = os.path.join(self.temp.name, "legacy-stages.sqlite3")
+        db = sqlite3.connect(legacy, isolation_level=None)
+        db.execute("""CREATE TABLE stages (
+            item_id TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL,
+            allowed_routes TEXT NOT NULL, preferred_routes TEXT NOT NULL,
+            owner_id TEXT, owner_route TEXT, lease_until REAL,
+            author_owner TEXT, author_route TEXT, is_review INTEGER NOT NULL,
+            blocked_reason TEXT, revision INTEGER NOT NULL,
+            updated_at REAL NOT NULL, PRIMARY KEY(item_id, stage))""")
+        db.execute("""INSERT INTO stages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ("a", "build", "owned", '["claude"]', '["claude"]',
+                    "owner", "claude", 2000.0, None, None, 0, None, 7, 1000.0))
+        db.close()
+
+        router = StageRouter(legacy, clock=self.clock)
+        current = router.require_live_execution_binding(
+            "a", "build", owner_id="owner", route="claude", revision=7)
+        self.assertEqual(current["assignment"], 0)
+        renewed = router.renew("a", "build", owner_id="owner", lease_seconds=10,
+                               expected_revision=7)
+        with self.assertRaisesRegex(RoutingError, "execution_stage_binding_invalid"):
+            router.require_live_execution_binding(
+                "a", "build", owner_id="owner", route="claude", revision=7)
+        router.require_live_execution_binding(
+            "a", "build", owner_id="owner", route="claude",
+            revision=7, assignment=renewed["assignment"])
+
 
 class CapacityIsEvidenceNotAnAssertion(unittest.TestCase):
     """An adversarial review found this table was evidence in name only.
