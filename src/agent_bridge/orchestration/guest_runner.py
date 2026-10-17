@@ -1599,6 +1599,12 @@ def _write_workspace_file(root: str, name: str, source: object,
         os.close(descriptor)
 
 
+def _has_baseline(workdir: str) -> bool:
+    """Whether the guest's own git baseline is present beside the workspace."""
+
+    return os.path.isdir(os.path.join(workdir, ".git"))
+
+
 def capture_diff(workdir: str) -> bytes:
     """The patch the job produced, bounded. Empty when it changed nothing.
 
@@ -2260,6 +2266,15 @@ def _execute_provider_job(request: dict[str, object], call: object,
     else:
         egress_receipt = ""
 
+    # capture_diff reads an absent baseline as "no change". Without the
+    # baseline the guest cannot tell no edits from an invalid workspace, so
+    # that is a failure, never no_patch.
+    if not _has_baseline(workdir):
+        return build_response(
+            status="aborted", harness_status=HARNESS_FAILED,
+            reason="workspace_baseline_missing", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started)
     # A provider that exits cleanly but changes nothing is no_patch, never a
     # completion, as in the POSIX lanes. Decided before verification, whose
     # own artifacts could otherwise read as a change. "aborted" because the
@@ -2293,6 +2308,15 @@ def _execute_provider_job(request: dict[str, object], call: object,
             failed = True
 
     diff = redact(capture_diff(workdir), auth)  # type: ignore[arg-type]
+
+    # Verification may not undo the provider's change and leave a completion
+    # with nothing in it.
+    if not diff:
+        return build_response(
+            status="aborted", harness_status=HARNESS_NO_PATCH,
+            reason="no_patch", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started, verification=evidence)
 
     if failed:
         return build_response(
