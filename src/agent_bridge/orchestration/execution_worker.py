@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from .. import health, preflight
-from ..execution import claude_config, claude_task, codex_task
+from ..execution import claude_config, claude_task, codex_promotion, codex_task
 from ..platform import platform as host_platform
 from . import autoroute
 from .config import load
@@ -87,8 +87,14 @@ def _codex_ready() -> bool:
         # to inspect its isolated home.  This probe must not read a local MCP
         # configuration merely to decide whether to hold work.
         preflight.assert_peer_home_has_no_config(str(home))
-        report = health.auth_status("codex", executable,
-                                    {**codex_task._env(), "CODEX_HOME": str(home)})
+        # Match the execution lane exactly: admission holds its shared lock,
+        # rejects a maintenance gate or invalid promotion record, and returns
+        # the verified executable instead of a mutable PATH launcher.
+        node_bin = shutil.which("node", path=codex_task._env()["PATH"])
+        with codex_promotion.admit(Path(executable), node_bin=node_bin) as admission:
+            report = health.auth_status(
+                "codex", str(admission.exec_path),
+                {**codex_task._env(), "CODEX_HOME": str(home)})
     except Exception:
         # A probe exception is unknown readiness, never permission to claim.
         return False
@@ -290,18 +296,27 @@ def run(config_path: str, *, once: bool, interval: float,
                 if "claude" in changed:
                     holds["claude"] = "claude"
                 providers = queue.queued_providers()
-                for provider, reason in readiness_holds(cfg, providers).items():
+                readiness = readiness_holds(cfg, providers)
+                proven_ready = providers - set(readiness)
+                for provider, reason in readiness.items():
                     # Drift is the more specific dependency when both are
                     # present.  Neither condition changes the requested
                     # route, and the next pass rechecks both before release.
                     holds.setdefault(provider, reason)
+                # Re-read after the bounded probes. A provider which appeared
+                # since the initial snapshot has not been proved ready, so it
+                # remains held. The allowed-provider check in ``run_once``
+                # also covers arrivals after this second snapshot.
+                queued_now = queue.queued_providers()
+                for provider in queued_now - proven_ready:
+                    holds.setdefault(provider, READINESS_UNAVAILABLE)
                 queue.hold_dependencies(holds)
                 # Do not even enter the claim path when every queued job is
                 # waiting on a dependency.  Apart from avoiding a needless
                 # scan, this makes the pre-claim guarantee explicit.
-                if providers and providers.issubset(holds):
+                if queued_now and queued_now.issubset(holds):
                     return None
-                return queue.run_once(identity)
+                return queue.run_once(identity, allowed_providers=proven_ready - set(holds))
             if once:
                 result = run_checked_once()
                 if result is not None:

@@ -130,6 +130,14 @@ class QueueMutationTests(unittest.TestCase):
         self.assertEqual(self.queue.status(job["job_id"])["waiting_on_dependency"],
                          "waiting_on_dependency:provider_readiness_unavailable")
 
+    def test_run_once_does_not_claim_a_provider_outside_readiness_set(self):
+        codex = self.submit(provider="codex")
+        claude = self.submit(caller="codex", provider="claude", item_id="item-2",
+                             verify_argv=[["git", "status"]])
+        completed = self.queue.run_once("worker-1", allowed_providers={"claude"})
+        self.assertEqual(completed["job_id"], claude["job_id"])
+        self.assertEqual(self.queue.status(codex["job_id"])["state"], "queued")
+
     def test_result_refuses_queued_job_by_name(self):
         job = self.submit()
         with self.assertRaisesRegex(eq.ExecutionAdmissionError, "execution_job_not_terminal"):

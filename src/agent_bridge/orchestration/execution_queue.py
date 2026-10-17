@@ -837,7 +837,16 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("execution_job_not_terminal")
         return {**receipt, "receipt_path": str(directory / "receipt.json")}
 
-    def run_once(self, worker_id: str) -> dict[str, Any] | None:
+    def run_once(self, worker_id: str, *,
+                 allowed_providers: set[str] | None = None) -> dict[str, Any] | None:
+        """Claim one unheld job, optionally only from readiness-proven routes.
+
+        The worker supplies the providers whose same-lane readiness probes
+        completed successfully in its current pass.  Keeping this check under
+        the queue lock closes the interval between that pass's queue snapshot
+        and the claim: newly submitted work cannot be claimed on a route that
+        was not probed.
+        """
         self._clean_text(worker_id, "worker_id")
         if self.executor is None:
             raise ExecutionAdmissionError("execution_worker_not_configured")
@@ -848,7 +857,10 @@ class ExecutionQueue:
                 receipt = self._receipt_for_scan(receipt_path) if receipt_path.is_file() else {}
                 if receipt is None:
                     continue
-                if receipt.get("state") == "queued" and not receipt.get("waiting_on_dependency"):
+                if (receipt.get("state") == "queued"
+                        and not receipt.get("waiting_on_dependency")
+                        and (allowed_providers is None
+                             or receipt.get("provider") in allowed_providers)):
                     # A claim is evidence that a previous worker may already
                     # have sent this job.  Do not let it starve later jobs,
                     # but never infer success or send it again.
