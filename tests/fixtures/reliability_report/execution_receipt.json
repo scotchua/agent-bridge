@@ -1,13 +1,15 @@
 {
   "brief": "RELIABILITY_REPORT_SECRET_SENTINEL",
-  "error_detail": "verify_not_runnable",
+  "error_detail": "verify_not_runnable: pytest is not on PATH",
   "finished_at": 1700000030,
   "harness": {
     "harness_status": "failed",
     "harness_verdict": "read"
   },
   "provider": "claude",
-  "source_integrity_reasons": ["head_changed"],
+  "source_integrity_reasons": [
+    "head_changed"
+  ],
   "started_at": 1700000010,
   "state": "failed",
   "submitted_at": 1700000000

@@ -25,20 +25,72 @@ from .errors import ErrorCategory
 from .orchestration import config as orchestration_config
 from . import runner
 
+# Every code ExecutionAdmissionError can carry, by its leading token.  A
+# test scans src/ for those literals and fails when one is missing here, so a
+# new refusal cannot silently report as "unrecognized".
+_QUEUE_PRIVACY_REASONS = (
+    "acl_unenforceable", "acl_unverified", "directory_absent",
+    "directory_not_owner_only", "file_absent", "file_changed_while_reading",
+    "file_not_owner_only", "file_not_regular", "file_owned_by_another_account",
+    "file_too_large", "file_unreadable", "lock_unavailable", "lock_unsupported",
+    "path_traverses_a_link", "path_unreadable", "replace_failed",
+    "replace_identity_changed", "secure_writer_required",
+)
 _SAFE_EXECUTION_CODES = frozenset({
-    "interrupted_requires_reconciliation", "execution_harness_timeout",
-    "execution_receipt_unreadable", "execution_receipt_invalid",
-    "command_timeout",
-    "source_snapshot_unavailable", "source_repository_changed",
-    "brief_changed_after_admission", "model_reserved", "model_invalid",
-    "reservation_policy_check_failed", "claude_config_dir_unavailable",
-    "execution_worker_platform_unsupported", "verify_argv_invalid",
-    "verify_argv_rejected", "verify_not_runnable", "unreadable",
+    # Written by the queue or the report itself, not raised.
+    "interrupted_requires_reconciliation", "command_timeout",
+    "source_snapshot_unavailable", "source_repository_changed", "model_reserved",
+    "unreadable",
+    # Raised as ExecutionAdmissionError.
+    "brief_changed_after_admission", "brief_invalid", "brief_not_utf8",
+    "brief_size_invalid", "classification_not_eligible",
+    "claude_config_dir_unavailable", "claude_verification_required",
+    "cleanup_timeout_invalid", "client_derived_dispatch_not_admitted",
+    "execution_configuration_missing", "execution_deadline_invalid",
+    "execution_harness_timeout", "execution_job_not_found",
+    "execution_job_not_terminal", "execution_outcome_harness_ok_invalid",
+    "execution_outcome_harness_status_invalid",
+    "execution_outcome_harness_verdict_invalid", "execution_outcome_incomplete",
+    "execution_outcome_inconsistent", "execution_outcome_not_a_mapping",
+    "execution_outcome_returncode_invalid", "execution_receipt_invalid",
+    "execution_receipt_unreadable", "execution_worker_not_configured",
+    "execution_worker_platform_unsupported", "idempotency_conflict",
+    "interval_invalid", "job_id_invalid", "job_kind_invalid", "model_invalid",
+    "model_reserved_to_operator", "paid_fallback_forbidden",
+    "provider_not_eligible_for_caller", "python_harness_not_executable",
+    "repo_and_brief_must_be_absolute", "repo_invalid",
+    "reservation_policy_check_failed", "review_direction_invalid",
+    "review_harness_unavailable", "review_provider_unsupported",
+    "review_receipt_outside_job", "review_request_invalid",
+    "review_verify_argv_forbidden", "stage_revision_invalid", "timeout_invalid",
+    "total_timeout_invalid", "verify_argv_invalid", "verify_argv_rejected",
+    "verify_not_runnable", "verify_timeout_invalid",
+    "windows_wsl_configuration_missing",
+    # The stage-binding recheck in PR #61 (R5).
+    "execution_stage_binding_invalid", "execution_stage_ledger_unavailable",
+    "stage_assignment_invalid",
+    *(f"queue_{reason}" for reason in _QUEUE_PRIVACY_REASONS),
 })
+# Exception class names the queue records in a receipt's top-level "error".
+_SAFE_ERROR_CLASSES = frozenset({
+    "ExecutionAdmissionError", "OSError", "PermissionError", "FileNotFoundError",
+    "IsADirectoryError", "NotADirectoryError", "TimeoutError", "ValueError",
+    "TypeError", "KeyError", "RuntimeError", "UnicodeDecodeError",
+    "JSONDecodeError", "TaskError", "RoutingError", "CalledProcessError",
+    "TimeoutExpired",
+})
+# localq/spool.py: _failure_text names, its client-data refusals, lease and
+# timeout outcomes, and the prefixes of queued-job notes.  A test keeps this a
+# superset of spool._BACKEND_EXCEPTION_NAMES.
 _SAFE_LOCAL_CODES = frozenset({
     "executor_lease_lost", "execution_timeout", "cancel_requested",
-    "waiting_on_dependency", "unreadable",
+    "waiting_on_dependency", "deferred", "backend_failure",
+    "client_data_backend_unsupported", "client_data_health_unverified",
+    "RuntimeError", "ValueError", "TypeError", "OSError", "PermissionError",
+    "FileNotFoundError", "KeyError", "IndexError", "UnicodeError",
+    "UnicodeDecodeError", "JSONDecodeError", "TimeoutExpired", "unreadable",
 })
+_LOCAL_FAILURE_STATES = frozenset({"failed", "unknown", "cancelled"})
 _SAFE_SOURCE_REASONS = frozenset({
     "source_snapshot_unavailable", "git_config_changed", "head_changed",
     "status_changed", "dirty_content_changed", "source_repository_changed",
@@ -48,6 +100,12 @@ _SAFE_STAGE_REASONS = frozenset({
     "lease_expired", "no_fresh_eligible_route", "unreadable",
 })
 _TEST_ID = re.compile(r"^[A-Za-z0-9_./:-]{1,240}$")
+_CODE = re.compile(r"[a-z][a-z0-9_]*")
+_CLASS_NAME = re.compile(r"[A-Z][A-Za-z0-9]*")
+# pytest prints "FAILED path::test"; unittest prints "FAIL: name (dotted.id)"
+# and "ERROR: name (dotted.id)".  GitHub log lines carry a timestamp prefix.
+_PYTEST_FAILURE = re.compile(r"(?:FAILED|ERROR)\s+([A-Za-z0-9_./:-]+)")
+_UNITTEST_FAILURE = re.compile(r"\b(?:FAIL|ERROR): [A-Za-z_][A-Za-z0-9_]* \(([A-Za-z0-9_.]+)\)")
 _GH_OUTPUT_LIMIT = 1_000_000
 _SOURCE_INTEGRITY_PREFIX = "source repository integrity changed: "
 _COMMAND_TIMEOUT = re.compile(r"^command timed out after [0-9]+s$")
@@ -84,7 +142,11 @@ def _execution_detail(value: object) -> tuple[str, list[str]]:
         ]
     if _COMMAND_TIMEOUT.fullmatch(value):
         return "command_timeout", []
-    return _fixed(value, _SAFE_EXECUTION_CODES), []
+    # The queue writes "verify_not_runnable: <reason>" and
+    # "model_reserved_to_operator:<model>"; only the leading code is reported.
+    code = value.split(":", 1)[0].strip()
+    return (_fixed(code, _SAFE_EXECUTION_CODES) if _CODE.fullmatch(code)
+            else "unrecognized"), []
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -103,15 +165,27 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+_EXECUTION_BUCKETS = ("provider", "state", "harness_status", "harness_verdict",
+                      "error_detail", "error_class", "source_integrity_reasons")
+
+
+def _empty_execution(present: bool) -> dict[str, Any]:
+    return {"present": present, **{f"by_{key}": {} for key in _EXECUTION_BUCKETS},
+            "queue_wait_seconds": {"median": None, "p90": None},
+            "run_seconds": {"median": None, "p90": None}}
+
+
+def _config_unreadable(section: dict[str, Any], key: str) -> dict[str, Any]:
+    """An installed but unreadable config is never reported as absent or clean."""
+    return {**section, "present": True, "config": "unreadable", key: {"unreadable": 1}}
+
+
 def _execution(root: Path | None, since: float) -> dict[str, Any]:
-    buckets: dict[str, list[str]] = {key: [] for key in (
-        "provider", "state", "harness_status", "harness_verdict", "error_detail", "source_integrity_reasons")}
+    buckets: dict[str, list[str]] = {key: [] for key in _EXECUTION_BUCKETS}
     waits: list[float] = []
     runs: list[float] = []
     if root is None or not root.is_dir():
-        return {"present": False, "by_provider": {}, "by_state": {}, "by_harness_status": {},
-                "by_harness_verdict": {}, "by_error_detail": {}, "by_source_integrity_reasons": {},
-                "queue_wait_seconds": {"median": None, "p90": None}, "run_seconds": {"median": None, "p90": None}}
+        return _empty_execution(False)
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -132,16 +206,30 @@ def _execution(root: Path | None, since: float) -> dict[str, Any]:
             continue
         buckets["provider"].append(_fixed(receipt.get("provider"), frozenset({"claude", "codex", "local"})))
         buckets["state"].append(_fixed(receipt.get("state"), frozenset({"queued", "running", "complete", "failed", "blocked"})))
-        harness = receipt.get("harness") if isinstance(receipt.get("harness"), dict) else {}
-        buckets["harness_status"].append(_fixed(harness.get("harness_status"), frozenset({"complete", "failed", "aborted", "verification_failed", "no_patch"})))
-        buckets["harness_verdict"].append(_fixed(harness.get("harness_verdict"), frozenset({"guest_receipt", "runtime_aborted", "receipt_absent", "receipt_not_an_object", "receipt_status_unknown", "receipt_unparseable", "read", "read_failure", "refused", "translation_refused"})))
+        # Queued, running, blocked and refused jobs have no harness outcome.
+        # They are absent from the harness buckets rather than "unrecognized".
+        harness = receipt.get("harness")
+        if isinstance(harness, dict):
+            buckets["harness_status"].append(_fixed(harness.get("harness_status"), frozenset({"complete", "failed", "aborted", "verification_failed", "no_patch"})))
+            buckets["harness_verdict"].append(_fixed(harness.get("harness_verdict"), frozenset({"guest_receipt", "runtime_aborted", "receipt_absent", "receipt_not_an_object", "receipt_status_unknown", "receipt_unparseable", "read", "read_failure", "refused", "translation_refused"})))
+        else:
+            harness = {}
+        # At most one error_detail entry per job.  The top-level "error" is an
+        # exception class name, counted on its own, except for the fixed code
+        # a reconciliation block writes there with no detail.
         detail = receipt.get("error_detail", harness.get("error_detail"))
+        error = receipt.get("error")
+        if isinstance(error, str) and _CODE.fullmatch(error):
+            if detail is None:
+                detail = error
+        elif error is not None:
+            buckets["error_class"].append(
+                _fixed(error, _SAFE_ERROR_CLASSES) if isinstance(error, str)
+                and _CLASS_NAME.fullmatch(error) else "unrecognized")
         if detail is not None:
             code, reasons = _execution_detail(detail)
             buckets["error_detail"].append(code)
             buckets["source_integrity_reasons"].extend(reasons)
-        if receipt.get("error") is not None:
-            buckets["error_detail"].append(_fixed(receipt.get("error"), _SAFE_EXECUTION_CODES))
         reasons = receipt.get("source_integrity_reasons")
         if isinstance(reasons, list):
             buckets["source_integrity_reasons"].extend(_fixed(reason, _SAFE_SOURCE_REASONS) for reason in reasons)
@@ -194,6 +282,12 @@ def _readonly(path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _local_failure_code(error: object) -> str:
+    if not isinstance(error, str):
+        return "unrecognized"
+    return _fixed(error.split(":", 1)[0].strip(), _SAFE_LOCAL_CODES)
+
+
 def _local_queue(root: Path | None, since: float) -> dict[str, Any]:
     if root is None or not root.is_dir():
         return {"present": False, "by_state": {}, "by_failure_code": {}}
@@ -209,23 +303,34 @@ def _local_queue(root: Path | None, since: float) -> dict[str, Any]:
     finally:
         db.close()
     return {"present": True, "by_state": _count(_fixed(row[0], frozenset({"queued", "running", "complete", "failed", "cancelled", "expired", "unknown"})) for row in rows),
-            "by_failure_code": _count(_fixed(row[1].split(":", 1)[0], _SAFE_LOCAL_CODES) for row in rows if row[1])}
+            "by_failure_code": _count(_local_failure_code(row[1]) for row in rows
+                                      if row[0] in _LOCAL_FAILURE_STATES and row[1])}
 
 
-def _stages(path: Path | None, since: float, now: float) -> dict[str, Any]:
+def _stages(path: Path | None, now: float) -> dict[str, Any]:
+    """Current stuck stages, whenever they got stuck.
+
+    ``blocked`` is terminal and ``reconcile_required`` waits for an operator,
+    so neither row is touched again.  Filtering by the report window would
+    hide exactly the stages stuck longest.
+    """
     if path is None or not path.is_file():
         return {"present": False, "by_blocked_reason": {}, "blocked_over_24_hours": 0}
     db = _readonly(path)
     if db is None:
         return {"present": True, "by_blocked_reason": {"unreadable": 1}, "blocked_over_24_hours": 0}
     try:
-        rows = db.execute("SELECT blocked_reason,updated_at FROM stages WHERE state='blocked' AND updated_at>=?", (since,)).fetchall()
+        rows = db.execute("SELECT state,blocked_reason,updated_at FROM stages "
+                          "WHERE state IN ('blocked','reconcile_required')").fetchall()
     except sqlite3.Error:
         return {"present": True, "by_blocked_reason": {"unreadable": 1}, "blocked_over_24_hours": 0}
     finally:
         db.close()
-    return {"present": True, "by_blocked_reason": _count(_fixed(row[0], _SAFE_STAGE_REASONS) for row in rows),
-            "blocked_over_24_hours": sum(1 for row in rows if isinstance(row[1], (int, float)) and now - row[1] > 86400)}
+    reasons = ("liveness_reconciliation_required" if row[0] == "reconcile_required"
+               else _fixed(row[1], _SAFE_STAGE_REASONS) for row in rows)
+    return {"present": True, "by_blocked_reason": _count(reasons),
+            "blocked_over_24_hours": sum(1 for row in rows if isinstance(row[2], (int, float))
+                                         and not isinstance(row[2], bool) and now - row[2] > 86400)}
 
 
 def _gh(argv: list[str], *, cwd: Path) -> tuple[int | None, str, bool]:
@@ -242,7 +347,7 @@ def _gh(argv: list[str], *, cwd: Path) -> tuple[int | None, str, bool]:
     return result.returncode, result.stdout.decode("utf-8", "replace"), bounded
 
 
-def _ci(repo: str | None = None) -> dict[str, Any]:
+def _ci(repo: str | None = None, since: float | None = None) -> dict[str, Any]:
     gh = shutil.which("gh")
     if not gh:
         return {"note": "gh_unavailable", "failure_rate_by_job_name": {}, "frequent_failing_test_ids": {}}
@@ -254,7 +359,7 @@ def _ci(repo: str | None = None) -> dict[str, Any]:
                 raise ValueError
         else:
             repository = repo
-        code, output, bounded = _gh([gh, "run", "list", "--repo", repository, "--json", "databaseId", "--limit", "100"], cwd=_REPOSITORY_ROOT)
+        code, output, bounded = _gh([gh, "run", "list", "--repo", repository, "--json", "databaseId,createdAt", "--limit", "100"], cwd=_REPOSITORY_ROOT)
         runs = json.loads(output) if code == 0 and bounded else []
         if not isinstance(runs, list): raise ValueError
     except (OSError, ValueError, json.JSONDecodeError):
@@ -263,6 +368,9 @@ def _ci(repo: str | None = None) -> dict[str, Any]:
     for run in runs[:100]:
         run_id = run.get("databaseId") if isinstance(run, dict) else None
         if not isinstance(run_id, int): continue
+        # Keep CI rates on the same window as the rest of the report.
+        created = _epoch(run.get("createdAt"))
+        if since is not None and (created is None or created < since): continue
         try:
             code, output, bounded = _gh([gh, "run", "view", str(run_id), "--repo", repository, "--json", "jobs"], cwd=_REPOSITORY_ROOT)
             payload = json.loads(output) if code == 0 and bounded else {}
@@ -280,7 +388,7 @@ def _ci(repo: str | None = None) -> dict[str, Any]:
         except OSError:
             continue
         if logs_bounded and log_code in (0, 1):
-            for test_id in re.findall(r"(?:FAILED|ERROR)\s+([A-Za-z0-9_./:-]+)", logs):
+            for test_id in (*_PYTEST_FAILURE.findall(logs), *_UNITTEST_FAILURE.findall(logs)):
                 if _TEST_ID.fullmatch(test_id): tests[test_id] += 1
     return {"note": "ok", "failure_rate_by_job_name": {name: {"failed": failed[name], "total": total, "rate": round(failed[name] / total, 4)} for name, total in sorted(totals.items())}, "frequent_failing_test_ids": dict(tests.most_common(20))}
 
@@ -291,25 +399,47 @@ def build_report(days: int = 7, *, ci: bool = False, repo: str | None = None,
         raise ValueError("days must be a positive integer")
     now = time.time() if now is None else now
     since = now - days * 86400
+    # broker_config.load() falls back to the shipped defaults when nothing is
+    # installed, so any failure here is an unreadable config, not an absent one.
     try:
-        broker = broker_config.load()
-        broker_root = Path(broker.state_root)
+        broker_root: Path | None = Path(broker_config.load().state_root)
     except Exception:
-        broker_root = Path(".") / "__unreadable__"
-    orchestration_path = drift.discover_config()
+        broker_root = None
+    orchestration = None
+    orchestration_state = "absent"
     try:
-        orchestration = orchestration_config.load(orchestration_path) if orchestration_path else None
+        orchestration_path = drift.discover_config()
+        if orchestration_path:
+            orchestration = orchestration_config.load(orchestration_path)
+            orchestration_state = "ok"
     except Exception:
-        orchestration = None
-    report = {"window_days": days, "execution": _execution(None if orchestration is None else orchestration.execution_queue_root, since),
-              "consultations": _consultations(broker_root, since), "local_queue": _local_queue(None if orchestration is None else orchestration.local_queue_root, since),
-              "stage_health": _stages(None if orchestration is None else orchestration.capacity_db, since, now)}
-    if ci: report["ci"] = _ci(repo)
+        orchestration_state = "unreadable"
+    if broker_root is None:
+        consultations = _config_unreadable(
+            {"by_direction": {}, "by_outcome": {}, "by_error_category": {}}, "by_outcome")
+    else:
+        consultations = _consultations(broker_root, since)
+    if orchestration_state == "unreadable":
+        execution = _config_unreadable(_empty_execution(True), "by_state")
+        local_queue = _config_unreadable({"by_state": {}, "by_failure_code": {}}, "by_state")
+        stage_health = _config_unreadable(
+            {"by_blocked_reason": {}, "blocked_over_24_hours": 0}, "by_blocked_reason")
+    else:
+        execution = _execution(None if orchestration is None else orchestration.execution_queue_root, since)
+        local_queue = _local_queue(None if orchestration is None else orchestration.local_queue_root, since)
+        stage_health = _stages(None if orchestration is None else orchestration.capacity_db, now)
+    report = {"window_days": days,
+              "config": {"broker": "unreadable" if broker_root is None else "ok",
+                         "orchestration": orchestration_state},
+              "execution": execution, "consultations": consultations,
+              "local_queue": local_queue, "stage_health": stage_health}
+    if ci: report["ci"] = _ci(repo, since)
     return report
 
 
 def _markdown(value: dict[str, Any]) -> str:
     lines = [f"# Bridge reliability report ({value['window_days']} days)"]
+    lines.extend(("", "## Config", "```json", json.dumps(value["config"], sort_keys=True, indent=2), "```"))
     for title, key in (("Execution", "execution"), ("Consultations", "consultations"), ("Local queue", "local_queue"), ("Stage health", "stage_health")):
         lines.extend(("", f"## {title}", "```json", json.dumps(value[key], sort_keys=True, indent=2), "```"))
     if "ci" in value: lines.extend(("", "## CI", "```json", json.dumps(value["ci"], sort_keys=True, indent=2), "```"))
