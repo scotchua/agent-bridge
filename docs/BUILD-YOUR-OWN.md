@@ -31,10 +31,10 @@ If that says `"loggedIn": false`, run `claude auth login`. Same idea on the
 Codex side, against whatever `CODEX_HOME` the bridge will use.
 
 **Sign each home in on its own; never copy a login between homes.** Each
-config directory or `CODEX_HOME` keeps its own login. Copying one home's
-login file into another leaves two homes holding the same refresh grant, and
-providers that rotate refresh tokens can then invalidate one when the other
-refreshes. Run the login command inside each home instead.
+config directory or `CODEX_HOME` keeps its own login. Copying a login from
+one home into another can leave two homes holding the same refresh grant, and
+where the provider rotates refresh tokens, one home's refresh can then
+invalidate the other. Run the login command inside each home instead.
 
 **What a fresh build gets you, and what it does not.** The reference
 implementation this brief is derived from is about 4,000 lines with 2,500 lines
