@@ -107,6 +107,17 @@ class ServerTests(unittest.TestCase):
         server.service.once.assert_called_once_with()
         server._stop.wait.assert_called_once_with(0.25)
 
+    def test_executor_records_fixed_runtime_state_error_when_poll_fails(self):
+        server = object.__new__(Server)
+        server.service = mock.Mock()
+        server.service.once.side_effect = RuntimeError("INVENTED_PRIVATE_LOOP_DETAIL")
+        server.interval = 0.25
+        server._stop = mock.Mock()
+        server._stop.is_set.side_effect = (False, True)
+        server._executor()
+        server.service.record_loop_error.assert_called_once_with()
+        server._stop.wait.assert_called_once_with(0.25)
+
     def test_stop_signals_and_joins_with_interval_grace(self):
         server = object.__new__(Server)
         server.interval = 0.25
