@@ -36,7 +36,9 @@ LOCAL_FIRST_BYPASS_REASONS = frozenset({"needs_judgment", "not_mechanical", "loc
 
 
 # ------------------------------------------------------------------ responses
-def error_response(category: ErrorCategory, **identifiers: Any) -> dict[str, Any]:
+def error_response(category: ErrorCategory, *, limit_chars: int | None = None,
+                   actual_chars: int | None = None, operation: str | None = None,
+                   **identifiers: Any) -> dict[str, Any]:
     """Closed-vocabulary category and hint, with broker-owned metadata."""
     response: dict[str, Any] = {
         "ok": False,
@@ -47,6 +49,13 @@ def error_response(category: ErrorCategory, **identifiers: Any) -> dict[str, Any
     for key, value in identifiers.items():
         if value is not None:
             response[key] = value
+    if category is ErrorCategory.INPUT_TOO_LARGE and all(
+            (type(limit_chars) is int, type(actual_chars) is int,
+             operation in {"start", "continue", "corrective"})):
+        response.update(limit_chars=limit_chars, actual_chars=actual_chars, operation=operation)
+        response["error_hint"] = (
+            f"{operation} prompt is {actual_chars:,} characters; the limit is {limit_chars:,}."
+        )
     return response
 
 
@@ -66,8 +75,10 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
-    if len(prompt) > cfg.prompt_budget(operation):
-        raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+    limit_chars = cfg.prompt_budget(operation)
+    if len(prompt) > limit_chars:
+        raise BrokerError(ErrorCategory.INPUT_TOO_LARGE, limit_chars=limit_chars,
+                          actual_chars=len(prompt), operation=operation)
 
     classification = args.get("source_classification")
     if not isinstance(classification, str):
@@ -819,6 +830,21 @@ def _dispatch(cfg: Config, peer: str, conversation_id: str, job_id: str) -> dict
     )
 
 
+def _size_details_from_status(category: ErrorCategory,
+                              status: dict[str, Any]) -> dict[str, int | str]:
+    """Return only validated prompt-size metadata stored by a worker."""
+    limit_chars = status.get("limit_chars")
+    actual_chars = status.get("actual_chars")
+    operation = status.get("operation")
+    if (category is ErrorCategory.INPUT_TOO_LARGE
+            and type(limit_chars) is int and limit_chars >= 0
+            and type(actual_chars) is int and actual_chars >= 0
+            and operation in {"start", "continue", "corrective"}):
+        return {"limit_chars": limit_chars, "actual_chars": actual_chars,
+                "operation": operation}
+    return {}
+
+
 def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     job_id = _validate_identifier_request(args, "job_id")
     _authorize_job_caller(cfg, caller, job_id)
@@ -838,7 +864,9 @@ def poll(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     if status.get("status") in registry.TERMINAL_STATUSES and category and category != "ok":
         enum_category = category_from_status(status)
         payload["error_category"] = enum_category.value
-        payload["error_hint"] = hint(enum_category)
+        details = _size_details_from_status(enum_category, status)
+        payload.update(details)
+        payload["error_hint"] = error_response(enum_category, **details)["error_hint"]
         if status.get("retries_exhausted"):
             payload["retries_exhausted"] = True
         if status.get("receipt"):
@@ -858,7 +886,7 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         category = category_from_status(status)
         response = error_response(
             category, job_id=job_id, conversation_id=status.get("conversation_id"),
-            status=status.get("status"),
+            status=status.get("status"), **_size_details_from_status(category, status),
         )
         if status.get("retries_exhausted"):
             response["retries_exhausted"] = True
