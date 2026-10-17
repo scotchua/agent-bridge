@@ -2260,6 +2260,17 @@ def _execute_provider_job(request: dict[str, object], call: object,
     else:
         egress_receipt = ""
 
+    # A provider that exits cleanly but changes nothing is no_patch, never a
+    # completion, as in the POSIX lanes. Decided before verification, whose
+    # own artifacts could otherwise read as a change. "aborted" because the
+    # host refuses "completed" with any status but complete or a failure.
+    if not capture_diff(workdir):
+        return build_response(
+            status="aborted", harness_status=HARNESS_NO_PATCH,
+            reason="no_patch", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started)
+
     evidence: list[dict[str, object]] = []
     failed = False
     for command in verify_commands:

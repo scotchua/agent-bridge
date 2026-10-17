@@ -345,6 +345,25 @@ class CodexTaskTests(unittest.TestCase):
                          hashlib.sha256(b"codex done\n").hexdigest())
         self.assertNotEqual(receipt["status"], "complete")
 
+    def test_an_empty_fresh_replay_of_a_nonempty_patch_fails_integrity(self):
+        requires_confinement(self)
+        real_patch = module._patch
+        calls = []
+
+        def patch_once_then_empty(tree, base, env):
+            calls.append(tree)
+            if len(calls) == 1:
+                return real_patch(tree, base, env)
+            raise module.NoPatchError("provider reported success but produced no patch")
+
+        with mock.patch.object(module, "_patch", side_effect=patch_once_then_empty), \
+             self.assertRaises(TaskError) as caught:
+            self.run_default()
+        self.assertNotIsInstance(caught.exception, module.NoPatchError)
+        self.assertEqual(str(caught.exception), "fresh patch differs from generated patch")
+        receipt_path = next((self.root / "tasks").glob("*/receipt.json"))
+        self.assertNotEqual(json.loads(receipt_path.read_text())["status"], "no_patch")
+
     def test_environment_does_not_inherit_api_credentials_or_git_config(self):
         old = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "CODEX_HOME", "GIT_CONFIG_GLOBAL")}
         try:

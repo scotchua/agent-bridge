@@ -677,7 +677,9 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
-        applied=_patch(fresh,base_sha,env)
+        # An empty replay of a nonempty patch is an integrity failure, never no_patch.
+        try: applied=_patch(fresh,base_sha,env)
+        except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
         evidence=[]
         for i,c in enumerate(checks,1):

@@ -669,13 +669,15 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
             raise TaskError(_with_result_detail("Claude output failed success contract",r.stdout))
         # The response itself stays in the private output log.  Its digest is
         # enough to bind a no-patch outcome to the provider's final message.
-        receipt["last_message_sha256"]=hashlib.sha256(response["result"].encode("utf-8")).hexdigest()
+        receipt["last_message_sha256"]=hashlib.sha256(response["result"].encode("utf-8","surrogatepass")).hexdigest()
         if (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
         patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600); _remove(repo,gen,env,cleanup_timeout)
         _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
-        applied=_patch(fresh,base_sha,env)
+        # An empty replay of a nonempty patch is an integrity failure, never no_patch.
+        try: applied=_patch(fresh,base_sha,env)
+        except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
         evidence=[]
         for i,c in enumerate(checks,1):

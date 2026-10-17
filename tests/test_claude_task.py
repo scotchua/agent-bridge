@@ -273,6 +273,20 @@ class ClaudeTaskTests(unittest.TestCase):
                      classification="synthetic", model="fake", effort="low",
                      verify_argv=[["git", "diff", "--check"]])
 
+    def test_a_lone_surrogate_in_the_result_never_decides_the_outcome(self):
+        requires_confinement(self)
+        output = '{\"result\":\"half \\ud800\",\"is_error\":false}'
+        self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf '%s\\n' '" + output + "'\n")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IXUSR)
+        result = run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks-surrogate",
+                          claude_bin=self.fake, claude_config_dir=self.store,
+                          classification="synthetic", model="fake", effort="low",
+                          verify_argv=[["git", "diff", "--check"]])
+        self.assertEqual(result["status"], "no_patch")
+        receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
+        self.assertEqual(receipt["last_message_sha256"],
+                         hashlib.sha256("half \ud800".encode("utf-8", "surrogatepass")).hexdigest())
+
     def test_success_without_changes_records_no_patch_not_complete(self):
         requires_confinement(self)
         output = '{\"result\":\"done\",\"is_error\":false}'
