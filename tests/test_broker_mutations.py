@@ -38,6 +38,57 @@ class BrokerMutationTests(unittest.TestCase):
                                         broker.START_FIELDS, "claude")
         self.assertEqual(caught.exception.category, ErrorCategory.INPUT_SCHEMA_INVALID)
 
+    def test_oversized_start_and_continue_report_safe_size_details(self) -> None:
+        sandbox = Sandbox(limits={"prompt_max_chars": 10_000,
+                                  "prompt_start_max_chars": 10,
+                                  "prompt_continue_max_chars": 5})
+        self.addCleanup(sandbox.cleanup)
+
+        def mcp(name: str, arguments: dict) -> dict:
+            result = sandbox.mcp("codex", [{
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }])
+            return result[0]["result"]["structuredContent"]
+
+        prompt = "secret-start-prompt"
+        start = mcp("claude_start", {"prompt": prompt, "source_classification": "internal"})
+        self.assertEqual(start["error_category"], ErrorCategory.INPUT_TOO_LARGE.value)
+        self.assertEqual({key: start[key] for key in ("limit_chars", "actual_chars", "operation")}, {
+            "limit_chars": 10, "actual_chars": len(prompt), "operation": "start",
+        })
+        self.assertNotIn(prompt, str(start))
+        self.assertEqual(start["error_hint"],
+                         "start prompt is 19 characters; the limit is 10.")
+
+        started, status, result = sandbox.run_to_completion("codex", prompt="hello")
+        self.assertEqual(status["status"], "complete")
+        self.assertTrue(result["ok"])
+        prompt = "hidden"
+        continued = mcp("claude_continue", {
+            "conversation_id": started["conversation_id"], "prompt": prompt,
+            "source_classification": "internal",
+        })
+        self.assertEqual(continued["error_category"], ErrorCategory.INPUT_TOO_LARGE.value)
+        self.assertEqual({key: continued[key] for key in ("limit_chars", "actual_chars", "operation")}, {
+            "limit_chars": 5, "actual_chars": len(prompt), "operation": "continue",
+        })
+        self.assertNotIn(prompt, str(continued))
+
+    def test_envelope_limit_reports_full_envelope_size(self) -> None:
+        sandbox = Sandbox(limits={"prompt_max_chars": 100, "prompt_start_max_chars": 99})
+        self.addCleanup(sandbox.cleanup)
+        prompt = "unique-envelope-prompt"
+        started = sandbox.consult("codex", prompt=prompt)
+        status = sandbox.wait(started["job_id"])
+        result = broker.read(sandbox.cfg, "codex", {"job_id": started["job_id"]})
+        self.assertEqual(status["error_category"], ErrorCategory.INPUT_TOO_LARGE.value)
+        self.assertEqual({key: result[key] for key in ("limit_chars", "operation")}, {
+            "limit_chars": 100, "operation": "start",
+        })
+        self.assertGreater(result["actual_chars"], result["limit_chars"])
+        self.assertNotIn(prompt, str(result))
+
     def test_receipt_count_accepts_zero_but_not_negative(self) -> None:
         self.assertTrue(broker._receipt_count(0))
         self.assertFalse(broker._receipt_count(-1))
