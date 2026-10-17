@@ -12,6 +12,7 @@ import errno
 import os
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import sys
 
@@ -77,10 +78,16 @@ def _record_skip(reason: str) -> None:
     value = os.environ.get(diagnostics.SKIP_RECORD_PATH)
     if not value:
         return
+    # The scratch directory is writable by the code under test, so the record
+    # path may have been replaced by a FIFO or a link.  Never follow a link,
+    # never wait for a reader, and append only to a regular file.
+    flags = (os.O_APPEND | os.O_CREAT | os.O_WRONLY
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
-        descriptor = os.open(value, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        descriptor = os.open(value, flags, 0o600)
         try:
-            os.write(descriptor, reason.encode("ascii") + b"\n")
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                os.write(descriptor, reason.encode("ascii") + b"\n")
         finally:
             os.close(descriptor)
     except OSError:

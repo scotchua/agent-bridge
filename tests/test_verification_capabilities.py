@@ -110,5 +110,29 @@ class SkipRecordReaderTests(unittest.TestCase):
                 record.unlink()
 
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX only")
+    def test_writer_does_not_block_on_or_follow_a_replaced_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fifo = Path(temp) / "fifo"
+            os.mkfifo(fifo)
+            regular = Path(temp) / "regular"
+            regular.write_bytes(b"")
+            record = Path(temp) / diagnostics.SKIP_RECORD_NAME
+            for replacement in ("fifo", "link"):
+                if replacement == "fifo":
+                    os.mkfifo(record)
+                else:
+                    record.symlink_to(regular)
+                done = threading.Event()
+                with mock.patch.dict(os.environ, {diagnostics.SKIP_RECORD_PATH: str(record)}):
+                    writer = threading.Thread(
+                        target=lambda: (capabilities._record_skip(
+                            diagnostics.LOOPBACK_UNAVAILABLE), done.set()), daemon=True)
+                    writer.start()
+                    self.assertTrue(done.wait(5), f"writer blocked on a {replacement}")
+                record.unlink()
+            self.assertEqual(regular.read_bytes(), b"")
+
+
 if __name__ == "__main__":
     unittest.main()
