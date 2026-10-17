@@ -121,16 +121,19 @@ class ReadToolPathsMutationTests(unittest.TestCase):
 
 
 class JudgeWriteMutationTests(GateCase):
-    def write_decision(self, decide=None):
+    def write_decision(self, decide=None, **kwargs):
         return gate._judge_write(
             "claude", "edit", [str(self.repo / "new.py")], {}, str(self.repo),
             state_root=str(self.state), clock=self.clock, protected=(), capacity_db=None,
-            decide=decide)
+            decide=decide, **kwargs)
 
     def test_judge_write_expires_its_budget_at_the_exact_deadline(self):
-        with mock.patch.object(gate.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 7.0]), \
-             mock.patch.object(gate, "decision_lock", return_value=contextlib.nullcontext()):
-            decision = self.write_decision()
+        # Passed in, not patched onto gate.time: _judge_write binds its
+        # monotonic default when it is defined. Readings: the budget, the lock
+        # deadline, the lock timeout, then the first check, exactly at 7.0.
+        monotonic = mock.Mock(side_effect=[0.0, 0.0, 0.0, 7.0])
+        with mock.patch.object(gate, "decision_lock", return_value=contextlib.nullcontext()):
+            decision = self.write_decision(monotonic=monotonic)
         self.assertEqual(decision.code, "gate_state_unavailable")
 
     def test_judge_write_redecides_an_overtaken_receipt(self):

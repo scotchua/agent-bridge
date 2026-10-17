@@ -11,9 +11,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_bridge.orchestration import config as orchestration_config
 from agent_bridge.orchestration.execution_queue import (
-    ExecutionAdmissionError, SubprocessHarnessExecutor)
+    ExecutionAdmissionError, ExecutionQueue, SubprocessHarnessExecutor,
+    reserve_nothing)
 from agent_bridge.orchestration.execution_worker import (
-    QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, run, select_executor)
+    QueueNotPrivate, WorkerAlreadyRunning, WorkerLock, _configured_queue, run,
+    select_executor)
 import platform_support
 
 
@@ -75,6 +77,76 @@ class ExecutionWorkerTests(unittest.TestCase):
         self.assertEqual(run(str(config), once=True, interval=0.01,
                              worker_id="test-worker"), 0)
         self._assert_owner_only(state / "execution", 0o700)
+
+    def test_configured_worker_requires_the_configured_stage_ledger(self):
+        executable = self.root / "python"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        codex = self.root / "codex_task.py"
+        claude = self.root / "claude_task.py"
+        codex.write_text("# fake\n", encoding="utf-8")
+        claude.write_text("# fake\n", encoding="utf-8")
+        state = self.root / "state"
+        config = self.root / "orchestration.json"
+        config.write_text(json.dumps({
+            "config_version": "1", "state_root": str(state),
+            "local_queue_root": str(state / "local"),
+            "capacity_db": str(state / "capacity.sqlite3"),
+            "worker_executable": str(executable),
+            "worker_state": str(state / "worker-state"),
+            "execution_queue_root": str(state / "execution"),
+            "codex_task_executable": str(codex),
+            "claude_task_executable": str(claude),
+            "python_executable": str(executable),
+            **(WINDOWS_PATHS if os.name == "nt" else {}),
+        }), encoding="utf-8")
+        queue = _configured_queue(str(config))
+        self.assertTrue(queue._require_stage_binding)
+        self.assertEqual(queue._stage_router.path, state / "capacity.sqlite3")
+
+    def test_corrupt_stage_ledger_blocks_queued_work_without_stopping_worker(self):
+        executable = self.root / "python"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        codex = self.root / "codex_task.py"
+        claude = self.root / "claude_task.py"
+        codex.write_text("# fake\n", encoding="utf-8")
+        claude.write_text("# fake\n", encoding="utf-8")
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        brief = self.root / "brief.md"
+        brief.write_text("Synthetic brief", encoding="utf-8")
+        state = self.root / "state"
+        config = self.root / "orchestration.json"
+        config.write_text(json.dumps({
+            "config_version": "1", "state_root": str(state),
+            "local_queue_root": str(state / "local"),
+            "capacity_db": str(state / "capacity.sqlite3"),
+            "worker_executable": str(executable),
+            "worker_state": str(state / "worker-state"),
+            "execution_queue_root": str(state / "execution"),
+            "codex_task_executable": str(codex),
+            "claude_task_executable": str(claude),
+            "python_executable": str(executable),
+            **(WINDOWS_PATHS if os.name == "nt" else {}),
+        }), encoding="utf-8")
+        sent = []
+        staging = ExecutionQueue(state / "execution", lambda request, _: sent.append(request),
+                                 model_reserved=reserve_nothing)
+        job = staging.submit(
+            caller="codex", provider="claude", repo=str(repo), brief=str(brief),
+            base="HEAD", classification="synthetic", model="sonnet", effort="medium",
+            verify_argv=[["git", "status"]], timeout_seconds=90,
+            item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1)
+        (state / "capacity.sqlite3").write_bytes(b"not a sqlite ledger")
+
+        self.assertEqual(run(str(config), once=True, interval=0.01,
+                             worker_id="test-worker"), 0)
+        status = staging.result(job["job_id"])
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["error_detail"], "execution_stage_ledger_unavailable")
+        self.assertEqual(sent, [])
 
 
 WINDOWS_PATHS = {
