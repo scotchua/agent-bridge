@@ -1082,7 +1082,8 @@ class ProviderJobExecutionTests(unittest.TestCase):
         return runner
 
     def _execute(self, request=None, responses=None, resolve=None,
-                 egress=lambda: "verify-egress-denied:test"):
+                 egress=lambda: "verify-egress-denied:test", diff=b"PATCH\n",
+                 baseline=True, changed=None):
         """``egress`` stands in for the nftables deny policy.
 
         There is no nft on this machine and no kernel to load a table into, so
@@ -1095,7 +1096,12 @@ class ProviderJobExecutionTests(unittest.TestCase):
         with mock.patch.object(gr, "read_versions", return_value=VERSIONS["tools"]), \
              mock.patch.object(gr, "_AuthCapsule", _ProviderCapsule), \
              mock.patch.object(gr, "unpack_workspace", lambda *a: None), \
-             mock.patch.object(gr, "capture_diff", lambda workdir: b"PATCH\n"), \
+             mock.patch.object(gr, "capture_diff",
+                               diff if callable(diff) else (lambda workdir: diff)), \
+             mock.patch.object(gr, "_has_baseline", lambda workdir: baseline), \
+             mock.patch.object(gr, "_workspace_changed",
+                               lambda workdir: changed if changed is not None
+                               else callable(diff) or bool(diff)), \
              mock.patch.object(gr, "enforce_verification_egress", egress), \
              mock.patch.object(gr, "verify_program_path", resolve):
             return gr.execute(gr.validate_request(request or _provider_request()),
@@ -1131,6 +1137,32 @@ class ProviderJobExecutionTests(unittest.TestCase):
         self.assertEqual(len(response["verification"]), 2)
         self.assertEqual(response["harness_status"],
                          gr.HARNESS_VERIFICATION_FAILED)
+
+    def test_a_clean_provider_exit_with_no_change_is_no_patch_not_complete(self):
+        response = self._execute(diff=b"")
+        self.assertEqual(response["status"], "aborted")
+        self.assertEqual(response["harness_status"], gr.HARNESS_NO_PATCH)
+        self.assertEqual(response["reason"], "no_patch")
+        self.assertEqual(response["diff_b64"], "")
+        self.assertEqual(response["verification"], [])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_verification_that_undoes_the_change_is_no_patch_not_complete(self):
+        # The provider changed the tree; the patch captured after the checks
+        # is empty because a check put it back.
+        diffs = [b""]
+        response = self._execute(diff=lambda workdir: diffs.pop(0), changed=True)
+        self.assertEqual(response["status"], "aborted")
+        self.assertEqual(response["harness_status"], gr.HARNESS_NO_PATCH)
+        self.assertEqual(response["diff_b64"], "")
+        self.assertEqual(len(response["verification"]), 1)
+
+    def test_a_missing_baseline_is_a_failure_not_no_patch(self):
+        response = self._execute(diff=b"", baseline=False)
+        self.assertEqual(response["status"], "aborted")
+        self.assertEqual(response["harness_status"], gr.HARNESS_FAILED)
+        self.assertEqual(response["reason"], "workspace_baseline_missing")
+        self.assertEqual(response["verification"], [])
 
     def test_a_provider_that_exits_nonzero_never_reaches_verification(self):
         response = self._execute(responses=[(2, b"", b"boom\n")])

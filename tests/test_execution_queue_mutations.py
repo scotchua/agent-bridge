@@ -123,6 +123,18 @@ class QueueMutationTests(unittest.TestCase):
         self.queue.hold_dependencies({})
         self.assertNotIn("waiting_on_dependency", self.queue.status(pending["job_id"]))
 
+    def test_drift_hold_status_has_only_fixed_reason_and_timing(self):
+        job = self.submit()
+        self.queue.hold_dependencies({"codex": "codex"}, drift_status={
+            "checked_at": 100.0, "cache_age_seconds": 12.5})
+        status = self.queue.status(job["job_id"])
+        self.assertEqual(status["drift_checked_at"], 100.0)
+        self.assertEqual(status["drift_cache_age_seconds"], 12.5)
+        self.assertEqual(status["drift_hold_reason"], "provider_changed:codex")
+        self.queue.hold_dependencies({}, drift_status={
+            "checked_at": 101.0, "cache_age_seconds": 0.0})
+        self.assertNotIn("drift_checked_at", self.queue.status(job["job_id"]))
+
     def test_result_refuses_queued_job_by_name(self):
         job = self.submit()
         with self.assertRaisesRegex(eq.ExecutionAdmissionError, "execution_job_not_terminal"):

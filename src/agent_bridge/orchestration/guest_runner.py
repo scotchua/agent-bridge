@@ -254,8 +254,11 @@ HARNESS_COMPLETE = "complete"
 HARNESS_VERIFICATION_FAILED = "verification_failed"
 HARNESS_FAILED = "failed"
 HARNESS_ABORTED = "aborted"
+#: Shared with the POSIX harnesses: a provider that reports success without
+#: changing anything. It is never a success.
+HARNESS_NO_PATCH = "no_patch"
 HARNESS_STATUSES = (HARNESS_COMPLETE, HARNESS_VERIFICATION_FAILED,
-                    HARNESS_FAILED, HARNESS_ABORTED)
+                    HARNESS_NO_PATCH, HARNESS_FAILED, HARNESS_ABORTED)
 
 ALLOWED_WORKDIR_PREFIXES = ("/root/", "/home/", "/tmp/", "/workspace/")
 
@@ -1596,6 +1599,12 @@ def _write_workspace_file(root: str, name: str, source: object,
         os.close(descriptor)
 
 
+def _has_baseline(workdir: str) -> bool:
+    """Whether the guest's own git baseline is present beside the workspace."""
+
+    return os.path.isdir(os.path.join(workdir, ".git"))
+
+
 def capture_diff(workdir: str) -> bytes:
     """The patch the job produced, bounded. Empty when it changed nothing.
 
@@ -1621,6 +1630,29 @@ def capture_diff(workdir: str) -> bytes:
     if returncode != 0:
         raise GuestRunnerError("diff_failed")
     return patch
+
+
+def _workspace_changed(workdir: str) -> bool:
+    """Whether the provider changed anything, without touching the index.
+
+    capture_diff stages everything (``add -A``) to build the patch. Calling it
+    before verification would hand the checks a different index than the
+    provider left, so a check such as ``git diff --exit-code`` would pass on a
+    changed tree. A lock-free status answers the same question read-only:
+    tracked, staged and untracked non-ignored changes, as ``add -A`` sees them.
+    """
+
+    try:
+        returncode, status, _stderr = _bounded_git(
+            ["--no-optional-locks", "status", "--porcelain", "-z",
+             "--untracked-files=all"], workdir, limit=MAX_DIFF_BYTES)
+    except _OutputTooLarge:
+        return True
+    except TimeoutError:
+        raise GuestRunnerError("diff_timed_out") from None
+    if returncode != 0:
+        raise GuestRunnerError("diff_failed")
+    return bool(status)
 
 
 class _OutputTooLarge(Exception):
@@ -2257,6 +2289,27 @@ def _execute_provider_job(request: dict[str, object], call: object,
     else:
         egress_receipt = ""
 
+    # capture_diff reads an absent baseline as "no change". Without the
+    # baseline the guest cannot tell no edits from an invalid workspace, so
+    # that is a failure, never no_patch.
+    if not _has_baseline(workdir):
+        return build_response(
+            status="aborted", harness_status=HARNESS_FAILED,
+            reason="workspace_baseline_missing", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started)
+    # A provider that exits cleanly but changes nothing is no_patch, never a
+    # completion, as in the POSIX lanes. Decided before verification, whose
+    # own artifacts could otherwise read as a change, and without staging
+    # anything the checks would then see. "aborted" because the host refuses
+    # "completed" with any status but complete or a failure.
+    if not _workspace_changed(workdir):
+        return build_response(
+            status="aborted", harness_status=HARNESS_NO_PATCH,
+            reason="no_patch", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started)
+
     evidence: list[dict[str, object]] = []
     failed = False
     for command in verify_commands:
@@ -2279,6 +2332,15 @@ def _execute_provider_job(request: dict[str, object], call: object,
             failed = True
 
     diff = redact(capture_diff(workdir), auth)  # type: ignore[arg-type]
+
+    # Verification may not undo the provider's change and leave a completion
+    # with nothing in it.
+    if not diff:
+        return build_response(
+            status="aborted", harness_status=HARNESS_NO_PATCH,
+            reason="no_patch", exit_code=returncode,
+            stdout=capped_out, stderr=capped_err, truncated=False,
+            duration_seconds=time.monotonic() - started, verification=evidence)
 
     if failed:
         return build_response(
