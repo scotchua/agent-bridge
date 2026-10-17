@@ -58,7 +58,9 @@ def paths(home: str | None = None) -> dict[str, str]:
     root = os.path.join(_home(home), ".agent-bridge", "drift")
     return {"root": root, "baseline": os.path.join(root, "baseline.json"),
             "audit": os.path.join(root, "audit.jsonl"),
-            "attention": os.path.join(root, "attention.json")}
+            "attention": os.path.join(root, "attention.json"),
+            "alerts": os.path.join(root, "alerts.json"),
+            "attention_lock": os.path.join(root, "attention.lock")}
 
 
 def _config_candidates(home: str) -> list[str]:
@@ -978,27 +980,53 @@ def update(config_path: str | None = None, *, home: str | None = None,
     return report
 
 
+# A signature that already raised a desktop alert stays quiet this long, even
+# if the state moved away and back in between.  The execution worker and every
+# orchestration server run this check every few seconds, so a dependency whose
+# probe flickers would otherwise alert on each flip.
+ALERT_REPEAT_SECONDS = 24 * 3600
+
+
 def report_attention(home: str | None, report: dict[str, Any]) -> None:
-    """Persist drift state and notify only when its stable signature changes."""
+    """Persist drift state when it changes and alert at most once per change.
+
+    Many processes call this on every loop.  The read, compare, write and the
+    alert decision happen under one lock, so two of them cannot both see a new
+    signature and both alert.  The state file is rewritten only when the
+    signature changes, so its modification time marks a real change and the
+    bridge doctor's probe can watch it instead of the desktop alert.
+    """
     actual_home = _home(home)
+    locations = paths(actual_home)
     attention = report.get("attention", report.get("needs_you", []))
     signature = json.dumps({"changed": sorted(report.get("changed", [])),
                             "needs_you": sorted(attention)}, sort_keys=True)
-    previous = None
+    clear = bool(report.get("ok", False)) and not attention
     try:
-        old = store.read_json(paths(actual_home)["attention"])
-        previous = old.get("signature") if isinstance(old, dict) else None
-    except (OSError, ValueError):
-        pass
-    try:
-        store.secure_mkdir(paths(actual_home)["root"])
-        store.atomic_write_json(paths(actual_home)["attention"], {**report, "signature": signature})
+        store.secure_mkdir(locations["root"])
+        with store.file_lock(locations["attention_lock"], timeout=2.0):
+            old = store.read_json_or_none(locations["attention"])
+            previous = old.get("signature") if isinstance(old, dict) else None
+            if previous != signature:
+                store.atomic_write_json(locations["attention"],
+                                        {**report, "signature": signature,
+                                         "signature_since": time.time()})
+            if clear:
+                return
+            now = time.time()
+            alerts = store.read_json_or_none(locations["alerts"])
+            alerts = {key: value for key, value in alerts.items()
+                      if isinstance(value, (int, float)) and 0 <= now - value < ALERT_REPEAT_SECONDS
+                      } if isinstance(alerts, dict) else {}
+            if signature in alerts:
+                return
+            alerts[signature] = now
+            store.atomic_write_json(locations["alerts"], alerts)
     except OSError:
         # An execution worker may be launched in a restricted test or service
-        # account.  Its queue-hold decision remains valid even if the optional
-        # desktop notification state cannot be written there.
-        return
-    if (report.get("ok", False) and not attention) or previous == signature:
+        # account, and a lock held past its timeout means another process is
+        # already deciding.  The queue-hold decision does not depend on this
+        # optional notification state.
         return
     try: subprocess.run(["osascript", "-e", "display notification \"Run setup_bridge.py doctor\" with title \"agent-bridge needs attention\""], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False)
     except (OSError, subprocess.SubprocessError): pass

@@ -132,6 +132,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_localq_server.py"
           python3 -m unittest discover -s tests -p "test_orchestration_server.py"
           python3 -m unittest discover -s tests -p "test_runtime_revision.py"
+          python3 -m unittest discover -s tests -p "test_drift_attention.py"
           python3 -m unittest discover -s tests -p "test_restart_worker.py"
           python3 -m unittest discover -s tests -p "test_delegation_gate.py"
           python3 -m unittest discover -s tests -p "test_system_acceptance.py"
