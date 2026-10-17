@@ -304,9 +304,11 @@ class WiringTests(unittest.TestCase):
 
     SRC = ROOT / "src" / "agent_bridge"
 
-    #: Creates and destroys its own queue root for one fixed synthetic job
-    #: with model="default", and has no cfg to read a policy from.
-    EXPECTED_OPT_OUTS = {"delegation_verify.py"}
+    #: delegation_verify.py creates and destroys its own queue root for one
+    #: fixed synthetic job with model="default", and has no cfg to read a
+    #: policy from. restart_worker.py builds a queue with no executor only to
+    #: read state_report() and never submits a job.
+    EXPECTED_OPT_OUTS = {"delegation_verify.py", "restart_worker.py"}
 
     def test_only_the_known_module_enforces_nothing(self):
         opted_out = {path.name for path in self.SRC.rglob("*.py")

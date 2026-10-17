@@ -244,6 +244,10 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
 
 
 class Server:
+    # Subclasses such as peer_mcp.PeerServer build their own state
+    # without calling this __init__; serve() still reads this.
+    _revision_record_path: str | None = None
+
     def __init__(self, caller: str, cfg: Config):
         if caller not in broker.CALLERS:
             raise ValueError(f"--caller must be one of {broker.CALLERS}")
