@@ -135,6 +135,11 @@ a foreground check and a background worker from running together. On restart,
 any job whose provider send may have started is marked `blocked` for manual
 reconciliation and is never automatically sent again.
 
+To refresh a drift hold after repairing a dependency, run the worker with
+`--refresh`. It repeats the metadata-only strict check and updates holds, but
+does not record a baseline or dispatch a queued job. A held job's
+`execution_status` reports the fixed hold reason, check time and cache age.
+
 For continuous macOS operation, copy
 `config/com.agent-bridge.execution-worker.plist.example`, replace every
 placeholder with an absolute path, keep the resulting file private, and load it

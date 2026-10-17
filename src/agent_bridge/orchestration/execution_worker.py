@@ -29,6 +29,11 @@ from .execution_queue import (
     Harnesses,
     SubprocessHarnessExecutor,
 )
+from .windows_privacy import PrivacyError, require_private_file
+
+
+REFRESH_REQUEST_NAME = ".drift-refresh-requested"
+REFRESH_REQUEST_INVALID = "drift_refresh_request_invalid"
 
 
 class WorkerAlreadyRunning(RuntimeError):
@@ -132,6 +137,92 @@ class WorkerLock:
             self._fd = None
 
 
+def _refresh_request_path(queue_root: Path) -> Path:
+    return queue_root / REFRESH_REQUEST_NAME
+
+
+def _refresh_request_exists(path: Path) -> bool:
+    """Check for the name without resolving a possible symlink."""
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
+def _discard_refresh_request(path: Path) -> bool:
+    """Remove an untrusted request without ever opening what it names."""
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        # The worker must not act on an unverified request. A later pass can
+        # retry removal, but this pass remains an ordinary cached check.
+        return False
+    return True
+
+
+def _refresh_request_is_private(queue_root: Path) -> bool:
+    """Confirm a request is a plain owner-only file before acting on it."""
+
+    path = _refresh_request_path(queue_root)
+    try:
+        # This checks the queue directory and request through the same
+        # platform verification used for the worker lock, while also proving
+        # the descriptor is regular, not a link, and owned by this account.
+        require_private_file(path, root=queue_root, platform=host_platform)
+    except PrivacyError:
+        _discard_refresh_request(path)
+        print(REFRESH_REQUEST_INVALID, file=sys.stderr)
+        return False
+    return True
+
+
+def _request_drift_refresh(queue_root: Path) -> None:
+    """Durably ask a lock-owning worker to bypass its drift cache once."""
+
+    queue_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = _refresh_request_path(queue_root)
+    if _refresh_request_exists(path):
+        if _refresh_request_is_private(queue_root):
+            return
+        # An invalid prior request was removed above. If a race replaced it,
+        # exclusive creation below refuses to overwrite the replacement.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise QueueNotPrivate("drift_refresh_request_unwritable") from exc
+    try:
+        try:
+            host_platform.enforce_owner_only_file(descriptor)
+        except OSError as exc:
+            raise QueueNotPrivate("drift_refresh_request_unverified") from exc
+        except (AttributeError, NotImplementedError) as exc:
+            raise QueueNotPrivate("drift_refresh_request_unverified") from exc
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if not _refresh_request_is_private(queue_root):
+        raise QueueNotPrivate("drift_refresh_request_unverified")
+
+
+def _consume_drift_refresh_request(queue_root: Path) -> bool:
+    """Return whether this pass must refresh, removing the request first."""
+
+    path = _refresh_request_path(queue_root)
+    if not _refresh_request_exists(path):
+        return False
+    if not _refresh_request_is_private(queue_root):
+        return False
+    return _discard_refresh_request(path)
+
+
 def select_executor(cfg, *, os_name: str | None = None):
     """Choose the executor this platform actually has.
 
@@ -197,7 +288,7 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
 
 
 def run(config_path: str, *, once: bool, interval: float,
-        worker_id: str | None = None) -> int:
+        worker_id: str | None = None, refresh: bool = False) -> int:
     if interval <= 0:
         raise ExecutionAdmissionError("interval_invalid")
     cfg = load(config_path)
@@ -234,11 +325,14 @@ def run(config_path: str, *, once: bool, interval: float,
                         except OSError:
                             raise ExecutionAdmissionError("execution_worker_restart_request_unavailable")
                         return None, True
-                return _run_checked_once(queue, identity, config_path), False
+                # A drift refresh request is consumed only by a pass that
+                # will actually run the check, never by one that restarts.
+                force_refresh = _consume_drift_refresh_request(cfg.execution_queue_root)
+                return _run_checked_once(force_refresh=force_refresh), False
 
-            def _run_checked_once(queue: ExecutionQueue, worker: str, path: str) -> dict | None:
+            def _run_checked_once(*, force_refresh: bool = False) -> dict | None:
                 from .. import drift
-                status = drift.quick_check(path)
+                status = drift.quick_check(config_path, force_refresh=force_refresh)
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
                 holds: dict[str, str] = {}
@@ -246,8 +340,20 @@ def run(config_path: str, *, once: bool, interval: float,
                     holds["codex"] = "codex"
                 if "claude" in changed:
                     holds["claude"] = "claude"
-                queue.hold_dependencies(holds)
-                return queue.run_once(worker)
+                queue.hold_dependencies(holds, drift_status=status)
+                return queue.run_once(identity)
+            if refresh:
+                # This is a status repair operation, not a dispatch command.
+                # It repeats the strict comparison but never accepts a new
+                # baseline and never sends a queued job.
+                from .. import drift
+                status = drift.quick_check(config_path, force_refresh=True)
+                changed = set(status["changed"])
+                drift.report_attention(None, status)
+                holds = {name: name for name in ("codex", "claude") if name in changed}
+                queue.hold_dependencies(holds, drift_status=status)
+                print("drift_refresh_complete")
+                return 0
             if once:
                 result, requested_restart = run_checked_once()
                 if requested_restart:
@@ -262,6 +368,14 @@ def run(config_path: str, *, once: bool, interval: float,
                 if result is None:
                     time.sleep(interval)
             return 0
+    except WorkerAlreadyRunning:
+        if not refresh:
+            raise
+        # The normal launchd worker owns this lock for its complete lifetime.
+        # Signal it instead of treating a healthy running worker as an error.
+        _request_drift_refresh(cfg.execution_queue_root)
+        print("drift_refresh_requested")
+        return 0
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
@@ -271,14 +385,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Consume agent-bridge execution jobs outside desktop app sandboxes.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--once", action="store_true",
-                        help="Process at most one job in the foreground, then exit.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true",
+                      help="Process at most one job in the foreground, then exit.")
+    mode.add_argument("--refresh", action="store_true",
+                      help="Refresh drift evidence and queue holds without dispatching a job.")
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--worker-id")
     args = parser.parse_args(argv)
     try:
         return run(args.config, once=args.once, interval=args.interval,
-                   worker_id=args.worker_id)
+                   worker_id=args.worker_id, refresh=args.refresh)
     except (ExecutionAdmissionError, WorkerAlreadyRunning, QueueNotPrivate,
             ValueError) as exc:
         print(str(exc), file=sys.stderr)
