@@ -167,6 +167,7 @@ class SubprocessHarnessExecutor:
         # importable on Windows, where the persistent worker is not supported.
         import pwd
         base = request["base_commit"] if "base_commit" in request else request["base"]
+        pinned_job_source = not is_review and "base_commit" in request
         if is_review:
             harness = self.harnesses.codex_review
             if harness is None or not harness.is_absolute() or not harness.is_file():
@@ -204,6 +205,8 @@ class SubprocessHarnessExecutor:
                      "--claude-config-dir", str(directory)]
         if "execution" in self.client_derived_routes and not is_review:
             argv += ["--client-derived-routes", "execution"]
+        if pinned_job_source:
+            argv += ["--job-source", str(job_dir)]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         # Reject a stale or tampered durable request immediately before it can
@@ -230,7 +233,7 @@ class SubprocessHarnessExecutor:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
                "USER": account, "LOGNAME": account}
-        process = subprocess.Popen(argv, cwd=request["repo"], env=env,
+        process = subprocess.Popen(argv, cwd=job_dir if pinned_job_source else request["repo"], env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
@@ -855,7 +858,9 @@ class ExecutionQueue:
         if receipt["state"] == "running":
             request = _read_json(directory / "request.json")
             repo = request.get("repo")
-            if isinstance(repo, str):
+            if "base_commit" in request:
+                answer["operator_checkout"] = "free_to_change"
+            elif isinstance(repo, str):
                 answer["active_repository"] = repo
         # Keep status a deliberately small, safe projection of the private
         # receipt.  In particular, stdout, stderr, a brief, and arbitrary
