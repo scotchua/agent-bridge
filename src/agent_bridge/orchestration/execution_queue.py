@@ -823,9 +823,23 @@ class ExecutionQueue:
             answer["finished_at"] = finished_at
         if receipt.get("waiting_on_dependency"):
             answer["waiting_on_dependency"] = "waiting_on_dependency:" + str(receipt["waiting_on_dependency"])
+            # Drift holds are written only by the worker from its fixed
+            # metadata comparison.  Show its timing and closed reason, never
+            # a probe's raw output or inventory details.
+            checked_at = receipt.get("drift_checked_at")
+            cache_age = receipt.get("drift_cache_age_seconds")
+            dependency = receipt.get("waiting_on_dependency")
+            if (dependency in {"codex", "claude"}
+                    and isinstance(checked_at, (int, float)) and not isinstance(checked_at, bool)
+                    and isinstance(cache_age, (int, float)) and not isinstance(cache_age, bool)
+                    and checked_at >= 0 and cache_age >= 0):
+                answer["drift_checked_at"] = checked_at
+                answer["drift_cache_age_seconds"] = cache_age
+                answer["drift_hold_reason"] = "provider_changed:" + dependency
         return answer
 
-    def hold_dependencies(self, dependencies: dict[str, str]) -> None:
+    def hold_dependencies(self, dependencies: dict[str, str], *,
+                          drift_status: Mapping[str, Any] | None = None) -> None:
         """Keep matching queued work queued and make the reason visible.
 
         This is deliberately an in-place receipt annotation, not an admission
@@ -844,8 +858,18 @@ class ExecutionQueue:
                 dependency = dependencies.get(receipt.get("provider"))
                 if dependency:
                     receipt["waiting_on_dependency"] = dependency
+                    if drift_status is not None:
+                        checked_at = drift_status.get("checked_at")
+                        cache_age = drift_status.get("cache_age_seconds")
+                        if (isinstance(checked_at, (int, float)) and not isinstance(checked_at, bool)
+                                and isinstance(cache_age, (int, float)) and not isinstance(cache_age, bool)
+                                and checked_at >= 0 and cache_age >= 0):
+                            receipt["drift_checked_at"] = checked_at
+                            receipt["drift_cache_age_seconds"] = cache_age
                 else:
                     receipt.pop("waiting_on_dependency", None)
+                    receipt.pop("drift_checked_at", None)
+                    receipt.pop("drift_cache_age_seconds", None)
                 _atomic_json(path, receipt)
 
     def result(self, job_id: str) -> dict[str, Any]:
