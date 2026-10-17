@@ -68,6 +68,10 @@ except ImportError:  # The orchestration worker invokes this file directly.
 
 class TaskError(RuntimeError): pass
 
+
+class NoPatchError(TaskError):
+    """The provider finished successfully but changed no tracked content."""
+
 #: Longest piece of Codex's own error text folded into a TaskError message.
 ERROR_MESSAGE_DETAIL_LIMIT=200
 
@@ -491,7 +495,7 @@ def _patch(tree:Path,base:str,env):
     if add.returncode: raise TaskError("could not stage intent-to-add entries")
     r=_run(_git_argv("diff","--binary","--no-ext-diff","--no-textconv",base),cwd=tree,env=env,timeout=60)
     if r.returncode: raise TaskError("could not capture patch")
-    if not r.stdout: raise TaskError("Codex produced an empty patch")
+    if not r.stdout: raise NoPatchError("provider reported success but produced no patch")
     return r.stdout
 
 def _remove(repo:Path,tree:Path,env,timeout:float=60,*,git_dir:Path|None=None):
@@ -769,7 +773,9 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         fresh_marker=(fresh/".git").read_bytes()
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
-        applied=_patch(fresh,base_sha,env)
+        # An empty replay of a nonempty patch is an integrity failure, never no_patch.
+        try: applied=_patch(fresh,base_sha,env)
+        except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
         evidence=[]
         for i,c in enumerate(checks,1):
@@ -845,6 +851,11 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
             receipt["prior_harness_failure"]={key:receipt[key] for key in ("error","error_detail")
                                                 if key in receipt}
         receipt.update(status="failed",error="SourceIntegrityError",finished_at=time.time())
+    elif isinstance(pending_exc, NoPatchError):
+        # A provider may say it is done without changing anything.  That is
+        # useful review evidence, but it is never an approval or completion.
+        receipt.update(status="no_patch", error=type(pending_exc).__name__,
+                       finished_at=time.time())
     elif pending_exc is not None:
         receipt.update(status="failed",error=type(pending_exc).__name__,finished_at=time.time())
     elif receipt["status"]=="verification_passed_pending_integrity":
@@ -854,8 +865,10 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
     _atomic_json(job/"receipt.json",receipt)
     if not cleanup_ok: raise TaskError("disposable worktree cleanup failed")
     if not source_match: raise TaskError("source repository integrity changed: "+",".join(receipt["source_integrity_reasons"]))
-    if pending_exc is not None: raise pending_exc
-    return {**receipt,"job_dir":str(job),"patch":str(job/"changes.patch")}
+    if pending_exc is not None and not isinstance(pending_exc, NoPatchError): raise pending_exc
+    result={**receipt,"job_dir":str(job)}
+    if receipt["status"] != "no_patch": result["patch"]=str(job/"changes.patch")
+    return result
 
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)

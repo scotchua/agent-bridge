@@ -69,7 +69,7 @@ class TheGateItselfTests(unittest.TestCase):
     def test_the_status_vocabulary_is_closed(self):
         self.assertEqual(
             eq.HARNESS_STATUSES,
-            frozenset({"complete", "verification_failed", "failed", "aborted"}))
+            frozenset({"complete", "verification_failed", "no_patch", "failed", "aborted"}))
 
 
 class QueuePathTests(unittest.TestCase):
