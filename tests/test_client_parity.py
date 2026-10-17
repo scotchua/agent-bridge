@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge import broker, config
+from git_fixture import make_git_repo
 from agent_bridge.errors import BrokerError
 from agent_bridge.execution import claude_task, codex_task
 from agent_bridge.orchestration import autoroute
@@ -56,9 +57,7 @@ class ClientDerivedParityTests(unittest.TestCase):
                     self.assertIn("client_derived", cfg.peer_allowed_classifications(peer))
 
     def test_execution_default_refusal_and_opt_in_queue_symmetry(self):
-        repo = self.root / "repo"
-        repo.mkdir()
-        (repo / ".git").mkdir()
+        repo = make_git_repo(self.root / "repo")
         brief = self.root / "brief.md"
         brief.write_text("fixture", encoding="utf-8")
         for routes, accepted in (((), False), (("execution",), True)):

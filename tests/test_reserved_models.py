@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from agent_bridge.orchestration import autoroute  # noqa: E402
+from git_fixture import make_git_repo  # noqa: E402
 from agent_bridge.orchestration import execution_queue as eq  # noqa: E402
 
 OK = {"returncode": 0, "harness_ok": True,
@@ -57,8 +58,7 @@ class QueueAdmissionTests(unittest.TestCase):
 
     def submit(self, queue, model, index=[0]):
         index[0] += 1
-        repo = Path(tempfile.mkdtemp(dir=str(self.base)))
-        (repo / ".git").mkdir()
+        repo = make_git_repo(Path(tempfile.mkdtemp(dir=str(self.base))))
         brief = repo / "brief.txt"
         brief.write_text("synthetic brief", encoding="utf-8")
         return queue.submit(caller="codex", provider="claude", repo=str(repo),
@@ -183,8 +183,7 @@ class SpawnTimeTests(unittest.TestCase):
 
     def submit(self, queue, model, index=[0]):
         index[0] += 1
-        repo = Path(tempfile.mkdtemp(dir=str(self.base)))
-        (repo / ".git").mkdir()
+        repo = make_git_repo(Path(tempfile.mkdtemp(dir=str(self.base))))
         brief = repo / "brief.txt"
         brief.write_text("synthetic brief", encoding="utf-8")
         return queue.submit(caller="codex", provider="claude", repo=str(repo),

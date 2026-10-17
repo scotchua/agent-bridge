@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from agent_bridge.orchestration.execution_queue import (
     reserve_nothing,
 )
 from agent_bridge.orchestration.server import Server
+from git_fixture import make_git_repo
 
 
 class FakeExecutor:
@@ -64,8 +66,7 @@ class ExecutionDispatcherTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
@@ -383,7 +384,8 @@ class ExecutionDispatcherTests(unittest.TestCase):
 
     def test_damaged_and_claimed_entries_do_not_block_a_later_job(self):
         """Unreadable and uncertain jobs remain held while healthy work runs."""
-        identifiers = iter(("0" * 31 + "1", "0" * 31 + "2", "0" * 31 + "3"))
+        # Each admission also uses one UUID while streaming its private source.
+        identifiers = iter(tuple("0" * 31 + str(number) for number in range(1, 7)))
         with mock.patch(
                 "agent_bridge.orchestration.execution_queue.uuid.uuid4",
                 side_effect=lambda: SimpleNamespace(hex=next(identifiers))):
@@ -437,8 +439,7 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.txt"
         self.brief.write_text("complete", encoding="utf-8")
         self.harness = self.root / "fake_harness.py"
@@ -629,8 +630,7 @@ class ExecutionDispatchClassificationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_repo(self.repo)
         self.brief = self.root / "brief.md"
         self.brief.write_text("Synthetic implementation brief", encoding="utf-8")
         self.fake = FakeExecutor()
