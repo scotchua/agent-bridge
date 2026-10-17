@@ -123,6 +123,21 @@ class QueueMutationTests(unittest.TestCase):
         self.queue.hold_dependencies({})
         self.assertNotIn("waiting_on_dependency", self.queue.status(pending["job_id"]))
 
+    def test_queued_providers_keeps_a_held_route_visible_for_recovery(self):
+        job = self.submit()
+        self.queue.hold_dependencies({"codex": "provider_readiness_unavailable"})
+        self.assertEqual(self.queue.queued_providers(), {"codex"})
+        self.assertEqual(self.queue.status(job["job_id"])["waiting_on_dependency"],
+                         "waiting_on_dependency:provider_readiness_unavailable")
+
+    def test_run_once_does_not_claim_a_provider_outside_readiness_set(self):
+        codex = self.submit(provider="codex")
+        claude = self.submit(caller="codex", provider="claude", item_id="item-2",
+                             verify_argv=[["git", "status"]])
+        completed = self.queue.run_once("worker-1", allowed_providers={"claude"})
+        self.assertEqual(completed["job_id"], claude["job_id"])
+        self.assertEqual(self.queue.status(codex["job_id"])["state"], "queued")
+
     def test_drift_hold_status_has_only_fixed_reason_and_timing(self):
         job = self.submit()
         self.queue.hold_dependencies({"codex": "codex"}, drift_status={

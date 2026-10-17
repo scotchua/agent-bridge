@@ -141,8 +141,10 @@ class RunMutationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def _context(self, queue, changed=(), status=None, queue_root=None):
-        cfg = SimpleNamespace(execution_queue_root=queue_root or Path("invented-queue"))
+    def _context(self, queue, changed=(), status=None, queue_root=None, **config_values):
+        cfg = SimpleNamespace(execution_queue_root=queue_root or Path("invented-queue"),
+                              **config_values)
+        queue.queued_providers.return_value = set()
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(worker, "load", return_value=cfg))
@@ -181,7 +183,8 @@ class RunMutationTests(unittest.TestCase):
             {"codex": "codex", "claude": "claude"}, drift_status={
                 "changed": ["codex", "claude"], "checked_at": 100.0,
                 "cache_age_seconds": 0.0})
-        queue.run_once.assert_called_once_with("worker-invented")
+        queue.run_once.assert_called_once_with("worker-invented",
+                                               allowed_providers=set())
         self.assertEqual(signals.call_count, 4)
 
     def test_refresh_rechecks_and_clears_a_hold_without_dispatching(self):
@@ -197,6 +200,22 @@ class RunMutationTests(unittest.TestCase):
         quick.assert_called_once_with("invented-config.json", force_refresh=True)
         attention.assert_called_once_with(None, status)
         queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
+        queue.run_once.assert_not_called()
+
+    def test_refresh_keeps_a_readiness_hold_while_login_is_unproved(self):
+        queue = mock.Mock()
+        status = {"changed": [], "checked_at": 200.0, "cache_age_seconds": 0.0}
+        quick, _, _ = self._context(queue, status=status)
+        queue.queued_providers.return_value = {"claude"}
+        with mock.patch.object(worker, "readiness_holds",
+                               return_value={"claude": worker.READINESS_UNAVAILABLE}) as probe, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = worker.run("invented-config.json", once=False, interval=1,
+                                worker_id="worker-invented", refresh=True)
+        self.assertEqual(result, 0)
+        probe.assert_called_once_with(mock.ANY, {"claude"})
+        queue.hold_dependencies.assert_called_once_with(
+            {"claude": worker.READINESS_UNAVAILABLE}, drift_status=status)
         queue.run_once.assert_not_called()
 
     def test_refresh_requests_running_worker_without_dispatching(self):
@@ -264,7 +283,7 @@ class RunMutationTests(unittest.TestCase):
         queue = mock.Mock()
         _, _, signals = self._context(queue)
 
-        def run_once(_identity):
+        def run_once(_identity, **_kwargs):
             if queue.run_once.call_count > 1:
                 self.fail("worker ran after stop signal")
             handler = signals.call_args_list[0].args[1]
@@ -282,6 +301,112 @@ class RunMutationTests(unittest.TestCase):
                          (worker.signal.SIGTERM, "previous"))
         self.assertEqual(signals.call_args_list[-1].args,
                          (worker.signal.SIGINT, "previous"))
+
+    def test_failed_auth_probe_makes_zero_generation_calls_and_restored_auth_runs_job(self):
+        """The same queued route is held before claim, then released on login."""
+
+        queue = mock.Mock()
+        queue.run_once.return_value = {"job_id": "same-job", "state": "complete"}
+        self._context(queue, claude_config_dir=Path("/invented/claude-home"))
+        queue.queued_providers.return_value = {"claude"}
+        signed_in = {"state": "signed_in", "authMethod": "claude.ai",
+                     "subscriptionType": "max"}
+        with (mock.patch.object(worker.claude_config, "is_ready", return_value=True),
+              mock.patch.object(worker, "_provider_executable", return_value="/fake/claude"),
+              mock.patch.object(worker.health, "auth_status",
+                                side_effect=[{"state": "not_signed_in"}, signed_in])):
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = worker.run("invented-config.json", once=True, interval=1,
+                                   worker_id="worker-invented")
+            self.assertEqual(first, 0)
+            # ``run_once`` is the only worker path that can invoke the
+            # provider harness. It was never reached while auth was absent.
+            queue.run_once.assert_not_called()
+            queue.hold_dependencies.assert_called_once_with(
+                {"claude": worker.READINESS_UNAVAILABLE}, drift_status=mock.ANY)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                second = worker.run("invented-config.json", once=True, interval=1,
+                                    worker_id="worker-invented")
+        self.assertEqual(second, 0)
+        queue.run_once.assert_called_once_with("worker-invented",
+                                               allowed_providers={"claude"})
+        self.assertEqual(queue.hold_dependencies.call_args_list[-1].args[0], {})
+
+    def test_late_unprobed_provider_is_held_and_cannot_be_claimed(self):
+        queue = mock.Mock()
+        queue.queued_providers.side_effect = [{"claude"}, {"claude", "codex"}]
+        queue.run_once.return_value = {"job_id": "claude-job", "state": "complete"}
+        self._context(queue)
+        with mock.patch.object(worker, "readiness_holds", return_value={}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(worker.run("invented-config.json", once=True,
+                                            interval=1, worker_id="worker-invented"), 0)
+        queue.hold_dependencies.assert_called_once_with(
+            {"codex": worker.READINESS_UNAVAILABLE}, drift_status=mock.ANY)
+        queue.run_once.assert_called_once_with("worker-invented",
+                                               allowed_providers={"claude"})
+
+    def test_refused_codex_admission_holds_the_queued_job(self):
+        queue = mock.Mock()
+        self._context(queue)
+        queue.queued_providers.return_value = {"codex"}
+        with tempfile.TemporaryDirectory() as home:
+            with (mock.patch.object(worker.codex_task, "DEFAULT_CODEX_HOME", Path(home)),
+                  mock.patch.object(worker, "_provider_executable", return_value="/path/codex"),
+                  mock.patch.object(worker.preflight, "assert_peer_home_has_no_config"),
+                  mock.patch.object(worker.codex_promotion, "admit", side_effect=
+                                    worker.codex_promotion.AdmissionRefused("maintenance")),
+                  mock.patch.object(worker.health, "auth_status") as auth):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(worker.run("invented-config.json", once=True,
+                                                interval=1, worker_id="worker-invented"), 0)
+        auth.assert_not_called()
+        queue.hold_dependencies.assert_called_once_with(
+            {"codex": worker.READINESS_UNAVAILABLE}, drift_status=mock.ANY)
+        queue.run_once.assert_not_called()
+
+
+class ReadinessMutationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "codex-home"
+        self.home.mkdir()
+
+    def test_claude_business_subscription_is_ready(self):
+        cfg = SimpleNamespace(claude_config_dir=Path("/invented/claude-home"))
+        report = {"state": "signed_in", "authMethod": "claude.ai",
+                  "subscriptionType": "business"}
+        with (mock.patch.object(worker.claude_config, "is_ready", return_value=True),
+              mock.patch.object(worker, "_provider_executable", return_value="/fake/claude"),
+              mock.patch.object(worker.health, "auth_status", return_value=report)):
+            self.assertTrue(worker._claude_ready(cfg))
+
+    def test_codex_refused_admission_does_not_probe_cli(self):
+        with (mock.patch.object(worker.codex_task, "DEFAULT_CODEX_HOME", self.home),
+              mock.patch.object(worker, "_provider_executable", return_value="/path/codex"),
+              mock.patch.object(worker.preflight, "assert_peer_home_has_no_config"),
+              mock.patch.object(worker.codex_promotion, "admit",
+                                side_effect=worker.codex_promotion.AdmissionRefused("gate")),
+              mock.patch.object(worker.health, "auth_status") as auth):
+            self.assertFalse(worker._codex_ready())
+        auth.assert_not_called()
+
+    def test_codex_probe_uses_admitted_executable(self):
+        admission = worker.codex_promotion.Admission("no_record", Path("/admitted/codex"))
+        report = {"state": "signed_in", "authMethod": "chatgpt"}
+        with (mock.patch.object(worker.codex_task, "DEFAULT_CODEX_HOME", self.home),
+              mock.patch.object(worker, "_provider_executable", return_value="/path/codex"),
+              mock.patch.object(worker.preflight, "assert_peer_home_has_no_config"),
+              mock.patch.object(worker.codex_promotion, "admit",
+                                return_value=contextlib.nullcontext(admission)) as admit,
+              mock.patch.object(worker.health, "auth_status", return_value=report) as auth):
+            self.assertTrue(worker._codex_ready())
+        admit.assert_called_once_with(Path("/path/codex"), node_bin=mock.ANY)
+        auth.assert_called_once_with(
+            "codex", "/admitted/codex",
+            {**worker.codex_task._env(), "CODEX_HOME": str(self.home)})
 
 
 class MainMutationTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from agent_bridge import health, runner, setup_cmd
 from agent_bridge.backends import claude_backend, codex_backend
 from agent_bridge.backends.base import auth_failure_reason
 from agent_bridge.errors import ErrorCategory
+from agent_bridge.execution import claude_task
 
 
 def result(stdout=b'', stderr=b'', code=0, **kw):
@@ -24,6 +25,17 @@ def result(stdout=b'', stderr=b'', code=0, **kw):
 
 
 class HealthTests(unittest.TestCase):
+    def test_claude_subscription_allowlist_matches_execution_lane(self):
+        self.assertEqual(health.CLAUDE_SUBSCRIPTION_TYPES,
+                         claude_task.ALLOWED_SUBSCRIPTIONS)
+
+    def test_business_subscription_is_forwarded_for_the_execution_lane(self):
+        data = {'loggedIn': True, 'authMethod': 'claude.ai',
+                'subscriptionType': 'business'}
+        with patch.object(runner, 'run', return_value=result(json.dumps(data).encode())):
+            report = health.auth_status('claude', '/synthetic/claude', {})
+        self.assertEqual(report['subscriptionType'], 'business')
+
     def test_allowlisted_status_only(self):
         data = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team',
                 'email': 'synthetic-secret', 'accessToken': 'synthetic-secret'}
@@ -130,6 +142,10 @@ class HealthMutationAuthTests(unittest.TestCase):
             self.assertEqual(report['apiProvider'], 'bedrock')
             self.assertEqual(report['subscriptionType'], 'team')
             self.assertNotIn('email', report)
+        data['subscriptionType'] = 'free'
+        with patch.object(runner, 'run', return_value=result(json.dumps(data).encode())):
+            self.assertNotIn('subscriptionType',
+                             health.auth_status('claude', '/synthetic/claude', {}))
         data['loggedIn'] = True
         with patch.object(runner, 'run', return_value=result(json.dumps(data).encode(), code=1)):
             self.assertEqual(health.auth_status('claude', '/synthetic/claude', {})['state'],

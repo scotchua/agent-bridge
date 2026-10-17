@@ -926,6 +926,28 @@ class ExecutionQueue:
                     receipt.pop("drift_cache_age_seconds", None)
                 _atomic_json(path, receipt)
 
+    def queued_providers(self) -> set[str]:
+        """Providers named by queued work, including work currently held.
+
+        The worker uses this read-only view to probe only routes that have
+        work waiting.  Held receipts stay in the view so a restored login can
+        release the same job without changing its ID or route.
+        """
+
+        providers: set[str] = set()
+        with self._lock:
+            for directory in self.root.iterdir():
+                path = directory / "receipt.json"
+                if not path.is_file():
+                    continue
+                receipt = self._receipt_for_scan(path)
+                if receipt is None or receipt.get("state") != "queued":
+                    continue
+                provider = receipt.get("provider")
+                if provider in PROVIDER_FOR_CALLER.values():
+                    providers.add(provider)
+        return providers
+
     def result(self, job_id: str) -> dict[str, Any]:
         directory = self._directory(job_id)
         receipt = _read_json(directory / "receipt.json")
@@ -933,7 +955,16 @@ class ExecutionQueue:
             raise ExecutionAdmissionError("execution_job_not_terminal")
         return {**receipt, "receipt_path": str(directory / "receipt.json")}
 
-    def run_once(self, worker_id: str) -> dict[str, Any] | None:
+    def run_once(self, worker_id: str, *,
+                 allowed_providers: set[str] | None = None) -> dict[str, Any] | None:
+        """Claim one unheld job, optionally only from readiness-proven routes.
+
+        The worker supplies the providers whose same-lane readiness probes
+        completed successfully in its current pass.  Keeping this check under
+        the queue lock closes the interval between that pass's queue snapshot
+        and the claim: newly submitted work cannot be claimed on a route that
+        was not probed.
+        """
         self._clean_text(worker_id, "worker_id")
         if self.executor is None:
             raise ExecutionAdmissionError("execution_worker_not_configured")
@@ -944,7 +975,10 @@ class ExecutionQueue:
                 receipt = self._receipt_for_scan(receipt_path) if receipt_path.is_file() else {}
                 if receipt is None:
                     continue
-                if receipt.get("state") == "queued" and not receipt.get("waiting_on_dependency"):
+                if (receipt.get("state") == "queued"
+                        and not receipt.get("waiting_on_dependency")
+                        and (allowed_providers is None
+                             or receipt.get("provider") in allowed_providers)):
                     # A claim is evidence that a previous worker may already
                     # have sent this job.  Do not let it starve later jobs,
                     # but never infer success or send it again.
