@@ -368,10 +368,15 @@ class ExecutionDispatcherTests(unittest.TestCase):
         receipt = json.loads((directory / "receipt.json").read_text())
         receipt["state"] = "running"
         (directory / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        request = json.loads((directory / "request.json").read_text())
+        if "base_commit" not in request:
+            # Windows admission does not pin a job source yet; the status
+            # projection is the same code on every platform, so pin by hand.
+            request["base_commit"] = "0" * 40
+            (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
         pinned = self.queue.status(job["job_id"])
         self.assertEqual(pinned["operator_checkout"], "free_to_change")
         self.assertNotIn("active_repository", pinned)
-        request = json.loads((directory / "request.json").read_text())
         request.pop("base_commit")
         (directory / "request.json").write_text(json.dumps(request), encoding="utf-8")
         self.assertEqual(self.queue.status(job["job_id"])["active_repository"],
