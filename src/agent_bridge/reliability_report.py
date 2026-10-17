@@ -46,6 +46,9 @@ _SAFE_EXECUTION_CODES = frozenset({
     "source_snapshot_unavailable", "source_repository_changed", "model_reserved",
     "unreadable",
     # Raised as ExecutionAdmissionError.
+    # The pinned job source in PR #70 (D5): job_source_refused:<reason>,
+    # job_source_integrity:<reason> and a missing manifest.
+    "job_source_integrity", "job_source_manifest_missing", "job_source_refused",
     "brief_changed_after_admission", "brief_invalid", "brief_not_utf8",
     "brief_size_invalid", "classification_not_eligible",
     "claude_config_dir_unavailable", "claude_verification_required",
@@ -73,6 +76,9 @@ _SAFE_EXECUTION_CODES = frozenset({
     # The stage-binding recheck in PR #61 (R5).
     "execution_stage_binding_invalid", "execution_stage_ledger_unavailable",
     "stage_assignment_invalid",
+    # Bounded harness capture in PR #62 (R6).
+    "execution_capture_limit_invalid", "execution_harness_capture_failed",
+    "execution_harness_output_overflow",
     *(f"queue_{reason}" for reason in _QUEUE_PRIVACY_REASONS),
     # The two dynamic sites: SubprocessHarnessExecutor's harness check and
     # ExecutionQueue._clean_text.  The sync test pins both.
