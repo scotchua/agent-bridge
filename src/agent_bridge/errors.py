@@ -286,8 +286,29 @@ def is_retryable(category: ErrorCategory) -> bool:
 class BrokerError(Exception):
     """Raised for a categorised failure. Carries no untrusted text."""
 
-    def __init__(self, category: ErrorCategory):
+    def __init__(self, category: ErrorCategory, *, limit_chars: int | None = None,
+                 actual_chars: int | None = None, operation: str | None = None):
         if not isinstance(category, ErrorCategory):
             raise TypeError("category must be an ErrorCategory")
+        details = (limit_chars, actual_chars, operation)
+        if any(value is not None for value in details):
+            if (category is not ErrorCategory.INPUT_TOO_LARGE
+                    or type(limit_chars) is not int or limit_chars < 0
+                    or type(actual_chars) is not int or actual_chars < 0
+                    or operation not in {"start", "continue", "corrective"}):
+                raise TypeError("size details require input_too_large and safe values")
         super().__init__(category.value)
         self.category = category
+        self.limit_chars = limit_chars
+        self.actual_chars = actual_chars
+        self.operation = operation
+
+    def size_details(self) -> dict[str, int | str]:
+        """Return the fixed, caller-safe details for an oversized prompt."""
+        if self.limit_chars is None:
+            return {}
+        return {
+            "limit_chars": self.limit_chars,
+            "actual_chars": self.actual_chars,
+            "operation": self.operation,
+        }
