@@ -57,14 +57,14 @@ try:
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from ..errors import BrokerError
-    from . import codex_promotion, hostenv, job_source, verify_policy
+    from . import codex_promotion, hostenv, job_source, verification_diagnostics, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from agent_bridge import runner, preflight, store, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.errors import BrokerError
-    from agent_bridge.execution import codex_promotion, hostenv, job_source, verify_policy
+    from agent_bridge.execution import codex_promotion, hostenv, job_source, verification_diagnostics, verify_policy
 
 class TaskError(RuntimeError): pass
 
@@ -580,7 +580,9 @@ def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],t
     verification result, because a command that did not run under the
     confinement it claims has told us nothing."""
     scratch.mkdir(mode=0o700)
-    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
+                 verification_diagnostics.JOB_VERIFICATION_MARKER:"1",
+                 verification_diagnostics.SKIP_RECORD_PATH:str(scratch / verification_diagnostics.SKIP_RECORD_NAME)}
     sandbox_env.pop("CODEX_HOME",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
@@ -658,7 +660,9 @@ def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str
                        f'(allow file-write* (literal "/dev/null") (subpath "{quoted(tree)}") (subpath "{quoted(tree.resolve())}") '
                        f'(subpath "{quoted(scratch)}") (subpath "{quoted(scratch.resolve())}"))\n')
     os.chmod(profile,0o600)
-    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch)}
+    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
+                 verification_diagnostics.JOB_VERIFICATION_MARKER:"1",
+                 verification_diagnostics.SKIP_RECORD_PATH:str(scratch / verification_diagnostics.SKIP_RECORD_NAME)}
     # The base environment never carried CODEX_HOME (it is added per Codex
     # call), and this makes that invariant explicit rather than inherited:
     # verification runs project code and has no use for a credential store.
@@ -816,7 +820,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         try: applied=_patch(fresh,base_sha,env)
         except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
-        evidence=[]
+        evidence=[]; capability_skips={}
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
             if manifest is not None:
@@ -826,9 +830,14 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
                 v=_sandboxed(c,fresh,scratch,_verification_env(env),verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
+            skipped=verification_diagnostics.skip_counts(
+                scratch / verification_diagnostics.SKIP_RECORD_NAME)
+            for reason, count in skipped.items():
+                capability_skips[reason]=capability_skips.get(reason,0)+count
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
-                             "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
+                             "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest(),
+                             "capability_skips":skipped})
         if manifest is not None:
             _worktree_checkpoint(fresh,pinned_git_dir,base_sha,"verification_worktree_after_verification",source_checks,env,
                                   marker_bytes=fresh_marker)
@@ -844,6 +853,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         receipt.update(status="verification_passed_pending_integrity" if all(x["returncode"]==0 for x in evidence) else "verification_failed_pending_integrity",
                        generated_patch_sha256=hashlib.sha256(patch).hexdigest(),applied_patch_sha256=hashlib.sha256(applied).hexdigest(),
                        patch_sha256=hashlib.sha256(patch).hexdigest(),patch_bytes=len(patch),verification=evidence,
+                       verification_capability_skips=capability_skips,
                        fresh_worktree_patch_match=True,finished_at=time.time())
     except Exception as exc:
         pending_exc=exc

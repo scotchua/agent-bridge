@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from ..capacity_router import StageRouter
+from .. import revision, store
 from ..localq.intake import AutomaticIntake
 from ..localq.service import Service
 from . import autoroute, gate
@@ -42,9 +43,20 @@ class Server:
             raise ValueError("interval_invalid")
         self.caller, self.service, self.router = caller, service, router
         self.execution, self.interval = execution, interval
+        self._code_revision = revision.capture()
+        self._revision_record_path: str | None = None
+        if state_root is not None:
+            self._revision_record_path = revision.process_record_path(
+                state_root, "orchestration-server", caller)
+            try:
+                revision.record(self._revision_record_path, self._code_revision,
+                                pid=os.getpid(), started_at=store.utc_now())
+            except OSError:
+                sys.stderr.write("agent-bridge: revision marker unavailable\n")
         self.intake = AutomaticIntake(service.queue)
         self.tools = build_tools(caller, router, service.queue, self.intake, execution,
-                                 state_root=state_root, protected=protected)
+                                 state_root=state_root, protected=protected,
+                                 revision_status=lambda: revision.report(self._code_revision))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._dependency_check = dependency_check
@@ -83,6 +95,11 @@ class Server:
         if self._thread is not None:
             self._thread.join(timeout=self.interval + 1)
             self._thread = None
+        if self._revision_record_path is not None:
+            try:
+                revision.remove_record(self._revision_record_path)
+            except OSError:
+                pass
 
     @staticmethod
     def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:

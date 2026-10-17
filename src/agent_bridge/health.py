@@ -12,7 +12,13 @@ from typing import Any
 
 from . import preflight, runner, store
 from .config import Config, effective_config_sha256
+from .execution import claude_task
 from .errors import BrokerError
+
+
+# This is the execution lane's contract, not a separate health-policy copy.
+# Forwarding another value would make a status caller treat it as supported.
+CLAUDE_SUBSCRIPTION_TYPES = claude_task.ALLOWED_SUBSCRIPTIONS
 
 
 def peer_env(cfg: Config, peer: str) -> dict[str, str]:
@@ -51,7 +57,7 @@ def auth_status(peer: str, executable: str, env: dict[str, str]) -> dict[str, An
         for key, allowed in {
             "authMethod": ("claude.ai", "api_key", "none"),
             "apiProvider": ("firstParty", "bedrock", "vertex", "foundry"),
-            "subscriptionType": ("free", "pro", "max", "team", "enterprise"),
+            "subscriptionType": CLAUDE_SUBSCRIPTION_TYPES,
         }.items():
             if value.get(key) in allowed:
                 report[key] = value[key]

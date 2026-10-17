@@ -18,7 +18,7 @@ import os
 import sys
 from typing import Any, Callable
 
-from . import broker, store
+from . import broker, revision, store
 from .config import Config, load as load_config
 from .errors import BrokerError, ErrorCategory, hint
 
@@ -185,7 +185,7 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
     continue_schema = _continue_schema(peer, allowed)
     start_schema["properties"]["prompt"]["maxLength"] = cfg.prompt_budget("start") if cfg else 32000
     continue_schema["properties"]["prompt"]["maxLength"] = cfg.prompt_budget("continue") if cfg else 16000
-    return {
+    tools = {
         f"{peer}_start": {
             "description": (
                 f"Ask {peer} for an independent second opinion on a bounded question, "
@@ -240,14 +240,32 @@ def build_tools(caller: str, cfg: Config | None = None) -> dict[str, dict[str, A
             "handler": broker.close,
         },
     }
+    return tools
 
 
 class Server:
+    # Subclasses such as peer_mcp.PeerServer build their own state
+    # without calling this __init__; serve() still reads this.
+    _revision_record_path: str | None = None
+
     def __init__(self, caller: str, cfg: Config):
         if caller not in broker.CALLERS:
             raise ValueError(f"--caller must be one of {broker.CALLERS}")
         self.caller = caller
         self.cfg = cfg
+        self._code_revision = revision.capture()
+        self._revision_record_path: str | None = None
+        # Production startup always receives Config.  Keep the lightweight
+        # in-memory test doubles usable without treating an arbitrary object
+        # as a filesystem path.
+        if isinstance(cfg, Config):
+            self._revision_record_path = revision.process_record_path(
+                cfg.state_root, "consultation-server", caller)
+            try:
+                revision.record(self._revision_record_path, self._code_revision,
+                                pid=os.getpid(), started_at=store.utc_now())
+            except OSError:
+                sys.stderr.write("agent-bridge: revision marker unavailable\n")
         self.tools = build_tools(caller, cfg)
 
     # ---- JSON-RPC plumbing ---------------------------------------------
@@ -347,55 +365,62 @@ class Server:
     def serve(self, stdin: Any = None, stdout: Any = None) -> int:
         stdin = stdin or sys.stdin
         stdout = stdout or sys.stdout
-        while True:
-            line = stdin.readline(MAX_MCP_FRAME_CHARS + 1)
-            if not line:
-                break
-            if len(line) > MAX_MCP_FRAME_CHARS:
-                stdout.write(json.dumps(
-                    self._error(None, -32600, "request exceeds frame limit")) + "\n")
-                stdout.flush()
-                return 1
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except (ValueError, RecursionError):
-                stdout.write(json.dumps(self._error(None, -32700, "parse error")) + "\n")
-                stdout.flush()
-                continue
-            if isinstance(message, list):
-                if not message:
+        try:
+            while True:
+                line = stdin.readline(MAX_MCP_FRAME_CHARS + 1)
+                if not line:
+                    break
+                if len(line) > MAX_MCP_FRAME_CHARS:
+                    stdout.write(json.dumps(
+                        self._error(None, -32600, "request exceeds frame limit")) + "\n")
+                    stdout.flush()
+                    return 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except (ValueError, RecursionError):
+                    stdout.write(json.dumps(self._error(None, -32700, "parse error")) + "\n")
+                    stdout.flush()
+                    continue
+                if isinstance(message, list):
+                    if not message:
+                        stdout.write(json.dumps(
+                            self._error(None, -32600, "invalid request")) + "\n")
+                        stdout.flush()
+                        continue
+                    responses = []
+                    for element in message:
+                        try:
+                            response = self.handle(element)
+                        except Exception:  # noqa: BLE001 - one bad frame, not the server
+                            response = self._error(None, -32603, "internal error")
+                        if response:
+                            responses.append(response)
+                    if responses:
+                        stdout.write(json.dumps(responses) + "\n")
+                        stdout.flush()
+                    continue
+                if not isinstance(message, dict):
                     stdout.write(json.dumps(
                         self._error(None, -32600, "invalid request")) + "\n")
                     stdout.flush()
                     continue
-                responses = []
-                for element in message:
-                    try:
-                        response = self.handle(element)
-                    except Exception:  # noqa: BLE001 - one bad frame, not the server
-                        response = self._error(None, -32603, "internal error")
-                    if response:
-                        responses.append(response)
-                if responses:
-                    stdout.write(json.dumps(responses) + "\n")
+                try:
+                    response = self.handle(message)
+                except Exception:  # noqa: BLE001 - the transport must survive
+                    response = self._error(message.get("id"), -32603, "internal error")
+                if response is not None:
+                    stdout.write(json.dumps(response) + "\n")
                     stdout.flush()
-                continue
-            if not isinstance(message, dict):
-                stdout.write(json.dumps(
-                    self._error(None, -32600, "invalid request")) + "\n")
-                stdout.flush()
-                continue
-            try:
-                response = self.handle(message)
-            except Exception:  # noqa: BLE001 - the transport must survive
-                response = self._error(message.get("id"), -32603, "internal error")
-            if response is not None:
-                stdout.write(json.dumps(response) + "\n")
-                stdout.flush()
-        return 0
+            return 0
+        finally:
+            if self._revision_record_path is not None:
+                try:
+                    revision.remove_record(self._revision_record_path)
+                except OSError:
+                    pass
 
 
 def main(argv: list[str] | None = None) -> int:

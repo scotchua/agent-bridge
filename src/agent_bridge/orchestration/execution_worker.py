@@ -11,13 +11,18 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import shutil
 import socket
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
+from .. import health, preflight
+from ..execution import claude_config, claude_task, codex_promotion, codex_task
 from ..platform import platform as host_platform
+from .. import revision
+from .. import store
 from ..capacity_router import StageRouter
 from . import autoroute
 from .config import load
@@ -40,6 +45,89 @@ class WorkerAlreadyRunning(RuntimeError):
 
 class QueueNotPrivate(RuntimeError):
     """The queue root could not be confirmed readable only by its owner."""
+
+
+# This is deliberately one fixed, public-safe dependency annotation.  The
+# status endpoint adds its own ``waiting_on_dependency:`` prefix and exposes
+# no provider output, account details, task material, or inferred quota.
+READINESS_UNAVAILABLE = "provider_readiness_unavailable"
+
+
+def _provider_executable(provider: str) -> str | None:
+    """Find the same PATH-selected CLI the POSIX harness will use."""
+
+    executable = shutil.which(provider, path=os.environ.get("PATH"))
+    return executable if executable and os.path.isabs(executable) else None
+
+
+def _claude_ready(cfg: object) -> bool:
+    """Read the isolated Claude lane's login status without changing it."""
+
+    directory = getattr(cfg, "claude_config_dir", None)
+    if not claude_config.is_ready(directory):
+        return False
+    executable = _provider_executable("claude")
+    if executable is None:
+        return False
+    try:
+        report = health.auth_status("claude", executable,
+                                    claude_task._env(Path(directory)))
+    except Exception:
+        # A probe exception is unknown readiness, never permission to claim.
+        return False
+    return (report.get("state") == "signed_in"
+            and report.get("authMethod") == "claude.ai"
+            and report.get("subscriptionType") in claude_task.ALLOWED_SUBSCRIPTIONS)
+
+
+def _codex_ready() -> bool:
+    """Read the isolated Codex lane's ChatGPT login status without changing it."""
+
+    # The same isolated home the harness defaults to, so the probe can never
+    # check a different login from the one the job will use.
+    home = codex_task.DEFAULT_CODEX_HOME
+    if not home.is_dir():
+        return False
+    executable = _provider_executable("codex")
+    if executable is None:
+        return False
+    try:
+        # Match the harness's source-integrity guard before allowing the CLI
+        # to inspect its isolated home.  This probe must not read a local MCP
+        # configuration merely to decide whether to hold work.
+        preflight.assert_peer_home_has_no_config(str(home))
+        # Match the execution lane exactly: admission holds its shared lock,
+        # rejects a maintenance gate or invalid promotion record, and returns
+        # the verified executable instead of a mutable PATH launcher.
+        node_bin = shutil.which("node", path=codex_task._env()["PATH"])
+        with codex_promotion.admit(Path(executable), node_bin=node_bin) as admission:
+            report = health.auth_status(
+                "codex", str(admission.exec_path),
+                {**codex_task._env(), "CODEX_HOME": str(home)})
+    except Exception:
+        # A probe exception is unknown readiness, never permission to claim.
+        return False
+    return report.get("state") == "signed_in" and report.get("authMethod") == "chatgpt"
+
+
+def readiness_holds(cfg: object, providers: set[str]) -> dict[str, str]:
+    """Return fixed holds for queued providers whose login cannot be proved.
+
+    This is a login-status probe only.  It makes no generation request and
+    does not infer remaining subscription quota from a successful login.  The
+    Windows lane has no equivalent same-lane read-only status command: its
+    credentials live in the WSL guest capsule, so this function deliberately
+    holds nothing there rather than guessing from host-side credentials.
+    """
+
+    if os.name == "nt":
+        return {}
+    holds: dict[str, str] = {}
+    if "claude" in providers and not _claude_ready(cfg):
+        holds["claude"] = READINESS_UNAVAILABLE
+    if "codex" in providers and not _codex_ready():
+        holds["codex"] = READINESS_UNAVAILABLE
+    return holds
 
 
 class WorkerLock:
@@ -266,6 +354,11 @@ def _configured_queue(config_path: str) -> ExecutionQueue:
     if cfg.execution_queue_root is None:
         raise ExecutionAdmissionError("execution_configuration_missing")
     try:
+        revision.record(str(cfg.execution_queue_root / "execution-worker-status.json"), revision.capture(),
+                        pid=os.getpid(), started_at=store.utc_now())
+    except OSError as exc:
+        raise ExecutionAdmissionError("execution_worker_status_unavailable") from exc
+    try:
         stage_router = StageRouter(cfg.capacity_db)
     except (OSError, sqlite3.Error):
         # A configured worker may consume only after its independent live
@@ -301,7 +394,29 @@ def run(config_path: str, *, once: bool, interval: float,
             # Recovery happens only after this process owns the global lock.
             # Any uncertain prior send becomes blocked and is never repeated.
             queue = _configured_queue(config_path)
-            def run_checked_once(*, force_refresh: bool = False) -> dict | None:
+            restart_lock = str(cfg.execution_queue_root / ".execution-restart.lock")
+            restart_request = cfg.execution_queue_root / ".execution-restart-request.json"
+
+            def run_checked_once() -> tuple[dict | None, bool]:
+                # The restart command takes this lock while it scans durable
+                # state and writes its request.  It intentionally does not
+                # cover queue.run_once(): a provider run may last an hour and
+                # restart-worker needs a prompt, conservative answer while it
+                # does.  A request that lands after this check is consumed at
+                # the next idle pass; it never signals a provider run.
+                with store.file_lock(restart_lock):
+                    if restart_request.is_file():
+                        try:
+                            restart_request.unlink()
+                        except OSError:
+                            raise ExecutionAdmissionError("execution_worker_restart_request_unavailable")
+                        return None, True
+                # A drift refresh request is consumed only by a pass that
+                # will actually run the check, never by one that restarts.
+                force_refresh = _consume_drift_refresh_request(cfg.execution_queue_root)
+                return _run_checked_once(force_refresh=force_refresh), False
+
+            def _run_checked_once(*, force_refresh: bool = False) -> dict | None:
                 from .. import drift
                 status = drift.quick_check(config_path, force_refresh=force_refresh)
                 changed = set(status["changed"])
@@ -311,8 +426,28 @@ def run(config_path: str, *, once: bool, interval: float,
                     holds["codex"] = "codex"
                 if "claude" in changed:
                     holds["claude"] = "claude"
+                providers = queue.queued_providers()
+                readiness = readiness_holds(cfg, providers)
+                proven_ready = providers - set(readiness)
+                for provider, reason in readiness.items():
+                    # Drift is the more specific dependency when both are
+                    # present.  Neither condition changes the requested
+                    # route, and the next pass rechecks both before release.
+                    holds.setdefault(provider, reason)
+                # Re-read after the bounded probes. A provider which appeared
+                # since the initial snapshot has not been proved ready, so it
+                # remains held. The allowed-provider check in ``run_once``
+                # also covers arrivals after this second snapshot.
+                queued_now = queue.queued_providers()
+                for provider in queued_now - proven_ready:
+                    holds.setdefault(provider, READINESS_UNAVAILABLE)
                 queue.hold_dependencies(holds, drift_status=status)
-                return queue.run_once(identity)
+                # Do not even enter the claim path when every queued job is
+                # waiting on a dependency.  Apart from avoiding a needless
+                # scan, this makes the pre-claim guarantee explicit.
+                if queued_now and queued_now.issubset(holds):
+                    return None
+                return queue.run_once(identity, allowed_providers=proven_ready - set(holds))
             if refresh:
                 # This is a status repair operation, not a dispatch command.
                 # It repeats the strict comparison but never accepts a new
@@ -322,20 +457,25 @@ def run(config_path: str, *, once: bool, interval: float,
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
                 holds = {name: name for name in ("codex", "claude") if name in changed}
+                # hold_dependencies replaces every queued job's hold, so a
+                # refresh rechecks readiness too; otherwise it would release a
+                # login hold while the login is still unproved.
+                for provider, reason in readiness_holds(cfg, queue.queued_providers()).items():
+                    holds.setdefault(provider, reason)
                 queue.hold_dependencies(holds, drift_status=status)
                 print("drift_refresh_complete")
                 return 0
             if once:
-                result = run_checked_once(
-                    force_refresh=_consume_drift_refresh_request(
-                        cfg.execution_queue_root))
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is not None:
                     print(f"{result['job_id']} {result['state']}")
                 return 0
             while not stop:
-                result = run_checked_once(
-                    force_refresh=_consume_drift_refresh_request(
-                        cfg.execution_queue_root))
+                result, requested_restart = run_checked_once()
+                if requested_restart:
+                    return 0
                 if result is None:
                     time.sleep(interval)
             return 0
