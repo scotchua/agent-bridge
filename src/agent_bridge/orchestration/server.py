@@ -189,7 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         execution = ExecutionQueue(
             cfg.execution_queue_root, None, recover_interrupted=False,
             model_reserved=autoroute.model_reserved_for(str(cfg.state_root)),
-            client_derived_routes=cfg.client_derived_routes)
+            client_derived_routes=cfg.client_derived_routes,
+            stage_router=router)
     # The same protected list the delegation-first hook computes, so
     # work_digest_file refuses a target the hook would also refuse to write:
     # the gate's own state, the stage router's database, the local queue's

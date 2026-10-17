@@ -119,14 +119,20 @@ class ConfiguredQueueMutationTests(unittest.TestCase):
     def test_configured_queue_recovers_after_lock_acquisition(self):
         cfg = SimpleNamespace(execution_queue_root=Path("invented-queue"),
                               state_root=Path("invented-state"),
+                              capacity_db=Path("invented-capacity.sqlite3"),
                               client_derived_routes=frozenset())
         with mock.patch.object(worker, "load", return_value=cfg), \
              mock.patch.object(worker, "select_executor", return_value=object()), \
              mock.patch.object(worker.autoroute, "model_reserved_for", return_value=lambda _: False), \
+             mock.patch.object(worker, "StageRouter") as router_type, \
              mock.patch.object(worker, "ExecutionQueue") as queue_type:
             self.assertIs(worker._configured_queue("invented-config.json"),
                           queue_type.return_value)
         self.assertTrue(queue_type.call_args.kwargs["recover_interrupted"])
+        # The configured worker always rechecks the live stage binding.
+        router_type.assert_called_once_with(cfg.capacity_db)
+        self.assertIs(queue_type.call_args.kwargs["stage_router"], router_type.return_value)
+        self.assertTrue(queue_type.call_args.kwargs["require_stage_binding"])
 
 
 class RunMutationTests(unittest.TestCase):
