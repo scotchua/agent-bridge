@@ -133,21 +133,25 @@ def _manifest_matches(root:Path,manifest:dict)->bool:
         return json.loads(path.read_bytes())==manifest
     except (OSError,UnicodeDecodeError,json.JSONDecodeError): return False
 
-def _worktree_checkpoint(tree:Path,git_dir:Path,commit:str,checkpoint:str,checks:list[dict],env):
+def _worktree_checkpoint(tree:Path,git_dir:Path,commit:str,checkpoint:str,checks:list[dict],env,
+                          marker_bytes:bytes|None=None):
     reasons=[]
     try:
-        marker=(tree/".git").read_text(encoding="utf-8").strip()
+        marker_path=tree/".git"
+        marker_raw=marker_path.read_bytes()
+        if marker_bytes is not None and marker_raw!=marker_bytes:
+            reasons.append("worktree_marker_changed")
+        marker=marker_raw.decode("utf-8").strip()
         if not marker.startswith("gitdir: "): raise OSError
         admin=Path(marker[8:]).resolve()
         if admin.parent != (git_dir/"worktrees").resolve(): raise OSError
         commondir=(admin/(admin/"commondir").read_text(encoding="utf-8").strip()).resolve()
         if commondir != git_dir.resolve(): raise OSError
-    except OSError:
+    except (OSError,UnicodeDecodeError):
         reasons.append("worktree_pointer_changed")
-    if not reasons:
-        try:
-            if _git(tree,"rev-parse","HEAD",env=env)!=commit: reasons.append("worktree_head_changed")
-        except TaskError: reasons.append("worktree_head_changed")
+    try:
+        if _git(tree,"rev-parse","HEAD",env=env)!=commit: reasons.append("worktree_head_changed")
+    except TaskError: reasons.append("worktree_head_changed")
     checks.append({"checkpoint":checkpoint,"reasons":reasons})
     if reasons: raise TaskError("source repository integrity changed: "+",".join(reasons))
 
@@ -752,7 +756,8 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         if not last_message.strip(): raise TaskError("Codex produced no final message")
         receipt["last_message_sha256"]=hashlib.sha256(last_message).hexdigest()
         if manifest is not None:
-            _worktree_checkpoint(gen,pinned_git_dir,base_sha,"generation_worktree_before_patch",source_checks,env)
+            _worktree_checkpoint(gen,pinned_git_dir,base_sha,"generation_worktree_before_patch",source_checks,env,
+                                  marker_bytes=marker)
         elif (gen/".git").read_bytes()!=marker: raise TaskError("Codex altered git metadata")
         patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600)
         _remove(repo,gen,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
@@ -761,6 +766,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
             _add_pinned_worktree(pinned_git_dir,fresh,base_sha,env)
         else:
             _git(repo,"worktree","add","--detach",str(fresh),base_sha,timeout=120,env=env)
+        fresh_marker=(fresh/".git").read_bytes()
         a=_run(_git_argv("apply","--binary","--whitespace=nowarn",str(pp)),cwd=fresh,env=env,timeout=60)
         if a.returncode: raise TaskError("exact patch did not apply to fresh worktree")
         applied=_patch(fresh,base_sha,env)
@@ -768,15 +774,19 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         evidence=[]
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
-            v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend,
-                         (str(repo),) if manifest is not None else ())
+            if manifest is not None:
+                v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend,
+                             extra_canaries=(str(repo),))
+            else:
+                v=_sandboxed(c,fresh,scratch,env,verify_timeout,backend)
             outlog=job/f"verify-{i}.stdout"; errlog=job/f"verify-{i}.stderr"
             outlog.write_bytes(v.stdout); errlog.write_bytes(v.stderr); os.chmod(outlog,0o600); os.chmod(errlog,0o600)
             evidence.append({"argv":c,"returncode":v.returncode,"sandbox":v.sandbox_backend,
                              "sandbox_profile_sha256":v.sandbox_profile_sha256,"duration_seconds":v.duration_seconds,
                              "stdout_sha256":hashlib.sha256(v.stdout).hexdigest(),"stderr_sha256":hashlib.sha256(v.stderr).hexdigest()})
         if manifest is not None:
-            _worktree_checkpoint(fresh,pinned_git_dir,base_sha,"verification_worktree_after_verification",source_checks,env)
+            _worktree_checkpoint(fresh,pinned_git_dir,base_sha,"verification_worktree_after_verification",source_checks,env,
+                                  marker_bytes=fresh_marker)
             _source_checkpoint(job_source,manifest,"after_verification",source_checks)
         # The delivered patch is a file path, and verification ran between
         # writing it and returning it. Confinement is what stops a verify
