@@ -379,13 +379,14 @@ def undo(home: str, *, out: Callable[[str], None] = print) -> int:
 
 
 def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], None] = print,
-    platform: str | None = None) -> int:
+        platform: str | None = None) -> int:
     platform = platform or sys.platform
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         out("Refusing to run as root. Run this upgrade as your normal user.")
         return 1
     home = os.path.abspath(home)
-    python_runtime.record(home=home)
+    if python_runtime.record(home=home) is None:
+        out("launcher_python_record_failed")
     out("This checks first and changes nothing until you say yes at the end.")
     states = detect(home, platform=platform)
     if states["bridge_base"]["state"] == "available":

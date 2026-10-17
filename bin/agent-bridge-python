@@ -2,9 +2,9 @@
 # Shared Python selection for agent-bridge POSIX launchers.  This file is
 # sourced, never executed directly.
 
-# An explicit setting and the interpreter recorded by an installer are trusted
-# choices.  In particular, do not probe the recorded choice on a hook call:
-# hooks run for every covered tool invocation.
+# An explicit setting is trusted. The installer record is trusted only after
+# its owner-only boundary is checked. In particular, do not probe a valid
+# recorded choice on a hook call: hooks run for every covered tool invocation.
 agent_bridge_resolve_python() {
   if [ "${AGENT_BRIDGE_PYTHON+x}" = x ] && [ -n "${AGENT_BRIDGE_PYTHON}" ]; then
     PY=$AGENT_BRIDGE_PYTHON
@@ -12,11 +12,25 @@ agent_bridge_resolve_python() {
   fi
 
   agent_bridge_python_file="${HOME:-}/.agent-bridge/launcher-python"
-  if [ -n "${HOME:-}" ] && [ -r "$agent_bridge_python_file" ]; then
-    IFS= read -r agent_bridge_recorded < "$agent_bridge_python_file" || true
-    if [ -n "${agent_bridge_recorded:-}" ] && [ -x "$agent_bridge_recorded" ]; then
-      PY=$agent_bridge_recorded
-      return 0
+  agent_bridge_python_dir="${HOME:-}/.agent-bridge"
+  if [ -n "${HOME:-}" ] && [ -f "$agent_bridge_python_file" ] \
+      && [ ! -L "$agent_bridge_python_file" ] && [ -d "$agent_bridge_python_dir" ]; then
+    # One id and one find process check both the record and its parent. Keep
+    # these as the only added processes on the hook's ordinary path.
+    agent_bridge_record_owner=$(id -u 2>/dev/null || true)
+    agent_bridge_safe_record_paths=$(find "$agent_bridge_python_file" "$agent_bridge_python_dir" -prune \
+      -user "$agent_bridge_record_owner" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)
+    if [ "$agent_bridge_safe_record_paths" = "$agent_bridge_python_file
+$agent_bridge_python_dir" ]; then
+      IFS= read -r agent_bridge_recorded < "$agent_bridge_python_file" || true
+      case "${agent_bridge_recorded:-}" in
+        /*)
+          if [ -f "$agent_bridge_recorded" ] && [ -x "$agent_bridge_recorded" ]; then
+            PY=$agent_bridge_recorded
+            return 0
+          fi
+          ;;
+      esac
     fi
   fi
 

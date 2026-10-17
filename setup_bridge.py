@@ -25,7 +25,9 @@ def main(argv: list[str] | None = None) -> int:
     # whose PATH is often much smaller than an interactive shell's.
     if command in {"onboard", "upgrade"}:
         from agent_bridge import python_runtime
-        python_runtime.record()
+        home = os.path.abspath(os.path.expanduser(os.environ.get("HOME", "~")))
+        if python_runtime.record(home=home) is None:
+            print("launcher_python_record_failed", file=sys.stderr)
     if command == "onboard":
         from agent_bridge import onboard
         return onboard.main(rest)

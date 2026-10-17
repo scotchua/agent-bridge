@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_bridge import onboard, store, upgrade  # noqa: E402
+from agent_bridge import onboard, python_runtime, store, upgrade  # noqa: E402
 from agent_bridge.chat.grok import ALLOWED_COMMANDS  # noqa: E402
 
 
@@ -36,12 +36,21 @@ class UpgradeTests(unittest.TestCase):
                                        "allowlist": sorted(ALLOWED_COMMANDS)})
         return path
 
-    def test_first_install_exits_without_writing(self):
+    def test_first_install_records_only_the_launcher_interpreter(self):
         with tempfile.TemporaryDirectory() as home:
             result, messages = self._run(home, [])
             self.assertEqual(result, 0)
             self.assertIn("first install", "\n".join(messages))
-            self.assertFalse(os.path.exists(os.path.join(home, ".agent-bridge")))
+            self.assertEqual(os.listdir(os.path.join(home, ".agent-bridge")),
+                             ["launcher-python"])
+
+    def test_launcher_record_failure_does_not_abort_upgrade(self):
+        with tempfile.TemporaryDirectory() as home, \
+             mock.patch.object(upgrade.python_runtime, "record", return_value=None):
+            result, messages = self._run(home, [])
+        self.assertEqual(result, 0)
+        self.assertIn("launcher_python_record_failed", messages)
+        self.assertFalse(os.path.exists(python_runtime.record_path(home)))
 
     def test_detection_fixtures_distinguish_available_on_and_uncertain(self):
         with tempfile.TemporaryDirectory() as home:

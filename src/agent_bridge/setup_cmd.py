@@ -323,7 +323,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex", help="Force a specific codex binary.")
     args = parser.parse_args(argv)
     store.set_umask()
-    python_runtime.record()
+    home = os.path.abspath(os.path.expanduser(os.environ.get("HOME", "~")))
+    if python_runtime.record(home=home) is None:
+        print("launcher_python_record_failed", file=sys.stderr)
 
     if args.write:
         print("Direct --write activation is disabled. Emit a --candidate, run "

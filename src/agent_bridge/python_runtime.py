@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -26,20 +27,63 @@ def record_path(home: str | None = None) -> str:
     return os.path.join(base, ".agent-bridge", RECORD_NAME)
 
 
-def record(executable: str | None = None, *, home: str | None = None) -> str:
-    """Atomically save the interpreter that completed an installation path."""
+def record(executable: str | None = None, *, home: str | None = None) -> str | None:
+    """Best-effort save of the interpreter that completed an installation path.
+
+    This is a launcher convenience record, never a reason to fail an install
+    or a diagnostic command after its substantive work has completed.
+    """
     path = os.path.abspath(executable or sys.executable)
-    store.atomic_write_bytes(record_path(home), (path + "\n").encode("utf-8"))
+    try:
+        store.atomic_write_bytes(record_path(home), (path + "\n").encode("utf-8"))
+    except OSError:
+        return None
     return path
 
 
-def recorded(home: str | None = None) -> str | None:
+def _recorded_value(home: str | None = None) -> tuple[str | None, str | None]:
+    """Return a safe launcher record, or the fixed reason it was rejected."""
+    path = record_path(home)
+    parent = os.path.dirname(path)
     try:
-        with open(record_path(home), encoding="utf-8") as handle:
+        record_status = os.lstat(path)
+        parent_status = os.stat(parent)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "record_not_owner_only"
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    owner_only = (
+        stat.S_ISREG(record_status.st_mode)
+        and (uid is None or record_status.st_uid == uid)
+        and not (record_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        and stat.S_ISDIR(parent_status.st_mode)
+        and (uid is None or parent_status.st_uid == uid)
+        and not (parent_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    )
+    if not owner_only:
+        return None, "record_not_owner_only"
+    try:
+        with open(path, encoding="utf-8") as handle:
             value = handle.readline().rstrip("\r\n")
     except OSError:
-        return None
-    return value or None
+        return None, "record_not_owner_only"
+    if not value:
+        return None, "record_invalid_interpreter"
+    try:
+        executable_status = os.stat(value) if os.path.isabs(value) else None
+    except OSError:
+        executable_status = None
+    if (executable_status is None or not stat.S_ISREG(executable_status.st_mode)
+            or not os.access(value, os.X_OK)):
+        return value, "record_invalid_interpreter"
+    return value, None
+
+
+def recorded(home: str | None = None) -> str | None:
+    """Return the recorded interpreter only when its trust boundary holds."""
+    value, issue = _recorded_value(home)
+    return value if issue is None else None
 
 
 def _probe(path: str) -> tuple[bool, str | None]:
@@ -71,32 +115,30 @@ def _path_fallback() -> str | None:
 def doctor(home: str | None = None) -> dict[str, Any]:
     """Report the common launcher selection and any stale recorded path."""
     path = record_path(home)
-    selected = os.environ.get("AGENT_BRIDGE_PYTHON") or recorded(home)
+    recorded_path, record_issue = _recorded_value(home)
+    selected = os.environ.get("AGENT_BRIDGE_PYTHON") or (recorded_path if record_issue is None else None)
     source = "AGENT_BRIDGE_PYTHON" if os.environ.get("AGENT_BRIDGE_PYTHON") else "recorded"
-    issue = None
+    issue = record_issue
     if selected is None:
-        source = "PATH fallback"
+        source = "PATH fallback" if issue is None else "PATH fallback (record rejected)"
         selected = _path_fallback()
     elif source == "recorded":
-        if not os.path.exists(selected):
-            issue = "recorded interpreter no longer exists"
-            source = "PATH fallback (recorded path missing)"
-            selected = _path_fallback()
+        # The current process already established this interpreter's version.
+        # Avoid a redundant child process on ordinary repeated doctor runs;
+        # another recorded path is checked explicitly.
+        if os.path.realpath(selected) == os.path.realpath(sys.executable):
+            ok, version = sys.version_info >= (3, 11), ".".join(map(str, sys.version_info[:3]))
         else:
-            # The current process already established this interpreter's
-            # version. Avoid a redundant child process on ordinary repeated
-            # doctor runs; another recorded path is checked explicitly.
-            if os.path.realpath(selected) == os.path.realpath(sys.executable):
-                ok, version = sys.version_info >= (3, 11), ".".join(map(str, sys.version_info[:3]))
-            else:
-                ok, version = _probe(selected)
-            if not ok:
-                issue = "recorded interpreter is too old or does not support -P"
-            elif version:
-                selected = os.path.abspath(selected)
+            ok, version = _probe(selected)
+        if not ok:
+            issue = "record_incompatible_interpreter"
+            source = "PATH fallback (record rejected)"
+            selected = _path_fallback()
+        elif version:
+            selected = os.path.abspath(selected)
     return {
         "record_path": path,
-        "recorded": recorded(home),
+        "recorded": recorded_path,
         "recorded_issue": issue,
         "launchers": {name: {"interpreter": selected, "source": source} for name in LAUNCHERS},
     }

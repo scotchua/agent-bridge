@@ -64,7 +64,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .. import store
+from .. import python_runtime, store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
@@ -840,6 +840,7 @@ def protected_paths(state_root: str, config_path: str | None, home: str,
             paths.extend(full + suffix for suffix in _SQLITE_SIDECARS)
         paths.append(os.path.join(local_queue_root, "runtime-state.json"))
     paths.extend(install_paths(home).values())
+    paths.append(python_runtime.record_path(home))
     return tuple(sorted({os.path.realpath(path) for path in paths}))
 
 
@@ -1644,13 +1645,14 @@ def _worktree_prune_decision(command: str, cwd: str, config_path: str | None,
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
-                 config_path: str | None = None, monotonic: Any = time.monotonic) -> Decision:
+                 config_path: str | None = None, monotonic: Any | None = None) -> Decision:
     """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
     classification: protected paths, then routing receipts. Split out of
     ``judge`` so a Codex shell command that both writes and reads a file
     whole (``cat a.log > b.log``) can be judged on both counts -- see
     ``judge``'s own overlay of ``judge_read`` for a whole-file read hiding
     behind a write-shaped command."""
+    monotonic = time.monotonic if monotonic is None else monotonic
     if kind == "edit":
         hit = [path for path in paths if any(_under(path, root) for root in protected)]
     else:
@@ -2619,8 +2621,9 @@ def install(home: str, root: str, config_path: str, clients: tuple[str, ...], *,
         if remove and os.path.exists(paths["receipt"]) and not _entries_remaining(originals[paths["receipt"]], clients):
             os.unlink(paths["receipt"])
         if not remove:
-            from .. import python_runtime
             report["python"] = python_runtime.record(home=home)
+            if report["python"] is None:
+                report.setdefault("notes", []).append("launcher_python_record_failed")
         report["applied"] = True
     report["codex_note"] = (
         "Codex runs a new or changed hook only after it is trusted once in its /hooks view "

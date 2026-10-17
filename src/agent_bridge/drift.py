@@ -516,9 +516,11 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     # Inspect the previous record before refreshing it.  Doctor is a repair
     # path, but hiding the stale record it repaired would defeat its warning.
     launcher_python = python_runtime.doctor(home)
-    python_runtime.record(home=home)
+    record_failed = python_runtime.record(home=home) is None
     current = inventory(config_path, home=home, bridge=bridge, runner=runner); baseline = _read_baseline(home)
     needs: list[str] = []; checked: dict[str, Any] = {}; passed: set[str] = set(); changed = changes(current, baseline)
+    if record_failed:
+        needs.append("launcher_python_record_failed")
     if not current["config_path"]:
         needs.append("No installed orchestration config was found; pass --config or install the gate, then run setup_bridge.py doctor.")
     for name, state in current["paths"].items():
