@@ -16,46 +16,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_bridge.execution import job_source
 
 
+_GIT_HOME: Path | None = None
+
+
+def git_env() -> dict[str, str]:
+    assert _GIT_HOME is not None
+    return {
+        **os.environ,
+        "HOME": str(_GIT_HOME),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_AUTHOR_NAME": "Job Source Test",
+        "GIT_AUTHOR_EMAIL": "job-source@example.invalid",
+        "GIT_COMMITTER_NAME": "Job Source Test",
+        "GIT_COMMITTER_EMAIL": "job-source@example.invalid",
+    }
+
+
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=repo, check=True, shell=False,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 def source_git(source: Path, *args: str) -> str:
     return subprocess.run(["git", "--git-dir", str(source), *args], check=True,
                           shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True).stdout.strip()
+                          text=True, env=git_env()).stdout.strip()
 
 
 def operator_state(repo: Path) -> dict[str, object]:
+    status = git(repo, "--no-optional-locks", "status", "--porcelain=v2",
+                 "--untracked-files=all")
     git_dir = Path(git(repo, "rev-parse", "--git-dir"))
     if not git_dir.is_absolute():
         git_dir = repo / git_dir
     files: dict[str, str] = {}
-    for path in sorted(git_dir.joinpath("objects").rglob("*")):
+    for path in sorted(git_dir.rglob("*")):
         if path.is_file():
             files[str(path.relative_to(git_dir))] = hashlib.sha256(path.read_bytes()).hexdigest()
     return {
-        "refs": git(repo, "for-each-ref", "--format=%(refname) %(objectname)"),
-        "packed_refs": (git_dir / "packed-refs").read_bytes() if (git_dir / "packed-refs").exists() else None,
-        "config": (git_dir / "config").read_bytes(),
-        "head": (git_dir / "HEAD").read_bytes(),
-        "index": (git_dir / "index").read_bytes(),
-        "objects": files,
-        "status": git(repo, "status", "--porcelain=v2", "--untracked-files=all"),
+        "files": files,
+        "status": status,
     }
 
 
+@unittest.skipIf(os.name == "nt", "POSIX-only job-source tests")
 class JobSourceTest(unittest.TestCase):
     def setUp(self) -> None:
+        global _GIT_HOME
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.git_home = self.root / "git-home"
+        self.git_home.mkdir(mode=0o700)
+        _GIT_HOME = self.git_home
         self.repo = self.root / "operator"
         self.repo.mkdir()
-        git(self.repo, "init")
-        git(self.repo, "config", "user.name", "Job Source Test")
-        git(self.repo, "config", "user.email", "job-source@example.invalid")
+        git(self.repo, "init", "--template=/dev/null")
         (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
         git(self.repo, "add", "base.txt")
         git(self.repo, "commit", "-m", "base")
@@ -64,6 +83,8 @@ class JobSourceTest(unittest.TestCase):
         os.chmod(self.jobs, 0o700)
 
     def tearDown(self) -> None:
+        global _GIT_HOME
+        _GIT_HOME = None
         self.temp.cleanup()
 
     def job_root(self, name: str = "job") -> Path:
@@ -144,6 +165,19 @@ class JobSourceTest(unittest.TestCase):
             job_source.prepare_job_source(self.repo, "HEAD", self.job_root("small-file"),
                                           limits={"max_file_bytes": 1})
 
+    def test_raised_preparation_limits_do_not_affect_verification(self) -> None:
+        large_tree = self.repo / "raised-limit"
+        large_tree.mkdir()
+        for number in range(job_source.MAX_SNAPSHOT_FILES + 1):
+            (large_tree / f"{number:04d}").touch()
+        git(self.repo, "add", "raised-limit")
+        git(self.repo, "commit", "-m", "large tree")
+        manifest = job_source.prepare_job_source(
+            self.repo, "HEAD", self.job_root(),
+            limits={"max_files": job_source.MAX_SNAPSHOT_FILES + 2},
+        )
+        self.assertEqual(job_source.verify_job_source(self.jobs / "job", manifest), [])
+
     def test_symlink_and_non_private_job_roots_are_refused(self) -> None:
         real = self.job_root("real")
         alias = self.jobs / "alias"
@@ -193,6 +227,21 @@ class JobSourceTest(unittest.TestCase):
         self.assertTrue(root.is_dir())
         self.assertTrue(keeper.exists())
         self.assertFalse((root / job_source.JOB_SOURCE_DIRNAME).exists())
+
+
+@unittest.skipUnless(os.name == "nt", "Windows-only platform guard test")
+class WindowsJobSourceTest(unittest.TestCase):
+    def test_public_operations_are_unsupported(self) -> None:
+        manifest = {"not": "used"}
+        for operation, args in (
+            (job_source.prepare_job_source, ("operator", "HEAD", "job")),
+            (job_source.verify_job_source, ("job", manifest)),
+            (job_source.remove_job_source, ("job",)),
+        ):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(job_source.JobSourceError,
+                                            "job_source_platform_unsupported"):
+                    operation(*args)
 
 
 if __name__ == "__main__":

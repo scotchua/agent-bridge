@@ -387,10 +387,11 @@ def _install_pack(source: Path, incoming: Path) -> None:
         raise JobSourceError("source_pack_incomplete") from exc
 
 
-def _tree_entries(source: Path, commit: str, limits: JobSourceLimits) -> list[dict[str, str]]:
+def _tree_entries(source: Path, commit: str,
+                  limits: JobSourceLimits | None) -> list[dict[str, str]]:
     try:
         raw = _run_git(
-            source, "--git-dir", str(source), "ls-tree", "-r", "-z", commit,
+            source, "--git-dir", str(source), "ls-tree", "-r", "-z", "-l", commit,
             timeout=PACK_TIMEOUT_SECONDS,
         )
     except JobSourceError as exc:
@@ -401,7 +402,7 @@ def _tree_entries(source: Path, commit: str, limits: JobSourceLimits) -> list[di
             continue
         try:
             prefix, path = record.split(b"\t", 1)
-            mode, kind, object_id = prefix.split(b" ", 2)
+            mode, kind, object_id, size = prefix.split(b" ", 3)
             item = {
                 "path": path.decode("utf-8", "surrogateescape"),
                 "mode": mode.decode("ascii"), "type": kind.decode("ascii"),
@@ -410,16 +411,14 @@ def _tree_entries(source: Path, commit: str, limits: JobSourceLimits) -> list[di
         except (UnicodeError, ValueError) as exc:
             raise JobSourceError("manifest_invalid") from exc
         entries.append(item)
-        if len(entries) > limits.max_files:
+        if limits is not None and len(entries) > limits.max_files:
             raise JobSourceError("source_file_count_exceeded")
         if item["type"] == "blob":
             try:
-                size = int(_run_git(
-                    source, "--git-dir", str(source), "cat-file", "-s", item["object"],
-                ).strip())
-            except (ValueError, JobSourceError) as exc:
+                blob_size = int(size)
+            except ValueError as exc:
                 raise JobSourceError("source_pack_incomplete") from exc
-            if size > limits.max_file_bytes:
+            if limits is not None and blob_size > limits.max_file_bytes:
                 raise JobSourceError("source_file_size_exceeded")
     return entries
 
@@ -450,7 +449,7 @@ def canonical_manifest_bytes(manifest: Mapping[str, Any]) -> bytes:
 
 
 def _make_manifest(source: Path, *, base_spelling: str, commit: str,
-                   object_format: str, limits: JobSourceLimits) -> dict[str, Any]:
+                   object_format: str, limits: JobSourceLimits | None) -> dict[str, Any]:
     try:
         tree = _run_git(
             source, "--git-dir", str(source), "rev-parse", f"{commit}^{{tree}}",
@@ -588,7 +587,7 @@ def verify_job_source(job_root: Path | str, manifest: Mapping[str, Any]) -> list
         elif ref and tree:
             current = _make_manifest(
                 source, base_spelling=manifest["base_spelling"], commit=ref,
-                object_format=manifest["object_format"], limits=DEFAULT_LIMITS,
+                object_format=manifest["object_format"], limits=None,
             )
             if canonical_manifest_bytes(current) != canonical_manifest_bytes(manifest):
                 reasons.append("manifest_mismatch")
