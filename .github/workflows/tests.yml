@@ -1,6 +1,12 @@
 name: tests
 
-# Runs the offline test suite on every push and pull request.
+# Runs the offline test suite on every pull request and on pushes to main.
+#
+# A push to a PR branch used to start a second, identical run beside the
+# pull_request run (22 of the 60 runs before 2026-10-17 were such duplicates)
+# and a newer push did not stop the older run. Now only the pull_request run
+# covers a branch, a newer push to the same PR cancels the run it supersedes,
+# and a run on main is never cancelled or displaced, so every merged commit keeps a result.
 #
 # The suite uses stand-in programs in place of the real Claude and Codex CLIs,
 # so this needs no credentials, makes no network calls, and costs nothing. The
@@ -9,8 +15,17 @@ name: tests
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Pull request runs share a group per PR so a newer push cancels the run it
+# supersedes. Every other run (a push to main, a manual dispatch) gets a group
+# of its own: a shared group would let a newly queued main run cancel a
+# pending one even with cancel-in-progress off.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('tests-pr-{0}', github.event.pull_request.number) || format('tests-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
