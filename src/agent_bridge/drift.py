@@ -1059,6 +1059,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="With --scheduled or --install-schedule: requalify changed dependencies and record the baseline, never install a Codex update.")
     modes = parser.add_mutually_exclusive_group(); modes.add_argument("--install-schedule", action="store_true"); modes.add_argument("--remove-schedule", action="store_true")
     args = parser.parse_args(argv)
+    if args.requalify_only and args.update:
+        parser.error("--requalify-only and --update conflict: requalification never installs an update")
     try:
         if args.install_schedule: print(install_schedule(args.config, update=not args.requalify_only)); return 0
         if args.remove_schedule: remove_schedule(); return 0

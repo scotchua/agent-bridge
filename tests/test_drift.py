@@ -306,6 +306,12 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertEqual(code, 0); updater.assert_not_called()
         self.assertEqual(doc.call_args.args, (str(self.config),))
 
+    def test_requalify_only_refuses_to_combine_with_update(self) -> None:
+        with mock.patch.object(drift, "update") as updater, mock.patch.object(drift, "doctor") as doc, \
+             self.assertRaises(SystemExit) as stop:
+            drift.main(["--scheduled", "--requalify-only", "--update", "--config", str(self.config)])
+        self.assertEqual(stop.exception.code, 2); updater.assert_not_called(); doc.assert_not_called()
+
     def test_install_schedule_flag_passes_requalify_only_through(self) -> None:
         with mock.patch.object(drift, "install_schedule", return_value="plist") as install:
             drift.main(["--install-schedule", "--requalify-only"])
