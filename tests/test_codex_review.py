@@ -321,3 +321,37 @@ exit 0
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchemaStrictnessTests(unittest.TestCase):
+    """Codex's structured output is strict: every property of every object
+    must be listed in ``required`` and no extra keys may appear. A schema that
+    breaks that rule is rejected before the review runs, which is how the
+    review lane failed on 2026-10-16 (``context`` was optional)."""
+
+    def test_every_object_requires_all_of_its_properties(self) -> None:
+        schema = json.loads(codex_review.SCHEMA_PATH.read_text(encoding="utf-8"))
+        objects = []
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    objects.append(node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(schema)
+        self.assertGreaterEqual(len(objects), 2)
+        for node in objects:
+            self.assertIs(node.get("additionalProperties"), False, node)
+            self.assertEqual(set(node.get("required", [])), set(node.get("properties", {})), node)
+
+    def test_validator_accepts_the_strict_shape(self) -> None:
+        finding = {"severity": "low", "file": "one.txt", "line": 1, "claim": "c",
+                   "failure_scenario": "f", "evidence": "e", "context": False}
+        out = codex_review.validate_findings({"verdict": "approve", "findings": [finding]}, {"one.txt"})
+        self.assertEqual(out["findings"][0]["context"], False)
+
