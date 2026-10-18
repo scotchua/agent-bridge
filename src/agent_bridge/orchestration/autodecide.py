@@ -281,6 +281,11 @@ def stage_name(router: StageRouter, item_id: str, task_type: str, *,
             current = router.get(item_id, candidate)
         except RoutingError:
             return candidate          # never registered: free
+        if current.get("archived_at") is not None:
+            # Archival removes a stage from live counts, not from history.
+            # Treat its name exactly like a completed generation so a later
+            # decision can never recreate an old receipt binding.
+            continue
         if current.get("state") in ("complete", "blocked"):
             continue                  # terminal: history, try the next one
         if (current.get("state") == "owned" and owner_id is not None

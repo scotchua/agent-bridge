@@ -343,8 +343,17 @@ def _stages(path: Path | None, now: float) -> dict[str, Any]:
     if db is None:
         return {"present": True, "by_blocked_reason": {"unreadable": 1}, "blocked_over_24_hours": 0}
     try:
-        rows = db.execute("SELECT state,blocked_reason,updated_at FROM stages "
-                          "WHERE state IN ('blocked','reconcile_required')").fetchall()
+        try:
+            rows = db.execute("SELECT state,blocked_reason,updated_at FROM stages "
+                              "WHERE state IN ('blocked','reconcile_required') "
+                              "AND archived_at IS NULL").fetchall()
+        except sqlite3.OperationalError as exc:
+            # The report is deliberately read-only, so it cannot migrate an
+            # older installed ledger.  Its former query remains safe there.
+            if "archived_at" not in str(exc):
+                raise
+            rows = db.execute("SELECT state,blocked_reason,updated_at FROM stages "
+                              "WHERE state IN ('blocked','reconcile_required')").fetchall()
     except sqlite3.Error:
         return {"present": True, "by_blocked_reason": {"unreadable": 1}, "blocked_over_24_hours": 0}
     finally:

@@ -156,6 +156,26 @@ class ReliabilityReportTests(unittest.TestCase):
             "liveness_reconciliation_required": 1, "no_fresh_eligible_route": 2})
         self.assertEqual(stages["blocked_over_24_hours"], 2)
 
+    def test_archived_stages_are_excluded_when_the_column_exists(self):
+        db = sqlite3.connect(self.capacity)
+        db.execute("CREATE TABLE stages (state TEXT, blocked_reason TEXT, updated_at REAL, archived_at REAL)")
+        db.executemany("INSERT INTO stages VALUES (?, ?, ?, ?)", (
+            ("blocked", "no_fresh_eligible_route", NOW - 90000, None),
+            ("blocked", "no_fresh_eligible_route", NOW - 90000, NOW - 1),
+            ("reconcile_required", None, NOW - 90000, NOW - 1),
+        ))
+        db.commit(); db.close()
+        self.assertEqual(self._report()["stage_health"], {
+            "present": True, "by_blocked_reason": {"no_fresh_eligible_route": 1},
+            "blocked_over_24_hours": 1})
+
+    def test_stage_reader_falls_back_for_an_old_read_only_schema(self):
+        db = sqlite3.connect(self.capacity)
+        db.execute("CREATE TABLE stages (state TEXT, blocked_reason TEXT, updated_at REAL)")
+        db.execute("INSERT INTO stages VALUES ('blocked', 'lease_expired', ?)", (NOW - 90000,))
+        db.commit(); db.close()
+        self.assertEqual(self._report()["stage_health"]["by_blocked_reason"], {"lease_expired": 1})
+
     def test_unreadable_config_is_never_reported_as_absent(self):
         with mock.patch.object(reliability_report.broker_config, "load", side_effect=ValueError), \
              mock.patch.object(reliability_report, "_orchestration_config", return_value=("/private/config", "ok")), \
