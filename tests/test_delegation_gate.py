@@ -2747,7 +2747,10 @@ class ProtectedDenialExplainsItself(unittest.TestCase):
     def test_a_tree_verb_over_a_parent_says_so(self):
         decision = self.judge("Bash", {"command": f"rm -rf {self.base}"})
         self.assertEqual(decision.code, "gate_state_protected")
-        self.assertIn(" is a parent folder of ", decision.reason)
+        self.assertIn(" is a parent folder of protected state", decision.reason)
+        # The command named only the parent; the reason must not reveal what lies below it.
+        self.assertNotIn(str(self.state), decision.reason)
+        self.assertNotIn(self.database, decision.reason)
 
     def test_an_edit_names_the_file(self):
         settings = os.path.join(str(self.home), ".claude", "settings.json")
