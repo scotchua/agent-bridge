@@ -289,6 +289,34 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertIn("--update", data["ProgramArguments"]); self.assertIn("--scheduled", data["ProgramArguments"]); self.assertEqual(launcher.call_count, 2)
         self.assertEqual(launcher.call_args_list[1].kwargs, {"remove": True})
 
+    def test_requalify_only_schedule_never_updates(self) -> None:
+        with mock.patch.object(drift, "_schedule_launchctl"), mock.patch.object(drift, "discover_config", return_value=str(self.config)):
+            path = drift.install_schedule(home=str(self.home), update=False); data = plistlib.loads(Path(path).read_bytes()); drift.remove_schedule(home=str(self.home))
+        self.assertEqual(data["StartCalendarInterval"], {"Hour": 3, "Minute": 30})
+        self.assertIn("--requalify-only", data["ProgramArguments"]); self.assertIn("--scheduled", data["ProgramArguments"])
+        self.assertNotIn("--update", data["ProgramArguments"])
+
+    def test_scheduled_requalify_only_runs_doctor_not_update(self) -> None:
+        report = {"ok": True, "needs_you": [], "changed": [], "updates": []}
+        with mock.patch.object(drift, "_read_baseline", return_value={"recorded": True}), \
+             mock.patch.object(drift, "_home", return_value=str(self.home)), \
+             mock.patch.object(drift, "update") as updater, \
+             mock.patch.object(drift, "doctor", return_value=report) as doc:
+            code = drift.main(["--scheduled", "--requalify-only", "--quiet", "--config", str(self.config)])
+        self.assertEqual(code, 0); updater.assert_not_called()
+        self.assertEqual(doc.call_args.args, (str(self.config),))
+
+    def test_requalify_only_refuses_to_combine_with_update(self) -> None:
+        with mock.patch.object(drift, "update") as updater, mock.patch.object(drift, "doctor") as doc, \
+             self.assertRaises(SystemExit) as stop:
+            drift.main(["--scheduled", "--requalify-only", "--update", "--config", str(self.config)])
+        self.assertEqual(stop.exception.code, 2); updater.assert_not_called(); doc.assert_not_called()
+
+    def test_install_schedule_flag_passes_requalify_only_through(self) -> None:
+        with mock.patch.object(drift, "install_schedule", return_value="plist") as install:
+            drift.main(["--install-schedule", "--requalify-only"])
+        self.assertEqual(install.call_args.kwargs, {"update": False})
+
     def test_quick_check_missing_baseline_is_attention_not_drift(self) -> None:
         current = self.inventory()
         with mock.patch.object(drift, "inventory", return_value=current):
