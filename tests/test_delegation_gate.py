@@ -2708,3 +2708,56 @@ class PostToolUseInstallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class ProtectedDenialExplainsItself(unittest.TestCase):
+    """A gate_state_protected denial names the path that matched and whether
+    it is under the protected root or a parent of it, so the five harmless
+    commands refused on 2026-10-17 (reads and writes that only mentioned a
+    protected folder) could have been corrected on the first try. The
+    decision is unchanged; only the reason text grows."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        self.repo = self.base / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.database = str(self.base / "capacity.sqlite3")
+        self.clock = lambda: 1000.0
+        self.protected = gate.protected_paths(str(self.state), str(self.base / "cfg.json"),
+                                              str(self.home), self.database)
+
+    def judge(self, tool, tool_input):
+        return gate.judge("claude", tool, tool_input, str(self.repo), state_root=str(self.state),
+                          clock=self.clock, protected=self.protected)
+
+    def test_a_write_under_the_state_names_the_file_and_the_root(self):
+        forged = gate.receipt_path(str(self.state), str(self.repo))
+        decision = self.judge("Bash", {"command": f"echo x > {forged}"})
+        self.assertEqual(decision.code, "gate_state_protected")
+        self.assertIn("nothing may write them through this client. Matched: ", decision.reason)
+        self.assertIn(os.path.basename(forged) + " is under ", decision.reason)
+        self.assertIn(os.sep + "state", decision.reason)
+
+    def test_a_tree_verb_over_a_parent_says_so(self):
+        decision = self.judge("Bash", {"command": f"rm -rf {self.base}"})
+        self.assertEqual(decision.code, "gate_state_protected")
+        self.assertIn(" is a parent folder of ", decision.reason)
+
+    def test_an_edit_names_the_file(self):
+        settings = os.path.join(str(self.home), ".claude", "settings.json")
+        decision = self.judge("Edit", {"file_path": settings})
+        self.assertEqual(decision.code, "gate_state_protected")
+        self.assertIn("settings.json is under ", decision.reason)
+
+    def test_at_most_three_matches_are_shown(self):
+        targets = [os.path.join(str(self.state), f"file{i}.json") for i in range(5)]
+        decision = self.judge("Bash", {"command": "touch " + " ".join(targets)})
+        self.assertEqual(decision.code, "gate_state_protected")
+        self.assertEqual(decision.reason.count(" is under "), 3)
+        self.assertIn("; and 2 more", decision.reason)
