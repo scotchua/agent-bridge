@@ -774,10 +774,19 @@ def _schedule_launchctl(path: str, *, remove: bool = False) -> dict[str, Any]:
     return delegation.deactivate_launch_agent(path, apply=True) if remove else delegation.activate_launch_agent(path, apply=True)
 
 
-def install_schedule(config_path: str | None = None, *, home: str | None = None) -> str:
+def install_schedule(config_path: str | None = None, *, home: str | None = None, update: bool = True) -> str:
+    """Install the nightly launchd job.
+
+    ``update=False`` schedules requalification only: the job re-runs the
+    synthetic checks for a changed Ollama, Gemma file or CLI and records a
+    new baseline when they pass, which is what releases a dependency hold
+    without a person running the doctor by hand. It never installs a newer
+    Codex release; version changes stay with the operator.
+    """
     if hasattr(os, "geteuid") and os.geteuid() == 0: raise PermissionError("doctor schedule refuses to run as root")
     home = _home(home); resolved = discover_config(config_path, home=home)
-    program = [sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "setup_bridge.py")), "doctor", "--update", "--scheduled", "--quiet"]
+    program = [sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "setup_bridge.py")), "doctor",
+               *(["--update"] if update else ["--requalify-only"]), "--scheduled", "--quiet"]
     if resolved: program += ["--config", resolved]
     data = {"Label": "com.agent-bridge.drift-doctor", "ProgramArguments": program, "RunAtLoad": True,
             "StartCalendarInterval": {"Hour": 3, "Minute": 30}, "ProcessType": "Background"}
@@ -1046,15 +1055,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="setup_bridge.py doctor")
     parser.add_argument("--config"); parser.add_argument("--json", action="store_true"); parser.add_argument("--quiet", action="store_true"); parser.add_argument("--accept-requalified", action="store_true"); parser.add_argument("--update", action="store_true"); parser.add_argument("--scheduled", action="store_true")
     parser.add_argument("--quarantine-hours", type=float, default=None)
+    parser.add_argument("--requalify-only", action="store_true",
+                        help="With --scheduled or --install-schedule: requalify changed dependencies and record the baseline, never install a Codex update.")
     modes = parser.add_mutually_exclusive_group(); modes.add_argument("--install-schedule", action="store_true"); modes.add_argument("--remove-schedule", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.install_schedule: print(install_schedule(args.config)); return 0
+        if args.install_schedule: print(install_schedule(args.config, update=not args.requalify_only)); return 0
         if args.remove_schedule: remove_schedule(); return 0
         if args.scheduled and _read_baseline(_home()) is None:
             report = scheduled_baseline(args.config)
         else:
-            report = update(args.config, quarantine_hours=args.quarantine_hours) if (args.update or args.scheduled) else doctor(args.config, accept_requalified=args.accept_requalified)
+            wants_update = args.update or (args.scheduled and not args.requalify_only)
+            report = update(args.config, quarantine_hours=args.quarantine_hours) if wants_update else doctor(args.config, accept_requalified=args.accept_requalified)
     except (OSError, ValueError, PermissionError) as exc: print(str(exc), file=sys.stderr); return 1
     if not report["ok"] and args.quiet: _notify_attention(_home(), report)
     elif (args.update or args.scheduled) and args.quiet:
