@@ -14,6 +14,7 @@ from unittest import mock
 
 from harness import Sandbox
 from agent_bridge import admin, store
+from agent_bridge.capacity_router import StageRouter
 
 
 def output(call) -> tuple[object, str]:
@@ -137,6 +138,49 @@ class AdminMutationTests(unittest.TestCase):
         _, text = output(lambda: admin.cmd_ledger(self.sandbox.cfg, args))
         self.assertEqual([row["job_id"] for row in json.loads(text)],
                          ["invented-job-1", "invented-job-2"])
+
+    def test_archive_named_item_dry_run_then_apply(self) -> None:
+        router = StageRouter(os.path.join(self.sandbox.root, "capacity.sqlite3"), clock=lambda: 1000.0)
+        router.register("named", "build", allowed_routes=["codex"])
+        args = argparse.Namespace(item=["named"], closed_tasks=None, stage=None,
+                                  reason="fixture", apply=False)
+        with mock.patch.object(admin, "_archive_router", return_value=router):
+            code, text = output(lambda: admin.cmd_archive(self.sandbox.cfg, args))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["items"]["named"]["archived"], ["build"])
+        self.assertIsNone(router.get("named", "build")["archived_at"])
+        args.apply = True
+        with mock.patch.object(admin, "_archive_router", return_value=router):
+            code, _ = output(lambda: admin.cmd_archive(self.sandbox.cfg, args))
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(router.get("named", "build")["archived_at"])
+
+    def test_archive_closed_tasks_dry_run_then_apply(self) -> None:
+        router = StageRouter(os.path.join(self.sandbox.root, "capacity.sqlite3"), clock=lambda: 1000.0)
+        for item in ("closed", "open", "without-record"):
+            router.register(item, "build", allowed_routes=["codex"])
+        tasks = os.path.join(self.sandbox.root, "tasks")
+        os.makedirs(os.path.join(tasks, "closed")); os.makedirs(os.path.join(tasks, "open"))
+        store.atomic_write_json(os.path.join(tasks, "closed", "task.json"), {"status": "done"})
+        store.atomic_write_json(os.path.join(tasks, "open", "task.json"), {"status": "working"})
+        args = argparse.Namespace(item=None, closed_tasks=tasks, stage=None,
+                                  reason="closed-task", apply=False)
+        with mock.patch.object(admin, "_archive_router", return_value=router):
+            code, text = output(lambda: admin.cmd_archive(self.sandbox.cfg, args))
+        plan = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["items"]["closed"]["archived"], ["build"])
+        self.assertEqual(plan["skipped"], {"not_closed": 1, "without_record": 1})
+        self.assertIsNone(router.get("closed", "build")["archived_at"])
+        args.apply = True
+        with mock.patch.object(admin, "_archive_router", return_value=router):
+            code, _ = output(lambda: admin.cmd_archive(self.sandbox.cfg, args))
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(router.get("closed", "build")["archived_at"])
+
+    def test_archive_stage_requires_named_item(self) -> None:
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            admin.main(["archive", "--closed-tasks", self.sandbox.root, "--stage", "build"])
 
     def test_reporting_rate_and_exact_minimum_sample(self) -> None:
         self.ledger(*({"peer": "claude", "peer_observed_version": "invented-v1",

@@ -1,5 +1,6 @@
 """Focused tests for conservative capacity-aware stage binding."""
 
+import json
 import os
 import sqlite3
 import sys
@@ -478,6 +479,102 @@ class CapacityRouterMutationGuards(unittest.TestCase):
         rows = [{"route": "codex", "available": 1, "trusted": 1,
                  "observed_at": 1001.0, "fresh_until": 1000.0}]
         self.assertEqual(capacity_fingerprint(rows, 1000.0), "codex")
+
+
+class StageArchivalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.clock = Clock()
+        self.path = os.path.join(self.temp.name, "routing.sqlite3")
+        self.router = StageRouter(self.path, clock=self.clock)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _owned(self, item, stage, lease=10):
+        self.router.observe_capacity(CapacityObservation(
+            "codex", self.clock(), self.clock() + 60, True, "test"), trusted=True)
+        row = self.router.register(item, stage, allowed_routes=["codex"])
+        return self.router.assign(item, stage, owner_id="owner", lease_seconds=lease,
+                                  expected_revision=row["revision"])
+
+    def test_migrates_archived_column_idempotently(self):
+        legacy = os.path.join(self.temp.name, "legacy.sqlite3")
+        db = sqlite3.connect(legacy)
+        db.execute("""CREATE TABLE stages (
+            item_id TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL,
+            allowed_routes TEXT NOT NULL, preferred_routes TEXT NOT NULL,
+            owner_id TEXT, owner_route TEXT, lease_until REAL,
+            author_owner TEXT, author_route TEXT, is_review INTEGER NOT NULL,
+            blocked_reason TEXT, revision INTEGER NOT NULL,
+            updated_at REAL NOT NULL, PRIMARY KEY(item_id, stage))""")
+        db.commit(); db.close()
+        StageRouter(legacy, clock=self.clock)
+        StageRouter(legacy, clock=self.clock)
+        db = sqlite3.connect(legacy)
+        self.assertIn("archived_at", {row[1] for row in db.execute("PRAGMA table_info(stages)")})
+        db.close()
+
+    def test_dry_run_apply_and_report_preserve_history(self):
+        self.router.register("done", "pending", allowed_routes=["codex"])
+        dry = self.router.archive("done", actor="operator", reason="closed", apply=False)
+        self.assertEqual(dry, {"archived": ["pending"], "refused": [], "already": []})
+        self.assertIsNone(self.router.get("done", "pending")["archived_at"])
+        applied = self.router.archive("done", actor="operator", reason="closed", apply=True)
+        self.assertEqual(applied["archived"], ["pending"])
+        row = self.router.get("done", "pending")
+        self.assertEqual(row["archived_at"], self.clock())
+        self.assertEqual(self.router.archive("done", actor="operator", reason="closed", apply=False),
+                         {"archived": [], "refused": [], "already": ["pending"]})
+        self.assertEqual(self.router.report()["states"], {"archived": 1})
+        with self.router._db() as db:
+            event = db.execute("SELECT event,detail FROM events WHERE event='archived'").fetchone()
+        self.assertEqual(event[0], "archived")
+        self.assertEqual(json.loads(event[1]),
+                         {"prior_state": "pending", "reason": "closed"})
+
+    def test_refuses_only_reconciliation_and_live_owner(self):
+        live = self._owned("live", "build")
+        expired = self._owned("expired", "build", lease=1)
+        expired_archive = self._owned("expired-archive", "build", lease=1)
+        self.clock.now += 2
+        with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+            self.router.assign("expired", "build", owner_id="other", lease_seconds=1,
+                               expected_revision=expired["revision"])
+        self.router.register("pending", "build", allowed_routes=["codex"])
+        self.router.register("blocked", "build", allowed_routes=["claude"])
+        blocked = self.router.assign("blocked", "build", owner_id="owner", lease_seconds=1,
+                                     expected_revision=0)
+        complete = self._owned("complete", "build")
+        self.router.complete("complete", "build", owner_id="owner",
+                             expected_revision=complete["revision"])
+        plan = self.router.archive("live", actor="operator", reason="closed", apply=False)
+        self.assertEqual(plan["refused"][0]["why"], "lease_unexpired")
+        plan = self.router.archive("expired", actor="operator", reason="closed", apply=True)
+        self.assertEqual(plan["refused"][0]["why"], "liveness_reconciliation_required")
+        for item in ("expired-archive", "pending", "blocked", "complete"):
+            self.assertEqual(self.router.archive(item, actor="operator", reason="closed", apply=True)["archived"],
+                             ["build"])
+        self.assertEqual(live["state"], "owned")
+
+    def test_archived_stage_refuses_mutations_but_get_and_generation_keep_it(self):
+        owned = self._owned("item", "implementation")
+        self.clock.now += 11
+        self.router.archive("item", actor="operator", reason="closed", apply=True)
+        archived = self.router.get("item", "implementation")
+        self.assertIsNotNone(archived["archived_at"])
+        for operation in (
+                lambda: self.router.register("item", "implementation", allowed_routes=["codex"]),
+                lambda: self.router.assign("item", "implementation", owner_id="owner", lease_seconds=1,
+                                           expected_revision=owned["revision"]),
+                lambda: self.router.renew("item", "implementation", owner_id="owner", lease_seconds=1,
+                                          expected_revision=owned["revision"]),
+                lambda: self.router.complete("item", "implementation", owner_id="owner",
+                                             expected_revision=owned["revision"])):
+            with self.subTest(operation=operation), self.assertRaisesRegex(RoutingError, "stage_archived"):
+                operation()
+        from agent_bridge.orchestration.autodecide import stage_name
+        self.assertEqual(stage_name(self.router, "item", "implementation"), "implementation#2")
 
 
 if __name__ == "__main__":

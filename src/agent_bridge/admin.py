@@ -14,10 +14,13 @@ import shutil
 import sys
 from typing import Any
 
-from . import registry, store
+from . import drift, registry, store
 from .broker import error_response
+from .capacity_router import RoutingError, StageRouter
 from .config import Config, load as load_config
 from .errors import BrokerError
+from .orchestration import config as orchestration_config
+from .orchestration.task_closure import task_record_state
 
 
 def _inside(root: str, candidate: str) -> bool:
@@ -515,6 +518,55 @@ def cmd_indeterminate(cfg: Config, _: argparse.Namespace) -> int:
     return 0
 
 
+def _archive_router() -> StageRouter:
+    """Open the configured orchestration ledger, not a guessed state path."""
+    path = drift.discover_config()
+    if path is None:
+        raise RoutingError("orchestration_config_not_found")
+    return StageRouter(orchestration_config.load(path).capacity_db)
+
+
+def cmd_archive(_: Config, args: argparse.Namespace) -> int:
+    """Archive explicitly named stages or stages for closed task records."""
+    try:
+        router = _archive_router()
+    except (OSError, ValueError, RoutingError) as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        return 2
+
+    item_ids = list(args.item or [])
+    skipped_not_closed: list[str] = []
+    skipped_without_record: list[str] = []
+    if args.closed_tasks:
+        for item_id in router.live_item_ids():
+            state = task_record_state(args.closed_tasks, item_id)
+            if state == "closed":
+                item_ids.append(item_id)
+            elif state == "no_record":
+                skipped_without_record.append(item_id)
+            else:
+                skipped_not_closed.append(item_id)
+
+    plans: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    for item_id in item_ids:
+        try:
+            plans[item_id] = router.archive(
+                item_id, args.stage, actor="operator", reason=args.reason,
+                apply=bool(args.apply))
+        except RoutingError as exc:
+            errors[item_id] = str(exc)
+    result = {
+        "applied": bool(args.apply), "items": plans, "errors": errors,
+        "skipped_not_closed": skipped_not_closed,
+        "skipped_without_record": skipped_without_record,
+        "skipped": {"not_closed": len(skipped_not_closed),
+                    "without_record": len(skipped_without_record)},
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 2 if errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     store.set_umask()
     parser = argparse.ArgumentParser(prog="agent-bridge-admin")
@@ -544,13 +596,24 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("--acknowledge-live-process", action="store_true",
                          help="Required when an unverifiable peer process may "
                               "still be alive.")
+    archive = sub.add_parser("archive", help="Archive finished stage history. Dry run unless --apply.")
+    archive_group = archive.add_mutually_exclusive_group(required=True)
+    archive_group.add_argument("--item", action="append",
+                               help="Item to archive; repeat for more items.")
+    archive_group.add_argument("--closed-tasks", help="Task root whose closed records select live items.")
+    archive.add_argument("--stage", help="Archive only this stage for each --item.")
+    archive.add_argument("--reason", default="operator_archive", help="Reason recorded in the event ledger.")
+    archive.add_argument("--apply", action="store_true", help="Actually archive the planned stages.")
     args = parser.parse_args(argv)
+    if args.command == "archive" and args.stage and not args.item:
+        parser.error("--stage applies only to --item")
     try:
         cfg = load_config(args.config)
         from .health import cmd_health
         return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
                 "reporting": cmd_reporting, "local-first": cmd_local_first,
-                "indeterminate": cmd_indeterminate, "resolve": cmd_resolve}[
+                "indeterminate": cmd_indeterminate, "resolve": cmd_resolve,
+                "archive": cmd_archive}[
             args.command](cfg, args)
     except BrokerError as exc:
         print(json.dumps(error_response(exc.category), sort_keys=True))

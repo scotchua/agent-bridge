@@ -127,6 +127,12 @@ class StageRouter:
                                     db.execute("PRAGMA table_info(stages)")}:
                 db.execute("ALTER TABLE stages ADD COLUMN "
                            "assignment INTEGER NOT NULL DEFAULT 0")
+            # Archived rows remain in the ledger.  In particular, generation
+            # names must remain occupied even after their work has left the
+            # live operational view.
+            if "archived_at" not in {row["name"] for row in
+                                      db.execute("PRAGMA table_info(stages)")}:
+                db.execute("ALTER TABLE stages ADD COLUMN archived_at REAL")
             db.execute("""CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
                 stage TEXT NOT NULL, at REAL NOT NULL, event TEXT NOT NULL,
@@ -179,15 +185,19 @@ class StageRouter:
                             int(is_review), now))
             except sqlite3.IntegrityError as exc:
                 db.execute("ROLLBACK")
+                with self._db() as check:
+                    existing = self._row(check, item_id, stage)
+                if existing["archived_at"] is not None:
+                    raise RoutingError("stage_archived") from exc
                 raise RoutingError("stage_exists") from exc
             self._event(db, item_id, stage, "registered", None, {})
             db.execute("COMMIT")
         return self.get(item_id, stage)
 
     def _event(self, db: sqlite3.Connection, item_id: str, stage: str,
-               event: str, actor: str | None, detail: dict) -> None:
+               event: str, actor: str | None, detail: dict, *, at: float | None = None) -> None:
         db.execute("INSERT INTO events(item_id,stage,at,event,actor,detail) VALUES(?,?,?,?,?,?)",
-                   (item_id, stage, self.clock(), event, actor,
+                   (item_id, stage, self.clock() if at is None else at, event, actor,
                     json.dumps(detail, sort_keys=True, separators=(",", ":"))))
 
     def _row(self, db: sqlite3.Connection, item_id: str, stage: str) -> sqlite3.Row:
@@ -246,6 +256,9 @@ class StageRouter:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._row(db, item_id, stage)
+            if row["archived_at"] is not None:
+                db.execute("ROLLBACK")
+                raise RoutingError("stage_archived")
             if row["revision"] != expected_revision:
                 db.execute("ROLLBACK")
                 raise RoutingError("revision_conflict")
@@ -299,6 +312,9 @@ class StageRouter:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._row(db, item_id, stage)
+            if row["archived_at"] is not None:
+                db.execute("ROLLBACK")
+                raise RoutingError("stage_archived")
             if row["revision"] != expected_revision:
                 db.execute("ROLLBACK")
                 raise RoutingError("revision_conflict")
@@ -342,6 +358,9 @@ class StageRouter:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._row(db, item_id, stage)
+            if row["archived_at"] is not None:
+                db.execute("ROLLBACK")
+                raise RoutingError("stage_archived")
             if row["revision"] != expected_revision:
                 db.execute("ROLLBACK")
                 raise RoutingError("revision_conflict")
@@ -363,6 +382,51 @@ class StageRouter:
         result["preferred_routes"] = json.loads(result["preferred_routes"])
         result["is_review"] = bool(result["is_review"])
         return result
+
+    def live_item_ids(self) -> list[str]:
+        """Item identifiers with at least one live stage, in stable order."""
+        with self._db() as db:
+            return [row["item_id"] for row in db.execute(
+                "SELECT DISTINCT item_id FROM stages WHERE archived_at IS NULL ORDER BY item_id")]
+
+    def archive(self, item_id: str, stage: str | None = None, *, actor: str,
+                reason: str, now: float | None = None, apply: bool) -> dict:
+        """Plan or archive selected stages without ever deleting their history."""
+        if not item_id or (stage is not None and not stage) or not actor:
+            raise RoutingError("archive_identity_invalid")
+        stamp = self.clock() if now is None else now
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not math.isfinite(stamp):
+            raise RoutingError("archive_time_invalid")
+        plan: dict[str, list] = {"archived": [], "refused": [], "already": []}
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if stage is None:
+                rows = db.execute("SELECT * FROM stages WHERE item_id=? ORDER BY stage", (item_id,)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM stages WHERE item_id=? AND stage=?", (item_id, stage)).fetchall()
+            if stage is not None and not rows:
+                db.execute("ROLLBACK")
+                raise RoutingError("stage_not_found")
+            for row in rows:
+                name = row["stage"]
+                if row["archived_at"] is not None:
+                    plan["already"].append(name)
+                elif row["state"] == "reconcile_required":
+                    plan["refused"].append({"stage": name, "state": row["state"],
+                                            "why": "liveness_reconciliation_required"})
+                elif (row["state"] == "owned" and
+                      (row["lease_until"] is None or row["lease_until"] >= stamp)):
+                    plan["refused"].append({"stage": name, "state": row["state"],
+                                            "why": "lease_unexpired"})
+                else:
+                    plan["archived"].append(name)
+                    if apply:
+                        db.execute("UPDATE stages SET archived_at=? WHERE item_id=? AND stage=?",
+                                   (stamp, item_id, name))
+                        self._event(db, item_id, name, "archived", actor,
+                                    {"reason": reason, "prior_state": row["state"]}, at=stamp)
+            db.execute("COMMIT")
+        return plan
 
     def require_live_execution_binding(self, item_id: object, stage: object, *,
                                        owner_id: object, route: object,
@@ -410,7 +474,9 @@ class StageRouter:
         now = self.clock()
         with self._db() as db:
             states = {row["state"]: row["n"] for row in db.execute(
-                "SELECT state,COUNT(*) AS n FROM stages GROUP BY state")}
+                "SELECT state,COUNT(*) AS n FROM stages WHERE archived_at IS NULL GROUP BY state")}
+            states["archived"] = db.execute(
+                "SELECT COUNT(*) FROM stages WHERE archived_at IS NOT NULL").fetchone()[0]
             capacities = {}
             for row in db.execute("SELECT * FROM capacity ORDER BY route"):
                 status = "available" if row["available"] and row["fresh_until"] >= now else "unavailable"
@@ -426,7 +492,8 @@ class StageRouter:
                                             "fresh_until": row["fresh_until"], "source": row["source"],
                                             "trusted": bool(row["trusted"])}
             blocked = [dict(row) for row in db.execute(
-                "SELECT item_id,stage,blocked_reason FROM stages WHERE state='blocked' ORDER BY item_id,stage")]
+                "SELECT item_id,stage,blocked_reason FROM stages WHERE state='blocked' "
+                "AND archived_at IS NULL ORDER BY item_id,stage")]
         return {"states": states, "capacity": capacities, "blocked": blocked}
 
 
