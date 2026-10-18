@@ -1642,6 +1642,37 @@ def _worktree_prune_decision(command: str, cwd: str, config_path: str | None,
                     (repo,))
 
 
+def _explain_protected(matched: list[tuple[str, str]]) -> str:
+    """Name what the protected-path rule matched, so a refused command can be
+    corrected instead of guessed at. The decision itself does not change.
+
+    A shell command is judged by every path it names, and a tree verb (``rm
+    -r``, ``find``, ``cp -r``) by every parent folder it could descend from, so
+    a command can be refused for a path that is only mentioned, or for a
+    folder above the protected state. Saying which path matched, and whether
+    it sits under the protected root or above it, is what tells the reader
+    which of those happened. At most three matches are shown. A parent-folder
+    match names only the command's own path: the protected root below it was
+    not in the command, and the reason must not be the thing that reveals
+    where the state lives."""
+    if not matched:
+        return ""
+    home = os.path.expanduser("~")
+
+    def short(path: str) -> str:
+        return "~" + path[len(home):] if home and path.startswith(home + os.sep) else path
+
+    lines: list[str] = []
+    for path, root in matched:
+        line = (f"{short(path)} is under {short(root)}" if _under(path, root)
+                else f"{short(path)} is a parent folder of protected state")
+        if line not in lines:
+            lines.append(line)
+    extra = len(lines) - 3
+    shown = "; ".join(lines[:3]) + (f"; and {extra} more" if extra > 0 else "")
+    return f". Matched: {shown}"
+
+
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
@@ -1653,17 +1684,20 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     ``judge``'s own overlay of ``judge_read`` for a whole-file read hiding
     behind a write-shaped command."""
     if kind == "edit":
-        hit = [path for path in paths if any(_under(path, root) for root in protected)]
+        matched = [(path, root) for path in paths for root in protected if _under(path, root)]
+        hit = [path for path, _ in matched]
     else:
         command = _command_text(tool_input)
         named = _command_paths(command, cwd)
         whole_trees = bool(_TREE_VERBS.search(command))
-        hit = [root for root in protected
-               if any(_reaches(path, root, through_ancestors=whole_trees) for path in named)]
+        matched = [(path, root) for path in named for root in protected
+                   if _reaches(path, root, through_ancestors=whole_trees)]
+        hit = [root for _, root in matched]
     if hit:
         return Decision("deny", "gate_state_protected",
                         "delegation-first gate: the target is the gate's own state or a hook file; "
-                        "nothing may write them through this client", tuple(sorted(set(hit))))
+                        "nothing may write them through this client" + _explain_protected(matched),
+                        tuple(sorted(set(hit))))
     if kind == "shell":
         prune = _worktree_prune_decision(command, cwd, config_path, protected)
         if prune is not None:
