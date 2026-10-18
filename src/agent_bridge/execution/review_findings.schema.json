@@ -10,7 +10,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "file", "line", "claim", "failure_scenario", "evidence"],
+        "required": ["severity", "file", "line", "claim", "failure_scenario", "evidence", "context"],
         "properties": {
           "severity": {"enum": ["critical", "high", "medium", "low"]},
           "file": {"type": "string", "minLength": 1},
