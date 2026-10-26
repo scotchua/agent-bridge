@@ -703,7 +703,7 @@ class ExecutionQueue:
                           for r in steps)
         resumes = receipt.get("resume_count", 0)
         if (spawn_began or not isinstance(resumes, int) or isinstance(resumes, bool)
-                or resumes >= MAX_RESUMES):
+                or resumes < 0 or resumes >= MAX_RESUMES):
             if last_step is not None:
                 receipt["last_step"] = last_step
             if spawn_began:

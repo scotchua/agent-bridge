@@ -342,6 +342,51 @@ class LocalQueueTests(unittest.TestCase):
             runner.join(5)
         self.assertEqual(results[0]["status"], "complete")
 
+    def _running_under(self, job, lock_owner, lock_until, job_until):
+        with self.queue._db() as db:
+            db.execute("UPDATE jobs SET status='running',lease_owner='sleeper',lease_until=? WHERE job_id=?",
+                       (job_until, job["job_id"]))
+            db.execute("INSERT INTO executor_lock(name,owner,lease_until) VALUES('executor',?,?) "
+                       "ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,lease_until=excluded.lease_until",
+                       (lock_owner, lock_until))
+
+    def _renew_once(self, job):
+        stop = mock.MagicMock()
+        stop.wait.side_effect = [False, True]
+        self.queue._renew_lease_while_running(job["job_id"], "sleeper", stop)
+        with self.queue._db() as db:
+            leased = db.execute("SELECT lease_until FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+            lock = db.execute("SELECT owner,lease_until FROM executor_lock").fetchone()
+        return leased, tuple(lock), stop.wait.call_count
+
+    def test_renewal_after_sleep_does_not_resurrect_an_expired_lease(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now - 1, now - 1)
+        leased, lock, waits = self._renew_once(job)
+        self.assertEqual(leased, now - 1)
+        self.assertEqual(lock, ("sleeper", now - 1))
+        self.assertEqual(waits, 1)  # renewal stopped for good
+
+    def test_renewal_stops_when_another_executor_holds_the_lock(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "successor", now + 5, now + 1)
+        leased, lock, waits = self._renew_once(job)
+        self.assertEqual(leased, now + 1)
+        self.assertEqual(lock, ("successor", now + 5))
+        self.assertEqual(waits, 1)
+
+    def test_renewal_extends_both_leases_while_still_held(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now + 1, now + 1)
+        leased, lock, waits = self._renew_once(job)
+        until = now + self.caps.lease_seconds
+        self.assertEqual(leased, until)
+        self.assertEqual(lock, ("sleeper", until))
+        self.assertEqual(waits, 2)
+
     def test_dead_executor_still_goes_unknown_after_its_lease_lapses(self):
         job = self.submit()
         with self.queue._db() as db:

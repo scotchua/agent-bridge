@@ -124,6 +124,18 @@ class StepLedgerTests(unittest.TestCase):
         self.assertNotIn("provider_send_may_have_happened", receipt)
         self.assertEqual(self.fake.requests, [])
 
+    def test_negative_resume_count_is_held_not_requeued(self):
+        job = self.submit()
+        self.interrupt(job, ("claimed", "commit"))
+        receipt = self.receipt(job)
+        receipt["resume_count"] = -5
+        (self.directory(job) / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+        self.queue = self.open_queue()
+        receipt = self.receipt(job)
+        self.assertEqual(receipt["state"], "blocked")
+        self.assertEqual(receipt["error"], "interrupted_requires_reconciliation")
+        self.assertEqual(self.fake.requests, [])
+
     def test_job_without_a_ledger_is_blocked_exactly_as_before(self):
         job = self.submit()
         self.interrupt(job)
