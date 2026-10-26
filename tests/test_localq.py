@@ -377,6 +377,36 @@ class LocalQueueTests(unittest.TestCase):
         self.assertEqual(lock, ("successor", now + 5))
         self.assertEqual(waits, 1)
 
+    def test_renewal_reads_the_clock_after_taking_the_write_lock(self):
+        """Leases that lapse while the renewer waits for the lock stay lapsed."""
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now + 1, now + 1)
+        blocker = self.queue._connect()
+        blocker.execute("BEGIN IMMEDIATE")
+        stop = mock.MagicMock()
+        stop.wait.side_effect = [False, True]
+        renewer = threading.Thread(target=self.queue._renew_lease_while_running,
+                                   args=(job["job_id"], "sleeper", stop))
+        try:
+            renewer.start()
+            deadline = time.monotonic() + 2
+            while stop.wait.call_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)  # renewer is now waiting on the write lock
+            self.clock.now += 2  # both leases lapse during the wait
+        finally:
+            blocker.execute("COMMIT")
+            blocker.close()
+            renewer.join(5)
+        self.assertFalse(renewer.is_alive())
+        with self.queue._db() as db:
+            leased = db.execute("SELECT lease_until FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+            lock = tuple(db.execute("SELECT owner,lease_until FROM executor_lock").fetchone())
+        self.assertEqual(leased, now + 1)
+        self.assertEqual(lock, ("sleeper", now + 1))
+        self.assertEqual(stop.wait.call_count, 1)
+
     def test_renewal_extends_both_leases_while_still_held(self):
         job = self.submit()
         now = self.clock()

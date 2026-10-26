@@ -701,10 +701,12 @@ class LocalQueue:
         """
         while not stop.wait(self.caps.lease_seconds / 3):
             try:
-                now = self.clock()
-                until = now + self.caps.lease_seconds
                 with self._db() as db:
                     db.execute("BEGIN IMMEDIATE")
+                    # Read the clock only once the write lock is held, so a
+                    # sleep or lock wait cannot make an expired lease look live.
+                    now = self.clock()
+                    until = now + self.caps.lease_seconds
                     lock = db.execute("SELECT owner,lease_until FROM executor_lock WHERE name='executor'").fetchone()
                     renewed = 0
                     if lock is not None and lock["owner"] == owner and lock["lease_until"] >= now:
