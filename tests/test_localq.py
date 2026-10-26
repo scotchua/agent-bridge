@@ -386,19 +386,26 @@ class LocalQueueTests(unittest.TestCase):
         blocker.execute("BEGIN IMMEDIATE")
         stop = mock.MagicMock()
         stop.wait.side_effect = [False, True]
+        waiting = threading.Event()
+        connect = self.queue._connect
+
+        def traced_connect():
+            # Signals once the renewer's own BEGIN IMMEDIATE has started.
+            conn = connect()
+            conn.set_trace_callback(lambda sql: sql == "BEGIN IMMEDIATE" and waiting.set())
+            return conn
+
         renewer = threading.Thread(target=self.queue._renew_lease_while_running,
                                    args=(job["job_id"], "sleeper", stop))
-        try:
-            renewer.start()
-            deadline = time.monotonic() + 2
-            while stop.wait.call_count < 1 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            time.sleep(0.2)  # renewer is now waiting on the write lock
-            self.clock.now += 2  # both leases lapse during the wait
-        finally:
-            blocker.execute("COMMIT")
-            blocker.close()
-            renewer.join(5)
+        with mock.patch.object(self.queue, "_connect", traced_connect):
+            try:
+                renewer.start()
+                self.assertTrue(waiting.wait(5))  # renewer is blocked on the write lock
+                self.clock.now += 2  # both leases lapse during the wait
+            finally:
+                blocker.execute("COMMIT")
+                blocker.close()
+                renewer.join(5)
         self.assertFalse(renewer.is_alive())
         with self.queue._db() as db:
             leased = db.execute("SELECT lease_until FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
