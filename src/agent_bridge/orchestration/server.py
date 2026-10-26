@@ -17,6 +17,7 @@ from ..localq.service import Service
 from . import autoroute, gate
 from .config import load
 from .execution_queue import ExecutionQueue
+from .harness_probe import HarnessReadinessProbe
 from .mcp import build_tools
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -196,7 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     # chosen exactly once, here, from the operator's own configuration file.
     # Nothing this server exposes to a caller can change it.
     service = Service.for_config(cfg)
-    router = StageRouter(cfg.capacity_db)
+    router = StageRouter(cfg.capacity_db, harness_probe=(
+        HarnessReadinessProbe.for_config(cfg) if cfg.execution_queue_root is not None else None))
     execution = None
     if cfg.execution_queue_root is not None:
         # Provider execution is deliberately not performed inside an MCP

@@ -2128,7 +2128,7 @@ def _write_presence(client: str, capacity_db: str, now: float) -> None:
                          isolation_level=None)
     try:
         db.execute("BEGIN IMMEDIATE")
-        upsert_observation(db, observation, trusted=True)
+        upsert_observation(db, observation, trusted=True, now=now)
         db.execute("COMMIT")
     finally:
         db.close()

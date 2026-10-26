@@ -1,9 +1,9 @@
 """Durable, conservative stage ownership and capacity-aware routing.
 
-This module decides *who may own a stage*.  It does not execute work, call a
-provider, or change the consultation bridge.  Capacity observations are an
-explicit input and expire closed: missing, unknown, or stale observations can
-never make a route eligible.
+This module decides *who may own a stage*. It does not execute work or change
+the consultation bridge. A broker may inject a bounded, non-inference harness
+probe to refresh stale execution presence. Capacity observations otherwise
+remain an explicit input and expire closed.
 
 Two limits on what an observation can be, both added because an adversarial
 review found the original table was evidence in name only:
@@ -46,6 +46,8 @@ MAX_FRESHNESS_SECONDS = 4 * 3600.0
 #: :func:`capacity_fingerprint` has to tell that row apart from every other
 #: one and must not import the module that writes it.
 PRESENCE_SOURCE = "gate-hook:client-present"
+BROKER_PROBE_SOURCE = "broker-probe:harness-ready"
+HARNESS_PROBE_FRESHNESS_SECONDS = 60.0
 
 #: What :func:`capacity_fingerprint` returns when no route is eligible.  A
 #: word rather than an empty string, so a receipt shows the state was computed
@@ -74,10 +76,13 @@ class StageRouter:
     before the stage can be assigned again.
     """
 
-    def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time):
+    def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time,
+                 harness_probe: Callable[[str], bool] | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.clock = clock
+        # Injected only by the broker's composition root, never from a tool.
+        self._harness_probe = harness_probe
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -97,6 +102,9 @@ class StageRouter:
         with self._db() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
+            db.execute("""CREATE TABLE IF NOT EXISTS harness_probes (
+                route TEXT PRIMARY KEY, attempted_at REAL NOT NULL,
+                fresh_until REAL NOT NULL, ready INTEGER)""")
             db.execute("""CREATE TABLE IF NOT EXISTS capacity (
                 route TEXT PRIMARY KEY, observed_at REAL NOT NULL,
                 fresh_until REAL NOT NULL, available INTEGER NOT NULL,
@@ -155,10 +163,11 @@ class StageRouter:
         the observation, so a caller that can only supply an observation
         cannot make itself trusted by naming a convincing ``source``.
         """
-        validate_observation(observation, self.clock())
+        now = self.clock()
+        validate_observation(observation, now)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            upsert_observation(db, observation, trusted=trusted)
+            upsert_observation(db, observation, trusted=trusted, now=now)
             db.execute("COMMIT")
 
     def register(self, item_id: str, stage: str, *, allowed_routes: Iterable[str],
@@ -245,6 +254,82 @@ class StageRouter:
             return [dict(row) for row in
                     db.execute("SELECT * FROM capacity ORDER BY route")]
 
+    def _refresh_harness_presence(self, routes: Iterable[str]) -> dict[str, str]:
+        """Broker-only evidence, with durable success/failure rate limiting.
+
+        Reserve before running outside the transaction: concurrent brokers
+        cannot stampede the CLI or hold the stage ledger during a subprocess.
+        A trusted refusal (including quota exhaustion) blocks presence and
+        readiness observations through fresh_until; after expiry, either may
+        establish availability again.  ready is NULL while a reservation's
+        probe is still running, so a waiting broker reports pending, not
+        failed.
+        """
+        failures = {}
+        if self._harness_probe is None:
+            return failures
+        for route in dict.fromkeys(routes):
+            if route not in {"claude", "codex"}:
+                continue
+            now = self.clock()
+            with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT * FROM capacity WHERE route=?", (route,)).fetchone()
+                if (row and row["trusted"]
+                        and row["observed_at"] <= now + 1 and row["fresh_until"] >= now):
+                    db.execute("COMMIT")
+                    continue
+                cached = db.execute("SELECT * FROM harness_probes WHERE route=?", (route,)).fetchone()
+                if cached and cached["attempted_at"] <= now and cached["fresh_until"] > now:
+                    if cached["ready"] is None:
+                        failures[route] = "harness_probe_pending"
+                    elif not cached["ready"]:
+                        failures[route] = "harness_probe_failed"
+                    db.execute("COMMIT")
+                    continue
+                until = now + HARNESS_PROBE_FRESHNESS_SECONDS
+                db.execute("""INSERT INTO harness_probes VALUES(?,?,?,NULL)
+                    ON CONFLICT(route) DO UPDATE SET attempted_at=excluded.attempted_at,
+                    fresh_until=excluded.fresh_until,ready=NULL""", (route, now, until))
+                db.execute("COMMIT")
+            try:
+                ready = self._harness_probe(route) is True
+            except Exception:
+                # Any probe defect is unknown readiness, never availability.
+                ready = False
+            with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE harness_probes SET ready=? WHERE route=? AND attempted_at=?",
+                           (int(ready), route, now))
+                # Re-read after the subprocess: quota evidence arriving while
+                # it ran wins, as does any other fresh trusted observation.
+                row = db.execute("SELECT * FROM capacity WHERE route=?", (route,)).fetchone()
+                current = self.clock()
+                if ready and current < until and not (
+                        row and row["trusted"]
+                        and row["observed_at"] <= current + 1 and row["fresh_until"] >= current):
+                    observation = CapacityObservation(route, now, until, True, BROKER_PROBE_SOURCE)
+                    validate_observation(observation, current)
+                    db.execute("""INSERT INTO capacity
+                        (route,observed_at,fresh_until,available,source,trusted) VALUES(?,?,?,?,?,1)
+                        ON CONFLICT(route) DO UPDATE SET observed_at=excluded.observed_at,
+                        fresh_until=excluded.fresh_until,available=1,source=excluded.source,trusted=1""",
+                               (observation.route, observation.observed_at,
+                                observation.fresh_until, 1, observation.source))
+                db.execute("COMMIT")
+            if not ready:
+                failures[route] = "harness_probe_failed"
+        return failures
+
+    def require_execution_presence(self, route: str) -> None:
+        """Refresh execution presence at broker admission; never renew a stage."""
+        if self._harness_probe is None:
+            return
+        failures = self._refresh_harness_presence([route])
+        with self._db() as db:
+            if route not in self._fresh_routes(db, self.clock()):
+                raise RoutingError(failures.get(route, "no_fresh_eligible_route"))
+
     def assign(self, item_id: str, stage: str, *, owner_id: str,
                lease_seconds: float, expected_revision: int,
                paid_fallback: bool = False) -> dict:
@@ -252,6 +337,15 @@ class StageRouter:
             raise RoutingError("paid_fallback_forbidden")
         if not owner_id or lease_seconds <= 0:
             raise RoutingError("assignment_invalid")
+        # Check before probing, then check again inside the assignment
+        # transaction. Terminal stages remain terminal without any probe.
+        snapshot = self.get(item_id, stage)
+        failures = {}
+        if (snapshot["state"] == "pending" and snapshot["revision"] == expected_revision
+                and snapshot["archived_at"] is None):
+            routes = [route for route in snapshot["preferred_routes"]
+                      if not snapshot["is_review"] or route != snapshot["author_route"]]
+            failures = self._refresh_harness_presence(routes)
         now = self.clock()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -286,7 +380,13 @@ class StageRouter:
             if row["is_review"]:
                 eligible = [route for route in eligible if route != row["author_route"]]
             if not eligible:
+                # Another broker's probe is still running: retry, don't block.
+                if any(failures.get(route) == "harness_probe_pending" for route in preferred):
+                    db.execute("ROLLBACK")
+                    raise RoutingError("harness_probe_pending")
                 reason = "no_fresh_eligible_route"
+                if any(failures.get(route) == "harness_probe_failed" for route in preferred):
+                    reason += ":harness_probe_failed"
                 db.execute("""UPDATE stages SET state='blocked',blocked_reason=?,
                     revision=revision+1,assignment=assignment+1,updated_at=? WHERE item_id=? AND stage=?""",
                            (reason, now, item_id, stage))
@@ -510,8 +610,23 @@ def validate_observation(observation: CapacityObservation, now: float) -> None:
 
 
 def upsert_observation(db: sqlite3.Connection, observation: CapacityObservation, *,
-                       trusted: bool) -> None:
-    """Write one validated observation inside the caller's transaction."""
+                       trusted: bool, now: float) -> None:
+    """Write one validated observation inside the caller's transaction.
+
+    ``now`` is the caller's decision time, the same one it validated with.
+    A refusal's protection is judged against it, never against the
+    observation's own timestamp, which may run up to a second ahead.
+    """
+    if observation.source == BROKER_PROBE_SOURCE:
+        raise RoutingError("capacity_source_reserved")
+    # Presence never clears a quota/usage refusal while it is still fresh.
+    if observation.source == PRESENCE_SOURCE:
+        existing = db.execute("SELECT trusted,available,fresh_until FROM capacity WHERE route=?",
+                              (observation.route,)).fetchone()
+        # The hook's no-create connection uses SQLite's default tuple rows.
+        if (existing and existing[0] and not existing[1]
+                and existing[2] >= now):
+            return
     db.execute("""INSERT INTO capacity(route,observed_at,fresh_until,available,source,trusted)
         VALUES(?,?,?,?,?,?) ON CONFLICT(route) DO UPDATE SET
         observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,
