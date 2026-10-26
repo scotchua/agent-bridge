@@ -105,6 +105,80 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
             pass
 
 
+STEPS_FILENAME = "steps.jsonl"
+STEP_PROVIDER_SPAWNED = "provider_spawned"
+# A job interrupted before any provider process began may go back in the queue
+# this many times. Beyond that it is held for a person, as before.
+MAX_RESUMES = 2
+
+
+def _step_id(job_id: str, step: str, attempt: int) -> str:
+    return hashlib.sha256(f"{job_id}\0{step}\0{attempt}".encode("utf-8")).hexdigest()
+
+
+def _read_steps(job_dir: Path) -> list[dict[str, Any]] | None:
+    """Return the job's step records, or None when it has no ledger.
+
+    A torn final line (a crash mid-append) is ignored; every earlier line was
+    fsynced whole.
+    """
+    try:
+        text = (job_dir / STEPS_FILENAME).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    records = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _append_step(job_dir: Path, step: str, phase: str, at: float,
+                 attempt: int = 0) -> None:
+    """Append one step record, once per (step_id, phase), and fsync it.
+
+    The record is durable before this returns, so a begin record written
+    ahead of a provider spawn survives the process dying right after it.
+    """
+    record = {"step_id": _step_id(job_dir.name, step, attempt), "step": step,
+              "phase": phase, "at": at}
+    path = job_dir / STEPS_FILENAME
+    created = not path.exists()
+    for existing in _read_steps(job_dir) or ():
+        if (existing.get("step_id"), existing.get("phase")) == (record["step_id"], phase):
+            return
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if created:
+        # Make the new directory entry durable too, where the OS allows it.
+        try:
+            dir_fd = os.open(job_dir, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
+
+
+def _attempt_of(job_dir: Path) -> int:
+    try:
+        value = json.loads((job_dir / "receipt.json").read_text(encoding="utf-8")).get("resume_count", 0)
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -117,6 +191,11 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 class SubprocessHarnessExecutor:
     """Invoke only a configured bounded harness, with no shell or fallback."""
+
+    # The queue writes the provider_spawned begin record for an executor that
+    # does not, before calling it. This one writes it itself, immediately
+    # before the process spawn, so earlier refusals cost the job nothing.
+    records_provider_spawn = True
 
     def __init__(self, harnesses: Harnesses, *, client_derived_routes: frozenset[str] = frozenset(),
                  capture_limit_bytes: int = HARNESS_CAPTURE_MAX_BYTES):
@@ -247,10 +326,12 @@ class SubprocessHarnessExecutor:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
                "USER": account, "LOGNAME": account}
+        _append_step(job_dir, STEP_PROVIDER_SPAWNED, "begin", time.time(), _attempt_of(job_dir))
         process = subprocess.Popen(argv, cwd=job_dir if pinned_job_source else request["repo"], env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True,
                                    shell=False)
+        _append_step(job_dir, STEP_PROVIDER_SPAWNED, "commit", time.time(), _attempt_of(job_dir))
         # ``total_timeout_seconds`` is admitted from the complete phase
         # budget, not guessed from generation.  The harness still owns each
         # generation, verification and cleanup timeout; this outer deadline
@@ -587,7 +668,7 @@ class ExecutionQueue:
             # process death between those two durable writes is uncertain, so
             # it is reconciled rather than silently retried.
             if state == "running" or (state == "queued" and (directory / "claim.lock").exists()):
-                self._block_for_reconciliation(receipt_path, receipt)
+                self._reconcile_interrupted(directory, receipt)
 
     @staticmethod
     def _receipt_for_scan(path: Path) -> dict[str, Any] | None:
@@ -602,6 +683,44 @@ class ExecutionQueue:
             return _read_json(path)
         except ExecutionAdmissionError:
             return None
+
+    def _reconcile_interrupted(self, directory: Path, receipt: dict[str, Any]) -> None:
+        """Requeue where nothing external can have happened, else hold.
+
+        The step ledger is the evidence. A job with no ledger predates it and
+        is held exactly as before. A ledger with no provider_spawned begin
+        record proves no provider process was started, so the job can go back
+        in the queue, at most MAX_RESUMES times. Anything else is held, with
+        the last recorded step named for the reconcile card.
+        """
+        receipt_path = directory / "receipt.json"
+        steps = _read_steps(directory)
+        if steps is None:
+            self._block_for_reconciliation(receipt_path, receipt)
+            return
+        last_step = steps[-1].get("step") if steps else None
+        spawn_began = any(r.get("step") == STEP_PROVIDER_SPAWNED and r.get("phase") == "begin"
+                          for r in steps)
+        resumes = receipt.get("resume_count", 0)
+        if (spawn_began or not isinstance(resumes, int) or isinstance(resumes, bool)
+                or resumes >= MAX_RESUMES):
+            if last_step is not None:
+                receipt["last_step"] = last_step
+            if spawn_began:
+                receipt["provider_send_may_have_happened"] = True
+            self._block_for_reconciliation(receipt_path, receipt)
+            return
+        # Drop the claim first. A death before the receipt write leaves a
+        # running job with no claim, which this method requeues again.
+        try:
+            (directory / "claim.lock").unlink()
+        except FileNotFoundError:
+            pass
+        for key in ("worker_id", "started_at", "finished_at", "error"):
+            receipt.pop(key, None)
+        receipt.update(state="queued", resume_count=resumes + 1,
+                       resume_reason="resumed_after_interruption", last_step=last_step)
+        _atomic_json(receipt_path, receipt)
 
     def _block_for_reconciliation(self, receipt_path: Path,
                                   receipt: dict[str, Any]) -> None:
@@ -1090,7 +1209,7 @@ class ExecutionQueue:
                     # have sent this job.  Do not let it starve later jobs,
                     # but never infer success or send it again.
                     if (directory / "claim.lock").exists():
-                        self._block_for_reconciliation(receipt_path, receipt)
+                        self._reconcile_interrupted(directory, receipt)
                         continue
                     selected = directory
                     break
@@ -1104,6 +1223,8 @@ class ExecutionQueue:
             os.close(descriptor)
             request = _read_json(selected / "request.json")
             receipt = _read_json(selected / "receipt.json")
+            attempt = receipt.get("resume_count", 0)
+            _append_step(selected, "claimed", "commit", self.clock(), attempt)
             receipt.update(state="running", worker_id=worker_id, started_at=self.clock())
             _atomic_json(selected / "receipt.json", receipt)
         try:
@@ -1134,7 +1255,13 @@ class ExecutionQueue:
             # check is therefore evidence only; this is the binding that may
             # actually start a provider process.
             self._require_live_stage_binding(request)
+            _append_step(selected, "stage_rechecked", "commit", self.clock(), attempt)
+            if not getattr(self.executor, "records_provider_spawn", False):
+                # An executor that cannot mark its own spawn is treated as
+                # having sent from the moment it is called.
+                _append_step(selected, STEP_PROVIDER_SPAWNED, "begin", self.clock(), attempt)
             outcome = self.executor(request, selected)
+            _append_step(selected, "provider_exited", "commit", self.clock(), attempt)
             validate_outcome(outcome)
             receipt.update(
                 state="complete" if outcome_is_success(outcome) else "failed",
@@ -1157,6 +1284,7 @@ class ExecutionQueue:
             if detail is not None:
                 receipt["error_detail"] = detail
         _atomic_json(selected / "receipt.json", receipt)
+        _append_step(selected, "result_written", "commit", self.clock(), attempt)
         return self.status(selected.name)
 
     def state_report(self) -> dict[str, int]:
