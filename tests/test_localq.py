@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -310,6 +311,134 @@ class LocalQueueTests(unittest.TestCase):
         self.assertIsNone(recovered.run_once("recovery"))
         self.assertEqual(recovered.status(job["job_id"])["status"], "unknown")
         self.assertEqual(recovered.result(job["job_id"])["disposition"]["reason"], "executor_lease_lost")
+
+    def test_lease_renewal_keeps_a_live_long_job_from_losing_its_lease(self):
+        """A job outliving the lease is not recovered while its executor runs."""
+        caps = dataclasses.replace(self.caps, lease_seconds=0.3, timeout_seconds=5)
+        sampler = Sampler(time.time)
+        release = threading.Event()
+        running = threading.Event()
+
+        def long_job(data):
+            running.set()
+            release.wait(5)
+            return {"draft": "done"}
+
+        queue = LocalQueue(self.temp.name, sampler=sampler, backend=FakeBackend(long_job),
+                           caps=caps, clock=time.time)
+        job = self.submit()
+        results = []
+        runner = threading.Thread(target=lambda: results.append(queue.run_once("alive")))
+        runner.start()
+        try:
+            self.assertTrue(running.wait(2))
+            time.sleep(0.9)  # three lease lengths without renewal
+            other = LocalQueue(self.temp.name, sampler=sampler, backend=FakeBackend(),
+                               caps=caps, clock=time.time)
+            self.assertIsNone(other._run_once_under_lock("recovery"))
+            self.assertEqual(queue.status(job["job_id"])["status"], "running")
+        finally:
+            release.set()
+            runner.join(5)
+        self.assertEqual(results[0]["status"], "complete")
+
+    def _running_under(self, job, lock_owner, lock_until, job_until):
+        with self.queue._db() as db:
+            db.execute("UPDATE jobs SET status='running',lease_owner='sleeper',lease_until=? WHERE job_id=?",
+                       (job_until, job["job_id"]))
+            db.execute("INSERT INTO executor_lock(name,owner,lease_until) VALUES('executor',?,?) "
+                       "ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,lease_until=excluded.lease_until",
+                       (lock_owner, lock_until))
+
+    def _renew_once(self, job):
+        stop = mock.MagicMock()
+        stop.wait.side_effect = [False, True]
+        self.queue._renew_lease_while_running(job["job_id"], "sleeper", stop)
+        with self.queue._db() as db:
+            leased = db.execute("SELECT lease_until FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+            lock = db.execute("SELECT owner,lease_until FROM executor_lock").fetchone()
+        return leased, tuple(lock), stop.wait.call_count
+
+    def test_renewal_after_sleep_does_not_resurrect_an_expired_lease(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now - 1, now - 1)
+        leased, lock, waits = self._renew_once(job)
+        self.assertEqual(leased, now - 1)
+        self.assertEqual(lock, ("sleeper", now - 1))
+        self.assertEqual(waits, 1)  # renewal stopped for good
+
+    def test_renewal_stops_when_another_executor_holds_the_lock(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "successor", now + 5, now + 1)
+        leased, lock, waits = self._renew_once(job)
+        self.assertEqual(leased, now + 1)
+        self.assertEqual(lock, ("successor", now + 5))
+        self.assertEqual(waits, 1)
+
+    def test_renewal_reads_the_clock_after_taking_the_write_lock(self):
+        """Leases that lapse while the renewer waits for the lock stay lapsed."""
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now + 1, now + 1)
+        blocker = self.queue._connect()
+        blocker.execute("BEGIN IMMEDIATE")
+        stop = mock.MagicMock()
+        stop.wait.side_effect = [False, True]
+        waiting = threading.Event()
+        connect = self.queue._connect
+
+        def traced_connect():
+            # Signals once the renewer's own BEGIN IMMEDIATE has started.
+            conn = connect()
+            conn.set_trace_callback(lambda sql: sql == "BEGIN IMMEDIATE" and waiting.set())
+            return conn
+
+        renewer = threading.Thread(target=self.queue._renew_lease_while_running,
+                                   args=(job["job_id"], "sleeper", stop))
+        with mock.patch.object(self.queue, "_connect", traced_connect):
+            try:
+                renewer.start()
+                self.assertTrue(waiting.wait(5))  # renewer is blocked on the write lock
+                self.clock.now += 2  # both leases lapse during the wait
+            finally:
+                blocker.execute("COMMIT")
+                blocker.close()
+                renewer.join(5)
+        self.assertFalse(renewer.is_alive())
+        with self.queue._db() as db:
+            leased = db.execute("SELECT lease_until FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+            lock = tuple(db.execute("SELECT owner,lease_until FROM executor_lock").fetchone())
+        self.assertEqual(leased, now + 1)
+        self.assertEqual(lock, ("sleeper", now + 1))
+        self.assertEqual(stop.wait.call_count, 1)
+
+    def test_renewal_extends_both_leases_while_still_held(self):
+        job = self.submit()
+        now = self.clock()
+        self._running_under(job, "sleeper", now + 1, now + 1)
+        leased, lock, waits = self._renew_once(job)
+        until = now + self.caps.lease_seconds
+        self.assertEqual(leased, until)
+        self.assertEqual(lock, ("sleeper", until))
+        self.assertEqual(waits, 2)
+
+    def test_dead_executor_still_goes_unknown_after_its_lease_lapses(self):
+        job = self.submit()
+        with self.queue._db() as db:
+            db.execute("UPDATE jobs SET status='running',lease_owner='dead',lease_until=? WHERE job_id=?",
+                       (self.clock() + 1, job["job_id"]))
+            db.execute("INSERT INTO executor_lock(name,owner,lease_until) VALUES('executor','dead',?) "
+                       "ON CONFLICT(name) DO UPDATE SET owner='dead',lease_until=?",
+                       (self.clock() + 1, self.clock() + 1))
+        self.assertIsNone(self.queue.run_once("successor"))
+        self.assertEqual(self.queue.status(job["job_id"])["status"], "running")
+        self.clock.now += 2  # nothing renews a dead executor's lease
+        self.assertIsNone(self.queue.run_once("successor"))
+        self.assertEqual(self.queue.status(job["job_id"])["status"], "unknown")
+        self.assertEqual(self.queue.result(job["job_id"])["disposition"]["reason"],
+                         "executor_lease_lost")
 
     def test_bulk_expiry_and_queue_cap(self):
         bulk = self.submit(priority="bulk")

@@ -689,6 +689,40 @@ class LocalQueue:
             finally:
                 os.close(fd)
 
+    def _renew_lease_while_running(self, job_id: str, owner: str,
+                                   stop: threading.Event) -> None:
+        """Keep a live executor's lease from expiring while its job runs.
+
+        Renews at a third of the lease, so two consecutive misses are still
+        survivable. It only extends leases this owner still holds unexpired:
+        the job must be running under this owner and the executor lock must
+        be this owner's. A lease that lapsed (laptop sleep) or a lock another
+        executor took stays lost, and renewal stops for good.
+        """
+        while not stop.wait(self.caps.lease_seconds / 3):
+            try:
+                with self._db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    # Read the clock only once the write lock is held, so a
+                    # sleep or lock wait cannot make an expired lease look live.
+                    now = self.clock()
+                    until = now + self.caps.lease_seconds
+                    lock = db.execute("SELECT owner,lease_until FROM executor_lock WHERE name='executor'").fetchone()
+                    renewed = 0
+                    if lock is not None and lock["owner"] == owner and lock["lease_until"] >= now:
+                        renewed = db.execute("UPDATE jobs SET lease_until=? WHERE job_id=? AND status='running' "
+                                             "AND lease_owner=? AND lease_until>=?",
+                                             (until, job_id, owner, now)).rowcount
+                        if renewed:
+                            db.execute("UPDATE executor_lock SET lease_until=? WHERE name='executor' AND owner=?",
+                                       (until, owner))
+                    db.execute("COMMIT")
+                    if not renewed:
+                        return
+            except sqlite3.Error:
+                # A busy database skips this beat; the next one retries.
+                continue
+
     def _run_once_under_lock(self, owner: str | None = None) -> dict[str, Any] | None:
         if self.backend is None:
             raise RuntimeError("no local executor configured")
@@ -738,6 +772,10 @@ class LocalQueue:
         payload = {"task_type": row["task_type"], "input": input_value,
                    "params": params, "job_id": row["job_id"]}
         outcome, result, error = "complete", None, None
+        stop_renewal = threading.Event()
+        renewer = threading.Thread(target=self._renew_lease_while_running,
+                                   args=(row["job_id"], owner, stop_renewal), daemon=True)
+        renewer.start()
         try:
             result = self.backend.run(payload, self.caps.timeout_seconds)
             if not isinstance(result, dict):
@@ -746,6 +784,9 @@ class LocalQueue:
             outcome, error = "unknown", "execution_timeout"
         except Exception as exc:  # backend error was observed, so it is not indeterminate
             outcome, error = "failed", _failure_text(exc)
+        finally:
+            stop_renewal.set()
+            renewer.join()
         now = self.clock()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
