@@ -270,6 +270,7 @@ def execute(job_dir: str) -> int:
                 send_binding.guard(
                     send_prompt, route="peer", provider=peer,
                     classification=request["source_classification"],
+                    exception_id=request.get("exception_id"),
                     log_path=cfg.state("send-decisions.jsonl"),
                     legacy=[cfg.raw.get("client_derived_routes", [])],
                 )

@@ -131,6 +131,14 @@ def _start_schema(peer: str, allowed: tuple[str, ...] | None = None) -> dict[str
                 "description": "Optional short human-readable label for the audit ledger.",
             },
             "local_first": _local_first_schema(),
+            "exception_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                "description": (
+                    "Optional id of an identifier exception Scott approved for this "
+                    "exact prompt. Covers one send only."
+                ),
+            },
             "preparation_dir": {
                 "type": "string",
                 "description": (

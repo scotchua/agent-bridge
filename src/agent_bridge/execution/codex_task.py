@@ -68,10 +68,12 @@ except ImportError:  # The orchestration worker invokes this file directly.
 
 class TaskError(RuntimeError): pass
 
-def _release_send(outbound:bytes,provider:str,classification:str,job:Path,routes)->None:
+def _release_send(outbound:bytes,provider:str,classification:str,job:Path,routes,
+                  exception_id:str|None=None)->None:
     """U3: bind the exact brief bytes and release them just before generation."""
     try:
         send_binding.guard(outbound,route="execution",provider=provider,classification=classification,
+                           exception_id=exception_id,
                            log_path=str(job/"send-decisions.jsonl"),legacy=[routes])
     except send_binding.SendRefused as exc:
         raise TaskError(f"execution send refused: {exc.reason}") from exc
@@ -719,7 +721,7 @@ def run_task(*,codex_bin:Path,promotion_dir:Path|None=None,job_source:Path|None=
 def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission:codex_promotion.Admission,
                   codex_home:Path=DEFAULT_CODEX_HOME,
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
-                  client_derived_routes: tuple[str, ...] = (),
+                  client_derived_routes: tuple[str, ...] = (),exception_id:str|None=None,
                   verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,
                   verify_timeout:int=300,cleanup_timeout:int=60,job_source:Path|None=None):
     # The operator settings file decides; the argument is the legacy fallback.
@@ -797,7 +799,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         argv=_command(codex_bin,model,reasoning_effort,gen,last_message_file)
         codex_env={**env,"CODEX_HOME":str(codex_home)}
         outbound=("TASK BRIEF\n\n"+brief_text).encode()
-        _release_send(outbound,"codex",classification,job,client_derived_routes)
+        _release_send(outbound,"codex",classification,job,client_derived_routes,exception_id)
         r=_run(argv,cwd=gen,env=codex_env,timeout=timeout,input_bytes=outbound)
         for n,data in (("codex.stdout",r.stdout),("codex.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
@@ -935,6 +937,10 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
     if receipt["status"] != "no_patch": result["patch"]=str(job/"changes.patch")
     return result
 
+def _exception_id(value:str)->str:
+    if not send_binding.valid_exception_id(value): raise argparse.ArgumentTypeError("invalid exception id")
+    return value
+
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("brief",type=Path); p.add_argument("--repo",required=True,type=Path)
     p.add_argument("--job-source",type=Path,default=None)
@@ -943,6 +949,7 @@ def main(argv=None):
     p.add_argument("--classification",required=True,
                    choices=sorted(ALLOWED_CLASSIFICATIONS | {"client_derived"}))
     p.add_argument("--client-derived-routes", action="append", default=[], choices=["execution"])
+    p.add_argument("--exception-id",default=None,dest="exception_id",type=_exception_id)
     p.add_argument("--model",default=None); p.add_argument("--reasoning-effort",default=None,dest="reasoning_effort")
     p.add_argument("--base",default="HEAD"); p.add_argument("--timeout",type=int,default=900)
     p.add_argument("--verify-timeout",type=int,default=300)

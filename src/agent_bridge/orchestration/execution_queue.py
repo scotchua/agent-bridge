@@ -25,6 +25,7 @@ from agent_bridge.bounded_capture import capture_process
 
 from ..execution import claude_config, verify_policy
 from ..execution import job_source
+from .. import send_binding
 from ..capacity_router import RoutingError, StageRouter
 from . import windows_privacy as wpv
 
@@ -298,6 +299,8 @@ class SubprocessHarnessExecutor:
                      "--claude-config-dir", str(directory)]
         if "execution" in self.client_derived_routes and not is_review:
             argv += ["--client-derived-routes", "execution"]
+        if request.get("exception_id") is not None and not is_review:
+            argv += ["--exception-id", request["exception_id"]]
         if pinned_job_source:
             argv += ["--job-source", str(job_dir)]
         for command in request["verify_argv"]:
@@ -833,7 +836,11 @@ class ExecutionQueue:
                total_timeout_seconds: int | None = None,
                idempotency_key: str | None = None, kind: str = "execution",
                head: str | None = None, author_provider: str | None = None,
-               client_derived_admitted: bool = False) -> dict[str, Any]:
+               client_derived_admitted: bool = False,
+               exception_id: str | None = None) -> dict[str, Any]:
+        if exception_id is not None and (kind != "execution"
+                                         or not send_binding.valid_exception_id(exception_id)):
+            raise ExecutionAdmissionError("exception_id_invalid")
         if caller not in PROVIDER_FOR_CALLER or provider != PROVIDER_FOR_CALLER[caller]:
             raise ExecutionAdmissionError("provider_not_eligible_for_caller")
         if paid_fallback:
@@ -960,6 +967,9 @@ class ExecutionQueue:
                     "stage_assignment": stage_assignment, "kind": kind, "head": head,
                     "author_provider": author_provider,
                     "client_derived_admitted": client_derived_admitted}
+        # Only when given, so jobs submitted before U3 keep the same identity.
+        if exception_id is not None:
+            identity["exception_id"] = exception_id
 
         # Reviews and non-POSIX workers keep their existing admission shape;
         # only POSIX execution jobs receive a private pinned source here.

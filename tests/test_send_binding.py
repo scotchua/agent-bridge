@@ -98,6 +98,22 @@ class DetectionTests(unittest.TestCase):
     def test_bare_nine_digits_fail_closed_as_ssn(self):
         self.assertIn("ssn", sb.identifier_classes("ref 123456789"))
 
+    def test_separator_variants(self):
+        cases = {
+            "ssn": ("id 123 45 6789 here", "id 123.45.6789 here"),
+            "ein": ("ein 12 3456789 here", "ein 12.3456789 here"),
+            "phone": ("call 555.010.0199 today", "call +44 20 7946 0958 today",
+                      "call +1 555 010 0199 today"),
+            "account": ("acct 12345678 on file", "acct 1234-5678 on file"),
+        }
+        for name, texts in cases.items():
+            for text in texts:
+                with self.subTest(name=name, text=text):
+                    self.assertIn(name, sb.identifier_classes(text))
+
+    def test_iso_dates_stay_clean(self):
+        self.assertEqual(sb.identifier_classes("Closed on 2026-10-27, filed 2026-01-31."), ())
+
 
 class BindTests(StateCase):
     def test_clean_payload_auto_binds_and_releases(self):
@@ -185,6 +201,34 @@ class ExceptionTests(StateCase):
         os.chmod(self.state / sb.EXCEPTIONS_DIR / "exc-open.json", 0o666)
         self.refused(sb.REFUSED_EXCEPTION, self.bind, SYNTHETIC_EMAIL, exception_id="exc-open")
 
+    def test_exception_spend_survives_a_new_process(self):
+        self.exception("exc-durable", SYNTHETIC_EMAIL)
+        self.bind(SYNTHETIC_EMAIL, exception_id="exc-durable")
+        with mock.patch.object(sb, "_SPENT", set()):
+            self.refused(sb.REFUSED_EXCEPTION, self.bind, SYNTHETIC_EMAIL,
+                         exception_id="exc-durable")
+
+    def test_untrusted_spent_folder_refuses(self):
+        self.exception("exc-spent", SYNTHETIC_EMAIL)
+        spent = self.state / sb.EXCEPTIONS_DIR / "spent"
+        spent.mkdir(mode=0o700)
+        os.chmod(spent, 0o777)
+        self.refused(sb.REFUSED_EXCEPTION, self.bind, SYNTHETIC_EMAIL, exception_id="exc-spent")
+
+    def test_non_finite_exception_expiry_refuses(self):
+        for exception_id, value in (("exc-inf", float("inf")), ("exc-nan", float("nan"))):
+            with self.subTest(exception_id=exception_id):
+                self.exception(exception_id, SYNTHETIC_EMAIL, expires_at=value)
+                self.refused(sb.REFUSED_EXCEPTION, self.bind, SYNTHETIC_EMAIL,
+                             exception_id=exception_id)
+
+    def test_binding_never_outlives_its_exception(self):
+        self.exception("exc-short", SYNTHETIC_EMAIL, expires_at=1005)
+        binding = self.bind(SYNTHETIC_EMAIL, exception_id="exc-short", now=1000.0,
+                            ttl_seconds=300)
+        self.assertEqual(binding.expires_at, 1005)
+        self.refused(sb.REFUSED_EXPIRED, self.release, binding, SYNTHETIC_EMAIL, now=1006.0)
+
     def test_bad_exception_id_refuses(self):
         self.refused(sb.REFUSED_EXCEPTION, self.bind, SYNTHETIC_EMAIL, exception_id="../x")
 
@@ -226,6 +270,16 @@ class ReleaseTests(StateCase):
     def test_missing_binding_refuses(self):
         self.refused(sb.REFUSED_CAPABILITY, self.release, None)
 
+    def test_binding_under_another_label_refuses(self):
+        binding = self.bind()
+        self.refused(sb.REFUSED_CAPABILITY, self.release, binding, classification="public")
+        self.release(binding)
+
+    def test_bad_ttl_refuses(self):
+        for ttl in (0, -1, float("inf"), float("nan"), True):
+            with self.subTest(ttl=ttl):
+                self.refused(sb.REFUSED_EXPIRED, self.bind, ttl_seconds=ttl)
+
     def test_policy_change_refuses(self):
         binding = self.bind()
         self.settings(["peer"])
@@ -266,6 +320,33 @@ class LogTests(StateCase):
     def test_log_is_owner_only(self):
         self.bind()
         self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+
+    def test_approval_ref_is_hashed_in_the_log(self):
+        self.exception("exc-ref", SYNTHETIC_EMAIL)
+        self.bind(SYNTHETIC_EMAIL, exception_id="exc-ref")
+        text = Path(self.log).read_text(encoding="utf-8")
+        self.assertNotIn("synthetic-approval", text)
+        self.assertEqual(self.entries()[0]["approval_ref_sha256"],
+                         sb.hashlib.sha256(b"synthetic-approval").hexdigest())
+
+    def test_symlinked_log_refuses(self):
+        target = Path(self.temp.name) / "elsewhere.jsonl"
+        target.touch(mode=0o600)
+        os.symlink(target, self.log)
+        self.refused(sb.REFUSED_LOG, self.bind)
+        self.assertEqual(target.read_text(encoding="utf-8"), "")
+
+    def test_shared_log_refuses(self):
+        Path(self.log).touch()
+        os.chmod(self.log, 0o644)
+        self.refused(sb.REFUSED_LOG, self.bind)
+
+    def test_log_in_shared_folder_refuses(self):
+        shared = Path(self.temp.name) / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        self.refused(sb.REFUSED_LOG, sb.bind, CLEAN, route="peer", provider="codex",
+                     classification="client_derived", log_path=str(shared / "d.jsonl"))
 
 
 if __name__ == "__main__":

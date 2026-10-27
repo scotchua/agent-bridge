@@ -51,9 +51,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -78,6 +80,7 @@ REFUSED_REPLAY = "capability_spent"
 REFUSED_EXPIRED = "binding_expired"
 REFUSED_BODY = "body_changed"
 REFUSED_POLICY = "policy_changed"
+REFUSED_LOG = "log_untrusted"
 
 
 class SendRefused(Exception):
@@ -93,17 +96,24 @@ class SendRefused(Exception):
 _SEP = r"[ .-]?"
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")),
-    ("ssn", re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)|(?<![\d-])\d{9}(?![\d-])")),
-    ("ein", re.compile(r"(?<!\d)\d{2}-\d{7}(?!\d)")),
+    # Any separator, or none: 123-45-6789, 123 45 6789, 123.45.6789, 123456789.
+    ("ssn", re.compile(r"(?<!\d)\d{3}" + _SEP + r"\d{2}" + _SEP + r"\d{4}(?!\d)")),
+    ("ein", re.compile(r"(?<!\d)\d{2}" + _SEP + r"\d{7}(?!\d)")),
     ("phone", re.compile(
-        r"(?<![\w-])(?:\+?1[ .-]?)?(?:\(\d{3}\)\s?|\d{3}" + _SEP + r")\d{3}" + _SEP + r"\d{4}(?![\w-])")),
-    ("account", re.compile(r"(?<!\d)(?:\d[ -]?){10,18}\d(?!\d)")),
+        r"(?<![\w-])(?:\+\d{1,3}" + _SEP + r")?(?:\(\d{3}\)\s?|\d{3}" + _SEP + r")\d{3}"
+        + _SEP + r"\d{4}(?![\w-])"
+        r"|(?<![\w-])\+\d(?:" + _SEP + r"\d){6,13}(?![\w-])")),
+    ("account", re.compile(r"(?<!\d)(?:\d[ -]?){7,18}\d(?!\d)")),
 )
+# An ISO date is eight digits with separators; it is not an account number.
+_ISO_DATE = re.compile(r"(?<!\d)\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?!\d)")
 
 
 def identifier_classes(text: str) -> tuple[str, ...]:
     """The identifier classes found in ``text``, sorted. Never the values."""
-    found = {name for name, pattern in _PATTERNS if pattern.search(text)}
+    undated = _ISO_DATE.sub(" ", text)
+    found = {name for name, pattern in _PATTERNS
+             if pattern.search(undated if name == "account" else text)}
     return tuple(sorted(found))
 
 
@@ -126,10 +136,18 @@ class Binding:
     capability: str = field(repr=False, compare=False)
 
     def record(self) -> dict:
-        """The loggable record: everything except the capability."""
+        """The signed record: everything except the capability."""
         value = asdict(self)
         value.pop("capability")
         value["identifier_classes"] = list(self.identifier_classes)
+        return value
+
+    def log_entry(self) -> dict:
+        """The record as logged: the approval reference only as a hash."""
+        value = self.record()
+        ref = value.pop("approval_ref")
+        value["approval_ref_sha256"] = (hashlib.sha256(ref.encode("utf-8")).hexdigest()
+                                        if ref else None)
         return value
 
 
@@ -167,20 +185,43 @@ def _check_destination(route: str, provider: str) -> None:
         raise SendRefused(REFUSED_DESTINATION)
 
 
+def _owned(st: os.stat_result, mask: int) -> bool:
+    getuid = getattr(os, "getuid", None)
+    return (getuid is None or st.st_uid == getuid()) and not st.st_mode & mask
+
+
 def _log(log_path: str | None, event: str, entry: Mapping) -> None:
+    """Append one decision. A log that cannot be trusted refuses the send."""
     if not log_path:
         return
     line = json.dumps({"event": event, "logged_at": time.time(), **entry},
                       sort_keys=True) + "\n"
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        parent = os.stat(os.path.dirname(os.path.abspath(log_path)))
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        raise SendRefused(REFUSED_LOG) from None
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or not _owned(st, 0o077)
+                or not stat.S_ISDIR(parent.st_mode) or not _owned(parent, 0o022)):
+            raise SendRefused(REFUSED_LOG)
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
 
 
+EXCEPTION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def valid_exception_id(value) -> bool:
+    """True for an id the exception store can name; callers check at intake."""
+    return isinstance(value, str) and EXCEPTION_ID.fullmatch(value) is not None
+
+
 def _exception_path(exception_id: str, home, environ) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", exception_id):
+    if not valid_exception_id(exception_id):
         raise SendRefused(REFUSED_EXCEPTION)
     return os.path.join(operator_settings.state_home(home, environ), EXCEPTIONS_DIR,
                         exception_id + ".json")
@@ -205,9 +246,29 @@ def _load_exception(exception_id: str, *, body_sha256: str, route: str, provider
             or not isinstance(document.get("classes"), list)
             or not set(classes) <= set(document["classes"])
             or type(document.get("expires_at")) not in (int, float)
+            or not math.isfinite(document["expires_at"])
             or document["expires_at"] <= now):
         raise SendRefused(REFUSED_EXCEPTION, classes)
     return document
+
+
+def _spend_exception(exception_id: str, classes: tuple[str, ...], home, environ) -> None:
+    """Spend an exception for good: a marker file that survives this process."""
+    folder = os.path.join(operator_settings.state_home(home, environ), EXCEPTIONS_DIR, "spent")
+    try:
+        try:
+            os.mkdir(folder, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(folder)
+        if not stat.S_ISDIR(st.st_mode) or not _owned(st, 0o022):
+            raise SendRefused(REFUSED_EXCEPTION, classes)
+        fd = os.open(os.path.join(folder, exception_id),
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                     0o600)
+        os.close(fd)
+    except OSError:
+        raise SendRefused(REFUSED_EXCEPTION, classes) from None
 
 
 def bind(body: str | bytes, *, route: str, provider: str, classification: str,
@@ -224,6 +285,10 @@ def bind(body: str | bytes, *, route: str, provider: str, classification: str,
     base = {"body_sha256": body_sha256, "body_length": len(data),
             "route": route, "provider": provider}
     try:
+        if (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
+                or not math.isfinite(ttl_seconds) or ttl_seconds <= 0
+                or not math.isfinite(now)):
+            raise SendRefused(REFUSED_EXPIRED)
         routes, revision, fail_closed = _policy(home, environ, legacy)
         if fail_closed:
             raise SendRefused(REFUSED_SETTINGS)
@@ -250,18 +315,21 @@ def bind(body: str | bytes, *, route: str, provider: str, classification: str,
             "exception_id": exception_id if exception else None,
             "approval_ref": exception["approval_ref"] if exception else None,
             "created_at": now,
-            "expires_at": now + ttl_seconds,
+            # Never outlive the exception that allowed it.
+            "expires_at": (min(now + ttl_seconds, exception["expires_at"]) if exception
+                           else now + ttl_seconds),
         }
         if exception is not None:
-            # D3: one payload only. Spend the exception before anything is sent.
-            _spend("exception:" + exception_id, REFUSED_EXCEPTION, classes)
+            # D3: one payload only. Spend the exception before anything is sent,
+            # durably, so a restart or another process cannot spend it again.
+            _spend_exception(exception_id, classes, home, environ)
         binding = Binding(**record, capability=_sign({**record,
                                                       "identifier_classes": list(classes)}))
     except SendRefused as exc:
         _log(log_path, "refused", {**base, "reason": exc.reason,
                                     "identifier_classes": list(exc.classes)})
         raise
-    _log(log_path, "bound", binding.record())
+    _log(log_path, "bound", binding.log_entry())
     return binding
 
 
@@ -277,18 +345,21 @@ def release(binding: Binding | None, body: str | bytes, *, route: str, provider:
             home=None, environ: Mapping[str, str] | None = None,
          legacy=None) -> None:
     """Check and spend the capability immediately before ``body`` is sent."""
-    if classification.strip().lower() not in CLIENT_DERIVED:
+    client_derived = classification.strip().lower() in CLIENT_DERIVED
+    if binding is None and not client_derived:
         return
     data, body_sha256 = _digest(body)
     base = {"body_sha256": body_sha256, "route": route, "provider": provider}
     try:
-        if not isinstance(binding, Binding):
+        # A binding offered under another classification is a relabel, not a pass.
+        if not client_derived or not isinstance(binding, Binding):
             raise SendRefused(REFUSED_CAPABILITY)
         record = binding.record()
         if not hmac.compare_digest(binding.capability, _sign(record)):
             raise SendRefused(REFUSED_CAPABILITY)
         now = time.time() if now is None else now
-        if now >= binding.expires_at:
+        if (not math.isfinite(now) or not math.isfinite(binding.expires_at)
+                or now >= binding.expires_at):
             raise SendRefused(REFUSED_EXPIRED)
         if binding.route != route or binding.provider != provider:
             raise SendRefused(REFUSED_DESTINATION)
