@@ -111,8 +111,11 @@ class DetectionTests(unittest.TestCase):
                 with self.subTest(name=name, text=text):
                     self.assertIn(name, sb.identifier_classes(text))
 
-    def test_iso_dates_stay_clean(self):
-        self.assertEqual(sb.identifier_classes("Closed on 2026-10-27, filed 2026-01-31."), ())
+    def test_date_shaped_numbers_fail_closed_as_account(self):
+        # F9: stripping dates let "Account number: 2026-10-27" auto-send.
+        for text in ("Account number: 2026-10-27", "Closed on 2026-10-27."):
+            with self.subTest(text=text):
+                self.assertIn("account", sb.identifier_classes(text))
 
 
 class BindTests(StateCase):
@@ -335,6 +338,18 @@ class LogTests(StateCase):
         os.symlink(target, self.log)
         self.refused(sb.REFUSED_LOG, self.bind)
         self.assertEqual(target.read_text(encoding="utf-8"), "")
+
+    def test_short_write_completes_the_record(self):
+        real = os.write
+        with mock.patch.object(sb.os, "write", side_effect=lambda fd, b: real(fd, bytes(b)[:5])):
+            self.bind()
+        self.assertEqual(self.entries()[0]["event"], "bound")
+
+    def test_stalled_or_failed_write_refuses(self):
+        for effect in (lambda fd, b: 0, OSError("disk full")):
+            with self.subTest(effect=effect), \
+                    mock.patch.object(sb.os, "write", side_effect=effect):
+                self.refused(sb.REFUSED_LOG, self.bind)
 
     def test_shared_log_refuses(self):
         Path(self.log).touch()

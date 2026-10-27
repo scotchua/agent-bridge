@@ -103,18 +103,15 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?<![\w-])(?:\+\d{1,3}" + _SEP + r")?(?:\(\d{3}\)\s?|\d{3}" + _SEP + r")\d{3}"
         + _SEP + r"\d{4}(?![\w-])"
         r"|(?<![\w-])\+\d(?:" + _SEP + r"\d){6,13}(?![\w-])")),
+    # Date-shaped digit runs (2026-10-27) match too: a date cannot be told from
+    # an eight-digit account without context, so it fails closed (F2/F9).
     ("account", re.compile(r"(?<!\d)(?:\d[ -]?){7,18}\d(?!\d)")),
 )
-# An ISO date is eight digits with separators; it is not an account number.
-_ISO_DATE = re.compile(r"(?<!\d)\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?!\d)")
 
 
 def identifier_classes(text: str) -> tuple[str, ...]:
     """The identifier classes found in ``text``, sorted. Never the values."""
-    undated = _ISO_DATE.sub(" ", text)
-    found = {name for name, pattern in _PATTERNS
-             if pattern.search(undated if name == "account" else text)}
-    return tuple(sorted(found))
+    return tuple(sorted(name for name, pattern in _PATTERNS if pattern.search(text)))
 
 
 # -------------------------------------------------------------------- binding
@@ -207,7 +204,14 @@ def _log(log_path: str | None, event: str, entry: Mapping) -> None:
         if (not stat.S_ISREG(st.st_mode) or not _owned(st, 0o077)
                 or not stat.S_ISDIR(parent.st_mode) or not _owned(parent, 0o022)):
             raise SendRefused(REFUSED_LOG)
-        os.write(fd, line.encode("utf-8"))
+        data = memoryview(line.encode("utf-8"))
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise SendRefused(REFUSED_LOG)
+            data = data[written:]
+    except OSError:
+        raise SendRefused(REFUSED_LOG) from None
     finally:
         os.close(fd)
 
