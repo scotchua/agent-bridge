@@ -4,18 +4,27 @@ from __future__ import annotations
 import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
-    from .. import operator_settings, runner, token_usage
+    from .. import operator_settings, runner, send_binding, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from . import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from agent_bridge import operator_settings, runner, token_usage
+    from agent_bridge import operator_settings, runner, send_binding, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.execution import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
 
 class TaskError(RuntimeError): pass
+
+def _release_send(outbound:bytes,provider:str,classification:str,job:Path,routes)->None:
+    """U3: bind the exact brief bytes and release them just before generation."""
+    try:
+        send_binding.guard(outbound,route="execution",provider=provider,classification=classification,
+                           log_path=str(job/"send-decisions.jsonl"),legacy=[routes])
+    except send_binding.SendRefused as exc:
+        raise TaskError(f"execution send refused: {exc.reason}") from exc
+
 
 
 class NoPatchError(TaskError):
@@ -741,7 +750,9 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
         marker=(gen/".git").read_bytes()
         gen_command,gen_env,fence=_fenced_generation(_command(claude_bin,model,effort),job,gen,claude_config_dir,env,backend.name)
         receipt["generation_write_fence"]=fence
-        r=_run(gen_command,cwd=gen,env=gen_env,timeout=timeout,input_bytes=("TASK BRIEF\n\n"+brief_text).encode())
+        outbound=("TASK BRIEF\n\n"+brief_text).encode()
+        _release_send(outbound,"claude",classification,job,client_derived_routes)
+        r=_run(gen_command,cwd=gen,env=gen_env,timeout=timeout,input_bytes=outbound)
         for n,data in (("claude.stdout",r.stdout),("claude.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
             receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
