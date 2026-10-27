@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import store
+from . import operator_settings, store
 from .errors import BrokerError, ErrorCategory
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -115,13 +115,23 @@ class Config:
 
     @property
     def client_derived_routes(self) -> frozenset[str]:
-        """Operator opt-ins for client-derived data, empty in a fresh clone."""
+        """Operator opt-ins for client-derived data, empty in a fresh clone.
+
+        The operator settings file decides. This config's own key is only the
+        legacy fallback, read through the same loader as every other reader. It
+        is validated only when it would be used, so a stale malformed key cannot
+        override a file that decides, and a malformed key still fails at load
+        when nothing else does.
+        """
+        decided = operator_settings.resolve()
+        if decided.source == operator_settings.SOURCE_OPERATOR:
+            return decided.routes
         value = self.raw.get("client_derived_routes", [])
         if not isinstance(value, list) or any(not isinstance(route, str)
                                               or route not in CLIENT_DERIVED_ROUTES
                                               for route in value):
             raise ValueError("client_derived_routes must be a list drawn from peer, execution")
-        return frozenset(value)
+        return operator_settings.client_derived_routes(legacy=[value])
 
     #: Effort levels both CLIs accept. Kept identical so one setting means the
     #: same thing on each side.

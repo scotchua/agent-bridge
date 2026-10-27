@@ -270,9 +270,10 @@ available, a single `Authored-By: claude|codex|local` or
 `Co-Authored-By: claude|codex|local` trailer across the reviewed commits is
 required; unknown or conflicting provenance refuses dispatch.
 
-Client-derived repositories are refused unless both the orchestration policy
-and routing policy opt into `client_derived_routes: ["execution"]`, the same
-operator setting used by the implementation lane. A receipt retains the
+Client-derived repositories are refused unless the operator settings file
+lists `execution` under `client_derived_routes`, the same setting used by the
+implementation lane. On an older install that still carries the key in the
+orchestration config and routing policy, both must opt in. A receipt retains the
 `client_derived` classification. `review_result` reads the durable receipt,
 and `review_verify` requires the exact reviewed head plus a disposition for
 every finding: `fixed`, `rejected` with a reason, or `waived` with an approval

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from collections.abc import Callable
 from typing import Any, Mapping
 
+from .. import operator_settings
 from ..localq.spool import QueueCaps
 
 #: Mirrors ``localfirst.MIN_LOCAL_IDLE_RATIO``/``QueueCaps.min_cpu_idle_ratio``:
@@ -787,11 +788,19 @@ def parse_policy(document: object) -> Policy:
     declared = document.get("declared_available", [])
     if not isinstance(declared, list) or any(route not in ROUTES for route in declared):
         raise PolicyError("declared_available must be a list of known routes")
-    client_routes = document.get("client_derived_routes", [])
-    if (not isinstance(client_routes, list)
-            or any(not isinstance(route, str) or route not in CLIENT_DERIVED_ROUTES
-                   for route in client_routes)):
-        raise PolicyError("client_derived_routes must be a list drawn from peer, execution")
+    # The operator settings file decides; this document's own key is the
+    # legacy fallback, validated only when it would be used and then read
+    # through the shared loader.
+    decided = operator_settings.resolve()
+    if decided.source == operator_settings.SOURCE_OPERATOR:
+        client_routes = decided.routes
+    else:
+        client_routes = document.get("client_derived_routes", [])
+        if (not isinstance(client_routes, list)
+                or any(not isinstance(route, str) or route not in CLIENT_DERIVED_ROUTES
+                       for route in client_routes)):
+            raise PolicyError("client_derived_routes must be a list drawn from peer, execution")
+        client_routes = operator_settings.client_derived_routes(legacy=[client_routes])
     peer_classes = (PEER_CLASSIFICATIONS | {"client_derived"}
                     if "execution" in client_routes else PEER_CLASSIFICATIONS)
     raw_route_classifications = document.get("route_classifications", {})

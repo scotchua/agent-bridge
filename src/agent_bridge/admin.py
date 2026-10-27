@@ -14,7 +14,7 @@ import shutil
 import sys
 from typing import Any
 
-from . import drift, registry, store
+from . import drift, operator_settings, registry, store
 from .broker import error_response
 from .capacity_router import RoutingError, StageRouter
 from .config import Config, load as load_config
@@ -567,6 +567,149 @@ def cmd_archive(_: Config, args: argparse.Namespace) -> int:
     return 2 if errors else 0
 
 
+def _legacy_values(raw: Any) -> tuple[frozenset[str], str | None]:
+    """A legacy ``client_derived_routes`` value as a set, or empty plus a note."""
+    if raw is None:
+        return frozenset(), None
+    routes = operator_settings.parse_routes(raw)
+    if routes is None:
+        return frozenset(), "malformed, counted as empty"
+    return routes, None
+
+
+def _read_raw(path: str) -> tuple[dict | None, str | None]:
+    """(document, failure). Both None means the file is absent.
+
+    Only ENOENT counts as absent. A file that is present but unreadable, not
+    JSON or not an object comes back with a failure note, never as absent.
+    """
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read().decode("utf-8-sig")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError):
+        return None, "unreadable, counted as empty"
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return None, "bad JSON, counted as empty"
+    if not isinstance(document, dict):
+        return None, "not an object, counted as empty"
+    return document, None
+
+
+def legacy_sources(cfg: Config) -> dict[str, dict[str, Any]]:
+    """The legacy values now in force, one entry per file that is present.
+
+    A file that is absent holds no opinion and is left out of the
+    intersection. A present file that cannot be read or parsed, or that has no
+    key or a malformed key, counts as empty, so it can only narrow the result.
+    An orchestration config that cannot say where its routing policy lives
+    marks the entry ``blocks``: the policy might exist and disagree, so
+    migration must not guess.
+    """
+    sources: dict[str, dict[str, Any]] = {}
+    routes, note = _legacy_values(cfg.raw.get("client_derived_routes"))
+    sources["broker_config"] = {"path": cfg.path, "routes": routes, "note": note}
+    orchestration_path = drift.discover_config()
+    if not orchestration_path:
+        return sources
+    orchestration_raw, failure = _read_raw(orchestration_path)
+    if orchestration_raw is None:
+        if failure is not None:
+            sources["orchestration_config"] = {
+                "path": orchestration_path, "routes": frozenset(), "note": failure,
+                "blocks": "orchestration_config_unreadable"}
+        return sources
+    routes, note = _legacy_values(orchestration_raw.get("client_derived_routes"))
+    sources["orchestration_config"] = {"path": orchestration_path, "routes": routes, "note": note}
+    state_root = orchestration_raw.get("state_root")
+    if not (isinstance(state_root, str) and os.path.isabs(state_root)):
+        sources["orchestration_config"]["blocks"] = "routing_policy_location_unknown"
+        return sources
+    from .orchestration import autoroute
+    policy_file = autoroute.policy_path(state_root)
+    policy_raw, failure = _read_raw(policy_file)
+    if policy_raw is not None:
+        routes, note = _legacy_values(policy_raw.get("client_derived_routes"))
+        sources["routing_policy"] = {"path": policy_file, "routes": routes, "note": note}
+    elif failure is not None:
+        sources["routing_policy"] = {"path": policy_file, "routes": frozenset(), "note": failure}
+    return sources
+
+
+def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
+                   environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """What migrate would write, and whether it may. Reads only."""
+    current = operator_settings.resolve(home, environ)
+    intersection = (frozenset.intersection(*(entry["routes"] for entry in sources.values()))
+                    if sources else frozenset())
+    preserved = operator_settings.existing_allow_client_derived(home, environ)
+    plan: dict[str, Any] = {
+        "path": current.path,
+        "legacy": {name: {"path": entry["path"], "routes": sorted(entry["routes"]),
+                          **({"note": entry["note"]} if entry["note"] else {})}
+                   for name, entry in sources.items()},
+        "routes": sorted(intersection),
+        "preserved_allow_client_derived": preserved,
+        "current": {"source": current.source, "reason": current.reason,
+                    "routes": sorted(current.routes)},
+    }
+    # Migration creates the file, or upgrades the runner's own file (no
+    # routes key, nothing but allow_client_derived and version) in place,
+    # keeping its allow_client_derived value. One that already decides, or
+    # is present but untrusted, malformed or holding other keys, is the
+    # operator's to fix by hand.
+    blockers = [entry["blocks"] for entry in sources.values() if entry.get("blocks")]
+    expected = None
+    if current.reason == operator_settings.REASON_NO_ROUTES_KEY:
+        expected = operator_settings.read_text(home, environ)
+    if current.source == operator_settings.SOURCE_OPERATOR:
+        plan["writable"] = False
+        plan["blocked_by"] = ("already_migrated" if not current.fail_closed
+                              else f"existing_file_{current.reason}")
+    elif (current.reason != operator_settings.REASON_ABSENT
+          and not operator_settings.upgradable(expected)):
+        plan["writable"] = False
+        plan["blocked_by"] = "existing_file_needs_manual_merge"
+    elif blockers:
+        plan["writable"] = False
+        plan["blocked_by"] = blockers[0]
+    else:
+        plan["writable"] = True
+    plan["action"] = "upgrade" if expected is not None and plan["writable"] else "create"
+    # The exact text the plan was made from; not printed.
+    plan["_expected"] = expected
+    return plan
+
+
+def cmd_operator_settings(cfg: Config, args: argparse.Namespace,
+                          home: str | None = None,
+                          environ: dict[str, str] | None = None) -> int:
+    """Exit 2 whenever the plan is blocked, dry run included."""
+    plan = plan_migration(legacy_sources(cfg), home, environ)
+    expected = plan.pop("_expected")
+    plan["mode"] = "write" if args.write else "dry-run"
+    plan["written"] = False
+    if args.write and plan["writable"]:
+        # Created without replacing: a file that appeared at any point since
+        # the plan was made is someone else's, and is left exactly as it is.
+        # An upgrade replaces only while the file still holds the planned text.
+        try:
+            if plan["action"] == "upgrade":
+                operator_settings.upgrade(plan["routes"], expected, home, environ)
+            else:
+                operator_settings.create(plan["routes"], home, environ)
+        except FileExistsError:
+            plan["writable"] = False
+            plan["blocked_by"] = "changed_during_migration"
+        else:
+            plan["written"] = True
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0 if plan["writable"] else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     store.set_umask()
     parser = argparse.ArgumentParser(prog="agent-bridge-admin")
@@ -604,6 +747,15 @@ def main(argv: list[str] | None = None) -> int:
     archive.add_argument("--stage", help="Archive only this stage for each --item.")
     archive.add_argument("--reason", default="operator_archive", help="Reason recorded in the event ledger.")
     archive.add_argument("--apply", action="store_true", help="Actually archive the planned stages.")
+    settings = sub.add_parser(
+        "operator-settings", help="The one file that decides client-derived cloud routes.")
+    settings_sub = settings.add_subparsers(dest="settings_command", required=True)
+    migrate = settings_sub.add_parser(
+        "migrate", help="Fold the legacy client_derived_routes keys into the operator "
+                        "settings file as their intersection. Dry run unless --write.")
+    mode = migrate.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Print the plan only (the default).")
+    mode.add_argument("--write", action="store_true", help="Write the file, mode 0600.")
     args = parser.parse_args(argv)
     if args.command == "archive" and args.stage and not args.item:
         parser.error("--stage applies only to --item")
@@ -613,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
         return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
                 "reporting": cmd_reporting, "local-first": cmd_local_first,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve,
-                "archive": cmd_archive}[
+                "archive": cmd_archive, "operator-settings": cmd_operator_settings}[
             args.command](cfg, args)
     except BrokerError as exc:
         print(json.dumps(error_response(exc.category), sort_keys=True))

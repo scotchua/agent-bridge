@@ -17,7 +17,7 @@ import tempfile
 import tomllib
 from typing import Any, Callable
 
-from . import config, setup_cmd, store
+from . import config, operator_settings, setup_cmd, store
 from .orchestration import (autoroute, delegation, gate as delegation_gate,
                             windows_activation,
                             windows_preflight, windows_wsl,
@@ -171,23 +171,22 @@ def validate_answers(raw: Any) -> dict[str, Any]:
 
 
 def privacy_overlay(answers: dict[str, Any]) -> dict[str, Any]:
+    # The client-derived route choice is not part of this overlay. It is
+    # written to the operator settings file (see operator_settings.py); older
+    # installs that carry the key here are still read, as a legacy fallback.
     privacy = answers["privacy"]
-    routes = list(answers.get("client_derived_routes", []))
     if privacy["mode"] == "baseline":
         return {"allowed_source_classifications": list(SAFE_CLASSES),
                 "peers": {peer: {"allowed_source_classifications": list(SAFE_CLASSES)}
-                          for peer in ("claude", "codex")},
-                "client_derived_routes": routes}
+                          for peer in ("claude", "codex")}}
     if privacy["mode"] == "strict":
         return {"allowed_source_classifications": list(STRICT_CLASSES),
                 "peers": {peer: {"allowed_source_classifications": list(STRICT_CLASSES)}
-                          for peer in ("claude", "codex")},
-                "client_derived_routes": routes}
+                          for peer in ("claude", "codex")}}
     # Global list remains the non-client ceiling. Per-peer lists only reduce it.
     return {"allowed_source_classifications": list(SAFE_CLASSES),
             "peers": {peer: {"allowed_source_classifications": labels}
-                      for peer, labels in privacy["peers"].items()},
-            "client_derived_routes": routes}
+                      for peer, labels in privacy["peers"].items()}}
 
 
 def _choice(prompt: str, allowed: set[str], ask: Callable[[str], str]) -> str:
@@ -907,7 +906,12 @@ def _paths(home: str, desktop_path: str | None = None, root: str | None = None) 
             "receipt": os.path.join(home, ".agent-bridge", "onboarding", "installation.json"),
             "delegation_config": delegation.paths_for(home, root or config.REPO_ROOT)["config"],
             "delegation_receipt": os.path.join(home, ".agent-bridge", "onboarding", "delegation-installation.json"),
-            "launch_agent": delegation.launch_agent_path(home)}
+            "launch_agent": delegation.launch_agent_path(home),
+            # The runner's state home, so a bridge install and the runner read
+            # one file. The state-home environment override applies only when
+            # this install targets the account's own home.
+            "operator_settings": operator_settings.settings_path(
+                home, os.environ if own_home else {})}
 
 
 # Keys of _paths() that name a file this project does not own: Claude Code's
@@ -966,7 +970,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     if recorded.get("pins") != expected_pins:
         raise ValueError("candidate pins differ from the staged deployment plan; stage again")
     expected = config.merge(config.load().raw, privacy_overlay(answers))
-    for key in ("allowed_source_classifications", "peers", "client_derived_routes"):
+    for key in ("allowed_source_classifications", "peers"):
         if key == "peers":
             for peer in ("claude", "codex"):
                 expected_peer = privacy_overlay(answers).get("peers", {}).get(peer, {}).get("allowed_source_classifications")
@@ -999,8 +1003,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
             raise ValueError(blocker)
         worker_executable = delegation_choice.get("local_worker_executable")
         delegation_cfg = delegation.build_config(
-            home, root, local_worker_executable=worker_executable,
-            client_derived_routes=tuple(answers["client_derived_routes"]))
+            home, root, local_worker_executable=worker_executable)
         if not delegation_results:
             raise ValueError("automatic_delegation is enabled but no --delegation-results evidence was supplied")
         if not setup_cmd.is_durable(delegation_results):
@@ -1151,6 +1154,17 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
         if originals[paths["delegation_receipt"]] != new_delegation_receipt_bytes:
             add(paths["delegation_receipt"], new_delegation_receipt_bytes)
 
+    # The one switch for client-derived cloud routes. It replaces the three
+    # legacy keys, which new installs no longer write. A legacy
+    # allow_client_derived value the job runner owns is carried over as found.
+    own_home = _same_directory(home, os.path.expanduser("~"))
+    operator_environ = os.environ if own_home else {}
+    operator_bytes = operator_settings.render(
+        answers["client_derived_routes"],
+        operator_settings.existing_allow_client_derived(home, operator_environ))
+    if originals[paths["operator_settings"]] != operator_bytes:
+        updates[paths["operator_settings"]] = operator_bytes
+
     # Ask the existing promotion gate to produce the exact overlay in a
     # temporary destination; live activation is part of the guarded write set.
     fd, scratch = tempfile.mkstemp(prefix="promotion-", suffix=".json")
@@ -1211,6 +1225,9 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
     print(json.dumps({"backups": backups, "installed_files": sorted(updates),
                       "restore_note": "Inspect backups before restoring; whole-file restore may erase later edits.",
                       "host_loading_verified": False,
+                      "operator_settings": {
+                          "path": paths["operator_settings"],
+                          "client_derived_routes": sorted(set(answers["client_derived_routes"]))},
                       "automatic_delegation": delegation_report}, indent=2))
 
 
@@ -1218,7 +1235,7 @@ def _apply(answers: dict[str, Any], candidate_path: str, results_path: str, root
 #: dispatched. Installing the automatic component must not begin sending
 #: repositories nobody has spoken about to a provider, so the scaffold is
 #: inert and the operator fills it in.
-def _routing_policy_scaffold(client_derived_routes: tuple[str, ...] = ()) -> bytes:
+def _routing_policy_scaffold() -> bytes:
     document = {
         "version": autoroute.POLICY_VERSION,
         "_comment": [
@@ -1228,7 +1245,9 @@ def _routing_policy_scaffold(client_derived_routes: tuple[str, ...] = ()) -> byt
             "assistant is working, and never dispatched. Add an entry to make "
             "a repository eligible.",
             "classification: synthetic | public | internal_nonclient | client_derived. "
-            "client_derived is retained unless client_derived_routes includes execution.",
+            "client_derived is retained unless the operator settings file "
+            "(operator-settings.json in the state home) lists execution under "
+            "client_derived_routes.",
             "allowed_routes: any of claude, codex, local. There is no paid "
             "API route and none can be added here.",
             "prefer: empty means no preference, so when both providers are "
@@ -1246,7 +1265,6 @@ def _routing_policy_scaffold(client_derived_routes: tuple[str, ...] = ()) -> byt
             "docs/LOCAL-FIRST-DESIGN.md.",
         ],
         "prefer": [],
-        "client_derived_routes": list(client_derived_routes),
         "declared_available": [],
         "max_local_load_ratio": autoroute.DEFAULT_MAX_LOCAL_LOAD,
         "local_first": {"enabled": False},
@@ -1282,30 +1300,13 @@ def _install_gate(home: str, root: str, config_path: str,
             try:
                 store.secure_mkdir(os.path.dirname(policy_path))
                 if not os.path.exists(policy_path):
-                    routes = delegation_cfg.get("client_derived_routes", [])
-                    store.atomic_write_bytes(policy_path, _routing_policy_scaffold(tuple(routes)))
+                    store.atomic_write_bytes(policy_path, _routing_policy_scaffold())
                     report["policy_created"] = True
                 else:
                     # Never rewritten: it is the operator's document, and an
                     # install that reset it would silently un-classify every
                     # repository they had already decided about.
                     report["policy_created"] = False
-                    # Execution needs the opt-in in BOTH files: the queue reads
-                    # the orchestration config, routing and dispatch read this
-                    # policy. A mismatch fails closed (refuses), so say how to
-                    # finish rather than leave the operator guessing.
-                    wanted = "execution" in delegation_cfg.get("client_derived_routes", [])
-                    try:
-                        existing = store.read_json(policy_path)
-                        has = isinstance(existing, dict) and "execution" in (
-                            existing.get("client_derived_routes") or [])
-                    except (OSError, ValueError):
-                        has = False
-                    if wanted and not has:
-                        report["client_derived_policy_step"] = (
-                            f'Add "client_derived_routes": ["execution"] to {policy_path} '
-                            "(it is your document, so setup does not edit it). Until then "
-                            "client-derived work is refused by routing and dispatch.")
             except OSError as exc:
                 report["policy_error"] = type(exc).__name__
     try:
@@ -1472,7 +1473,8 @@ def uninstall(answers: dict[str, Any], root: str, home: str | None = None,
             "preserved_conflicts": conflicts,
             "launch_agent_deactivation": launch_agent_action,
             "retained_files": [paths["shared"], paths["receipt"], paths["delegation_config"],
-                              paths["delegation_receipt"], default_answers_path(home),
+                              paths["delegation_receipt"], paths["operator_settings"],
+                              default_answers_path(home),
                               config.local_config_path()]}
 
 

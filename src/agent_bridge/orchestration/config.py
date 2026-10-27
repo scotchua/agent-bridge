@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import operator_settings
 from . import windows_wsl
 
 
@@ -302,7 +303,7 @@ def load(path: str | Path) -> OrchestrationConfig:
         execution_queue_root=execution_paths[0], codex_task_executable=execution_paths[1],
         claude_task_executable=execution_paths[2], python_executable=execution_paths[3],
         claude_config_dir=claude_config_dir,
-        client_derived_routes=frozenset(client_routes),
+        client_derived_routes=operator_settings.client_derived_routes(legacy=[client_routes]),
         worktree_prune_roots=prune_roots,
         **windows_paths,
         **gemma_paths,
