@@ -351,6 +351,25 @@ class LogTests(StateCase):
                     mock.patch.object(sb.os, "write", side_effect=effect):
                 self.refused(sb.REFUSED_LOG, self.bind)
 
+    def test_failed_append_leaves_no_fragment(self):
+        # F11: a partial write then a stall must not corrupt the next record.
+        real = os.write
+        calls = iter((5, 0))
+        def stall(fd, b):
+            n = next(calls)
+            return real(fd, bytes(b)[:n]) if n else 0
+        with mock.patch.object(sb.os, "write", side_effect=stall):
+            self.refused(sb.REFUSED_LOG, self.bind)
+        self.assertEqual(Path(self.log).read_bytes(), b"")
+        self.release(self.bind())
+        self.assertEqual([e["event"] for e in self.entries()], ["bound", "released"])
+
+    def test_log_ending_mid_record_refuses(self):
+        Path(self.log).write_bytes(b'{"event": "bou')
+        os.chmod(self.log, 0o600)
+        self.refused(sb.REFUSED_LOG, self.bind)
+        self.assertEqual(Path(self.log).read_bytes(), b'{"event": "bou')
+
     def test_shared_log_refuses(self):
         Path(self.log).touch()
         os.chmod(self.log, 0o644)

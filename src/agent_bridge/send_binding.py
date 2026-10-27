@@ -48,6 +48,7 @@ refusals live in the broker and the execution lanes.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -62,6 +63,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Mapping
 
 from . import operator_settings
+from .platform import platform
 
 SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 300
@@ -195,7 +197,7 @@ def _log(log_path: str | None, event: str, entry: Mapping) -> None:
                       sort_keys=True) + "\n"
     try:
         parent = os.stat(os.path.dirname(os.path.abspath(log_path)))
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(log_path, os.O_RDWR | os.O_CREAT | os.O_APPEND
                      | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
         raise SendRefused(REFUSED_LOG) from None
@@ -204,12 +206,26 @@ def _log(log_path: str | None, event: str, entry: Mapping) -> None:
         if (not stat.S_ISREG(st.st_mode) or not _owned(st, 0o077)
                 or not stat.S_ISDIR(parent.st_mode) or not _owned(parent, 0o022)):
             raise SendRefused(REFUSED_LOG)
-        data = memoryview(line.encode("utf-8"))
-        while data:
-            written = os.write(fd, data)
-            if written <= 0:
-                raise SendRefused(REFUSED_LOG)
-            data = data[written:]
+        # One writer at a time, and only after a complete record (F11): a
+        # fragment left by a failed append is cut back, and a log that still
+        # ends mid-record refuses every later send until it is repaired.
+        with platform.lock_exclusive(fd, log_path, 10.0):
+            start = os.fstat(fd).st_size
+            if start:
+                os.lseek(fd, start - 1, os.SEEK_SET)
+                if os.read(fd, 1) != b"\n":
+                    raise SendRefused(REFUSED_LOG)
+            data = memoryview(line.encode("utf-8"))
+            try:
+                while data:
+                    written = os.write(fd, data)
+                    if written <= 0:
+                        raise SendRefused(REFUSED_LOG)
+                    data = data[written:]
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.ftruncate(fd, start)
+                raise
     except OSError:
         raise SendRefused(REFUSED_LOG) from None
     finally:
