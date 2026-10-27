@@ -177,10 +177,47 @@ class FailClosedTests(StateCase):
 
     def test_descriptor_errors_fail_closed(self):
         self.write({"version": 1, "client_derived_routes": ["peer"]})
-        for name in ("fstat", "fdopen"):
+        for name in ("fstat", "read"):
             with self.subTest(name=name), \
                     mock.patch.object(operator_settings.os, name, side_effect=OSError("synthetic")):
                 self.assertClosed("unreadable")
+
+    @unittest.skipUnless(operator_settings._HAS_SAFE_OPEN, "descriptor-relative open")
+    def test_close_errors_fail_closed_and_release_both_descriptors(self):
+        self.write({"version": 1, "client_derived_routes": ["peer"]})
+        real_close = os.close
+        for failing in (0, 1):
+            closed = []
+
+            def close(fd, failing=failing):
+                closed.append(fd)
+                real_close(fd)
+                if (len(closed) - 1) % 2 == failing:
+                    raise OSError("synthetic")
+
+            with self.subTest(failing=failing), \
+                    mock.patch.object(operator_settings.os, "close", side_effect=close):
+                self.assertClosed("unreadable")
+            # Each read opens the folder and the file; every descriptor was
+            # still closed although one close reported an error.
+            self.assertEqual(len(closed) % 2, 0)
+
+    @unittest.skipUnless(operator_settings._HAS_SAFE_OPEN, "descriptor-relative open")
+    def test_close_error_after_absent_file_fails_closed(self):
+        with mock.patch.object(operator_settings.os, "close", side_effect=OSError("synthetic")):
+            self.assertClosed("unreadable")
+
+    @unittest.skipUnless(POSIX, "mode bits")
+    def test_close_error_keeps_the_first_refusal(self):
+        self.write({"version": 1, "client_derived_routes": ["peer"]}, mode=0o620)
+        real_close = os.close
+
+        def close(fd):
+            real_close(fd)
+            raise OSError("synthetic")
+
+        with mock.patch.object(operator_settings.os, "close", side_effect=close):
+            self.assertClosed("untrusted")
 
     @unittest.skipUnless(POSIX, "mode bits")
     def test_group_writable_file(self):
@@ -559,22 +596,47 @@ class MigrationTests(StateCase):
         self.assertEqual((code, plan["mode"], plan["writable"]), (2, "dry-run", False))
 
     def test_file_that_appears_during_migration_is_not_overwritten(self):
+        # The file appears after the plan and immediately before the publish,
+        # with no further check in between: only the no-replace link stops it.
         cfg = self.legacy(["peer"])
-        real_resolve = operator_settings.resolve
-        calls = []
+        real_link = os.link
 
-        def resolve(*args, **kwargs):
-            calls.append(1)
-            if len(calls) > 1:
-                self.write({"version": 1, "client_derived_routes": []})
-            return real_resolve(*args, **kwargs)
+        def link(source, destination):
+            self.write({"version": 1, "client_derived_routes": []})
+            return real_link(source, destination)
 
-        with mock.patch.object(admin.operator_settings, "resolve", side_effect=resolve):
+        with mock.patch.object(operator_settings.os, "link", side_effect=link):
             code, plan = self.run_cli(cfg, "--write")
         self.assertEqual(code, 2)
+        self.assertFalse(plan["written"])
         self.assertEqual(plan["blocked_by"], "changed_during_migration")
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")),
                          {"version": 1, "client_derived_routes": []})
+        leftovers = [name for name in os.listdir(self.state) if name.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_runner_file_that_appears_during_migration_is_not_overwritten(self):
+        cfg = self.legacy(["peer"])
+        real_link = os.link
+
+        def link(source, destination):
+            self.write({"allow_client_derived": False})
+            return real_link(source, destination)
+
+        with mock.patch.object(operator_settings.os, "link", side_effect=link):
+            code, plan = self.run_cli(cfg, "--write")
+        self.assertEqual((code, plan["blocked_by"]), (2, "changed_during_migration"))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")),
+                         {"allow_client_derived": False})
+
+    def test_create_never_replaces(self):
+        self.write({"allow_client_derived": True})
+        before = self.path.read_bytes()
+        with self.assertRaises(FileExistsError):
+            operator_settings.create(["peer"])
+        self.assertEqual(self.path.read_bytes(), before)
+        leftovers = [name for name in os.listdir(self.state) if name.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
 
     @unittest.skipUnless(POSIX, "mode bits")
     def test_write_creates_a_private_file_the_loader_trusts(self):
@@ -589,15 +651,19 @@ class MigrationTests(StateCase):
         leftovers = [name for name in os.listdir(self.state) if name.startswith(".tmp-")]
         self.assertEqual(leftovers, [])
 
-    def test_write_preserves_allow_client_derived(self):
+    def test_existing_runner_file_blocks_for_a_manual_merge(self):
         self.write({"allow_client_derived": True})
+        before = self.path.read_bytes()
         cfg = self.legacy(["peer"])
-        code, plan = self.run_cli(cfg, "--write")
-        self.assertEqual(code, 0)
-        document = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(document, {"version": 1, "client_derived_routes": ["peer"],
-                                    "allow_client_derived": True})
-        self.assertIs(plan["preserved_allow_client_derived"], True)
+        for flags in ((), ("--write",)):
+            with self.subTest(flags=flags):
+                code, plan = self.run_cli(cfg, *flags)
+                self.assertEqual(code, 2)
+                self.assertFalse(plan["written"])
+                self.assertEqual(plan["blocked_by"], "existing_file_needs_manual_merge")
+                self.assertEqual(plan["routes"], ["peer"])
+                self.assertIs(plan["preserved_allow_client_derived"], True)
+                self.assertEqual(self.path.read_bytes(), before)
 
     def test_write_refuses_to_overwrite_a_deciding_file(self):
         self.write({"version": 1, "client_derived_routes": []})
@@ -634,7 +700,7 @@ class MigrationTests(StateCase):
 
     def test_render_and_write_reject_unknown_routes(self):
         with self.assertRaises(ValueError):
-            operator_settings.write(["peer", "local"])
+            operator_settings.create(["peer", "local"])
         self.assertFalse(self.path.exists())
 
 

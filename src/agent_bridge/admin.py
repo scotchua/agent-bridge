@@ -656,13 +656,18 @@ def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
         "current": {"source": current.source, "reason": current.reason,
                     "routes": sorted(current.routes)},
     }
-    # Never overwrite a file that already decides, nor one that is present but
-    # untrusted or malformed: both are the operator's to fix by hand.
+    # Migration only ever creates the file. One that already decides, or is
+    # present but untrusted or malformed, is the operator's to fix by hand;
+    # so is the runner's own file without the routes key, which gets the
+    # planned version and client_derived_routes added by hand.
     blockers = [entry["blocks"] for entry in sources.values() if entry.get("blocks")]
     if current.source == operator_settings.SOURCE_OPERATOR:
         plan["writable"] = False
         plan["blocked_by"] = ("already_migrated" if not current.fail_closed
                               else f"existing_file_{current.reason}")
+    elif current.reason != operator_settings.REASON_ABSENT:
+        plan["writable"] = False
+        plan["blocked_by"] = "existing_file_needs_manual_merge"
     elif blockers:
         plan["writable"] = False
         plan["blocked_by"] = blockers[0]
@@ -679,13 +684,14 @@ def cmd_operator_settings(cfg: Config, args: argparse.Namespace,
     plan["mode"] = "write" if args.write else "dry-run"
     plan["written"] = False
     if args.write and plan["writable"]:
-        # Re-resolved just before the write: an operator file that appeared
-        # since the plan was made is theirs, and is not overwritten.
-        if operator_settings.resolve(home, environ).source == operator_settings.SOURCE_OPERATOR:
+        # Created without replacing: a file that appeared at any point since
+        # the plan was made is someone else's, and is left exactly as it is.
+        try:
+            operator_settings.create(plan["routes"], home, environ)
+        except FileExistsError:
             plan["writable"] = False
             plan["blocked_by"] = "changed_during_migration"
         else:
-            operator_settings.write(plan["routes"], home, environ)
             plan["written"] = True
     print(json.dumps(plan, indent=2, sort_keys=True))
     return 0 if plan["writable"] else 2

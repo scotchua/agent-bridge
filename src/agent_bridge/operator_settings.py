@@ -152,6 +152,8 @@ def _read_trusted(path: str) -> str | None:
     except OSError:
         raise _Refused(REASON_UNREADABLE) from None
     fd = -1
+    text: str | None = None
+    refusal: _Refused | None = None
     try:
         st = os.fstat(dir_fd)
         if not stat.S_ISDIR(st.st_mode) or not _trusted(st):
@@ -159,23 +161,35 @@ def _read_trusted(path: str) -> str | None:
         try:
             fd = os.open(os.path.basename(path), flags, dir_fd=dir_fd)
         except FileNotFoundError:
-            return None
-        # Checked on the descriptor before it is wrapped, so a directory or a
-        # FIFO that won the race is refused without a read.
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or not _trusted(st):
-            raise _Refused(REASON_UNTRUSTED)
-        with os.fdopen(fd, "rb") as handle:
             fd = -1
-            return handle.read().decode("utf-8")
+        else:
+            # Checked on the descriptor before it is read, so a directory or
+            # a FIFO that won the race is refused without a read.
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not _trusted(st):
+                raise _Refused(REASON_UNTRUSTED)
+            chunks = []
+            while chunk := os.read(fd, 65536):
+                chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8")
+    except _Refused as exc:
+        refusal = exc
     except (OSError, UnicodeDecodeError):
         # A symlink (ELOOP), a permission error or any other failure on a
         # file that exists is not a reason to widen.
-        raise _Refused(REASON_UNREADABLE) from None
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        os.close(dir_fd)
+        refusal = _Refused(REASON_UNREADABLE)
+    # Closed one at a time, outside any handler: a failed close refuses
+    # rather than escaping, and never hides an earlier refusal.
+    for descriptor in (fd, dir_fd):
+        if descriptor < 0:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError:
+            refusal = refusal or _Refused(REASON_UNREADABLE)
+    if refusal is not None:
+        raise refusal
+    return text
 
 
 def parse_routes(value: Any) -> frozenset[str] | None:
@@ -284,20 +298,41 @@ def render(routes: Iterable[str], allow_client_derived: Any = None) -> bytes:
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def write(routes: Iterable[str], home: str | os.PathLike[str] | None = None,
-          environ: Mapping[str, str] | None = None) -> str:
-    """Write the file atomically with owner-only permissions (mode 0600).
+def create(routes: Iterable[str], home: str | os.PathLike[str] | None = None,
+           environ: Mapping[str, str] | None = None) -> str:
+    """Create the file with owner-only permissions (mode 0600). Never replaces.
 
-    A legacy ``allow_client_derived`` value already in a trusted file is kept
-    as found. Any other content is replaced, so a caller that must not clobber
-    an operator's file checks ``resolve`` first.
+    The bytes are written and synced to a private temporary file in the state
+    folder, then hard-linked into place. The link fails with FileExistsError
+    when anything already holds the name, however recently it appeared, so an
+    operator's or the runner's file is never overwritten.
     """
+    import contextlib
+    import tempfile
+
     from . import store
+    from .platform import platform
 
     chosen = frozenset(routes)
     if not chosen <= ROUTES:
         raise ValueError("client_derived_routes must be drawn from peer, execution")
     path = settings_path(home, environ)
-    store.atomic_write_bytes(
-        path, render(chosen, existing_allow_client_derived(home, environ)), owner_only=True)
+    directory = store.secure_mkdir(os.path.dirname(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            platform.enforce_owner_only_file(handle.fileno())
+            handle.write(render(chosen))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     return path

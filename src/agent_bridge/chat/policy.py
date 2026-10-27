@@ -12,9 +12,20 @@ class RoomPolicy:
         if isinstance(cfg, bool) and allow_client is False:
             allow_client, cfg = cfg, None
         self.cfg = cfg
-        self.allow_client = bool(cfg is not None and "peer" in cfg.client_derived_routes)
         if allow_client and not self.allow_client:
             raise ValueError('Client-derived material is not enabled')
+
+    @property
+    def allow_client(self) -> bool:
+        # Read on every use, so revoking the peer route in the operator
+        # settings file takes effect without restarting the room.  A settings
+        # error refuses.
+        if self.cfg is None:
+            return False
+        try:
+            return "peer" in self.cfg.client_derived_routes
+        except ValueError:
+            return False
 
     def _allowed(self, target: str) -> tuple[str, ...]:
         if self.cfg is None:

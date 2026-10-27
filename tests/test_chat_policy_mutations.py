@@ -35,6 +35,25 @@ class EffectiveClassificationTests(unittest.TestCase):
         self.assertEqual(policy.effective_classification(['public', 'client-derived']),
                          'client-derived')
 
+    def test_revoking_the_peer_route_takes_effect_without_a_restart(self):
+        cfg = PolicyConfig(('peer',))
+        policy = RoomPolicy(cfg)
+        cfg.client_derived_routes = frozenset()
+        with self.assertRaisesRegex(ValueError, 'refuses this classification'):
+            policy.effective_classification(['client-derived'])
+
+    def test_a_settings_error_refuses_client_derived(self):
+        class Broken(PolicyConfig):
+            @property
+            def client_derived_routes(self):
+                raise ValueError('client_derived_routes must be a list')
+
+            @client_derived_routes.setter
+            def client_derived_routes(self, value):
+                pass
+
+        self.assertFalse(RoomPolicy(Broken()).allow_client)
+
 
 class AuthorizeTests(unittest.TestCase):
     def test_configured_policy_rejects_unknown_peer(self):
