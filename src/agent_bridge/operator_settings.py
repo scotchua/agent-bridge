@@ -126,29 +126,40 @@ class _Refused(Exception):
 
 
 def _read_trusted(path: str) -> str | None:
-    """The file's text, None when it is absent, or _Refused when it cannot be trusted."""
-    if not os.path.lexists(path):
-        return None
+    """The file's text, None when it is absent, or _Refused when it cannot be trusted.
+
+    There is no existence check first: a path that cannot be looked up (a
+    folder the user cannot search, say) would look absent and widen. Absence
+    is only what an open reports as ENOENT; every other failure refuses.
+    """
     if not _HAS_SAFE_OPEN:
+        # Absence is still only ENOENT; a present file cannot be read safely.
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise _Refused(REASON_UNREADABLE) from None
         raise _Refused(REASON_UNSUPPORTED_PLATFORM)
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        dir_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            st = os.fstat(dir_fd)
-            if not stat.S_ISDIR(st.st_mode) or not _trusted(st):
-                raise _Refused(REASON_UNTRUSTED)
-            fd = os.open(os.path.basename(path), flags, dir_fd=dir_fd)
-        finally:
-            os.close(dir_fd)
+        # The state folder itself must not be a symlink. Its ancestors may be
+        # (macOS keeps /tmp and /var behind one).
+        dir_fd = os.open(os.path.dirname(path),
+                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        # Removed between the existence check and the open: absent.
         return None
     except OSError:
-        # A symlink (ELOOP), a permission error or any other failure on a
-        # file that exists is not a reason to widen.
         raise _Refused(REASON_UNREADABLE) from None
+    fd = -1
     try:
+        st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st.st_mode) or not _trusted(st):
+            raise _Refused(REASON_UNTRUSTED)
+        try:
+            fd = os.open(os.path.basename(path), flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
         # Checked on the descriptor before it is wrapped, so a directory or a
         # FIFO that won the race is refused without a read.
         st = os.fstat(fd)
@@ -156,13 +167,15 @@ def _read_trusted(path: str) -> str | None:
             raise _Refused(REASON_UNTRUSTED)
         with os.fdopen(fd, "rb") as handle:
             fd = -1
-            try:
-                return handle.read().decode("utf-8")
-            except (OSError, UnicodeDecodeError):
-                raise _Refused(REASON_UNREADABLE) from None
+            return handle.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        # A symlink (ELOOP), a permission error or any other failure on a
+        # file that exists is not a reason to widen.
+        raise _Refused(REASON_UNREADABLE) from None
     finally:
         if fd >= 0:
             os.close(fd)
+        os.close(dir_fd)
 
 
 def parse_routes(value: Any) -> frozenset[str] | None:
@@ -188,6 +201,11 @@ def _read_document(path: str) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(data, dict):
         return None, REASON_NOT_OBJECT
     return data, None
+
+
+def _supported_version(version: Any) -> bool:
+    # An int exactly: not True, not 1.0.
+    return type(version) is int and version == SETTINGS_VERSION
 
 
 def _intersection(legacy: Iterable[Iterable[str]] | None) -> frozenset[str] | None:
@@ -218,11 +236,16 @@ def resolve(home: str | os.PathLike[str] | None = None,
         if reason != REASON_ABSENT:
             return closed(reason or REASON_UNREADABLE)
         fallback_reason = REASON_ABSENT
+    elif "version" in document and not _supported_version(document["version"]):
+        # Checked before the missing-key fallback: a file from a newer or
+        # unknown schema must not fall back to the legacy values.
+        return closed(REASON_BAD_VERSION)
     elif "client_derived_routes" not in document:
+        # The runner's own legacy shape, allow_client_derived alone with no
+        # version, still falls back.
         fallback_reason = REASON_NO_ROUTES_KEY
     else:
-        version = document.get("version")
-        if isinstance(version, bool) or version != SETTINGS_VERSION:
+        if "version" not in document:
             return closed(REASON_BAD_VERSION)
         raw = document["client_derived_routes"]
         if not isinstance(raw, list) or any(not isinstance(route, str) for route in raw):

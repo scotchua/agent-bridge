@@ -577,38 +577,65 @@ def _legacy_values(raw: Any) -> tuple[frozenset[str], str | None]:
     return routes, None
 
 
-def _read_raw(path: str) -> dict | None:
+def _read_raw(path: str) -> tuple[dict | None, str | None]:
+    """(document, failure). Both None means the file is absent.
+
+    Only ENOENT counts as absent. A file that is present but unreadable, not
+    JSON or not an object comes back with a failure note, never as absent.
+    """
     try:
         with open(path, "rb") as handle:
-            document = json.loads(handle.read().decode("utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    return document if isinstance(document, dict) else None
+            text = handle.read().decode("utf-8-sig")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError):
+        return None, "unreadable, counted as empty"
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return None, "bad JSON, counted as empty"
+    if not isinstance(document, dict):
+        return None, "not an object, counted as empty"
+    return document, None
 
 
 def legacy_sources(cfg: Config) -> dict[str, dict[str, Any]]:
     """The legacy values now in force, one entry per file that is present.
 
     A file that is absent holds no opinion and is left out of the
-    intersection. A present file with no key, or a malformed key, counts as
-    empty, so it can only narrow the result.
+    intersection. A present file that cannot be read or parsed, or that has no
+    key or a malformed key, counts as empty, so it can only narrow the result.
+    An orchestration config that cannot say where its routing policy lives
+    marks the entry ``blocks``: the policy might exist and disagree, so
+    migration must not guess.
     """
     sources: dict[str, dict[str, Any]] = {}
     routes, note = _legacy_values(cfg.raw.get("client_derived_routes"))
     sources["broker_config"] = {"path": cfg.path, "routes": routes, "note": note}
     orchestration_path = drift.discover_config()
-    orchestration_raw = _read_raw(orchestration_path) if orchestration_path else None
-    if orchestration_raw is not None:
-        routes, note = _legacy_values(orchestration_raw.get("client_derived_routes"))
-        sources["orchestration_config"] = {"path": orchestration_path, "routes": routes, "note": note}
-        state_root = orchestration_raw.get("state_root")
-        if isinstance(state_root, str) and os.path.isabs(state_root):
-            from .orchestration import autoroute
-            policy_file = autoroute.policy_path(state_root)
-            policy_raw = _read_raw(policy_file) if os.path.isfile(policy_file) else None
-            if policy_raw is not None:
-                routes, note = _legacy_values(policy_raw.get("client_derived_routes"))
-                sources["routing_policy"] = {"path": policy_file, "routes": routes, "note": note}
+    if not orchestration_path:
+        return sources
+    orchestration_raw, failure = _read_raw(orchestration_path)
+    if orchestration_raw is None:
+        if failure is not None:
+            sources["orchestration_config"] = {
+                "path": orchestration_path, "routes": frozenset(), "note": failure,
+                "blocks": "orchestration_config_unreadable"}
+        return sources
+    routes, note = _legacy_values(orchestration_raw.get("client_derived_routes"))
+    sources["orchestration_config"] = {"path": orchestration_path, "routes": routes, "note": note}
+    state_root = orchestration_raw.get("state_root")
+    if not (isinstance(state_root, str) and os.path.isabs(state_root)):
+        sources["orchestration_config"]["blocks"] = "routing_policy_location_unknown"
+        return sources
+    from .orchestration import autoroute
+    policy_file = autoroute.policy_path(state_root)
+    policy_raw, failure = _read_raw(policy_file)
+    if policy_raw is not None:
+        routes, note = _legacy_values(policy_raw.get("client_derived_routes"))
+        sources["routing_policy"] = {"path": policy_file, "routes": routes, "note": note}
+    elif failure is not None:
+        sources["routing_policy"] = {"path": policy_file, "routes": frozenset(), "note": failure}
     return sources
 
 
@@ -631,28 +658,37 @@ def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
     }
     # Never overwrite a file that already decides, nor one that is present but
     # untrusted or malformed: both are the operator's to fix by hand.
+    blockers = [entry["blocks"] for entry in sources.values() if entry.get("blocks")]
     if current.source == operator_settings.SOURCE_OPERATOR:
         plan["writable"] = False
         plan["blocked_by"] = ("already_migrated" if not current.fail_closed
                               else f"existing_file_{current.reason}")
+    elif blockers:
+        plan["writable"] = False
+        plan["blocked_by"] = blockers[0]
     else:
         plan["writable"] = True
     return plan
 
 
-def cmd_operator_settings(cfg: Config, args: argparse.Namespace) -> int:
-    plan = plan_migration(legacy_sources(cfg))
+def cmd_operator_settings(cfg: Config, args: argparse.Namespace,
+                          home: str | None = None,
+                          environ: dict[str, str] | None = None) -> int:
+    """Exit 2 whenever the plan is blocked, dry run included."""
+    plan = plan_migration(legacy_sources(cfg), home, environ)
     plan["mode"] = "write" if args.write else "dry-run"
     plan["written"] = False
-    code = 0
-    if args.write:
-        if not plan["writable"]:
-            code = 2
+    if args.write and plan["writable"]:
+        # Re-resolved just before the write: an operator file that appeared
+        # since the plan was made is theirs, and is not overwritten.
+        if operator_settings.resolve(home, environ).source == operator_settings.SOURCE_OPERATOR:
+            plan["writable"] = False
+            plan["blocked_by"] = "changed_during_migration"
         else:
-            operator_settings.write(plan["routes"])
+            operator_settings.write(plan["routes"], home, environ)
             plan["written"] = True
     print(json.dumps(plan, indent=2, sort_keys=True))
-    return code
+    return 0 if plan["writable"] else 2
 
 
 def main(argv: list[str] | None = None) -> int:

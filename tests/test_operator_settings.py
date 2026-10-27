@@ -129,7 +129,7 @@ class FailClosedTests(StateCase):
                 self.assertClosed("wrong_type")
 
     def test_version_must_be_exactly_one(self):
-        for version in (None, 2, "1", True, 1.5):
+        for version in (None, 2, "1", True, 1.5, 1.0):
             with self.subTest(version=version):
                 document = {"client_derived_routes": ["peer"]}
                 if version is not None:
@@ -149,6 +149,38 @@ class FailClosedTests(StateCase):
     def test_dangling_symlink_file_is_not_treated_as_absent(self):
         os.symlink(self.root / "missing.json", self.path)
         self.assertClosed("unreadable")
+
+    def test_unsupported_version_without_the_routes_key_does_not_fall_back(self):
+        for version in (999, 1.0, "1", True):
+            with self.subTest(version=version):
+                self.write({"version": version})
+                self.assertClosed("bad_version")
+
+    @unittest.skipUnless(POSIX and hasattr(os, "geteuid") and os.geteuid() != 0, "mode bits")
+    def test_unsearchable_state_directory_is_not_treated_as_absent(self):
+        self.write({"version": 1, "client_derived_routes": []})
+        os.chmod(self.state, 0o000)
+        self.addCleanup(os.chmod, self.state, 0o700)
+        self.assertClosed("unreadable")
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_symlinked_state_directory_is_refused(self):
+        real = self.root / "real-state"
+        real.mkdir(mode=0o700)
+        target = real / operator_settings.FILE_NAME
+        target.write_text(json.dumps({"version": 1, "client_derived_routes": ["peer"]}))
+        os.chmod(target, 0o600)
+        linked = self.root / "linked-state"
+        os.symlink(real, linked)
+        with mock.patch.dict(os.environ, {operator_settings.STATE_ENV: str(linked)}):
+            self.assertClosed("unreadable")
+
+    def test_descriptor_errors_fail_closed(self):
+        self.write({"version": 1, "client_derived_routes": ["peer"]})
+        for name in ("fstat", "fdopen"):
+            with self.subTest(name=name), \
+                    mock.patch.object(operator_settings.os, name, side_effect=OSError("synthetic")):
+                self.assertClosed("unreadable")
 
     @unittest.skipUnless(POSIX, "mode bits")
     def test_group_writable_file(self):
@@ -214,6 +246,21 @@ class FailClosedTests(StateCase):
             {"version": autoroute.POLICY_VERSION, "client_derived_routes": ["execution"]})
         self.assertEqual(policy.client_derived_routes, frozenset())
         self.assertNotIn("client_derived", policy.peer_classifications)
+
+    def test_deciding_file_outranks_a_malformed_legacy_key(self):
+        self.write({"version": 1, "client_derived_routes": ["peer"]})
+        cfg = config.Config(_raw_with_routes(["bogus"]), config.DEFAULT_CONFIG_PATH)
+        self.assertEqual(cfg.client_derived_routes, frozenset({"peer"}))
+        policy = autoroute.parse_policy(
+            {"version": autoroute.POLICY_VERSION, "client_derived_routes": "bogus"})
+        self.assertEqual(policy.client_derived_routes, frozenset({"peer"}))
+
+    def test_malformed_legacy_key_still_raises_on_the_fallback(self):
+        with self.assertRaises(ValueError):
+            config.Config(_raw_with_routes(["bogus"]), config.DEFAULT_CONFIG_PATH)
+        with self.assertRaises(autoroute.PolicyError):
+            autoroute.parse_policy(
+                {"version": autoroute.POLICY_VERSION, "client_derived_routes": "bogus"})
 
 
 class LegacyTransitionTests(StateCase):
@@ -486,6 +533,48 @@ class MigrationTests(StateCase):
         _, plan = self.run_cli(cfg)
         self.assertEqual(plan["routes"], [])
         self.assertIn("note", plan["legacy"]["orchestration_config"])
+
+    def test_present_bad_policy_file_counts_as_empty(self):
+        cfg = self.legacy(["peer", "execution"], ["peer", "execution"])
+        (self.orch_state / "routing" / autoroute.POLICY_FILE).write_text("{", encoding="utf-8")
+        code, plan = self.run_cli(cfg)
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["routes"], [])
+        self.assertIn("note", plan["legacy"]["routing_policy"])
+
+    @unittest.skipUnless(POSIX and hasattr(os, "geteuid") and os.geteuid() != 0, "mode bits")
+    def test_unreadable_orchestration_config_blocks(self):
+        cfg = self.legacy(["peer", "execution"], ["peer", "execution"])
+        os.chmod(self.orch_path, 0o000)
+        self.addCleanup(os.chmod, self.orch_path, 0o600)
+        code, plan = self.run_cli(cfg, "--write")
+        self.assertEqual(code, 2)
+        self.assertFalse(plan["written"])
+        self.assertEqual(plan["blocked_by"], "orchestration_config_unreadable")
+        self.assertFalse(self.path.exists())
+
+    def test_blocked_dry_run_exits_nonzero(self):
+        self.write({"version": 1, "client_derived_routes": []})
+        code, plan = self.run_cli(self.legacy(["peer"]))
+        self.assertEqual((code, plan["mode"], plan["writable"]), (2, "dry-run", False))
+
+    def test_file_that_appears_during_migration_is_not_overwritten(self):
+        cfg = self.legacy(["peer"])
+        real_resolve = operator_settings.resolve
+        calls = []
+
+        def resolve(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                self.write({"version": 1, "client_derived_routes": []})
+            return real_resolve(*args, **kwargs)
+
+        with mock.patch.object(admin.operator_settings, "resolve", side_effect=resolve):
+            code, plan = self.run_cli(cfg, "--write")
+        self.assertEqual(code, 2)
+        self.assertEqual(plan["blocked_by"], "changed_during_migration")
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")),
+                         {"version": 1, "client_derived_routes": []})
 
     @unittest.skipUnless(POSIX, "mode bits")
     def test_write_creates_a_private_file_the_loader_trusts(self):

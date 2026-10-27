@@ -118,9 +118,14 @@ class Config:
         """Operator opt-ins for client-derived data, empty in a fresh clone.
 
         The operator settings file decides. This config's own key is only the
-        legacy fallback, validated here so a malformed overlay still fails at
-        load, and read through the same loader as every other reader.
+        legacy fallback, read through the same loader as every other reader. It
+        is validated only when it would be used, so a stale malformed key cannot
+        override a file that decides, and a malformed key still fails at load
+        when nothing else does.
         """
+        decided = operator_settings.resolve()
+        if decided.source == operator_settings.SOURCE_OPERATOR:
+            return decided.routes
         value = self.raw.get("client_derived_routes", [])
         if not isinstance(value, list) or any(not isinstance(route, str)
                                               or route not in CLIENT_DERIVED_ROUTES
