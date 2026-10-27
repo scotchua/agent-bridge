@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import operator_isolation  # noqa: E402,F401
 from agent_bridge.execution import codex_review
 from agent_bridge.orchestration import autoroute, mcp
 from agent_bridge.orchestration.execution_queue import ExecutionQueue, reserve_nothing

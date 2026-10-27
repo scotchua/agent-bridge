@@ -96,10 +96,14 @@ def _execution_route_classifications(policy: autoroute.Policy,
                                      execution: ExecutionQueue) -> frozenset[str]:
     """Return the operator-authorized peer classifications for execution.
 
-    The server configuration selects whether this operator allows
-    client-derived execution; routing-policy.json independently scopes that
-    permission.  They are deliberately a matched pair.  A lone opt-in is a
-    configuration mistake, not a permissive fallback an MCP caller may use.
+    Both values come from the operator settings loader. When the operator
+    settings file decides, the server configuration and routing-policy.json
+    read the same answer and cannot differ, so the check below passes. It
+    stays for the legacy fallback, where each file still carries its own
+    ``client_derived_routes``: a lone opt-in there is a configuration mistake,
+    not a permissive fallback an MCP caller may use. The intersection rule
+    does not replace it, because a loud refusal tells the operator which file
+    to fix, where an intersection would quietly turn the route off.
     """
     configured = "execution" in execution.client_derived_routes
     policy_enabled = "execution" in policy.client_derived_routes

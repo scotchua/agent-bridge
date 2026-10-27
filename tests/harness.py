@@ -12,6 +12,8 @@ from typing import Any
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import operator_isolation  # noqa: E402,F401
 
 from agent_bridge import broker, config, registry, store  # noqa: E402
 import platform_support  # noqa: E402,F401  (drops ACL-bypass privileges on import)

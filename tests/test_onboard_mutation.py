@@ -14,6 +14,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+import operator_isolation  # noqa: E402,F401
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
 from test_onboard import active_in, answers  # noqa: E402
 
@@ -184,10 +185,15 @@ class GateAndUninstallMutationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             policy = onboard.autoroute.policy_path(tmp)
             store.atomic_write_json(policy, [])
-            cfg = {"state_root": tmp, "client_derived_routes": ["execution"]}
+            cfg = {"state_root": tmp}
             with mock.patch.object(onboard.delegation_gate, "install", return_value={}):
                 report = onboard._install_gate(tmp, str(ROOT), os.path.join(tmp, "config.json"), cfg)
-            self.assertIn("client_derived_policy_step", report)
+            # The operator settings file carries the route choice now, so the
+            # installer no longer asks the operator to edit the policy by hand
+            # and never rewrites an existing policy document.
+            self.assertNotIn("client_derived_policy_step", report)
+            self.assertIs(report["policy_created"], False)
+            self.assertEqual(store.read_json(policy), [])
 
     def test_uninstall_defaults_to_isolated_home(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -131,9 +131,14 @@ Setup asks what may be sent to each receiving peer:
 | Custom | A narrower list for each peer; synthetic examples remain necessary for full setup verification. |
 
 Client-derived material is refused by default. An operator who wants Claude
-and Codex to have the same client-data access may set
-`client_derived_routes` to include `peer` and/or `execution` in their local
-configuration; secrets, credentials and confidential labels remain refused.
+and Codex to have the same client-data access sets `client_derived_routes`
+(`peer` and/or `execution`) once, in `operator-settings.json` in the runner
+state home (`~/.codex-job-runner`, or `~/.codex-bridge` before its migration).
+Every part of the bridge reads that one file, and a file that is untrusted or
+malformed turns the routes off. Older installs that carry the key in the broker
+config, orchestration config and routing policy keep working until you run
+`bin/agent-bridge-admin operator-settings migrate` (a dry run unless `--write`).
+Secrets, credentials and confidential labels remain refused.
 
 **The bridge checks the supplied classification, not the contents of the text.**
 Disallowed labels are rejected before dispatch, but it does not detect a secret
@@ -455,7 +460,7 @@ human reviewed them, or prove that redaction is semantically complete.
 
 The request payload and source classification must exactly equal the
 preparation. Client-derived material remains refused in both directions unless
-the operator has enabled the `peer` route in `client_derived_routes`; each
+the operator has enabled the `peer` route in the operator settings file; each
 peer's configured allowance and the secret and credential refusals still
 apply. There is no bypass flag.
 Handoff requests cannot include a free-form label. Only the redacted payload,

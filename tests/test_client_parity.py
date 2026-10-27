@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+import operator_isolation  # noqa: E402,F401
 
 from agent_bridge import broker, config
 from git_fixture import make_git_repo

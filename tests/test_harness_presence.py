@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import operator_isolation  # noqa: E402,F401
 
 from agent_bridge.capacity_router import (
     BROKER_PROBE_SOURCE, HARNESS_PROBE_FRESHNESS_SECONDS, PRESENCE_SOURCE,

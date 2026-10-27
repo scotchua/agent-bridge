@@ -12,6 +12,7 @@ import uuid
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import operator_isolation  # noqa: E402,F401
 from agent_bridge import config  # noqa: E402
 from agent_bridge.errors import BrokerError, ErrorCategory  # noqa: E402
 

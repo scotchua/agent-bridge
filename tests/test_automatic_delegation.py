@@ -22,6 +22,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+import operator_isolation  # noqa: E402,F401
 from agent_bridge import config, onboard, setup_cmd, store  # noqa: E402
 from agent_bridge.orchestration import (  # noqa: E402
     autoroute, delegation, gate as delegation_gate, windows_preflight,

@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
-    from .. import runner, token_usage
+    from .. import operator_settings, runner, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from . import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from agent_bridge import runner, token_usage
+    from agent_bridge import operator_settings, runner, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.execution import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
@@ -676,6 +676,8 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
              classification:str,model:str,effort:str,client_derived_routes: tuple[str, ...] = (),
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300,
              cleanup_timeout:int=60,job_source:Path|None=None):
+    # The operator settings file decides; the argument is the legacy fallback.
+    client_derived_routes=operator_settings.client_derived_routes(legacy=[client_derived_routes])
     if classification not in ALLOWED_CLASSIFICATIONS and not (
             classification == "client_derived" and "execution" in client_derived_routes):
         raise TaskError("execution lane refuses client-derived material")

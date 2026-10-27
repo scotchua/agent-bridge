@@ -89,13 +89,14 @@ def paths_for(home: str, root: str) -> dict[str, str]:
 
 
 def build_config(home: str, root: str, *, local_worker_executable: str | None,
-                 client_derived_routes: tuple[str, ...] = (),
-                  interval_seconds: float = 5.0) -> dict[str, Any]:
+                 interval_seconds: float = 5.0) -> dict[str, Any]:
     """Return the complete private orchestration config document.
 
     Every value is an absolute path. Nothing here is a credential, token, or
     account secret: provider sign-in keeps using each CLI's own
-    subscription-backed session.
+    subscription-backed session. The client-derived route choice is not
+    written here; it lives in the operator settings file, and an older config
+    that carries ``client_derived_routes`` is still read as a legacy fallback.
     """
     paths = paths_for(home, root)
     worker_executable = (os.path.abspath(os.path.expanduser(local_worker_executable))
@@ -114,7 +115,6 @@ def build_config(home: str, root: str, *, local_worker_executable: str | None,
         "claude_config_dir": paths["claude_config_dir"],
         "python_executable": _portable_python(),
         "interval_seconds": float(interval_seconds),
-        "client_derived_routes": list(client_derived_routes),
     }
 
 

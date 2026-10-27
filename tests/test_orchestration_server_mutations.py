@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import operator_isolation  # noqa: E402,F401
 
 from agent_bridge.orchestration import server as module
 

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from collections.abc import Callable
 from typing import Any, Mapping
 
+from .. import operator_settings
 from ..localq.spool import QueueCaps
 
 #: Mirrors ``localfirst.MIN_LOCAL_IDLE_RATIO``/``QueueCaps.min_cpu_idle_ratio``:
@@ -792,6 +793,9 @@ def parse_policy(document: object) -> Policy:
             or any(not isinstance(route, str) or route not in CLIENT_DERIVED_ROUTES
                    for route in client_routes)):
         raise PolicyError("client_derived_routes must be a list drawn from peer, execution")
+    # The operator settings file decides; this document's own key is the
+    # legacy fallback, validated above and read through the shared loader.
+    client_routes = operator_settings.client_derived_routes(legacy=[client_routes])
     peer_classes = (PEER_CLASSIFICATIONS | {"client_derived"}
                     if "execution" in client_routes else PEER_CLASSIFICATIONS)
     raw_route_classifications = document.get("route_classifications", {})

@@ -14,7 +14,7 @@ import shutil
 import sys
 from typing import Any
 
-from . import drift, registry, store
+from . import drift, operator_settings, registry, store
 from .broker import error_response
 from .capacity_router import RoutingError, StageRouter
 from .config import Config, load as load_config
@@ -567,6 +567,94 @@ def cmd_archive(_: Config, args: argparse.Namespace) -> int:
     return 2 if errors else 0
 
 
+def _legacy_values(raw: Any) -> tuple[frozenset[str], str | None]:
+    """A legacy ``client_derived_routes`` value as a set, or empty plus a note."""
+    if raw is None:
+        return frozenset(), None
+    routes = operator_settings.parse_routes(raw)
+    if routes is None:
+        return frozenset(), "malformed, counted as empty"
+    return routes, None
+
+
+def _read_raw(path: str) -> dict | None:
+    try:
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def legacy_sources(cfg: Config) -> dict[str, dict[str, Any]]:
+    """The legacy values now in force, one entry per file that is present.
+
+    A file that is absent holds no opinion and is left out of the
+    intersection. A present file with no key, or a malformed key, counts as
+    empty, so it can only narrow the result.
+    """
+    sources: dict[str, dict[str, Any]] = {}
+    routes, note = _legacy_values(cfg.raw.get("client_derived_routes"))
+    sources["broker_config"] = {"path": cfg.path, "routes": routes, "note": note}
+    orchestration_path = drift.discover_config()
+    orchestration_raw = _read_raw(orchestration_path) if orchestration_path else None
+    if orchestration_raw is not None:
+        routes, note = _legacy_values(orchestration_raw.get("client_derived_routes"))
+        sources["orchestration_config"] = {"path": orchestration_path, "routes": routes, "note": note}
+        state_root = orchestration_raw.get("state_root")
+        if isinstance(state_root, str) and os.path.isabs(state_root):
+            from .orchestration import autoroute
+            policy_file = autoroute.policy_path(state_root)
+            policy_raw = _read_raw(policy_file) if os.path.isfile(policy_file) else None
+            if policy_raw is not None:
+                routes, note = _legacy_values(policy_raw.get("client_derived_routes"))
+                sources["routing_policy"] = {"path": policy_file, "routes": routes, "note": note}
+    return sources
+
+
+def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
+                   environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """What migrate would write, and whether it may. Reads only."""
+    current = operator_settings.resolve(home, environ)
+    intersection = (frozenset.intersection(*(entry["routes"] for entry in sources.values()))
+                    if sources else frozenset())
+    preserved = operator_settings.existing_allow_client_derived(home, environ)
+    plan: dict[str, Any] = {
+        "path": current.path,
+        "legacy": {name: {"path": entry["path"], "routes": sorted(entry["routes"]),
+                          **({"note": entry["note"]} if entry["note"] else {})}
+                   for name, entry in sources.items()},
+        "routes": sorted(intersection),
+        "preserved_allow_client_derived": preserved,
+        "current": {"source": current.source, "reason": current.reason,
+                    "routes": sorted(current.routes)},
+    }
+    # Never overwrite a file that already decides, nor one that is present but
+    # untrusted or malformed: both are the operator's to fix by hand.
+    if current.source == operator_settings.SOURCE_OPERATOR:
+        plan["writable"] = False
+        plan["blocked_by"] = ("already_migrated" if not current.fail_closed
+                              else f"existing_file_{current.reason}")
+    else:
+        plan["writable"] = True
+    return plan
+
+
+def cmd_operator_settings(cfg: Config, args: argparse.Namespace) -> int:
+    plan = plan_migration(legacy_sources(cfg))
+    plan["mode"] = "write" if args.write else "dry-run"
+    plan["written"] = False
+    code = 0
+    if args.write:
+        if not plan["writable"]:
+            code = 2
+        else:
+            operator_settings.write(plan["routes"])
+            plan["written"] = True
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     store.set_umask()
     parser = argparse.ArgumentParser(prog="agent-bridge-admin")
@@ -604,6 +692,15 @@ def main(argv: list[str] | None = None) -> int:
     archive.add_argument("--stage", help="Archive only this stage for each --item.")
     archive.add_argument("--reason", default="operator_archive", help="Reason recorded in the event ledger.")
     archive.add_argument("--apply", action="store_true", help="Actually archive the planned stages.")
+    settings = sub.add_parser(
+        "operator-settings", help="The one file that decides client-derived cloud routes.")
+    settings_sub = settings.add_subparsers(dest="settings_command", required=True)
+    migrate = settings_sub.add_parser(
+        "migrate", help="Fold the legacy client_derived_routes keys into the operator "
+                        "settings file as their intersection. Dry run unless --write.")
+    mode = migrate.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Print the plan only (the default).")
+    mode.add_argument("--write", action="store_true", help="Write the file, mode 0600.")
     args = parser.parse_args(argv)
     if args.command == "archive" and args.stage and not args.item:
         parser.error("--stage applies only to --item")
@@ -613,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
                 "reporting": cmd_reporting, "local-first": cmd_local_first,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve,
-                "archive": cmd_archive}[
+                "archive": cmd_archive, "operator-settings": cmd_operator_settings}[
             args.command](cfg, args)
     except BrokerError as exc:
         print(json.dumps(error_response(exc.category), sort_keys=True))
