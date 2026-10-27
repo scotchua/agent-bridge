@@ -820,6 +820,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 if reserved is not None:
                     return {"ok": False, "error":
                             f"execution_dispatch_refused:model_reserved_to_operator:{reserved}"}
+                router.require_execution_presence(provider)
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
                     "verify_timeout_seconds": 300, "cleanup_timeout_seconds": 60,

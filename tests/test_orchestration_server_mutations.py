@@ -185,6 +185,7 @@ class MainMutationTests(unittest.TestCase):
         fake_server.serve.return_value = 13
         with mock.patch.object(module, "load", return_value=self.cfg), \
                 mock.patch.object(module.Service, "for_config", return_value=object()), \
+                mock.patch.object(module.HarnessReadinessProbe, "for_config", return_value=mock.Mock()), \
                 mock.patch.object(module, "StageRouter", return_value=object()), \
                 mock.patch.object(module, "ExecutionQueue", return_value=object()) as execution, \
                 mock.patch.object(module.autoroute, "model_reserved_for", return_value={}), \
