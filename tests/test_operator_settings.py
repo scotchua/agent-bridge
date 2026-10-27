@@ -651,19 +651,63 @@ class MigrationTests(StateCase):
         leftovers = [name for name in os.listdir(self.state) if name.startswith(".tmp-")]
         self.assertEqual(leftovers, [])
 
-    def test_existing_runner_file_blocks_for_a_manual_merge(self):
+    def test_dry_run_plans_an_upgrade_of_the_runner_file(self):
         self.write({"allow_client_derived": True})
         before = self.path.read_bytes()
-        cfg = self.legacy(["peer"])
+        code, plan = self.run_cli(self.legacy(["peer"]))
+        self.assertEqual((code, plan["writable"], plan["action"]), (0, True, "upgrade"))
+        self.assertIs(plan["preserved_allow_client_derived"], True)
+        self.assertNotIn("_expected", plan)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    @unittest.skipUnless(POSIX, "mode bits")
+    def test_runner_file_is_upgraded_keeping_its_value(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.write({"allow_client_derived": value})
+                code, plan = self.run_cli(self.legacy(["peer"]), "--write")
+                self.assertEqual((code, plan["written"], plan["action"]), (0, True, "upgrade"))
+                self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")),
+                                 {"version": 1, "client_derived_routes": ["peer"],
+                                  "allow_client_derived": value})
+                self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+                self.assertEqual(operator_settings.client_derived_routes(), frozenset({"peer"}))
+                leftovers = [n for n in os.listdir(self.state) if n.startswith(".tmp-")]
+                self.assertEqual(leftovers, [])
+
+    def test_runner_file_with_other_keys_needs_a_manual_merge(self):
+        self.write({"allow_client_derived": True, "other": 1})
+        before = self.path.read_bytes()
         for flags in ((), ("--write",)):
             with self.subTest(flags=flags):
-                code, plan = self.run_cli(cfg, *flags)
-                self.assertEqual(code, 2)
-                self.assertFalse(plan["written"])
+                code, plan = self.run_cli(self.legacy(["peer"]), *flags)
+                self.assertEqual((code, plan["written"]), (2, False))
                 self.assertEqual(plan["blocked_by"], "existing_file_needs_manual_merge")
-                self.assertEqual(plan["routes"], ["peer"])
-                self.assertIs(plan["preserved_allow_client_derived"], True)
                 self.assertEqual(self.path.read_bytes(), before)
+
+    def test_runner_file_changed_before_the_replace_is_left_alone(self):
+        # The change lands after the first comparison and before the second.
+        self.write({"allow_client_derived": True})
+        real_fsync = os.fsync
+        calls = []
+
+        def fsync(fd):
+            if not calls:
+                calls.append(fd)
+                self.write({"allow_client_derived": False})
+            return real_fsync(fd)
+
+        with mock.patch.object(operator_settings.os, "fsync", side_effect=fsync):
+            code, plan = self.run_cli(self.legacy(["peer"]), "--write")
+        self.assertEqual((code, plan["blocked_by"]), (2, "changed_during_migration"))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")),
+                         {"allow_client_derived": False})
+        leftovers = [n for n in os.listdir(self.state) if n.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_upgrade_refuses_a_file_that_is_not_the_runners(self):
+        with self.assertRaises(ValueError):
+            operator_settings.upgrade(["peer"], '{"version": 1, "client_derived_routes": []}')
 
     def test_write_refuses_to_overwrite_a_deciding_file(self):
         self.write({"version": 1, "client_derived_routes": []})

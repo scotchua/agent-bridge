@@ -289,6 +289,33 @@ def existing_allow_client_derived(home: str | os.PathLike[str] | None = None,
     return None if document is None else document.get("allow_client_derived")
 
 
+def read_text(home: str | os.PathLike[str] | None = None,
+              environ: Mapping[str, str] | None = None) -> str | None:
+    """The file's exact text from a trusted read, or None when it is absent or refused."""
+    try:
+        return _read_trusted(settings_path(home, environ))
+    except _Refused:
+        return None
+
+
+#: The only keys the runner's legacy file may hold for migration to upgrade it
+#: in place. Anything else is the operator's to merge by hand.
+UPGRADABLE_KEYS = frozenset({"allow_client_derived", "version"})
+
+
+def upgradable(text: str | None) -> bool:
+    """True for the runner's own file: no routes key, nothing but known keys."""
+    if text is None:
+        return False
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return False
+    return (isinstance(document, dict) and "client_derived_routes" not in document
+            and set(document) <= UPGRADABLE_KEYS
+            and ("version" not in document or _supported_version(document["version"])))
+
+
 def render(routes: Iterable[str], allow_client_derived: Any = None) -> bytes:
     """The file's bytes. A legacy ``allow_client_derived`` value is kept as it was."""
     document: dict[str, Any] = {"version": SETTINGS_VERSION,
@@ -326,6 +353,54 @@ def create(routes: Iterable[str], home: str | os.PathLike[str] | None = None,
             handle.flush()
             os.fsync(handle.fileno())
         os.link(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    return path
+
+
+def upgrade(routes: Iterable[str], expected: str,
+            home: str | os.PathLike[str] | None = None,
+            environ: Mapping[str, str] | None = None) -> str:
+    """Add routes to the runner's own file, keeping its allow_client_derived value.
+
+    ``expected`` is the exact text the plan was made from. The file is read
+    again and compared before the new bytes are written and again just before
+    the atomic replace, the same guard the installer uses for files whose
+    other writers do not honor a lock. Any difference raises FileExistsError
+    and leaves the file as it is.
+    """
+    import contextlib
+    import tempfile
+
+    from .platform import platform
+
+    chosen = frozenset(routes)
+    if not chosen <= ROUTES:
+        raise ValueError("client_derived_routes must be drawn from peer, execution")
+    if not upgradable(expected):
+        raise ValueError("only the runner's own file is upgraded in place")
+    path = settings_path(home, environ)
+    if read_text(home, environ) != expected:
+        raise FileExistsError(path)
+    content = render(chosen, json.loads(expected).get("allow_client_derived"))
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            platform.enforce_owner_only_file(handle.fileno())
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if read_text(home, environ) != expected:
+            raise FileExistsError(path)
+        os.replace(tmp, path)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)

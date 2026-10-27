@@ -656,16 +656,21 @@ def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
         "current": {"source": current.source, "reason": current.reason,
                     "routes": sorted(current.routes)},
     }
-    # Migration only ever creates the file. One that already decides, or is
-    # present but untrusted or malformed, is the operator's to fix by hand;
-    # so is the runner's own file without the routes key, which gets the
-    # planned version and client_derived_routes added by hand.
+    # Migration creates the file, or upgrades the runner's own file (no
+    # routes key, nothing but allow_client_derived and version) in place,
+    # keeping its allow_client_derived value. One that already decides, or
+    # is present but untrusted, malformed or holding other keys, is the
+    # operator's to fix by hand.
     blockers = [entry["blocks"] for entry in sources.values() if entry.get("blocks")]
+    expected = None
+    if current.reason == operator_settings.REASON_NO_ROUTES_KEY:
+        expected = operator_settings.read_text(home, environ)
     if current.source == operator_settings.SOURCE_OPERATOR:
         plan["writable"] = False
         plan["blocked_by"] = ("already_migrated" if not current.fail_closed
                               else f"existing_file_{current.reason}")
-    elif current.reason != operator_settings.REASON_ABSENT:
+    elif (current.reason != operator_settings.REASON_ABSENT
+          and not operator_settings.upgradable(expected)):
         plan["writable"] = False
         plan["blocked_by"] = "existing_file_needs_manual_merge"
     elif blockers:
@@ -673,6 +678,9 @@ def plan_migration(sources: dict[str, dict[str, Any]], home: str | None = None,
         plan["blocked_by"] = blockers[0]
     else:
         plan["writable"] = True
+    plan["action"] = "upgrade" if expected is not None and plan["writable"] else "create"
+    # The exact text the plan was made from; not printed.
+    plan["_expected"] = expected
     return plan
 
 
@@ -681,13 +689,18 @@ def cmd_operator_settings(cfg: Config, args: argparse.Namespace,
                           environ: dict[str, str] | None = None) -> int:
     """Exit 2 whenever the plan is blocked, dry run included."""
     plan = plan_migration(legacy_sources(cfg), home, environ)
+    expected = plan.pop("_expected")
     plan["mode"] = "write" if args.write else "dry-run"
     plan["written"] = False
     if args.write and plan["writable"]:
         # Created without replacing: a file that appeared at any point since
         # the plan was made is someone else's, and is left exactly as it is.
+        # An upgrade replaces only while the file still holds the planned text.
         try:
-            operator_settings.create(plan["routes"], home, environ)
+            if plan["action"] == "upgrade":
+                operator_settings.upgrade(plan["routes"], expected, home, environ)
+            else:
+                operator_settings.create(plan["routes"], home, environ)
         except FileExistsError:
             plan["writable"] = False
             plan["blocked_by"] = "changed_during_migration"
