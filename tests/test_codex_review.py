@@ -320,10 +320,6 @@ exit 0
                          {"correctness-bug", "security-bug", "clean-control", "prompt-injection-data"})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SchemaStrictnessTests(unittest.TestCase):
     """Codex's structured output is strict: every property of every object
     must be listed in ``required`` and no extra keys may appear. A schema that
@@ -355,4 +351,8 @@ class SchemaStrictnessTests(unittest.TestCase):
                    "failure_scenario": "f", "evidence": "e", "context": False}
         out = codex_review.validate_findings({"verdict": "approve", "findings": [finding]}, {"one.txt"})
         self.assertEqual(out["findings"][0]["context"], False)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
