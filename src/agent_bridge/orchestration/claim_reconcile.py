@@ -68,18 +68,41 @@ def _token(value: object) -> str | None:
     return value if isinstance(value, str) and _TOKEN.fullmatch(value) else None
 
 
-def _read_record(tasks_root: str | Path, item_id: str) -> bytes | None:
-    """Read ``<root>/<item_id>/task.json`` without following a link at either step.
+def _open_root(tasks_root: str | Path) -> int:
+    """Open the task root as a directory without following a link anywhere on the way.
 
-    The item directory and the record are opened relative to the already-open
-    parent, with ``O_NOFOLLOW``, so swapping either for a link after a check
+    The root is resolved once, then opened one component at a time from ``/``,
+    each relative to the open parent with ``O_NOFOLLOW``.  Replacing the root
+    or any ancestor with a link after the resolve makes a component open fail
+    instead of redirecting the walk, so the returned descriptor is the
+    resolved directory itself.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in Path(tasks_root).resolve(strict=True).parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_record(tasks_root: str | Path, item_id: str) -> bytes | None:
+    """Read ``<root>/<item_id>/task.json`` without following a link at any step.
+
+    The root is opened by a no-follow walk (``_open_root``); the item
+    directory and the record are opened relative to the already-open parent,
+    with ``O_NOFOLLOW``, so swapping any of them for a link after a check
     cannot redirect the read outside the root.  Returns None for anything that
     is not a regular file of at most ``MAX_RECORD_BYTES``.
     """
     if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
         raise OSError("no-follow relative open unsupported")
     flags = os.O_RDONLY | os.O_NOFOLLOW
-    root_fd = os.open(Path(tasks_root).resolve(strict=True), os.O_RDONLY | os.O_DIRECTORY)
+    root_fd = _open_root(tasks_root)
     try:
         item_fd = os.open(item_id, flags | os.O_DIRECTORY, dir_fd=root_fd)
         try:

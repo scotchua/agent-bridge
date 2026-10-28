@@ -210,6 +210,27 @@ class ClaimReconcileTests(unittest.TestCase):
         self.assertEqual(claim_reconcile.read_task_claim(self.tasks, "real")["status"],
                          "claim")
 
+    def test_root_swapped_for_a_link_after_resolve_is_not_followed(self):
+        # RECON-F1 round 2: the root and its ancestors are opened without
+        # following links, so a swap between resolve and open fails closed.
+        real = self.root.resolve()
+        outside = real / "outside"
+        (outside / "item").mkdir(parents=True)
+        (outside / "item" / "task.json").write_text(
+            json.dumps({"workload": {"revision": 1, "claim": claim()}}), encoding="utf-8")
+        swapped = real / "swapped"
+        swapped.symlink_to(outside, target_is_directory=True)
+        # Resolve "ran" before the swap: it returns the path unchanged.
+        with mock.patch.object(Path, "resolve", lambda path, strict=False: path):
+            self.assertEqual(claim_reconcile.read_task_claim(swapped, "item"),
+                             {"status": "unreadable"})
+            ancestor = real / "linkparent"
+            ancestor.symlink_to(real, target_is_directory=True)
+            self.assertEqual(claim_reconcile.read_task_claim(ancestor / "outside", "item"),
+                             {"status": "unreadable"})
+        # A root reached through a link is fine when resolve sees it first.
+        self.assertEqual(claim_reconcile.read_task_claim(swapped, "item")["status"], "claim")
+
     def test_hostile_values_are_malformed_not_crashes(self):
         # RECON-F2: wrong-typed or oversized values become findings.
         self.owned("listreason")
