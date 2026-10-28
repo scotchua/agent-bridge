@@ -116,9 +116,16 @@ class DetectionTests(unittest.TestCase):
         for text in ("Account number: 2026-10-27", "acct 2026-10-27", "card # 2026-10-27",
                      "Closed on 2026-13-45.", "Closed on 2026-02-30.", "Ref 1899-01-01.",
                      "Closed on 20261027.", "Closed on 2026-10-27 1234.",
-                     "Closed on 2026 10 27."):
+                     "Closed on 2026 10 27.", "acc: 2026-10-27", "a.c.: 2026-10-27",
+                     "A/C 2026-10-27", "PAN: 2026-10-27", "Accounts 2026-10-27",
+                     "Card no. 2026-10-27", "IBAN 2026-10-27", "#2026-10-27"):
             with self.subTest(text=text):
                 self.assertIn("account", sb.identifier_classes(text))
+
+    def test_label_words_inside_other_words_do_not_block_a_date(self):
+        for text in ("postcard received 2026-10-27", "accounting closed 2026-10-27"):
+            with self.subTest(text=text):
+                self.assertEqual(sb.identifier_classes(text), ())
 
     def test_plain_calendar_dates_are_not_identifiers(self):
         for text in ("Closed on 2026-10-27.", "Period 2026-01-01 to 2026-12-31.",

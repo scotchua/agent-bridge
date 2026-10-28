@@ -112,7 +112,10 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # A real calendar date (2026-10-27) is not an account number unless a label
 # near it says it is: "Account number: 2026-10-27" still fails closed (F9).
 _ISO_DATE = re.compile(r"(19|20)\d\d-(\d\d)-(\d\d)")
-_ACCOUNT_LABEL = re.compile(r"(?i)acc(?:oun)?t|acct|a/c|card|routing|iban|number|\bno\b|#")
+# Whole words only, so "postcard" or "accounting" alone do not block a date.
+_ACCOUNT_LABEL = re.compile(
+    r"(?i)\b(?:acc(?:oun)?t?s?|accts?|cards?|pan|routing|iban|numbers?|nbr|num|no)\b"
+    r"|(?<!\w)a[/.]c\b|#")
 _LABEL_WINDOW = 40
 
 
