@@ -111,11 +111,35 @@ class DetectionTests(unittest.TestCase):
                 with self.subTest(name=name, text=text):
                     self.assertIn(name, sb.identifier_classes(text))
 
-    def test_date_shaped_numbers_fail_closed_as_account(self):
+    def test_labelled_or_invalid_dates_fail_closed_as_account(self):
         # F9: stripping dates let "Account number: 2026-10-27" auto-send.
-        for text in ("Account number: 2026-10-27", "Closed on 2026-10-27."):
+        for text in ("Account number: 2026-10-27", "acct 2026-10-27", "card # 2026-10-27",
+                     "Closed on 2026-13-45.", "Closed on 2026-02-30.", "Ref 1899-01-01.",
+                     "Closed on 20261027.", "Closed on 2026-10-27 1234.",
+                     "Closed on 2026 10 27.", "acc: 2026-10-27", "a.c.: 2026-10-27",
+                     "A/C 2026-10-27", "PAN: 2026-10-27", "Accounts 2026-10-27",
+                     "Card no. 2026-10-27", "IBAN 2026-10-27", "#2026-10-27",
+                     "AccountNo: 2026-10-27", "CardNumber: 2026-10-27",
+                     "ACCOUNTNO 2026-10-27", "accountnumber 2026-10-27",
+                     "acctno 2026-10-27", "AcctNbr 2026-10-27", "acct# 2026-10-27",
+                     "acct. 2026-10-27"):
             with self.subTest(text=text):
                 self.assertIn("account", sb.identifier_classes(text))
+
+    def test_label_words_inside_other_words_do_not_block_a_date(self):
+        for text in ("postcard received 2026-10-27", "accounting closed 2026-10-27"):
+            with self.subTest(text=text):
+                self.assertEqual(sb.identifier_classes(text), ())
+
+    def test_plain_calendar_dates_are_not_identifiers(self):
+        for text in ("Closed on 2026-10-27.", "Period 2026-01-01 to 2026-12-31.",
+                     "Leap day 2028-02-29 was a Tuesday."):
+            with self.subTest(text=text):
+                self.assertEqual(sb.identifier_classes(text), ())
+
+    def test_a_plain_date_does_not_hide_a_real_account(self):
+        text = "Closed on 2026-10-27, acct 12345678 on file"
+        self.assertIn("account", sb.identifier_classes(text))
 
 
 class BindTests(StateCase):

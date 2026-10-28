@@ -49,6 +49,7 @@ refusals live in the broker and the execution lanes.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import hashlib
 import hmac
 import json
@@ -105,15 +106,46 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?<![\w-])(?:\+\d{1,3}" + _SEP + r")?(?:\(\d{3}\)\s?|\d{3}" + _SEP + r")\d{3}"
         + _SEP + r"\d{4}(?![\w-])"
         r"|(?<![\w-])\+\d(?:" + _SEP + r"\d){6,13}(?![\w-])")),
-    # Date-shaped digit runs (2026-10-27) match too: a date cannot be told from
-    # an eight-digit account without context, so it fails closed (F2/F9).
     ("account", re.compile(r"(?<!\d)(?:\d[ -]?){7,18}\d(?!\d)")),
 )
+
+# A real calendar date (2026-10-27) is not an account number unless a label
+# near it says it is: "Account number: 2026-10-27" still fails closed (F9).
+_ISO_DATE = re.compile(r"(19|20)\d\d-(\d\d)-(\d\d)")
+# Whole words only, so "postcard" or "accounting" alone do not block a date.
+# CamelCase is split first ("CardNumber" reads as "Card Number"), and run-on
+# compounds such as "accountno" are listed outright.
+_ACCOUNT_LABEL = re.compile(
+    r"(?i)\b(?:acc(?:oun)?t?s?|accts?|cards?|pan|routing|iban|numbers?|nbr|num|no)\b"
+    r"|\b(?:acc(?:oun)?t?|acct|card|iban|routing)(?:no|nbr|num|number)s?\b"
+    r"|(?<!\w)a[/.]c\b|#")
+_CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+def _labelled(window: str) -> bool:
+    return _ACCOUNT_LABEL.search(_CAMEL.sub(" ", window)) is not None
+_LABEL_WINDOW = 40
+
+
+def _is_plain_date(text: str, match: re.Match[str]) -> bool:
+    if not _ISO_DATE.fullmatch(match.group()):
+        return False
+    try:
+        datetime.date.fromisoformat(match.group())
+    except ValueError:
+        return False
+    return not _labelled(text[max(0, match.start() - _LABEL_WINDOW):match.start()])
+
+
+def _found(name: str, pattern: re.Pattern[str], text: str) -> bool:
+    if name != "account":
+        return pattern.search(text) is not None
+    return any(not _is_plain_date(text, m) for m in pattern.finditer(text))
 
 
 def identifier_classes(text: str) -> tuple[str, ...]:
     """The identifier classes found in ``text``, sorted. Never the values."""
-    return tuple(sorted(name for name, pattern in _PATTERNS if pattern.search(text)))
+    return tuple(sorted(name for name, pattern in _PATTERNS if _found(name, pattern, text)))
 
 
 # -------------------------------------------------------------------- binding
