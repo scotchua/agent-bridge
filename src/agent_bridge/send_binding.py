@@ -113,9 +113,17 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # near it says it is: "Account number: 2026-10-27" still fails closed (F9).
 _ISO_DATE = re.compile(r"(19|20)\d\d-(\d\d)-(\d\d)")
 # Whole words only, so "postcard" or "accounting" alone do not block a date.
+# CamelCase is split first ("CardNumber" reads as "Card Number"), and run-on
+# compounds such as "accountno" are listed outright.
 _ACCOUNT_LABEL = re.compile(
     r"(?i)\b(?:acc(?:oun)?t?s?|accts?|cards?|pan|routing|iban|numbers?|nbr|num|no)\b"
+    r"|\b(?:acc(?:oun)?t?|acct|card|iban|routing)(?:no|nbr|num|number)s?\b"
     r"|(?<!\w)a[/.]c\b|#")
+_CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+def _labelled(window: str) -> bool:
+    return _ACCOUNT_LABEL.search(_CAMEL.sub(" ", window)) is not None
 _LABEL_WINDOW = 40
 
 
@@ -126,7 +134,7 @@ def _is_plain_date(text: str, match: re.Match[str]) -> bool:
         datetime.date.fromisoformat(match.group())
     except ValueError:
         return False
-    return not _ACCOUNT_LABEL.search(text[max(0, match.start() - _LABEL_WINDOW):match.start()])
+    return not _labelled(text[max(0, match.start() - _LABEL_WINDOW):match.start()])
 
 
 def _found(name: str, pattern: re.Pattern[str], text: str) -> bool:

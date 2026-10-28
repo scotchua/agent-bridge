@@ -118,7 +118,11 @@ class DetectionTests(unittest.TestCase):
                      "Closed on 20261027.", "Closed on 2026-10-27 1234.",
                      "Closed on 2026 10 27.", "acc: 2026-10-27", "a.c.: 2026-10-27",
                      "A/C 2026-10-27", "PAN: 2026-10-27", "Accounts 2026-10-27",
-                     "Card no. 2026-10-27", "IBAN 2026-10-27", "#2026-10-27"):
+                     "Card no. 2026-10-27", "IBAN 2026-10-27", "#2026-10-27",
+                     "AccountNo: 2026-10-27", "CardNumber: 2026-10-27",
+                     "ACCOUNTNO 2026-10-27", "accountnumber 2026-10-27",
+                     "acctno 2026-10-27", "AcctNbr 2026-10-27", "acct# 2026-10-27",
+                     "acct. 2026-10-27"):
             with self.subTest(text=text):
                 self.assertIn("account", sb.identifier_classes(text))
 
