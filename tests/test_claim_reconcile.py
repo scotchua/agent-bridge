@@ -187,6 +187,72 @@ class ClaimReconcileTests(unittest.TestCase):
                 self.assertEqual(claim_reconcile.read_task_claim(self.tasks, unsafe),
                                  {"status": "no_record"})
 
+    def test_no_link_or_special_file_is_followed_at_any_step(self):
+        # RECON-F1: containment holds at open time, not only at a prior check.
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps({"workload": {"revision": 1, "claim": claim()}}),
+                           encoding="utf-8")
+        (self.tasks / "filelink").mkdir()
+        (self.tasks / "filelink" / "task.json").symlink_to(outside)
+        (self.tasks / "real").mkdir()
+        (self.tasks / "innerlink").symlink_to(self.tasks / "real", target_is_directory=True)
+        self.task("real", {"revision": 1, "claim": claim()})
+        (self.tasks / "fifo").mkdir()
+        os.mkfifo(self.tasks / "fifo" / "task.json")
+        (self.tasks / "huge").mkdir()
+        (self.tasks / "huge" / "task.json").write_bytes(
+            b" " * (claim_reconcile.MAX_RECORD_BYTES + 1))
+        (self.tasks / "dirrecord" / "task.json").mkdir(parents=True)
+        for item_id in ("filelink", "innerlink", "fifo", "huge", "dirrecord"):
+            with self.subTest(item_id=item_id):
+                self.assertEqual(claim_reconcile.read_task_claim(self.tasks, item_id),
+                                 {"status": "unreadable"})
+        self.assertEqual(claim_reconcile.read_task_claim(self.tasks, "real")["status"],
+                         "claim")
+
+    def test_hostile_values_are_malformed_not_crashes(self):
+        # RECON-F2: wrong-typed or oversized values become findings.
+        self.owned("listreason")
+        self.task("listreason", {"revision": 1,
+                                 "claim": dict(claim(), released_at=NOW, release_reason=[])})
+        self.owned("hugelease")
+        self.task("hugelease", {"revision": 1,
+                                "claim": dict(claim(), lease_expires_at=10 ** 400)})
+        self.owned("deep")
+        self.task("deep", raw="[" * 100_000 + "]" * 100_000)
+        findings = self.run_reconcile()
+        self.assertIn("task_record_malformed", self.kinds(findings, "listreason"))
+        self.assertIn("task_record_malformed", self.kinds(findings, "hugelease"))
+        self.assertIn("task_record_unreadable", self.kinds(findings, "deep"))
+
+    def test_main_reports_an_unexpected_error_by_type_only(self):
+        config = mock.Mock(capacity_db=self.ledger)
+        stderr = io.StringIO()
+        with mock.patch.object(claim_reconcile, "load", return_value=config), \
+                mock.patch.object(claim_reconcile, "reconcile",
+                                  side_effect=TypeError("secret owner text")), \
+                contextlib.redirect_stderr(stderr):
+            code = claim_reconcile.main(["--config", "c", "--tasks-root", str(self.tasks)])
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue().strip(), "claim reconcile failed: TypeError")
+
+    def test_task_side_findings_carry_the_ledger_fencing_values(self):
+        # RECON-F3: an operator acting on any finding has both sides' revisions.
+        row = self.owned("late", lease=6000)
+        self.task("late", {"revision": 3, "claim": claim(lease_in=10)})
+        self.owned("broken")
+        self.task("broken", raw="{not json")
+        self.clock.now += 120
+        findings = self.run_reconcile()
+        [late] = [f for f in findings if f["kind"] == "task_lease_expired"]
+        self.assertEqual(late["task_record"]["revision"], 3)
+        self.assertEqual(late["ledger"]["revision"], row["revision"])
+        self.assertEqual(late["ledger"]["assignment"], row["assignment"])
+        [broken] = [f for f in findings if f["kind"] == "task_record_unreadable"]
+        self.assertEqual(broken["stage"], "build")
+        self.assertEqual(broken["ledger"]["owner_id"], "claude-session-1")
+        self.assertIsNotNone(broken["ledger"]["revision"])
+
     def test_reconcile_writes_nothing_on_either_side(self):
         self.owned("split", owner="codex-worker-9")
         record = self.task("split", {"revision": 4, "claim": claim()})

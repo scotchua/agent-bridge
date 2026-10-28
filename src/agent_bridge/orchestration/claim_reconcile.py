@@ -28,8 +28,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -54,11 +56,44 @@ NOTICE = "notice"
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:
+        # An integer too large for a float is not a timestamp.
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _token(value: object) -> str | None:
     return value if isinstance(value, str) and _TOKEN.fullmatch(value) else None
+
+
+def _read_record(tasks_root: str | Path, item_id: str) -> bytes | None:
+    """Read ``<root>/<item_id>/task.json`` without following a link at either step.
+
+    The item directory and the record are opened relative to the already-open
+    parent, with ``O_NOFOLLOW``, so swapping either for a link after a check
+    cannot redirect the read outside the root.  Returns None for anything that
+    is not a regular file of at most ``MAX_RECORD_BYTES``.
+    """
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("no-follow relative open unsupported")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    root_fd = os.open(Path(tasks_root).resolve(strict=True), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        item_fd = os.open(item_id, flags | os.O_DIRECTORY, dir_fd=root_fd)
+        try:
+            # O_NONBLOCK keeps a FIFO planted as task.json from hanging the open.
+            fd = os.open("task.json", flags | os.O_NONBLOCK, dir_fd=item_fd)
+        finally:
+            os.close(item_fd)
+    finally:
+        os.close(root_fd)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        data = handle.read(MAX_RECORD_BYTES + 1)
+    return None if len(data) > MAX_RECORD_BYTES else data
 
 
 def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
@@ -71,17 +106,14 @@ def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
     if not _safe_item_id(item_id):
         return {"status": "no_record"}
     try:
-        root = Path(tasks_root).resolve(strict=True)
-        record = (root / item_id / "task.json").resolve(strict=True)
-        record.relative_to(root)
-        if not record.is_file():
-            return {"status": "no_record"}
-        if record.stat().st_size > MAX_RECORD_BYTES:
+        data = _read_record(tasks_root, item_id)
+        if data is None:
             return {"status": "unreadable"}
-        value = json.loads(record.read_text(encoding="utf-8"))
+        value = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         return {"status": "no_record"}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError: deeply nested JSON is rejected, not a crash.
         return {"status": "unreadable"}
     if not isinstance(value, dict):
         return {"status": "malformed"}
@@ -103,7 +135,8 @@ def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
     if (owner is None or stage is None or lease is None
             or (released_at is not None and _number(released_at) is None)
             or (released_at is None and reason is not None)
-            or (released_at is not None and reason not in _RELEASE_REASONS)):
+            or (released_at is not None
+                and (not isinstance(reason, str) or reason not in _RELEASE_REASONS))):
         return {"status": "malformed", "revision": revision}
     return {"status": "claim", "revision": revision,
             "claim": {"owner": owner, "stage": stage, "lease_expires_at": lease,
@@ -156,15 +189,19 @@ def _finding(kind: str, severity: str, item_id: str, stage: str | None,
 def _compare(item_id: str, rows: list[dict], task: dict, now: float) -> list[dict]:
     findings = []
     claim = task.get("claim")
-    if task["status"] in ("unreadable", "malformed"):
-        findings.append(_finding(f"task_record_{task['status']}", CONFLICT,
-                                 item_id, None, task, None))
-    elif task["status"] == "no_record":
-        findings.append(_finding("task_record_missing", NOTICE, item_id, None, task, None))
+    by_stage = {row["stage"]: row for row in rows}
+    record_kind = {"unreadable": ("task_record_unreadable", CONFLICT),
+                   "malformed": ("task_record_malformed", CONFLICT),
+                   "no_record": ("task_record_missing", NOTICE)}.get(task["status"])
+    if record_kind:
+        # One finding per ledger row, so each carries that row's fencing values.
+        for row in rows or [None]:
+            findings.append(_finding(*record_kind, item_id,
+                                     None if row is None else row["stage"], task, row))
     if claim and claim["active"] and claim["lease_expires_at"] < now:
         findings.append(_finding("task_lease_expired", NOTICE, item_id, claim["stage"],
-                                 task, None))
-    if claim and claim["active"] and claim["stage"] not in {row["stage"] for row in rows}:
+                                 task, by_stage.get(claim["stage"])))
+    if claim and claim["active"] and claim["stage"] not in by_stage:
         findings.append(_finding("task_claim_stage_not_in_ledger", NOTICE, item_id,
                                  claim["stage"], task, None))
     for row in rows:
@@ -238,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         findings = reconcile(config.capacity_db, args.tasks_root, now=time.time(),
                              items=args.items)
-    except (OSError, sqlite3.Error, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - report the type only, never a traceback
         print(f"claim reconcile failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     conflicts = sum(1 for finding in findings if finding["severity"] == CONFLICT)
