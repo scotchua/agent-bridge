@@ -183,8 +183,8 @@ assistant asked for. The `considered` block holds no task content.
 
 ### Capacity evidence
 
-Capacity has exactly two writers, and neither of them is an assistant. There
-used to be a third, the MCP tool `capacity_observe`, and an adversarial
+Capacity has exactly three writers, and none of them is an assistant. There
+used to be another, the MCP tool `capacity_observe`, and an adversarial
 review was right about it: the assistant chose the route, the availability,
 the source string and the freshness window, so "a fresh observation from an
 authorized source" meant whatever the model typed, for any route, lasting
@@ -208,6 +208,26 @@ hook itself is not dispatched to.
 The withdrawal matches on that source, so deleting a route from your policy
 removes what the declaration put there and cannot remove a peer's own
 first-hand presence.
+
+**The usage feeder, refusals only.** `agent-bridge-capacity-feed` reads the
+operator's usage snapshots (`codex.json`, `claude.json`) and, when a fresh
+usage window is at or over the operator's `--ceiling-percent`, records that
+route as unavailable, sourced `quota:over-ceiling`, until the window resets
+(at most 4 hours; a later run extends it). It never records a route as
+available: every snapshot carries an unverified account binding, which
+cannot support routing, but usage inside a window only rises until it
+resets, so an over-ceiling window is good evidence of a refusal. It never
+withdraws a row and never shortens another writer's refusal. A missing,
+malformed, stale or future-dated snapshot writes nothing. There is no
+default ceiling; the operator sets it, and the command refuses to run
+without one. A lowered ceiling takes effect on the next run; a raised one
+waits for the existing refusal to expire.
+
+The ledger keeps one row per route, so **the presence and declaration
+replays cannot overwrite a fresh trusted refusal.** Without that, the next
+hook call would erase the feeder's refusal within seconds. Once the refusal
+expires they resume as before. Withdrawing a declaration matches on its own
+source, so it cannot remove a refusal either.
 
 Two hard limits on what a row can be:
 

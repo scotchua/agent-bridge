@@ -1,0 +1,11 @@
+#!/bin/sh
+# Record trusted capacity refusals from usage snapshots. Refusals only:
+# never marks a route available. The operator supplies --ceiling-percent.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+. "$HERE/agent-bridge-python"
+agent_bridge_resolve_python || { printf '%s\n' "$AGENT_BRIDGE_PYTHON_FAILURE" >&2; exit 2; }
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$PY" -P -m agent_bridge.orchestration.capacity_feed "$@"

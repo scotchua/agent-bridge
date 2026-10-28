@@ -1185,6 +1185,19 @@ class ProtectedLauncherTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertTrue(gate.shell_writes(command))
 
+    def test_the_capacity_feed_launcher_is_classified_as_a_write(self):
+        """It writes trusted refusals, so a covered client may not run it,
+        not even as a dry run, by launcher path, Windows spelling or ``-m``."""
+        for command in (
+            "./bin/agent-bridge-capacity-feed --config x --snapshot-dir y --ceiling-percent 90",
+            "bin/agent-bridge-capacity-feed --config x --snapshot-dir y --ceiling-percent 90 --dry-run",
+            "C:\\bridge\\bin\\Agent-Bridge-Capacity-Feed.CMD --config x",
+            "python3 -P -m agent_bridge.orchestration.capacity_feed --config x",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(gate.shell_writes(command))
+        self.assertFalse(gate.shell_writes("grep -n capacity_feed docs/DELEGATION-GATE.md"))
+
     def test_gate_hook_install_is_a_write_but_report_and_audit_are_not(self):
         self.assertTrue(gate.shell_writes(
             "./bin/agent-bridge-gate-hook install --root . --config x --apply"))

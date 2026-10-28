@@ -12,6 +12,7 @@ from . import store
 RECORD_NAME = "launcher-python"
 LAUNCHERS = (
     "agent-bridge-admin",
+    "agent-bridge-capacity-feed",
     "agent-bridge-execution-worker",
     "agent-bridge-gate-hook",
     "agent-bridge-mcp",

@@ -48,7 +48,7 @@ and it was the wrong shape: the assistant chose the route, the availability,
 the source string and the freshness window, so "a fresh observation from an
 authorized source" meant whatever the model typed, for as long as it liked.
 
-Capacity has exactly two writers now, neither of them on the wire:
+Capacity has exactly three writers now, none of them on the wire:
 
  • the gate hook records that the client calling it is running. First-hand,
    its own route only, fifteen minutes.
@@ -56,6 +56,10 @@ Capacity has exactly two writers now, neither of them on the wire:
    on this machine. That is a standing operator declaration, not a health
    check, and it is recorded as one: the ledger shows the source, and
    removing a route from the list withdraws it on the next decision.
+ • `agent-bridge-capacity-feed`, run by the operator, records a route as
+   unavailable while a fresh usage window is at or over the operator's
+   ceiling. Refusals only, until that window resets, at most four hours a
+   pass. The gate refuses it to a covered client. See DELEGATION-GATE.md.
 
 Missing, stale, untrusted or unavailable capacity never grants a stage claim,
 and no observation may claim a window longer than the routing lease. Capacity

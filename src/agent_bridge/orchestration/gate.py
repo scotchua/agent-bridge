@@ -183,9 +183,14 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # 57's already-fixed mistake for a different set of names is exactly the
     # kind of thing an adversarial review exists to catch.
     r"(^|[\s;&|('\"/\\])(?i:agent-bridge-orchestration-verify)(?i:\.cmd)?(\s|$)",
+    # ``agent-bridge-capacity-feed`` writes trusted capacity refusals into the
+    # routing ledger. It can only narrow capacity, but a trusted row is the
+    # operator's to write, not an assistant's, so it is blocked outright like
+    # the verify launcher above, ``--dry-run`` included.
+    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-capacity-feed)(?i:\.cmd)?(\s|$)",
     r"(^|[\s;&|('\"/\\])(?i:agent-bridge-gate-hook)(?i:\.cmd)?\b[^;&|]*\b(?i:install)\b",
     r"(^|[\s;&|('\"/\\])(?i:setup_bridge\.py|agent-bridge-setup)(?i:\.cmd)?\b[^;&|]*\b(?i:onboard\s+apply)\b",
-    # Every one of the three patterns above matches only the launcher
+    # Every one of the launcher patterns above matches only the launcher
     # SCRIPT's own filename. Both ``orchestration/delegation_verify.py`` and
     # ``orchestration/gate.py`` are ordinary modules with their own
     # ``if __name__ == "__main__"`` guard, exactly like the launcher scripts
@@ -202,6 +207,7 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # subprocess path is ``python3 -c "from agent_bridge import onboard; ..."``,
     # already caught by the ``-c`` pattern above).
     r"(?i:(^|[\s;&|('\"])-m\s+agent_bridge\.orchestration\.delegation_verify(\s|$))",
+    r"(?i:(^|[\s;&|('\"])-m\s+agent_bridge\.orchestration\.capacity_feed(\s|$))",
     r"(?i:(^|[\s;&|('\"])-m\s+agent_bridge\.orchestration\.gate)\b[^;&|]*\b(?i:install)\b",
 ))
 #: Formatters that write unless asked only to report.

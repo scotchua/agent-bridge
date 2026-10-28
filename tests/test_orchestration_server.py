@@ -104,8 +104,9 @@ class OrchestrationServerTests(unittest.TestCase):
         ``capacity_observe`` used to be here, and with it an assistant could
         name any route available, from any source, for any length of time,
         which made "a fresh observation from an authorized source" mean
-        whatever the model typed. Capacity has two writers now and neither is
-        a tool: the gate hook and the operator's policy file.
+        whatever the model typed. Capacity has three writers now and none is
+        a tool: the gate hook, the operator's policy file and the
+        operator-run usage feeder, which only records refusals.
         """
         server = Server("codex", self.service, self.router, interval=0.01)
         self.assertNotIn("capacity_observe", server.tools)
