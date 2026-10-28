@@ -26,7 +26,7 @@ import time
 import traceback
 from typing import Any
 
-from . import broker, envelope, preflight, provenance, receipts, registry, runner, schema_validate, store
+from . import broker, envelope, preflight, provenance, receipts, registry, runner, schema_validate, send_binding, store
 from .backends import claude_backend, codex_backend
 from .backends.base import PeerOutcome, argv_shape
 from .config import Config, load as load_config
@@ -264,6 +264,19 @@ def execute(job_dir: str) -> int:
                     cfg, request, published.get("redaction_handoff"), prompt_text,
                     schema, schema_file, peer_session_id, resume,
                 )
+            try:
+                # U3: bind this attempt's exact bytes and release them just
+                # before the backend starts. Client-derived only.
+                send_binding.guard(
+                    send_prompt, route="peer", provider=peer,
+                    classification=request["source_classification"],
+                    exception_id=request.get("exception_id"),
+                    log_path=cfg.state("send-decisions.jsonl"),
+                    legacy=[cfg.raw.get("client_derived_routes", [])],
+                )
+            except send_binding.SendRefused:
+                category = ErrorCategory.SOURCE_CLASSIFICATION_REFUSED
+                break
             outcome = _run_peer(
                 cfg, peer, prompt=send_prompt, schema=schema, schema_file=schema_file,
                 peer_session_id=peer_session_id, resume=resume,

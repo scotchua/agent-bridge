@@ -53,7 +53,7 @@ _SAFE_EXECUTION_CODES = frozenset({
     "brief_size_invalid", "classification_not_eligible",
     "claude_config_dir_unavailable", "claude_verification_required",
     "cleanup_timeout_invalid", "client_derived_dispatch_not_admitted",
-    "execution_configuration_missing", "execution_deadline_invalid",
+    "exception_id_invalid", "execution_configuration_missing", "execution_deadline_invalid",
     "execution_harness_timeout", "execution_job_not_found",
     "execution_job_not_terminal", "execution_outcome_harness_ok_invalid",
     "execution_outcome_harness_status_invalid",

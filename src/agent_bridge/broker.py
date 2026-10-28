@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import envelope, preflight, provenance, receipts, registry, store
+from . import envelope, preflight, provenance, receipts, registry, send_binding, store
 from .config import Config, canonical_uuid
 from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_from_status
 
@@ -28,7 +28,7 @@ CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
 HANDOFF_FIELDS = {"preparation_dir", "clearance_sha256"}
-START_FIELDS = {"prompt", "source_classification", "label", "local_first"} | HANDOFF_FIELDS
+START_FIELDS = {"prompt", "source_classification", "label", "local_first", "exception_id"} | HANDOFF_FIELDS
 CONTINUE_FIELDS = START_FIELDS | {"conversation_id"}
 
 #: local_first.bypass's closed vocabulary (design section 2.8).
@@ -103,6 +103,11 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
             raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
         if len(label) > cfg.limit("label_max_chars"):
             raise BrokerError(ErrorCategory.INPUT_TOO_LARGE)
+
+    # U3: names one Scott-approved identifier exception file; the worker
+    # checks it against the exact bytes it sends.
+    if "exception_id" in args and not send_binding.valid_exception_id(args["exception_id"]):
+        raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
 
     if HANDOFF_FIELDS & set(args):
         if (not HANDOFF_FIELDS <= set(args)
@@ -798,6 +803,8 @@ def _prepare_job(
         "config_path": snapshot_path,
         "created_at": store.utc_now(),
     }
+    if "exception_id" in args:
+        request["exception_id"] = args["exception_id"]
     if handoff is not None:
         request.update({key: args[key] for key in HANDOFF_FIELDS})
         request["redaction_handoff"] = handoff

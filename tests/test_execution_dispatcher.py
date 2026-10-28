@@ -629,7 +629,9 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
             "p.add_argument('--cleanup-timeout', type=float); p.add_argument('--tasks-dir', type=Path)\n"
             "p.add_argument('--verify-json', action='append', default=[])\n"
             "p.add_argument('--classification'); p.add_argument('--model'); p.add_argument('--reasoning-effort')\n"
+            "p.add_argument('--exception-id')\n"
             "a, _ = p.parse_known_args(); a.tasks_dir.mkdir(parents=True, exist_ok=True)\n"
+            "(a.tasks_dir / 'observed-exception.json').write_text(json.dumps(a.exception_id))\n"
             "(a.tasks_dir / 'observed-deadlines.json').write_text(json.dumps({'generation': a.timeout, 'verification': a.verify_timeout, 'cleanup': a.cleanup_timeout, 'checks': len(a.verify_json)}))\n"
             "time.sleep(a.timeout * 0.8)\n"
             "if Path(a.brief).read_text(encoding='utf-8') == 'chatty':\n"
@@ -648,13 +650,35 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         self.queue = ExecutionQueue(self.root / "queue", executor,
                                     model_reserved=reserve_nothing)
 
-    def _submit(self):
+    def _submit(self, **extra):
         return self.queue.submit(
             caller="claude", provider="codex", repo=str(self.repo), brief=str(self.brief),
             base="HEAD", classification="synthetic", model="gpt-5.6-terra", effort="low",
             item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1,
             verify_argv=[["git", "status"], ["git", "diff"]], timeout_seconds=1,
-            verify_timeout_seconds=1, cleanup_timeout_seconds=1)
+            verify_timeout_seconds=1, cleanup_timeout_seconds=1, **extra)
+
+    def _observed_exception(self, queued):
+        path = self.queue.root / queued["job_id"] / "harness" / "observed-exception.json"
+        return json.loads(path.read_text())
+
+    def test_exception_id_reaches_the_harness_argv(self):
+        queued = self._submit(exception_id="exc-1")
+        self.queue.run_once("worker-1")
+        self.assertEqual(self.queue.result(queued["job_id"])["state"], "complete")
+        self.assertEqual(self._observed_exception(queued), "exc-1")
+
+    def test_no_exception_id_passes_no_flag(self):
+        queued = self._submit()
+        self.queue.run_once("worker-1")
+        self.assertIsNone(self._observed_exception(queued))
+
+    def test_malformed_or_review_exception_id_is_refused_at_submit(self):
+        for extra in ({"exception_id": "../x"}, {"exception_id": ""},
+                      {"exception_id": "exc-1", "kind": "review"}):
+            with self.subTest(extra=extra), self.assertRaises(ExecutionAdmissionError) as caught:
+                self._submit(**extra)
+            self.assertEqual(str(caught.exception), "exception_id_invalid")
 
     def test_near_generation_limit_then_two_checks_finishes_with_explicit_deadlines(self):
         queued = self._submit()
