@@ -20,7 +20,11 @@ window under the reserve line "headroom".
 refuses to run without one rather than invent it.
 
 **Fail closed.**  A snapshot the feeder would not trust, or one with any
-window missing, partial, stale or reset, is never reported as headroom.  An
+window missing, partial, stale or reset, is never reported as headroom.
+
+**Limits are recorded, not enforced.**  ``max_units`` and ``until`` are the
+batch's declared limits; whoever runs the batch counts units and watches the
+clock.  This helper cannot know how many units fit in the headroom.  An
 account binding of ``unverified`` means even headroom is an observation, not
 routing authority, and the report says so.
 """
@@ -36,6 +40,24 @@ from pathlib import Path
 from typing import Any
 
 from .capacity_feed import MAX_EPOCH, SOURCES, _number, load_snapshot, usable_buckets
+
+#: The windows each provider's allowance has.  Headroom needs every one.
+REQUIRED_WINDOWS = {"claude": {"five_hour", "seven_day"}, "codex": {"primary", "secondary"}}
+
+
+def _covers_required_windows(provider: str, buckets: list[dict]) -> bool:
+    """Whether the buckets include every window the provider has.
+
+    Claude names its windows; Codex names a scope per limit, so each Codex
+    limit present needs both scopes.  A window left out of the snapshot
+    entirely could be the one at the ceiling.
+    """
+    if provider == "claude":
+        return {b.get("window") for b in buckets} >= REQUIRED_WINDOWS["claude"]
+    scopes: dict[Any, set] = {}
+    for bucket in buckets:
+        scopes.setdefault(bucket.get("limit"), set()).add(bucket.get("scope"))
+    return bool(scopes) and all(s >= REQUIRED_WINDOWS["codex"] for s in scopes.values())
 
 
 def _limits(max_units: Any, until: Any, stop_at_percent: Any) -> dict:
@@ -71,6 +93,8 @@ def plan_batch(snapshot_dir: Path, provider: str, reserve_percent: float, *,
         raise ValueError(f"provider must be one of {sorted(SOURCES)}")
     if _number(reserve_percent, low=0, high=100) is None or reserve_percent >= 100:
         raise ValueError("reserve_percent must be at least 0 and below 100")
+    if _number(now, low=0, high=MAX_EPOCH) is None:
+        raise ValueError("now must be an epoch time after 1970 and before 10000")
     limits = _limits(max_units, until, stop_at_percent)
     ceiling = 100 - reserve_percent
     if "stop_at_percent" in limits:
@@ -91,20 +115,25 @@ def plan_batch(snapshot_dir: Path, provider: str, reserve_percent: float, *,
         report.update(decision="hold", reason=reason)
         return report
     report["max_used_percent"] = max(b["used_percent"] for b in usable)
+    # usable_buckets drops window names, so coverage is read from the
+    # snapshot's own buckets, which are all usable when the counts match.
+    complete = (len(usable) == len(snapshot["buckets"])
+                and _covers_required_windows(provider, snapshot["buckets"]))
     over = [b for b in usable if b["used_percent"] >= ceiling]
     if over:
         # A skipped window may also be over and reset later, so this is the
         # earliest the batch could start, not a promise that it can.
         not_before = max(b["resets_at"] for b in over)
         report["not_before"] = not_before
+        report["not_before_is_lower_bound"] = not complete
         if "until" in limits and not_before >= limits["until"]:
             report.update(decision="stop", reason="limit_ends_before_reset")
         else:
             report.update(decision="wait_for_reset", reason="at_or_over_ceiling")
         return report
-    if len(usable) != len(snapshot["buckets"]):
-        # An absent, partial, stale or reset window could be the one at the
-        # ceiling: never call the rest headroom.
+    if not complete:
+        # An absent, partial, stale, reset or omitted window could be the one
+        # at the ceiling: never call the rest headroom.
         report.update(decision="hold", reason="incomplete_windows")
         return report
     report.update(decision="headroom_observed", reason="under_ceiling",

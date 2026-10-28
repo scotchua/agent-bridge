@@ -100,10 +100,38 @@ class NightShiftTests(unittest.TestCase):
                 self.assertEqual((report["decision"], report["reason"]),
                                  ("hold", "incomplete_windows"))
 
+    def test_an_omitted_window_is_never_called_headroom(self):
+        # NS-F1: a window left out of the snapshot entirely could be the one
+        # at the ceiling, and duplicates of one window do not cover another.
+        cases = {
+            "claude seven_day omitted": ("claude", [claude_bucket(10)]),
+            "claude duplicate five_hour": ("claude", [claude_bucket(10), claude_bucket(20)]),
+            "codex secondary omitted": ("codex", [codex_bucket(10)]),
+            "codex second limit half there": ("codex", [
+                codex_bucket(10), codex_bucket(10, scope="secondary"),
+                codex_bucket(10, limit="bucket_1")]),
+        }
+        for name, (provider, buckets) in cases.items():
+            with self.subTest(name):
+                self.write(provider, snapshot(provider, buckets))
+                report = self.plan(provider)
+                self.assertEqual((report["decision"], report["reason"]),
+                                 ("hold", "incomplete_windows"))
+                self.assertNotIn("headroom_percent", report)
+
     def test_a_skipped_window_does_not_hide_a_binding_one(self):
         self.write("codex", snapshot("codex", [codex_bucket(95), codex_bucket(
             10, scope="secondary", status="unknown (absent)")]))
-        self.assertEqual(self.plan()["decision"], "wait_for_reset")
+        report = self.plan()
+        self.assertEqual(report["decision"], "wait_for_reset")
+        self.assertTrue(report["not_before_is_lower_bound"])
+
+    def test_a_complete_snapshot_gives_an_exact_reset(self):
+        self.write("claude", snapshot("claude", [claude_bucket(90), claude_bucket(
+            10, window="seven_day", resets_in=86400)]))
+        report = self.plan("claude")
+        self.assertEqual(report["decision"], "wait_for_reset")
+        self.assertFalse(report["not_before_is_lower_bound"])
 
     def test_bad_inputs_raise(self):
         for kwargs in ({"reserve": 100}, {"reserve": -1}, {"reserve": float("nan")},
@@ -113,6 +141,13 @@ class NightShiftTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     self.plan(**kwargs)
+
+    def test_bad_now_raises(self):
+        # NS-F2: the clock is an input too.
+        for now in (float("inf"), float("nan"), True, -1, "1"):
+            with self.subTest(now=now):
+                with self.assertRaises(ValueError):
+                    night_shift.plan_batch(self.dir, "claude", 20, until=1, now=now)
 
     def test_writes_nothing(self):
         self.write("codex", snapshot("codex", [codex_bucket(95)]))
@@ -137,7 +172,7 @@ class NightShiftTests(unittest.TestCase):
         self.assertIn("--reserve-percent", err)
 
     def test_main_reports_json(self):
-        self.write("codex", snapshot("codex", [codex_bucket(10)]))
+        self.write("codex", snapshot("codex", [codex_bucket(10), codex_bucket(10, scope="secondary")]))
         code, out, _ = self.run_main("--snapshot-dir", str(self.dir), "--provider", "codex",
                                      "--reserve-percent", "20", "--max-units", "3")
         self.assertEqual(code, 0)
