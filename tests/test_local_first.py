@@ -1193,10 +1193,20 @@ class ProtectedLauncherTests(unittest.TestCase):
             "bin/agent-bridge-capacity-feed --config x --snapshot-dir y --ceiling-percent 90 --dry-run",
             "C:\\bridge\\bin\\Agent-Bridge-Capacity-Feed.CMD --config x",
             "python3 -P -m agent_bridge.orchestration.capacity_feed --config x",
+            # A quoted path, or a name run straight into a separator.
+            '"./bin/agent-bridge-capacity-feed" --config x',
+            "'bin/agent-bridge-capacity-feed' --config x",
+            "agent-bridge-capacity-feed;",
+            "(agent-bridge-capacity-feed)",
+            "python -m agent_bridge.orchestration.capacity_feed;",
+            "sh -c 'python3 -m agent_bridge.orchestration.capacity_feed'",
+            '"./bin/agent-bridge-orchestration-verify" --config x',
+            "python3 -m agent_bridge.orchestration.delegation_verify&& true",
         ):
             with self.subTest(command=command):
                 self.assertTrue(gate.shell_writes(command))
         self.assertFalse(gate.shell_writes("grep -n capacity_feed docs/DELEGATION-GATE.md"))
+        self.assertFalse(gate.shell_writes("cat bin/agent-bridge-capacity-feed-notes.md"))
 
     def test_gate_hook_install_is_a_write_but_report_and_audit_are_not(self):
         self.assertTrue(gate.shell_writes(

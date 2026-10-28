@@ -12,8 +12,8 @@ support automatic routing, so a snapshot is never evidence that a route *is*
 available.  It is good evidence that a route is not: usage inside a window
 only rises until the window resets, so a window at or over the ceiling stays
 there until ``resets_at``.  The feeder therefore never writes
-``available=True``, never retracts a row, and never shortens a refusal another
-writer recorded.  Anyone able to run it can only narrow capacity.
+``available=True``, never retracts a row, and never shortens a fresh refusal,
+its own included.  Anyone able to run it can only narrow capacity.
 
 **Fail closed.**  A missing, unreadable, malformed, stale or future-dated
 snapshot, or one whose window has already reset, writes nothing.  Nothing
@@ -23,9 +23,11 @@ already blocks reassignment.
 **No default ceiling.**  The ceiling is the operator's number.  The command
 refuses to run without one rather than invent it.
 
-The validation mirrors the snapshot reader's own report check field for
-field.  It is re-implemented, not imported, because this package must not
-depend on the operator's private tooling.
+The validation follows the snapshot reader's own report check field for
+field, and is stricter where a writer of trusted rows must be: a stale
+snapshot, or a malformed value in any available bucket, rejects the whole
+snapshot instead of only that bucket.  It is re-implemented, not imported,
+because this package must not depend on the operator's private tooling.
 """
 
 from __future__ import annotations
@@ -59,6 +61,8 @@ MAX_SNAPSHOT_BYTES = 64 * 1024
 #: Snapshot source -> routing ledger route.  ``local`` has no usage window.
 SOURCES = {"codex": "codex", "claude": "claude"}
 _CODEX_LIMIT = re.compile(r"codex|legacy|bucket_[a-f0-9]{16}|bucket_[0-9]+")
+#: The only bucket states other than ``available`` the snapshot writer emits.
+_UNKNOWN_STATES = {"unknown (absent)", "unknown (partial)"}
 
 
 def _number(value: Any, *, low: float | None = None,
@@ -90,17 +94,21 @@ def load_snapshot(snapshot_dir: Path, source: str) -> dict | None:
 def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str, list[dict]]:
     """``(reason, buckets)``: the fresh, well-formed, unreset windows only.
 
-    Any shape problem anywhere in the snapshot rejects the whole snapshot, as
-    the snapshot reader does.  A bucket that is only stale, partial or reset
-    is skipped on its own.
+    Any shape problem anywhere in the snapshot rejects the whole snapshot,
+    including a value in an available bucket that is not a number in bounds,
+    and so does a stale snapshot.  A bucket that is only absent, partial,
+    stale, future-dated or reset is skipped on its own.
     """
-    if not snapshot or snapshot.get("schema") != SNAPSHOT_SCHEMA or snapshot.get("source") != source:
+    schema = snapshot.get("schema") if snapshot else None
+    if type(schema) is not int or schema != SNAPSHOT_SCHEMA or snapshot.get("source") != source:
         return "snapshot_unknown", []
     if snapshot.get("status") != "available" or snapshot.get("account_binding") != "unverified":
         return "snapshot_unknown", []
     received = _number(snapshot.get("received_at"), low=0)
     if received is None or received > now + CLOCK_SKEW_SECONDS:
         return "snapshot_clock_anomaly", []
+    if now - received > MAX_AGE_SECONDS:
+        return "snapshot_stale", []
     buckets = snapshot.get("buckets")
     if not isinstance(buckets, list) or any(not isinstance(b, dict) for b in buckets):
         return "snapshot_malformed", []
@@ -113,16 +121,23 @@ def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str,
                                   or not _CODEX_LIMIT.fullmatch(bucket["limit"])):
             return "snapshot_malformed", []
         if bucket.get("status") != "available":
+            if bucket.get("status") not in _UNKNOWN_STATES:
+                return "snapshot_malformed", []
             continue
-        used = _number(bucket.get("used_percent"), low=0, high=100)
-        if used is None or (source == "codex"
-                            and _number(bucket.get("window_minutes"), low=1, high=525600) is None):
+        fields = {"used_percent": (0, 100), "freshness_at": (0, None),
+                  "resets_at": (0, MAX_EPOCH)}
+        if source == "codex":
+            fields["window_minutes"] = (1, 525600)
+        values = {name: _number(bucket.get(name), low=low, high=high)
+                  for name, (low, high) in fields.items()}
+        if any(values[name] is None and bucket.get(name) is not None for name in fields):
+            # A value present but not a number in bounds is not one to skip
+            # quietly: the rest of the snapshot is suspect too.
+            return "snapshot_malformed", []
+        if any(value is None for value in values.values()):
             continue
-        fresh = _number(bucket.get("freshness_at"), low=0)
-        if fresh is None or fresh > now + CLOCK_SKEW_SECONDS or now - fresh > MAX_AGE_SECONDS:
-            continue
-        reset = _number(bucket.get("resets_at"), low=0, high=MAX_EPOCH)
-        if reset is None or reset <= now:
+        used, fresh, reset = values["used_percent"], values["freshness_at"], values["resets_at"]
+        if fresh > now + CLOCK_SKEW_SECONDS or now - fresh > MAX_AGE_SECONDS or reset <= now:
             continue
         usable.append({"used_percent": used, "resets_at": float(reset)})
     return ("ok" if usable else "no_usable_window"), usable
@@ -159,9 +174,9 @@ def feed(router: StageRouter, snapshot_dir: Path, ceiling_percent: float, *,
         result.update(reason="over_ceiling", fresh_until=fresh_until,
                       max_used_percent=max(b["used_percent"] for b in over))
         existing = _fresh_refusal(router.capacity_rows(), route, now)
-        if existing is not None and existing["source"] != FEED_SOURCE \
-                and existing["fresh_until"] >= fresh_until:
-            # Never shorten another writer's refusal.
+        if existing is not None and existing["fresh_until"] >= fresh_until:
+            # Never shorten a fresh refusal, this feeder's own included: a
+            # long window missing from this snapshot has not reset.
             result["action"] = "kept_existing_refusal"
         elif dry_run:
             result["action"] = "would_refuse"
