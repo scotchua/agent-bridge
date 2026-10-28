@@ -1202,10 +1202,26 @@ class ProtectedLauncherTests(unittest.TestCase):
             "sh -c 'python3 -m agent_bridge.orchestration.capacity_feed'",
             '"./bin/agent-bridge-orchestration-verify" --config x',
             "python3 -m agent_bridge.orchestration.delegation_verify&& true",
+            # Shell quoting the program never sees (review round 2).
+            'python -m "agent_bridge.orchestration.capacity_feed"',
+            'python "-m" agent_bridge.orchestration.capacity_feed',
+            "python -m agent_bridge.orchestration.capacity_fee''d --config x",
+            "python -m agent_bridge.orchestration.capacity\\_feed",
+            "python3 -m 'agent_bridge.orchestration.delegation_verify' --config x",
+            'python "-m" agent_bridge.orchestration.delegation_verify',
+            "./bin/agent-bridge-capacity-fe''ed --config x",
+            '"./bin/agent-bridge-gate-hook" "install" --config x',
+            # ``-m`` sharing a word with other flags, or with the module.
+            "python3 -Pm agent_bridge.orchestration.capacity_feed",
+            "python3 -magent_bridge.orchestration.capacity_feed",
+            "python3 -Im agent_bridge.orchestration.delegation_verify",
         ):
             with self.subTest(command=command):
                 self.assertTrue(gate.shell_writes(command))
         self.assertFalse(gate.shell_writes("grep -n capacity_feed docs/DELEGATION-GATE.md"))
+        # The quote-stripped pass is for the launchers only: a quoted
+        # ``"tee"`` is still a search string, not the ``tee`` command.
+        self.assertFalse(gate.shell_writes('grep -n "tee" docs/DELEGATION-GATE.md'))
         self.assertFalse(gate.shell_writes("cat bin/agent-bridge-capacity-feed-notes.md"))
 
     def test_gate_hook_install_is_a_write_but_report_and_audit_are_not(self):

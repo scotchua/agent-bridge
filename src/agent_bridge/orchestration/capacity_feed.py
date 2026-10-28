@@ -121,7 +121,9 @@ def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str,
                                   or not _CODEX_LIMIT.fullmatch(bucket["limit"])):
             return "snapshot_malformed", []
         if bucket.get("status") != "available":
-            if bucket.get("status") not in _UNKNOWN_STATES:
+            # A list or dict status is unhashable: checked as a string first
+            # so it rejects the snapshot instead of raising.
+            if not isinstance(bucket.get("status"), str) or bucket["status"] not in _UNKNOWN_STATES:
                 return "snapshot_malformed", []
             continue
         fields = {"used_percent": (0, 100), "freshness_at": (0, None),

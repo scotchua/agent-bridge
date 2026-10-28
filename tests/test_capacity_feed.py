@@ -169,6 +169,8 @@ class CapacityFeedTests(unittest.TestCase):
             "string_fresh": codex_bucket(freshness_at="recent"),
             "inf_reset": codex_bucket(resets_at=float("inf")),
             "unknown_status": codex_bucket(status="exhausted"),
+            "list_status": codex_bucket(status=[]),
+            "dict_status": codex_bucket(status={}),
         }
         for name, bucket in bad.items():
             with self.subTest(name=name):
