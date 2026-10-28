@@ -189,6 +189,25 @@ def _owned(st: os.stat_result, mask: int) -> bool:
     return (getuid is None or st.st_uid == getuid()) and not st.st_mode & mask
 
 
+def _log_intact(fd: int, size: int) -> bool:
+    """True when every line of the log is one complete JSON object."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks, remaining = [], size
+    while remaining:
+        chunk = os.read(fd, min(remaining, 1 << 16))
+        if not chunk:
+            return False
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if not raw.endswith(b"\n"):
+        return False
+    try:
+        return all(isinstance(json.loads(line), dict) for line in raw[:-1].split(b"\n"))
+    except ValueError:
+        return False
+
+
 def _log(log_path: str | None, event: str, entry: Mapping) -> None:
     """Append one decision. A log that cannot be trusted refuses the send."""
     if not log_path:
@@ -206,15 +225,13 @@ def _log(log_path: str | None, event: str, entry: Mapping) -> None:
         if (not stat.S_ISREG(st.st_mode) or not _owned(st, 0o077)
                 or not stat.S_ISDIR(parent.st_mode) or not _owned(parent, 0o022)):
             raise SendRefused(REFUSED_LOG)
-        # One writer at a time, and only after a complete record (F11): a
-        # fragment left by a failed append is cut back, and a log that still
-        # ends mid-record refuses every later send until it is repaired.
+        # One writer at a time, and only onto an intact log (F11): a fragment
+        # left by a failed append is cut back, and a log holding any damaged
+        # record refuses every later send until it is repaired.
         with platform.lock_exclusive(fd, log_path, 10.0):
             start = os.fstat(fd).st_size
-            if start:
-                os.lseek(fd, start - 1, os.SEEK_SET)
-                if os.read(fd, 1) != b"\n":
-                    raise SendRefused(REFUSED_LOG)
+            if start and not _log_intact(fd, start):
+                raise SendRefused(REFUSED_LOG)
             data = memoryview(line.encode("utf-8"))
             try:
                 while data:

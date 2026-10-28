@@ -370,6 +370,22 @@ class LogTests(StateCase):
         self.refused(sb.REFUSED_LOG, self.bind)
         self.assertEqual(Path(self.log).read_bytes(), b'{"event": "bou')
 
+    def test_damaged_record_ending_in_newline_refuses(self):
+        # F11 round 1: a newline-terminated damaged log must also fail closed.
+        for damaged in (b'{"event":\n', b'{"a": 1}{"b": 2}\n', b'not json\n{"event": "bound"}\n',
+                        b'[1]\n', b'\n', b'{"a": 1}\n\n'):
+            with self.subTest(damaged=damaged):
+                Path(self.log).write_bytes(damaged)
+                os.chmod(self.log, 0o600)
+                self.refused(sb.REFUSED_LOG, self.bind)
+                self.assertEqual(Path(self.log).read_bytes(), damaged)
+
+    def test_intact_log_accepts_further_records(self):
+        self.release(self.bind())
+        self.release(self.bind())
+        self.assertEqual([e["event"] for e in self.entries()],
+                         ["bound", "released", "bound", "released"])
+
     def test_shared_log_refuses(self):
         Path(self.log).touch()
         os.chmod(self.log, 0o644)
