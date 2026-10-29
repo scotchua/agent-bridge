@@ -41,6 +41,11 @@ from typing import Any
 
 from .capacity_feed import MAX_EPOCH, SOURCES, _number, load_snapshot, usable_buckets
 
+#: Scott, 2026-10-28: no more than 10% burned overnight without his approval,
+#: and never past 90% used.
+OVERNIGHT_BURN_PERCENT = 10.0
+OVERNIGHT_MAX_PERCENT = 90.0
+
 #: The windows each provider's allowance has.  Headroom needs every one.
 REQUIRED_WINDOWS = {"claude": {"five_hour", "seven_day"}, "codex": {"primary", "secondary"}}
 
@@ -78,9 +83,25 @@ def _limits(max_units: Any, until: Any, stop_at_percent: Any) -> dict:
     return limits
 
 
+def overnight_stop_at(start_used_percent: Any) -> float:
+    """The overnight ceiling for a batch that started at this usage.
+
+    ``start_used_percent`` is the highest window's used percent when the batch
+    began (the ``max_used_percent`` of its first report).  The batch may burn
+    ``OVERNIGHT_BURN_PERCENT`` more, never past ``OVERNIGHT_MAX_PERCENT``.
+    The result is one ceiling for every window, so a window that started
+    lower may burn more than ten points before it reaches it.
+    Raises ValueError on a bad start.
+    """
+    if _number(start_used_percent, low=0, high=100) is None:
+        raise ValueError("start_used_percent must be from 0 to 100")
+    return min(start_used_percent + OVERNIGHT_BURN_PERCENT, OVERNIGHT_MAX_PERCENT)
+
+
 def plan_batch(snapshot_dir: Path, provider: str, reserve_percent: float, *,
                max_units: int | None = None, until: float | None = None,
-               stop_at_percent: float | None = None, now: float) -> dict:
+               stop_at_percent: float | None = None,
+               overnight_start_percent: float | None = None, now: float) -> dict:
     """One provider's report.  ``decision`` is one of:
 
     ``ask_scott``          the batch has no written limit
@@ -96,6 +117,10 @@ def plan_batch(snapshot_dir: Path, provider: str, reserve_percent: float, *,
     if _number(now, low=0, high=MAX_EPOCH) is None:
         raise ValueError("now must be an epoch time after 1970 and before 10000")
     limits = _limits(max_units, until, stop_at_percent)
+    if overnight_start_percent is not None:
+        overnight = overnight_stop_at(overnight_start_percent)
+        limits["overnight_start_percent"] = overnight_start_percent
+        limits["stop_at_percent"] = min(limits.get("stop_at_percent", 100), overnight)
     ceiling = 100 - reserve_percent
     if "stop_at_percent" in limits:
         ceiling = min(ceiling, limits["stop_at_percent"])
@@ -192,11 +217,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--until", type=_epoch, help="Written limit: end time, epoch seconds.")
     parser.add_argument("--stop-at-percent", type=_percent(False),
                         help="Written limit: stop when any window reaches this percent.")
+    parser.add_argument("--overnight-start-percent", type=float,
+                        help="Overnight cap: highest window's used percent when the batch "
+                             f"began. Stops at that plus {OVERNIGHT_BURN_PERCENT:g}, "
+                             f"never past {OVERNIGHT_MAX_PERCENT:g}.")
     args = parser.parse_args(argv)
     try:
         report = plan_batch(args.snapshot_dir, args.provider, args.reserve_percent,
                             max_units=args.max_units, until=args.until,
-                            stop_at_percent=args.stop_at_percent, now=time.time())
+                            stop_at_percent=args.stop_at_percent,
+                            overnight_start_percent=args.overnight_start_percent,
+                            now=time.time())
     except ValueError as exc:
         print(f"night shift: {exc}", file=sys.stderr)
         return 2

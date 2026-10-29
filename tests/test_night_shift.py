@@ -63,6 +63,65 @@ class NightShiftTests(unittest.TestCase):
         self.assertEqual(report["decision"], "wait_for_reset")
         self.assertEqual(report["not_before"], NOW + 3600)
 
+    def test_overnight_cap_allows_ten_points_over_the_start(self):
+        self.write("codex", snapshot("codex", [codex_bucket(39), codex_bucket(
+            20, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, max_units=None, overnight_start_percent=30)
+        self.assertEqual(report["effective_ceiling_percent"], 40)
+        self.assertEqual(report["limits"]["overnight_start_percent"], 30)
+        self.assertEqual(report["decision"], "headroom_observed")
+        self.assertEqual(report["headroom_percent"], 1)
+
+    def test_overnight_cap_alone_is_a_written_limit(self):
+        # OC-F2: the cap with no other limit does not ask Scott.
+        self.write("codex", snapshot("codex", [codex_bucket(10), codex_bucket(
+            10, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, max_units=None, overnight_start_percent=10)
+        self.assertEqual(report["decision"], "headroom_observed")
+
+    def test_overnight_cap_is_one_ceiling_for_every_window(self):
+        # OC-F1: the start is the highest window, so a lower window may burn
+        # more than ten points before it reaches the same ceiling.
+        self.write("codex", snapshot("codex", [codex_bucket(30), codex_bucket(
+            35, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, max_units=None, overnight_start_percent=30)
+        self.assertEqual(report["effective_ceiling_percent"], 40)
+        self.assertEqual(report["decision"], "headroom_observed")
+
+    def test_overnight_cap_reached_waits(self):
+        self.write("codex", snapshot("codex", [codex_bucket(40), codex_bucket(
+            20, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, overnight_start_percent=30)
+        self.assertEqual(report["decision"], "wait_for_reset")
+
+    def test_overnight_cap_never_passes_ninety(self):
+        self.write("codex", snapshot("codex", [codex_bucket(10)]))
+        report = self.plan(reserve=0, overnight_start_percent=85)
+        self.assertEqual(report["effective_ceiling_percent"], 90)
+
+    def test_overnight_cap_and_lower_limits_take_the_lowest(self):
+        self.write("codex", snapshot("codex", [codex_bucket(10)]))
+        self.assertEqual(self.plan(reserve=0, stop_at_percent=35, overnight_start_percent=30)
+                         ["effective_ceiling_percent"], 35)
+        self.assertEqual(self.plan(reserve=70, overnight_start_percent=30)
+                         ["effective_ceiling_percent"], 30)
+
+    def test_bad_overnight_start_raises(self):
+        for bad in (-1, 101, float("nan"), True, "30"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.plan(overnight_start_percent=bad)
+
+    def test_main_takes_the_overnight_start(self):
+        self.write("codex", snapshot("codex", [codex_bucket(10)]))
+        out = io.StringIO()
+        with mock.patch.object(night_shift.time, "time", return_value=NOW), \
+                contextlib.redirect_stdout(out):
+            code = night_shift.main(["--snapshot-dir", str(self.dir), "--provider", "codex",
+                                     "--reserve-percent", "0",
+                                     "--overnight-start-percent", "50"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["effective_ceiling_percent"], 60)
+
     def test_time_limit_before_reset_stops(self):
         self.write("codex", snapshot("codex", [codex_bucket(95, resets_in=7200)]))
         report = self.plan(max_units=None, until=NOW + 3600)
