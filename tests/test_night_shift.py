@@ -72,6 +72,22 @@ class NightShiftTests(unittest.TestCase):
         self.assertEqual(report["decision"], "headroom_observed")
         self.assertEqual(report["headroom_percent"], 1)
 
+    def test_overnight_cap_alone_is_a_written_limit(self):
+        # OC-F2: the cap with no other limit does not ask Scott.
+        self.write("codex", snapshot("codex", [codex_bucket(10), codex_bucket(
+            10, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, max_units=None, overnight_start_percent=10)
+        self.assertEqual(report["decision"], "headroom_observed")
+
+    def test_overnight_cap_is_one_ceiling_for_every_window(self):
+        # OC-F1: the start is the highest window, so a lower window may burn
+        # more than ten points before it reaches the same ceiling.
+        self.write("codex", snapshot("codex", [codex_bucket(30), codex_bucket(
+            35, scope="secondary", resets_in=7200)]))
+        report = self.plan(reserve=0, max_units=None, overnight_start_percent=30)
+        self.assertEqual(report["effective_ceiling_percent"], 40)
+        self.assertEqual(report["decision"], "headroom_observed")
+
     def test_overnight_cap_reached_waits(self):
         self.write("codex", snapshot("codex", [codex_bucket(40), codex_bucket(
             20, scope="secondary", resets_in=7200)]))

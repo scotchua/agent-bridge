@@ -89,6 +89,8 @@ def overnight_stop_at(start_used_percent: Any) -> float:
     ``start_used_percent`` is the highest window's used percent when the batch
     began (the ``max_used_percent`` of its first report).  The batch may burn
     ``OVERNIGHT_BURN_PERCENT`` more, never past ``OVERNIGHT_MAX_PERCENT``.
+    The result is one ceiling for every window, so a window that started
+    lower may burn more than ten points before it reaches it.
     Raises ValueError on a bad start.
     """
     if _number(start_used_percent, low=0, high=100) is None:
