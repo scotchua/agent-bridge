@@ -19,6 +19,8 @@ owner the owner.
 
 **Fail closed.**  A task record that is missing, unreadable, outside the task
 root or the wrong shape is reported as such; no claim is inferred from it.
+A missing task root is unreadable, not a missing record.  The trusted root is
+the directory the configured path resolves to at read time.
 The caller gets owner and stage identifiers from a task record only when they
 match the opaque-identifier pattern the claim tool enforces, and no other text.
 """
@@ -68,20 +70,34 @@ def _token(value: object) -> str | None:
     return value if isinstance(value, str) and _TOKEN.fullmatch(value) else None
 
 
+class _RootUnavailable(OSError):
+    """The task root itself is missing: unreadable, never a missing record."""
+
+
 def _open_root(tasks_root: str | Path) -> int:
     """Open the task root as a directory without following a link anywhere on the way.
 
-    The root is resolved once, then opened one component at a time from ``/``,
-    each relative to the open parent with ``O_NOFOLLOW``.  Replacing the root
-    or any ancestor with a link after the resolve makes a component open fail
-    instead of redirecting the walk, so the returned descriptor is the
-    resolved directory itself.
+    The trusted root is the directory the configured path resolves to when
+    the read starts: a link already in that path is followed once, by the
+    resolve, and its target is the root.  The resolved path is then opened
+    one component at a time from ``/``, each relative to the open parent with
+    ``O_NOFOLLOW``.  Replacing the root or any ancestor with a link after the
+    resolve makes a component open fail instead of redirecting the walk, so
+    the returned descriptor is the resolved directory itself.  A missing root
+    or ancestor raises ``_RootUnavailable``.
     """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        parts = Path(tasks_root).resolve(strict=True).parts[1:]
+    except FileNotFoundError as exc:
+        raise _RootUnavailable("task root missing") from exc
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in Path(tasks_root).resolve(strict=True).parts[1:]:
-            child = os.open(part, flags, dir_fd=fd)
+        for part in parts:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError as exc:
+                raise _RootUnavailable("task root missing") from exc
             os.close(fd)
             fd = child
     except BaseException:

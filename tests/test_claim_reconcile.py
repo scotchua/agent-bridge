@@ -228,8 +228,21 @@ class ClaimReconcileTests(unittest.TestCase):
             ancestor.symlink_to(real, target_is_directory=True)
             self.assertEqual(claim_reconcile.read_task_claim(ancestor / "outside", "item"),
                              {"status": "unreadable"})
-        # A root reached through a link is fine when resolve sees it first.
+        # Contract: the trusted root is what the configured path resolves to
+        # at start.  A link already in that path is followed once, by design.
         self.assertEqual(claim_reconcile.read_task_claim(swapped, "item")["status"], "claim")
+
+    def test_missing_root_is_unreadable_not_a_missing_record(self):
+        # RECON-F1 round 3: a missing root or ancestor must not read as no_record.
+        gone = self.root / "gone" / "tasks"
+        self.assertEqual(claim_reconcile.read_task_claim(gone, "item"),
+                         {"status": "unreadable"})
+        with mock.patch.object(Path, "resolve", lambda path, strict=False: path):
+            self.assertEqual(claim_reconcile.read_task_claim(gone, "item"),
+                             {"status": "unreadable"})
+        # A missing record inside an existing root is still no_record.
+        self.assertEqual(claim_reconcile.read_task_claim(self.tasks, "absent"),
+                         {"status": "no_record"})
 
     def test_hostile_values_are_malformed_not_crashes(self):
         # RECON-F2: wrong-typed or oversized values become findings.
