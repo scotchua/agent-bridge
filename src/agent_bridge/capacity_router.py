@@ -46,6 +46,16 @@ MAX_FRESHNESS_SECONDS = 4 * 3600.0
 #: :func:`capacity_fingerprint` has to tell that row apart from every other
 #: one and must not import the module that writes it.
 PRESENCE_SOURCE = "gate-hook:client-present"
+#: Source recorded when ``autodecide`` replays the operator's standing
+#: declaration.  Named here for the same reason as :data:`PRESENCE_SOURCE`:
+#: :func:`upsert_observation` has to recognise it without importing the
+#: module that writes it.
+DECLARED_SOURCE = "policy:operator-declared"
+#: Writers that re-assert availability on every decision.  Neither one looked
+#: at quota, so neither may clear a fresh trusted refusal from a writer that
+#: did.  Without this, the declaration replay would erase a quota refusal on
+#: the very next hook call, because the table keeps one row per route.
+REPLAYED_SOURCES = frozenset({PRESENCE_SOURCE, DECLARED_SOURCE})
 BROKER_PROBE_SOURCE = "broker-probe:harness-ready"
 HARNESS_PROBE_FRESHNESS_SECONDS = 60.0
 
@@ -619,8 +629,9 @@ def upsert_observation(db: sqlite3.Connection, observation: CapacityObservation,
     """
     if observation.source == BROKER_PROBE_SOURCE:
         raise RoutingError("capacity_source_reserved")
-    # Presence never clears a quota/usage refusal while it is still fresh.
-    if observation.source == PRESENCE_SOURCE:
+    # Presence and declaration never clear a quota/usage refusal while it is
+    # still fresh.
+    if observation.source in REPLAYED_SOURCES:
         existing = db.execute("SELECT trusted,available,fresh_until FROM capacity WHERE route=?",
                               (observation.route,)).fetchone()
         # The hook's no-create connection uses SQLite's default tuple rows.

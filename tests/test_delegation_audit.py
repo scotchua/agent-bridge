@@ -349,7 +349,7 @@ class TheAuditNamesWhoSaidARouteWasAvailable(unittest.TestCase):
 
     The removed ``capacity_observe`` tool left no way to tell an operator's
     statement from a model's assertion: every row looked the same. There are
-    two writers now and the report names them.
+    three writers now and the report names them.
     """
 
     def test_the_render_names_the_source_of_each_row(self):

@@ -61,8 +61,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import store
-from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
-                               StageRouter, capacity_fingerprint as _fingerprint)
+from ..capacity_router import (CapacityObservation, DECLARED_SOURCE, PRESENCE_SOURCE,
+                               RoutingError, StageRouter,
+                               capacity_fingerprint as _fingerprint)
 from . import autoroute, gate, localfirst
 
 #: How long an automatically claimed stage is leased for. Long enough that an
@@ -79,9 +80,11 @@ CLIENT_PRESENCE_SECONDS = 900
 #: apart from an operator-declared one. Defined in ``capacity_router`` because
 #: the fingerprint has to recognise the row without importing this module.
 CLIENT_PRESENCE_SOURCE = PRESENCE_SOURCE
-#: The source string recorded for a route the operator declared available.
-#: A different word from "observed" on purpose: nothing health-checked it.
-DECLARED_SOURCE = "policy:operator-declared"
+# DECLARED_SOURCE, imported above, is the source string recorded for a route
+# the operator declared available. A different word from "observed" on
+# purpose: nothing health-checked it. Defined in ``capacity_router`` so the
+# ledger can stop it from clearing a fresh quota refusal.
+
 #: Freshness of a declaration. As short as the presence observation, because
 #: it is re-read from the operator's file on every decision: keeping it short
 #: is what makes deleting a route from the file take effect at once instead

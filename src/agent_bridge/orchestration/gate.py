@@ -158,6 +158,19 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     r"(^|[\s;&|('\"])(?i:Remove-Item|Set-Content|Add-Content|Clear-Content|New-Item|"
     r"Copy-Item|Move-Item|Rename-Item|Out-File|Set-ItemProperty|New-ItemProperty|"
     r"Remove-ItemProperty|Set-Acl|Start-Process)(\s|$)",
+))
+#: The bridge's own state-changing launchers, matched by ``shell_writes``
+#: against the command as typed and again with every shell quote and
+#: backslash removed. The shell drops those before the program sees its
+#: arguments, so ``python -m "agent_bridge.orchestration.capacity_feed"``,
+#: ``python "-m" ...`` and ``capacity_fee''d`` all reach the same ``main()``
+#: as the plain spelling; no boundary set on the raw text can list every
+#: quoting, so the quotes are taken away instead. Only these patterns get
+#: the second pass: stripping quotes from ``grep "> x"`` would turn a quoted
+#: argument into a redirection for the general patterns above. Variable
+#: indirection (``m=capacity_feed; python -m ...$m``) stays out of reach of
+#: any text match, as the module docstring already says of this heuristic.
+_BRIDGE_LAUNCHERS = tuple(re.compile(pattern) for pattern in (
     # The bridge's own state-changing launchers. Their boundary set is widened
     # with a path separator, forward and back, because all three are almost
     # always invoked by their documented ``bin/`` relative path
@@ -182,10 +195,20 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # were not recognised as one until this was checked. Repeating finding
     # 57's already-fixed mistake for a different set of names is exactly the
     # kind of thing an adversarial review exists to catch.
-    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-orchestration-verify)(?i:\.cmd)?(\s|$)",
+    #
+    # The trailing boundary admits a closing quote, bracket or shell operator
+    # as well as whitespace, so a quoted path (``"./bin/agent-bridge-capacity-
+    # feed" --config x``) or a name run straight into ``;`` is still the
+    # launcher. The same boundary closes the two ``-m`` forms below.
+    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-orchestration-verify)(?i:\.cmd)?(\s|$|[;&|)'\"])",
+    # ``agent-bridge-capacity-feed`` writes trusted capacity refusals into the
+    # routing ledger. It can only narrow capacity, but a trusted row is the
+    # operator's to write, not an assistant's, so it is blocked outright like
+    # the verify launcher above, ``--dry-run`` included.
+    r"(^|[\s;&|('\"/\\])(?i:agent-bridge-capacity-feed)(?i:\.cmd)?(\s|$|[;&|)'\"])",
     r"(^|[\s;&|('\"/\\])(?i:agent-bridge-gate-hook)(?i:\.cmd)?\b[^;&|]*\b(?i:install)\b",
     r"(^|[\s;&|('\"/\\])(?i:setup_bridge\.py|agent-bridge-setup)(?i:\.cmd)?\b[^;&|]*\b(?i:onboard\s+apply)\b",
-    # Every one of the three patterns above matches only the launcher
+    # Every one of the launcher patterns above matches only the launcher
     # SCRIPT's own filename. Both ``orchestration/delegation_verify.py`` and
     # ``orchestration/gate.py`` are ordinary modules with their own
     # ``if __name__ == "__main__"`` guard, exactly like the launcher scripts
@@ -201,9 +224,21 @@ _WRITE_PATTERNS = tuple(re.compile(pattern) for pattern in (
     # guard, so it has no equivalent ``-m`` form to close (its only
     # subprocess path is ``python3 -c "from agent_bridge import onboard; ..."``,
     # already caught by the ``-c`` pattern above).
-    r"(?i:(^|[\s;&|('\"])-m\s+agent_bridge\.orchestration\.delegation_verify(\s|$))",
-    r"(?i:(^|[\s;&|('\"])-m\s+agent_bridge\.orchestration\.gate)\b[^;&|]*\b(?i:install)\b",
+    #
+    # ``-m`` may share its word with other single-letter flags and may run
+    # straight into the module name: ``python -Pm mod`` and ``python -mmod``
+    # both run ``mod``.
+    r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.delegation_verify(\s|$|[;&|)'\"]))",
+    r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.capacity_feed(\s|$|[;&|)'\"]))",
+    r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.gate)\b[^;&|]*\b(?i:install)\b",
 ))
+_SHELL_QUOTING = re.compile(r"[\"'\\]")
+
+
+def _launches_bridge(command: str) -> bool:
+    unquoted = _SHELL_QUOTING.sub("", command)
+    return any(pattern.search(text) for pattern in _BRIDGE_LAUNCHERS
+               for text in (command, unquoted))
 #: Formatters that write unless asked only to report.
 _FORMATTERS = re.compile(r"(^|[\s;&|('\"])(black|isort|prettier|autopep8)(\s|$)")
 _FORMATTER_REPORT_ONLY = re.compile(r"(^|\s)(--check(-only)?|--diff|--dry-run|-l|--list-different)(\s|$)")
@@ -1124,7 +1159,7 @@ def _git_worktree_writes(command: str) -> bool:
 def shell_writes(command: str) -> bool:
     """Whether ``command`` looks like it writes. A heuristic; see the module docstring."""
     return (any(pattern.search(command) for pattern in _WRITE_PATTERNS)
-            or _git_worktree_writes(command)
+            or _launches_bridge(command) or _git_worktree_writes(command)
             or _git_tag_writes(command) or _formatter_writes(command))
 
 

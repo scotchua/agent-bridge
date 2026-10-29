@@ -2706,11 +2706,6 @@ class PostToolUseInstallTests(unittest.TestCase):
         self.assertEqual(after["installed_post"], {"claude": True, "codex": False})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class ProtectedDenialExplainsItself(unittest.TestCase):
     """A gate_state_protected denial names the path that matched and whether
     it is under the protected root or a parent of it, so the five harmless
@@ -2764,3 +2759,7 @@ class ProtectedDenialExplainsItself(unittest.TestCase):
         self.assertEqual(decision.code, "gate_state_protected")
         self.assertEqual(decision.reason.count(" is under "), 3)
         self.assertIn("; and 2 more", decision.reason)
+
+
+if __name__ == "__main__":
+    unittest.main()
