@@ -288,7 +288,10 @@ contiguous and reaches the final head.
 document describes (Codex-to-Claude bounded execution, Claude-to-Codex bounded
 execution, eligible work to the local model) against disposable, synthetic
 content only, and writes a durable result the guided `onboard apply
---delegation-results` step validates before it will register anything. It
+--delegation-results` step validates before it will register anything. On a
+first install, point its `--config` at the `<candidate>.orchestration.json`
+that `onboard stage` writes; apply rebuilds that config and requires its
+hash to match. It
 never applies, commits, pushes, merges, downloads a model, or enables paid
 fallback, and it refuses to run against a result path inside a temporary
 directory.

@@ -253,7 +253,11 @@ If the user says yes:
    required directions, the private config path (outside the checkout), the
    platform's real support boundary, and whether a local-model worker was
    named.
-2. Run `bin/agent-bridge-orchestration-verify` with authorization, the same
+2. Run `onboard stage`. With delegation enabled it also writes the exact
+   delegation config apply will install, at `<candidate>.orchestration.json`.
+   Run `bin/agent-bridge-orchestration-verify --config` against that file
+   (not the live config, which does not exist yet on a first install) with
+   authorization, the same
    way the ordinary canaries need it: it makes live calls through this
    machine's signed-in CLIs, using only synthetic, disposable content, and
    never applies, commits, pushes, merges, downloads a model, or enables paid

@@ -325,7 +325,8 @@ def _peer_pin(peer: str, active: config.Config) -> dict[str, Any]:
     return {"executable": executable, "allowed_versions": [version]}
 
 
-def stage(answers: dict[str, Any], candidate_path: str) -> dict[str, Any]:
+def stage(answers: dict[str, Any], candidate_path: str, root: str = config.REPO_ROOT,
+          *, home: str | None = None) -> dict[str, Any]:
     if answers["privacy"]["mode"] == "custom" and any(
             "synthetic" not in labels for labels in answers["privacy"]["peers"].values()):
         raise ValueError("custom privacy excluding synthetic cannot complete the required full canaries; change the explicit choice before staging")
@@ -341,6 +342,20 @@ def stage(answers: dict[str, Any], candidate_path: str) -> dict[str, Any]:
             "directions": answers["directions"], "targets": answers["targets"],
             "pins": {peer: {key: candidate.peer(peer).get(key) for key in ("executable", "allowed_versions")}
                      for peer in ("claude", "codex")}}
+    delegation_choice = answers["automatic_delegation"]
+    if delegation_choice["enabled"] and not delegation_platform_blocker(delegation_choice):
+        # Apply is the only writer of the live orchestration config, and apply
+        # needs verify evidence for that config. Staging the same document
+        # beside the candidate breaks the cycle on a first install: verify
+        # runs against this copy, and apply rebuilds identical bytes (same
+        # home, root and worker), so the evidence hash matches.
+        delegation_cfg = delegation.build_config(
+            home or os.path.expanduser("~"), root,
+            local_worker_executable=delegation_choice.get("local_worker_executable"))
+        delegation_path = candidate_path + ".orchestration.json"
+        store.atomic_write_bytes(delegation_path, delegation.render_config_bytes(delegation_cfg))
+        plan["delegation_config_path"] = delegation_path
+        plan["delegation_config_sha256"] = delegation.config_sha256(delegation_cfg)
     store.atomic_write_json(candidate_path + ".onboarding-plan.json", plan)
     return plan
 
@@ -1484,7 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("questionnaire"); q.add_argument("--answers", default=default_answers_path())
     p = sub.add_parser("plan"); p.add_argument("--answers", required=True); p.add_argument("--root", default=config.REPO_ROOT)
     st = sub.add_parser("status"); st.add_argument("--answers", required=True)
-    s = sub.add_parser("stage"); s.add_argument("--answers", required=True); s.add_argument("--candidate", required=True)
+    s = sub.add_parser("stage"); s.add_argument("--answers", required=True); s.add_argument("--candidate", required=True); s.add_argument("--root", default=config.REPO_ROOT); s.add_argument("--home")
     a = sub.add_parser("apply"); a.add_argument("--answers", required=True); a.add_argument("--candidate", required=True); a.add_argument("--results", required=True); a.add_argument("--root", default=config.REPO_ROOT); a.add_argument("--home")
     a.add_argument("--delegation-results", help="Required when automatic_delegation.enabled is true.")
     u = sub.add_parser("uninstall"); u.add_argument("--answers", required=True); u.add_argument("--root", default=config.REPO_ROOT); u.add_argument("--home"); u.add_argument("--apply", action="store_true"); u.add_argument("--delegation-only", action="store_true", help="Remove automatic delegation while retaining consultation and its managed instructions.")
@@ -1502,7 +1517,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print(json.dumps(status(load_answers(args.answers)), indent=2))
         elif args.command == "stage":
-            print(json.dumps(stage(load_answers(args.answers), args.candidate), indent=2))
+            print(json.dumps(stage(load_answers(args.answers), args.candidate, args.root, home=args.home), indent=2))
         elif args.command == "apply":
             apply(load_answers(args.answers), args.candidate, args.results, args.root,
                   home=args.home, delegation_results=args.delegation_results)

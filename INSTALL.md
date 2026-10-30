@@ -413,11 +413,16 @@ guessed at.
 
 **Verify before applying.** This is a live check against your own signed-in
 CLIs; it never applies a patch, commits, pushes, merges, downloads a model, or
-enables paid fallback, and it only ever uses synthetic, disposable content:
+enables paid fallback, and it only ever uses synthetic, disposable content.
+Run it against the delegation config that `onboard stage` wrote next to your
+candidate (`<candidate>.orchestration.json`). Apply rebuilds the same config
+and refuses unless its hash matches the one you verified, so this works on a
+first install, before any live config exists. If you change the answers or
+the worker path after staging, run stage and verify again:
 
 ```
 ./bin/agent-bridge-orchestration-verify \
-  --config ~/.agent-bridge/orchestration/orchestration.json \
+  --config /absolute/private/candidate.json.orchestration.json \
   --callers codex,claude \
   --out ~/.agent-bridge/orchestration/delegation-verify.json
 ```
