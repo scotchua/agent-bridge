@@ -138,12 +138,13 @@ filename so the two cannot be confused.
 Outputs, in `--out-dir`:
 
 * `agent-bridge-rootfs-<arch>.tar`, the normalised filesystem tarball
-* `agent-bridge-rootfs-<arch>.manifest.json`, exactly the keys the runtime's
+* `agent-bridge-manifest-<arch>.json`, exactly the keys the runtime's
   `parse_manifest` accepts, and nothing else
-* `agent-bridge-rootfs-<arch>.sidecar.json`, the build provenance: architecture,
-  base image digest, guest runner hash, `wsl.conf` hash, the sha256 of every
-  installed tool, the canonical `manifest_sha256`, and the release blockers
-  outstanding at build time
+* `agent-bridge-rootfs-<arch>.tar.sha256`, the build provenance sidecar. Despite
+  the extension it is a JSON document, not a bare hash line. It holds the
+  architecture, base image digest, guest runner hash, `wsl.conf` hash, the
+  sha256 of every installed tool, the canonical `manifest_sha256`, and the
+  release blockers outstanding at build time
 
 ## What is pinned
 
@@ -198,6 +199,6 @@ directory. A mismatch is a refusal, not a warning.
 ## Not validated
 
 None of this has been imported into WSL2 on a live Windows host from this
-worktree. A successful build on a development machine is evidence that the build
+repository. A successful build on a development machine is evidence that the build
 pipeline works, not that the resulting guest boots, and not that the canaries
 pass inside it.

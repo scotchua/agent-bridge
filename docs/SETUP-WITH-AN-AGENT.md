@@ -79,8 +79,11 @@ checkout, normally under `~/.agent-bridge/`.
   either direction can be omitted.
 - **Would you like additional privacy restrictions?** Explain the baseline:
   public material, invented examples and the user's own non-client internal
-  work may be sent to either provider. Client-derived/confidential material and
-  secrets are not admitted through this bridge. Strict mode admits only public
+  work may be sent to either provider. Client-derived material is refused
+  unless the operator turns on `client_derived_routes`, which is off by default
+  (the questionnaire asks, and the setup is described in
+  [INSTALL.md](../INSTALL.md#4b-decide-what-each-side-is-allowed-to-receive)).
+  Confidential material and secrets are never admitted through this bridge. Strict mode admits only public
   material and invented examples. Custom mode narrows each receiving peer
   separately. These are enforced label checks, not content inspection or a
   filesystem privacy sandbox. If the user needs enforced read confinement,
@@ -322,9 +325,7 @@ overstate any of them:
 Uninstall follows the same pattern as ordinary removal: `onboard uninstall --delegation-only`
 removes only the orchestration MCP entries and LaunchAgent file it can still
 identify as its own, preserves the ordinary consultation bridge, and retains
-the private orchestration config for inspection. Do not claim continuous Linux
-or Windows execution-worker service support; only macOS has been independently
-tested there, and the guided flow reports that boundary rather than assuming
-it away. On Windows, background activation registers a per-user logon task that
-the user can see and delete in Task Scheduler, and it has not been exercised on
-a live Windows host; say that rather than reporting it as working.
+the private orchestration config for inspection. Do not claim Linux or Windows
+support for automatic delegation: `onboard plan` and `onboard apply` refuse it
+on both, and only macOS has been independently tested. Report that refusal
+rather than assuming it away or offering a partial install.

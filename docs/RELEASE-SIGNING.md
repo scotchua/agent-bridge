@@ -52,15 +52,33 @@ no flag that would accept one.
 ### 3. Sign, on the signing machine, with your own key
 
 Nothing in this repository participates in this step. Any Ed25519 signer over
-raw bytes works. For example, with an OpenSSH key:
+raw bytes works, as long as it gives you the raw 64-byte signature and the raw
+32-byte public key. An HSM, a smartcard or a hosted signing service is better
+than a key file.
+
+`ssh-keygen -Y sign` is not a drop-in choice. It writes an armored SSH
+signature file, not the raw signature, and `anchor` below will not read it.
+
+As one example, OpenSSL 3 signs the raw bytes directly. The macOS system
+`openssl` is LibreSSL and does not support this; use OpenSSL 3 or newer.
 
 ```bash
-ssh-keygen -Y sign -f ~/.ssh/release_ed25519 -n file build/rootfs/manifest.canonical
+openssl pkeyutl -sign -rawin -inkey release_ed25519.pem \
+    -in build/rootfs/manifest.canonical -out sig.bin
 ```
 
-An HSM, a smartcard or a hosted signing service is better. What you need out
-of this step is two hex strings: the 128-character detached signature and the
-64-character Ed25519 public key.
+#### Convert both values to hex
+
+`anchor` reads two hex strings: the 128-character signature and the
+64-character public key. Convert the raw bytes:
+
+```bash
+xxd -p -c 256 sig.bin > sig.hex
+openssl pkey -in release_ed25519.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64 > pub.hex
+```
+
+The last 32 bytes of an Ed25519 public key in DER form are the raw key. Check
+that `sig.hex` holds 128 hex characters and `pub.hex` holds 64.
 
 Move only those two values back. Do not copy the key, do not paste it into a
 terminal that logs, and do not place either half inside a checkout.
@@ -88,6 +106,15 @@ Paste the printed literal into `RELEASE_TRUST_ANCHORS` in
 `src/agent_bridge/orchestration/windows_rootfs.py`. This is a release action
 taken by a person who verified the manifest. It is never a change made to get
 a test to pass.
+
+To re-check an anchor later against a manifest, use `verify`. It reads the
+anchor as a JSON file with the keys `release`, `architecture`,
+`manifest_sha256`, `signature` and `public_key`, and prints
+`{"passed": true, "reason": "ok"}` on success:
+
+```bash
+python3 tools/release_signing.py verify --manifest build/rootfs/agent-bridge-manifest-arm64.json --anchor anchor.json
+```
 
 ### 6. Check the tree before you publish
 
@@ -119,7 +146,7 @@ python3 tools/make_test_image.py --check   # builds twice, compares every byte
 
 - Not that the image is safe. A signature says the manifest came from the
   holder of the release key; it says nothing about what is inside the tarball.
-- Not that the image boots. No image from this worktree has been run on a live
+- Not that the image boots. No image from this repository has been run on a live
   Windows host.
 - Not that the key is still trustworthy. There is no revocation here. A
   compromised key is handled by removing its anchor and publishing a release

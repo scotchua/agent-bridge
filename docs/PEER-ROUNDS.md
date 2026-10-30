@@ -62,9 +62,14 @@ Run the local room from the repository:
     python start_chat.py --open
 
 The provider-neutral MCP launcher accepts a registered caller such as claude or
-codex:
+codex. Run it from the repository root through the bootstrap script, which adds
+`src` to the import path for you:
 
-    python -m agent_bridge.peer_mcp --caller codex
+    python peer_bridge.py --caller codex
+
+Running `python -m agent_bridge.peer_mcp --caller codex` directly works only
+with `src` on `PYTHONPATH` (for example `$env:PYTHONPATH='src'` in PowerShell,
+or `PYTHONPATH=src` in a POSIX shell).
 
 Hermes is an optional third-party provider. To add it to the room, pass the
 explicit installed CLI path:

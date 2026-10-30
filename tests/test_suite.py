@@ -2,6 +2,14 @@
 """Full broker test suite against fake peer executables. No live model calls."""
 from __future__ import annotations
 
+import sys
+
+# Checked before anything else is imported, so an older Python gets a clear
+# message instead of a traceback partway through the suite.
+if sys.version_info < (3, 11):
+    print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
+    raise SystemExit(2)
+
 import argparse
 import ast
 import inspect

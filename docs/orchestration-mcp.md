@@ -4,11 +4,12 @@ This is an additive server. It does not replace or widen `agent-bridge-mcp`.
 The existing bridge remains consultation-only and exposes only the opposite
 peer's consultation tools.
 
-**Guided path.** `setup_bridge.py onboard` can now do everything below for you
-as an explicit opt-in ("automatic delegation"): generate the private config,
-register the caller-bound server in both app configurations, stage or install
-the macOS LaunchAgent, and gate all of it on the synthetic verification
-described here. See [INSTALL.md](../INSTALL.md#automatic-delegation-optional-opt-in).
+**Guided path.** On macOS, `setup_bridge.py onboard` can do everything below for
+you as an explicit opt-in ("automatic delegation"): generate the private
+config, register the caller-bound server in both app configurations, stage or
+install the macOS LaunchAgent, and gate all of it on the synthetic verification
+described here. On Windows and Linux it refuses the opt-in. See
+[INSTALL.md](../INSTALL.md#automatic-delegation-optional-opt-in).
 The rest of this document is the manual/reference path and still applies
 verbatim if you prefer to wire it up by hand, or need to troubleshoot what the
 guided path generated.
@@ -16,7 +17,9 @@ guided path generated.
 The standalone `agent-bridge-orchestration` server gives either caller the
 same durable work controls:
 
-- route eligible mechanical, non-client text to the local worker;
+- route eligible mechanical text to the local worker (client-derived text
+  only under the conditions in
+  [Client-derived text and the local lane](#client-derived-text-and-the-local-lane));
 - read local status and completed drafts, then record usefulness feedback;
 - register, claim, renew, complete and inspect capacity-routed stages; and
 - dispatch bounded implementation to the opposite provider and read its
@@ -24,7 +27,10 @@ same durable work controls:
 - read a content-free aggregate status report.
 
 The server never silently falls back from local processing to a cloud model.
-Client-derived and confidential material remains outside this inline route.
+Confidential and secret material stays outside this inline route. The queue's
+only worker is the on-device model, so it accepts `client_derived` text, but
+only when the operator has set up a client-data health check (see
+[Client-derived text and the local lane](#client-derived-text-and-the-local-lane)).
 Caller identity comes from `--caller`; it is not accepted from tool input.
 Expired stage leases require reconciliation outside this MCP surface, so a
 caller cannot seize a stage merely because time passed.
@@ -69,6 +75,50 @@ review rules.
 The local Ollama executor runs in the server's background thread while either
 app is connected. A local result is an untrusted draft until its supervising
 assistant checks it and records `work_feedback`.
+
+### Client-derived text and the local lane
+
+The local queue accepts four classifications: `synthetic`, `public`,
+`internal_nonclient` and `client_derived`. It accepts `client_derived` because
+its only worker is the on-device model. Text labeled `client_derived` is
+admitted only while all of these hold, and each failure refuses the job before
+it is queued, or fails an already queued job, with a fixed reason:
+
+- the backend is `gemma_certified` (any other backend refuses with
+  `client_data_backend_unsupported`);
+- the operator has configured the client-data health check, so the check
+  exists (without it the reason is `client_data_health_unverified`); and
+- the check passes at submit time and again before the job runs
+  (`client_data_health_unverified`, `client_data_health_failed` or
+  `client_data_health_binding_mismatch` otherwise).
+
+This is separate from the `client_derived_routes` setting. That setting
+controls the cloud `peer` and `execution` routes. It does not open or close the
+local lane. Everything is off by default.
+
+The check is configured by four keys in the orchestration config. They are
+protected operator configuration, never request input, and they are all or
+nothing: supplying some but not all fails to load with
+`client_data_health_configuration_incomplete`.
+
+- `client_data_health_command`: a list whose first item is an absolute path and
+  whose last two items are exactly `status` and `--json`.
+- `client_data_health_path`: the `PATH` string given to that command. The
+  command otherwise runs with a minimal environment.
+- `client_data_health_timeout_seconds`: a positive number. When the whole group
+  is absent the default is 30.
+- `client_data_health_record`: an absolute path to the verification record the
+  command reports on.
+
+The command must print one small JSON object with exactly `schema` (1),
+`result` (`verified`, `not verified` or `failed`) and `record_sha256`. Exit code
+0 with `verified` is the only pass. The record's hash must match what the
+command reports. The record must say `state: verified` and `full_passed: true`,
+and its wrapper hashes for `delegate.py`, `local_endpoint.py` and `config.json`
+must match the files beside the configured delegate, with `delegate.py` equal to
+`gemma_delegate_sha256`. Anything else is a refusal. Local inference does not
+make the surrounding conversation private: text sent to the local worker through
+a cloud assistant is already in that assistant's conversation.
 
 ### Checkpoints and production provenance
 
@@ -179,7 +229,8 @@ Keychain visibility.
 
 The macOS LaunchAgent is the only persistent execution-worker service currently
 live-tested. The orchestration MCP has a Windows launcher, but continuous
-Windows and Linux execution-worker service installation remains unverified.
+Windows and Linux execution-worker service installation remains unverified, and
+`onboard` refuses automatic delegation on both.
 The bundled resource sampler is also macOS-specific; without a separately
 reviewed platform sampler, local jobs on Windows or Linux defer rather than
 assuming the machine has safe spare capacity.

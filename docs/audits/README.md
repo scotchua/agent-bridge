@@ -60,4 +60,4 @@ First complete measurement after the fix, through the real layered path with no
 `--config` override: PASS, timeout canary `timed_out orphans=0`. The codex pin
 was then narrowed to `codex-cli 0.151.0` alone, the version actually measured.
 
-Full session record: `~/Claude/docs/codex-session-2026-08-30-dispositions.md`
+The full session record is kept outside this repository.

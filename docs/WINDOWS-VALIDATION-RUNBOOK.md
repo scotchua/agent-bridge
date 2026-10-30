@@ -11,10 +11,10 @@ something else is information, not a mistake to work around.
 ## Before you start
 
 - A Windows 11 host, build 22621 or newer, that you can restart.
-- Not the `TaxDome` VM. That VM holds client data and is deliberately out of
-  scope for this work.
+- Not a VM or machine that holds sensitive data. Use a disposable host or one
+  that holds nothing you would mind exposing.
 - Python 3.11 or newer on PATH.
-- A checkout of this branch.
+- A checkout of this repository.
 - Roughly 20 GB free for the guest image.
 
 Each step below is safe to stop after. Nothing in steps 1 to 3 changes the

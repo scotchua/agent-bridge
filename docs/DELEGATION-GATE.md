@@ -121,7 +121,10 @@ and what the operator configured. Four things decide a route, in this order,
 and the order is the point:
 
 1. **Privacy and eligibility.** A repository the operator has not classified
-   is retained, always. `client_derived` is refused outright. Capacity is
+   is retained, always. `client_derived` work is retained unless the operator
+   opted in: either `execution` is listed in `client_derived_routes`, or the
+   repository allows the `local` route, is marked `mechanical_ok`, and the
+   policy's local classifications include `client_derived`. Capacity is
    checked last precisely so it can never override this.
 2. **Task type.** Implementation work goes to a provider or stays. It is
    never sent to a local model, for the reason under "What it cannot do".
@@ -300,8 +303,11 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
   unmeetable. So the gate does not send local work: what is automatic at the
   local lane is the *admission*, not the *choice of lane*. An assistant calls
   `work_route_local`, and from that point nobody is asked anything: the
-  intake classifies the material, applies the privacy rules, refuses
-  client-derived text, submits the job and never falls back to a paid API.
+  intake classifies the material, applies the privacy rules, submits the job
+  and never falls back to a paid API. It admits client-derived text only when
+  the operator's client-data health check passes (see
+  [Client-derived text and the local lane](orchestration-mcp.md#client-derived-text-and-the-local-lane))
+  and refuses it otherwise.
   The assistant still decides to call it, and we do not describe that as the
   gate having routed the work.
 * **It cannot see mechanical work an assistant just does in its own
@@ -422,8 +428,8 @@ record). `--json` for the full record. It reports:
 
 ## How a stage becomes editable
 
-1. `stage_register` and `stage_claim` through the agent-orchestration MCP,
-   as today. The claim returns `owner_id`, `owner_route`, `revision`, and
+1. `stage_register` and `stage_claim` through the orchestration MCP (guided
+   setup registers it as `agent-bridge-orchestration`), as today. The claim returns `owner_id`, `owner_route`, `revision`, and
    `lease_until`.
 2. `routing_decide` with `item_id`, `stage`, `owner_id`, `stage_revision`,
    the repository path, and a short reason. The server re-checks the binding
