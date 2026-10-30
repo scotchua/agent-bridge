@@ -260,7 +260,10 @@ If the user says yes:
    way the ordinary canaries need it: it makes live calls through this
    machine's signed-in CLIs, using only synthetic, disposable content, and
    never applies, commits, pushes, merges, downloads a model, or enables paid
-   fallback.
+   fallback. Known issue: on a first-time install the config it reads does
+   not exist yet (only `onboard apply` writes it), so this step fails. Tell
+   the user automatic delegation cannot be turned on yet; see the known-issue
+   note in INSTALL.md.
 3. Pass its result to `onboard apply --delegation-results`. Apply refuses to
    enable anything the evidence does not actually prove, and reports exactly
    `enabled`, `partial`, or `blocked` per direction and overall. Report that
