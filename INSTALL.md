@@ -562,7 +562,8 @@ execution worker has only been independently verified on macOS, so
 `onboard questionnaire` does not offer the choice, and `onboard plan` and
 `onboard apply` refuse it with the message "automatic delegation is currently
 available only on macOS". On Windows the refusal lifts only when a boundary
-verification record exists on the machine, and no machine has one. The
+verification record exists on the machine; the project's documented live
+Windows validation has not produced one. The
 consultation bridge stays available on both platforms. The Windows provisioning
 work is described in the [Windows](#windows) section and is not a feature you
 can turn on.
