@@ -11,8 +11,9 @@ router and bounded cross-provider implementation lane described in
 unless you say yes during `onboard questionnaire` or set
 `automatic_delegation.enabled: true` in your answers file; every existing
 answers file without that key keeps working and stays disabled. See
-[Automatic delegation](#automatic-delegation-optional-opt-in) below. Its
-persistent execution-worker service is currently verified on macOS only.
+[Automatic delegation](#automatic-delegation-optional-opt-in) below. It is
+available on macOS only: its persistent execution-worker service is verified
+there and nowhere else, and `onboard` refuses it on Windows and Linux.
 
 Written for someone who is comfortable in a terminal but is not a developer. If
 any step fails, the failure message is meant to tell you what to do; if it does
@@ -22,14 +23,25 @@ not, that is a bug worth reporting.
 
 - **macOS, Linux, or Windows.** WSL remains an alternative on Windows; see
   [Windows](#windows) for the differences between native Windows and WSL.
-- **Python 3.11 or newer.** Check with `python3 --version`. No packages to
+  The consultation bridge runs on all three. Automatic delegation runs on
+  macOS only.
+- **Git**, to clone the repository. macOS offers it when you first run `git`.
+  On Windows, use [Git for Windows](https://gitforwindows.org/).
+- **Python 3.11 or newer.** Check with `python3 --version`. The `python3` that
+  comes with macOS may be older, in which case install a newer one from
+  [python.org](https://www.python.org/downloads/). No packages to
   install: this uses only the standard library on purpose, so there is nothing
   to keep updated and nothing new to trust.
-- **The Claude Code CLI**, signed in.
-- **The Codex CLI**, signed in.
+- **The Claude Code CLI**, signed in. Install it from the
+  [Claude Code setup guide](https://code.claude.com/docs/en/setup).
+- **The Codex CLI**, signed in. Install it from the
+  [Codex CLI guide](https://developers.openai.com/codex/cli).
 
 Both CLIs are paid products on their own subscriptions. This tool does not
 change what they cost; it just lets them talk to each other.
+
+The commands below use `python3`. On Windows, type `python` or `py -3`
+instead.
 
 ## Windows
 
@@ -44,8 +56,32 @@ deliberately escaping its Job Object is outside the process-tree guarantee,
 just as a POSIX process deliberately starting a new session escapes its
 original group.
 
-Use PowerShell and run the commands below with `python` where they say
-`python3`. Install the native Windows builds of the Claude and Codex CLIs.
+Use PowerShell and install the native Windows builds of the Claude and Codex
+CLIs. The numbered steps below are written for a POSIX shell (macOS, Linux or
+WSL). In PowerShell, make these substitutions:
+
+- Type `python` or `py -3` where a command says `python3`, and use backslashes
+  in paths inside the checkout, for example `python tests\test_suite.py`.
+- Run `bin\agent-bridge-setup.cmd` where a step says `./bin/agent-bridge-setup`.
+  The same holds for `agent-bridge-admin`, `agent-bridge-gate-hook` and
+  `agent-bridge-orchestration-verify`, each of which has a `.cmd` launcher in
+  `bin\`. The `./bin/...` shell scripts do not run in PowerShell.
+- Run the canaries with `python canaries\run_canaries.py`, since they are a
+  Python script. Pass `--config` and `--out` paths such as
+  `"$env:USERPROFILE\.agent-bridge\candidates\effective.json"`.
+- Where a step sets an environment variable in front of a command, as in
+  `CODEX_HOME=... <command>`, set it first and clear it afterwards:
+
+  ```
+  $env:CODEX_HOME = "$env:USERPROFILE\.agent-bridge\codex-home"
+  & "<the path it printed>" login
+  Remove-Item Env:CODEX_HOME
+  ```
+
+- Use `$env:USERPROFILE` where a step writes `~`.
+
+Automatic delegation steps (the "Automatic delegation" section below) do not
+apply on native Windows, because that feature is refused there.
 
 **What has actually been run on Windows, and what has not.** The offline suite
 has been run by hand on Windows 11 with CPython 3.12 as an ordinary interactive
@@ -121,7 +157,9 @@ The guest blocks the host filesystem completely and blocks every route to your
 host and local network, but it does have outbound internet access, because the
 provider CLIs need it. None of it has been validated on a live Windows host.
 
-WSL is also supported and provides the POSIX implementation. To use it:
+WSL is also supported for the consultation bridge and provides the POSIX
+implementation. It counts as Linux, so automatic delegation is refused there
+too. To use it:
 
 **1. Install WSL.** Open PowerShell as Administrator and run:
 
@@ -176,7 +214,13 @@ On WSL, `~` is your Linux home directory, which is correct. Do not substitute a
 ```
 
 This looks for both CLIs, tells you which versions it found and whether each one
-is signed in, and shows you what it would pin. It writes nothing yet.
+is signed in, and shows you what it would pin. It does not change
+`config/local.json` or pin anything yet. It does create a few things on first
+run: the owner-only directory `~/.agent-bridge/codex-home` (the isolated Codex
+home you sign in to below), and `~/.agent-bridge/launcher-python`, a record of
+the Python interpreter that ran setup. The POSIX `bin/` launchers reuse that
+interpreter later, so run setup with the Python 3.11 or newer you want them to keep using.
+Setting `AGENT_BRIDGE_PYTHON` overrides the record.
 
 It is normal to have more than one Claude install. Setup prefers one that is
 signed in, because a second copy that has never been logged in will fail every
@@ -269,13 +313,47 @@ If yours do not, you can allow one side less than the other by adding this to
 ```json
 {
   "peers": {
-    "codex": { "allowed_source_classifications": ["public"] }
+    "codex": { "allowed_source_classifications": ["public", "synthetic"] }
   }
 }
 ```
 
+Keep `"synthetic"` in the list. The canaries and the verification checks send
+synthetic prompts to each peer, so a list that allows only `"public"` makes
+verification fail for that peer.
+
 Substitute whichever peer is on the weaker plan. Doing nothing keeps both sides
 equal, which is the right default only if your plans really are equal.
+
+**Client-derived material is off by default.** Turn it on only if your
+provider agreements allow it. Three places are involved, and the same choice
+applies to Claude and Codex:
+
+- **Questionnaire.** `onboard questionnaire` asks "Allow client-derived work to
+  go to Claude and Codex through this bridge". The default is no.
+- **Answers file.** The answer is stored under `client_derived_routes`, a list
+  drawn from `"peer"` (consultations) and `"execution"` (implementation jobs).
+  `[]`, or leaving the key out, keeps both off. Any other value is refused.
+  Example: `"client_derived_routes": ["peer"]`.
+- **Operator settings file.** `onboard apply` writes the result to
+  `operator-settings.json` in the operator state home. That is the one file
+  every part of the bridge reads. Its schema is
+  `{"version": 1, "client_derived_routes": ["peer", "execution"]}`, with an
+  optional `"allow_client_derived"` key that belongs to a separate job runner
+  and never widens anything here. The state home is `$CODEX_JOB_RUNNER_STATE`
+  when that is set. Otherwise it is `~/.codex-job-runner`, or `~/.codex-bridge`
+  if only that older folder exists. The file must be a regular file owned by
+  you, not writable by group or others, and not a symlink. A file that is
+  untrusted, unreadable or malformed turns the routes off. With no file, the
+  routes stay off unless an older install still carries the key in its own
+  configuration (`bin/agent-bridge-admin operator-settings migrate` folds that
+  into the file). On Windows a present file is treated as unsupported and
+  the routes stay off.
+
+Labels are still checked rather than content. Secrets and credentials stay
+refused whatever you choose. The local worker has its own conditions for
+client-derived text; see
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md#client-derived-text-and-the-local-lane).
 
 ## 4c. Decide how hard each side should think
 
@@ -368,9 +446,15 @@ The default bridge above installs consultation only: either assistant can ask
 its peer a question and get an answer back. Automatic delegation is a
 separate, advanced opt-in that adds durable stage ownership, a queue for
 bounded cross-provider implementation jobs, and automatic local routing for
-eligible non-client mechanical text. It never applies, commits, pushes, or
-merges on its own, and it never silently falls back from local processing to
-a cloud model or a paid API.
+eligible mechanical text. The local lane takes client-derived text only under
+conditions you configure; see
+[Orchestration and local-worker MCP](docs/orchestration-mcp.md#client-derived-text-and-the-local-lane).
+It never applies, commits, pushes, or merges on its own, and it never silently
+falls back from local processing to a cloud model or a paid API.
+
+**This section is macOS only.** On Windows and Linux, `onboard questionnaire`
+does not ask the question and `onboard plan` and `onboard apply` refuse it.
+Consultation setup is unaffected.
 
 Both bounded implementation harnesses (Claude and Codex) already ship in this
 checkout; nothing extra needs installing for either direction. The Codex
@@ -401,7 +485,7 @@ harness files ship with this checkout and the login does not.
 **Turn it on:**
 
 ```
-python setup_bridge.py onboard questionnaire --answers /absolute/private/answers.json
+python3 setup_bridge.py onboard questionnaire --answers /absolute/private/answers.json
 ```
 
 Answer yes to "Enable automatic delegation?" (or set
@@ -415,6 +499,13 @@ guessed at.
 CLIs; it never applies a patch, commits, pushes, merges, downloads a model, or
 enables paid fallback, and it only ever uses synthetic, disposable content:
 
+> **Known issue.** On a machine where delegation has never been applied,
+> `orchestration.json` does not exist yet, so this verify step fails. Only
+> `onboard apply` writes that file, and apply needs this step's evidence first.
+> No supported command breaks the cycle today; a code fix is pending. Until it
+> lands, a first-time install cannot turn on automatic delegation by following
+> these steps.
+
 ```
 ./bin/agent-bridge-orchestration-verify \
   --config ~/.agent-bridge/orchestration/orchestration.json \
@@ -425,7 +516,7 @@ enables paid fallback, and it only ever uses synthetic, disposable content:
 **Apply with the evidence:**
 
 ```
-python setup_bridge.py onboard apply \
+python3 setup_bridge.py onboard apply \
   --answers /absolute/private/answers.json \
   --candidate /absolute/private/candidate.json \
   --results /absolute/private/canaries.json \
@@ -446,7 +537,7 @@ execution worker but does not silently load it. Load it into the login GUI
 domain yourself, never as root:
 
 ```
-python setup_bridge.py onboard activate-launch-agent --apply
+python3 setup_bridge.py onboard activate-launch-agent --apply
 ```
 
 Without `--apply` this only prints the exact command it would run. Loading is
@@ -455,9 +546,9 @@ idempotent: an already-active agent is reported as such and never re-loaded.
 **Check, disable, or remove it:**
 
 ```
-python setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only
-python setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only --apply
-python setup_bridge.py onboard deactivate-launch-agent --apply
+python3 setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only
+python3 setup_bridge.py onboard uninstall --answers /absolute/private/answers.json --delegation-only --apply
+python3 setup_bridge.py onboard deactivate-launch-agent --apply
 ```
 
 Uninstall removes only the orchestration MCP registrations and LaunchAgent
@@ -466,13 +557,16 @@ bridge installed and untouched. The private orchestration configuration and
 its receipt are retained for inspection, matching how consultation's shared
 instructions and `config/local.json` are retained.
 
-**Windows and Linux** support the same registration and private-config
-generation, but do not install a continuously-running execution-worker
-service; that has only been independently verified on macOS. `onboard plan`
-reports this boundary for your platform before you apply anything. Windows can
-register the worker as a per-user logon task in your own Task Scheduler
-namespace, with no administrator rights and no other account, and you can remove
-it yourself; that path has not been exercised on a live Windows host.
+**Windows and Linux** do not get automatic delegation at all. The persistent
+execution worker has only been independently verified on macOS, so
+`onboard questionnaire` does not offer the choice, and `onboard plan` and
+`onboard apply` refuse it with the message "automatic delegation is currently
+available only on macOS". On Windows the refusal lifts only when a boundary
+verification record exists on the machine; the project's documented live
+Windows validation has not produced one. The
+consultation bridge stays available on both platforms. The Windows provisioning
+work is described in the [Windows](#windows) section and is not a feature you
+can turn on.
 
 ## Delegation-first gate
 
@@ -491,6 +585,12 @@ Install by hand with:
 ```
 ./bin/agent-bridge-gate-hook install --root . --config <orchestration.json> --apply
 ```
+
+Without `--apply` this is a dry run. `--clients claude,codex` is the default.
+Add `--include-post` to also register the optional PostToolUse entry that
+measures inline command output for the output router. It applies to Claude
+Code only and is off by default. A later install without the flag leaves an
+entry you already registered as it is. `--remove` uninstalls the hook.
 
 Then do three things, in this order:
 
@@ -541,3 +641,50 @@ does in its own context produces no tool call to intercept) is in
 Shows how many consultations have run and warns you if any conversation is
 being held for review. `ledger --tail 20` shows recent activity, and `cleanup`
 removes old material but is a dry run until you add `--apply`.
+
+### Admin commands
+
+Run these as `./bin/agent-bridge-admin <command>`. On Windows use
+`bin\agent-bridge-admin.cmd`.
+
+- `status`, `health`, `ledger` and `cleanup`: described above and in
+  [docs/bridge-health.md](docs/bridge-health.md).
+- `indeterminate`: lists conversations held because an interrupted call left
+  the peer's state unknown. Read-only.
+- `resolve <conversation_id>`: shows the held conversation and any peer process
+  that could not be verified as stopped. It is a dry run until you add
+  `--apply`. If a peer process may still be alive, `--apply` is refused until
+  you confirm it is gone and add `--acknowledge-live-process`. Check whether
+  the peer finished that turn before you resolve.
+- `reporting [--peer claude|codex] [--min-sample N]`: how often a peer's CLI
+  reported its model and cost. Below the sample size it prints counts, not a
+  rate.
+- `local-first [--peer claude|codex]`: counts `local_first` declarations on
+  consultations, by peer and reason. This is accountability, not enforcement.
+- `archive (--item ID ... | --closed-tasks DIR) [--stage S] [--reason TEXT]`:
+  archives finished stage history. A dry run until you add `--apply`. It reads
+  the orchestration config, so it applies only where automatic delegation is
+  set up.
+- `operator-settings migrate [--dry-run | --write]`: folds older
+  `client_derived_routes` keys into the operator settings file. A dry run
+  unless you pass `--write`. See
+  [4b](#4b-decide-what-each-side-is-allowed-to-receive).
+
+### Reliability report
+
+`./bin/agent-bridge-reliability-report [--days N] [--json] [--ci --repo OWNER/NAME]`
+prints a content-free weekly summary of execution, consultations, the local
+queue and stage health. It reads existing state and exposes no request text.
+`--days` defaults to 7, and `--ci` adds GitHub Actions results for the named
+repository. This launcher has no Windows `.cmd`; run
+`python -m agent_bridge.reliability_report` with `PYTHONPATH` set to `src`.
+
+### Choosing the Python the launchers use
+
+The POSIX launchers pick an interpreter in this order: `AGENT_BRIDGE_PYTHON`
+if set, then the owner-only record at `~/.agent-bridge/launcher-python` that
+setup writes, then the first Python 3.11 or newer on `PATH`. Set
+`AGENT_BRIDGE_PYTHON` to an absolute path to force one. The reliability-report
+launcher is the exception: it uses `AGENT_BRIDGE_PYTHON`, and otherwise
+`python3`, without the other two steps. The Windows `.cmd` launchers use
+`AGENT_BRIDGE_PYTHON`, and otherwise `python`.

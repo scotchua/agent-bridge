@@ -1,9 +1,13 @@
 # Local-first for mechanical work: design for build
 
-Status: design, not built. It extends the delegation-first gate described in
-[DELEGATION-GATE.md](DELEGATION-GATE.md) and changes nothing for a machine that
-has not opted into automatic delegation. It is written to be handed to a
-building model. Section 5 is the build plan; section 6 is the adversarial
+Status: built, kept as the design record. The read gate, the calibration
+command and the output router described here ship in this repository. The
+document was written to hand to a building model, so it reads as a plan; where
+it differs from the code, README.md, [orchestration-mcp.md](orchestration-mcp.md)
+and the code are the current behavior. It extends the delegation-first gate
+described in [DELEGATION-GATE.md](DELEGATION-GATE.md) and changes nothing for a
+machine that has not opted into automatic delegation. It is written to be handed
+to a building model. Section 5 is the build plan; section 6 is the adversarial
 review this design was put through before hand-off, with the defects it found
 in its own first draft.
 

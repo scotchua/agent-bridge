@@ -38,6 +38,26 @@ python3 -m unittest discover -s tests -p "test_onboard.py"
 python3 -m unittest discover -s tests -p "test_local_worker.py"
 ```
 
+CI runs more than these three commands, on macOS, Linux and Windows with Python
+3.11 and 3.13. The full list is in
+[.github/workflows/tests.yml](.github/workflows/tests.yml). Besides the commands
+above, it covers:
+
+- the Agent Room tests (`test_chat_*.py`, `test_peer_*.py`) and
+  `node tests/test_chat_pending.cjs`, which needs Node;
+- the security regression tests (`test_*security*.py`);
+- the portable orchestration, automatic-routing and automatic-delegation tests,
+  such as `test_localq.py`, `test_delegation_gate.py`, `test_automatic_gate.py`
+  and `test_automatic_delegation.py`;
+- the Windows delegation component tests, which run on every platform;
+- `python3 tools/release_signing.py scan` and
+  `python3 tools/make_test_image.py --check`; and
+- a check that `./bin/agent-bridge-setup` exits 1 with no CLIs installed, and
+  that the MCP server lists only the opposite peer's tools.
+
+Run the files that match the area you changed. A pull request run executes all
+of them.
+
 Use your platform's Python command if it differs. A pull request should explain
 the trigger, the resulting behavior, the checks run and any platform or live
 path that was not verified. Do not include raw logs unless you have inspected

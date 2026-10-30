@@ -59,7 +59,6 @@ all now checked by the script, so a Windows run verifies the fixes there:
 ```
 git clone https://github.com/scotchua/agent-bridge
 cd agent-bridge
-git checkout claude/tender-tesla-7881pp
 python tools\windows_host_evidence.py --self-test
 python tools\windows_host_evidence.py --report windows-host-evidence.json
 ```

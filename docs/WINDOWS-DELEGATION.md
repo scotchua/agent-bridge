@@ -596,7 +596,7 @@ executor. `STAGE_PROVIDER_ENROLMENT` is a rung of its own, between
 
 So the lane is now connected end to end in code. It has still never been run
 against a real subscription on a real Windows host, and nothing in this
-worktree claims otherwise.
+repository claims otherwise.
 
 ## Where the session comes from
 
@@ -798,13 +798,13 @@ lane is a separate block inside the same record: a fully verified boundary does
 not open it, and it opens only after the two-gate observation above is written,
 re-read from disk and confirmed.
 
-No such record has been produced on a live Windows host from this worktree.
+No such record has been produced on a live Windows host from this repository.
 Every test here exercises the refusal paths.
 
 ### No live validation
 
 No job has been dispatched through this executor on a live Windows host from
-this worktree, no image has been imported into WSL2, and no canary has run
+this repository, no image has been imported into WSL2, and no canary has run
 inside a real guest. The provisioning argv, the activation argv and the runtime
 lifecycle are reviewed and tested as data. Treat "installed" and "verified" as
 separate claims, and do not report the second on the strength of the first.

@@ -14,8 +14,11 @@ fails closed on drift.
 ## Pinned executables
 
 Paths are machine-specific and are pinned by `bin/agent-bridge-setup` into
-`config/local.json`, which is gitignored. The versions below are the ones every
-measurement in this document was taken against.
+`config/local.json`, which is gitignored. The versions below are the ones the
+original measurements were taken against on 2026-08-23. Later sections record
+newer measurements at the versions they name, and your installed CLIs are
+probably newer than any listed here, so re-measure before relying on a
+version-specific fact.
 
 | Peer | Path | Observed version |
 |---|---|---|

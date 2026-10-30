@@ -7,9 +7,12 @@
 > platform limits below before using it. This early release is intended to find
 > problems on fresh installations; it does not depend on a tester-count gate.
 
-> **Windows support boundary:** the consultation bridge and guided setup work
-> on native Windows. Automatic cross-provider execution currently does not:
-> its persistent execution worker is macOS-only. Windows automatic delegation
+> **Windows support boundary:** the consultation bridge and guided setup are
+> written for native Windows, and CI runs the offline suite there. The full live
+> setup has not been walked on a Windows machine with both CLIs signed in (see
+> [INSTALL.md](INSTALL.md#windows)). Automatic cross-provider execution does not
+> work on Windows or Linux: its persistent execution worker is macOS-only and
+> `onboard` refuses it elsewhere. Windows automatic delegation
 > is under development and must not be presented as installed or verified.
 > The provisioning command in this tree refuses to enable it, and that refusal
 > is computed from the absence of a verification record on the machine, not
@@ -67,7 +70,6 @@ it this request:
 > limitations. Ask before live tests that use my provider allowance or money.
 
 A website-only chat cannot install the bridge on your computer.
-If the repository is still private, request access before starting setup.
 
 [The guided setup](docs/SETUP-WITH-AN-AGENT.md) takes the assistant through:
 
@@ -81,7 +83,8 @@ If the repository is still private, request access before starting setup.
    preserving unrelated settings and keeping backups.
 6. Reloading the selected apps as needed and verifying a question and follow-up.
 
-The consultation-bridge setup supports macOS and native Windows; Linux/WSL details are in
+The consultation-bridge setup is written for macOS, Linux and native Windows,
+and the full live Windows setup remains unverified. Windows and WSL details are in
 [INSTALL.md](INSTALL.md). In WSL, keep the checkout, Python, CLIs and state on
 the Linux side. Claude Desktop can receive the MCP connection, but loading the
 shared instructions into its chats/projects requires a separate verified step.
@@ -132,8 +135,9 @@ Setup asks what may be sent to each receiving peer:
 
 Client-derived material is refused by default. An operator who wants Claude
 and Codex to have the same client-data access sets `client_derived_routes`
-(`peer` and/or `execution`) once, in `operator-settings.json` in the runner
-state home (`~/.codex-job-runner`, or `~/.codex-bridge` before its migration).
+(`peer` and/or `execution`) once, in `operator-settings.json` in the operator
+state home. The questionnaire key, the answers key, the file schema and its
+location are in [INSTALL.md](INSTALL.md#4b-decide-what-each-side-is-allowed-to-receive).
 Every part of the bridge reads that one file, and a file that is untrusted or
 malformed turns the routes off. Older installs that carry the key in the broker
 config, orchestration config and routing policy keep working until you run
@@ -163,10 +167,29 @@ The worker accepts bounded inline text tasks. It does not read files, run shell
 commands, download models or provide a cloud fallback. Other local runtimes
 need a separately tested adapter.
 
+Guided setup registers this worker as `local-peer`. To start it by hand, run
+`python3 setup_bridge.py serve-local --model <installed model name>`. It also
+takes `--endpoint` (default `http://127.0.0.1:11434`, loopback only) and
+`--allow-internal`, which lets it receive non-client internal text. It serves
+MCP over stdio, so a terminal run is for checking that it starts.
+
 ## When Claude, Codex or Ollama updates
 
-Run `python setup_bridge.py doctor` after an update. You can also install one
-per-user LaunchAgent with `python setup_bridge.py doctor --install-schedule`.
+Run `python3 setup_bridge.py doctor` after an update. It is for a machine that
+already has the bridge installed with automatic delegation. On a machine with
+no install it reports a missing orchestration config and missing gate hooks,
+which look like breakage but only mean nothing is installed yet. It also writes
+the launcher-Python record, runs the CLIs' help to check their flags, and
+probes the Ollama endpoint (`OLLAMA_HOST`, default `http://127.0.0.1:11434`)
+whether or not you use a local model. Doctor records a changed dependency as
+accepted only when its own checks pass. `--accept-requalified` is accepted by
+the command line but currently changes nothing. `--requalify-only` (with
+`--scheduled` or `--install-schedule`) re-runs those checks and records a new
+baseline but never installs a Codex update.
+
+You can also install one per-user LaunchAgent with
+`python3 setup_bridge.py doctor --install-schedule` (macOS only; elsewhere it
+writes the plist but nothing loads it). Remove it with `--remove-schedule`.
 It checks at login and each night at 03:30 local time. The nightly run waits
 72 hours after a Codex release before considering it (change this with
 `--quarantine-hours` or `~/.agent-bridge/drift/settings.json`), installs that
@@ -174,9 +197,9 @@ exact version in a private staging prefix, and runs the free flag and model
 checks plus the synthetic checks there. Only then does it switch each writable
 npm-managed Codex installation. A failed post-switch free check restores that
 prefix's recorded version. Claude Code and Ollama are only inspected, never
-updated. If the live firm-tools `codex-job-runner` pins the installed Codex
-version, doctor reports the pin and the nightly run leaves Codex in place
-until that pin is updated. Doctor inventories the configured executables,
+updated. If an installed job-runner plugin pins the Codex version, doctor
+reports the pin and the nightly run leaves Codex in place until that pin is
+updated. Doctor inventories the configured executables,
 Ollama runtime, certified Gemma files, configured absolute paths, gate hooks,
 hook trust, and the Codex default model. Worker loops hold only work that
 depends on a drifted dependency, show `waiting_on_dependency:<name>`, and keep
@@ -193,8 +216,9 @@ sandbox around an arbitrary Ollama server.
 The repository includes an additive orchestration MCP server for users who want
 more than consultation. It can:
 
-- route eligible non-client mechanical text to the local worker without a cloud
-  fallback;
+- route eligible mechanical text to the local worker without a cloud
+  fallback (client-derived text only under conditions the operator configures,
+  see [Orchestration and local-worker MCP](docs/orchestration-mcp.md#client-derived-text-and-the-local-lane));
 - register and claim durable work stages so only one assistant owns a stage;
 - select a route only from routes with fresh capacity, which the operator
   declares in the policy file or the gate hook observes first-hand; no tool
@@ -256,8 +280,9 @@ checkpoint ledger. Assistant-facing work calls cannot label production as a
 test: they run as caller-bound `purpose=work`, consume a prior checkpoint or
 mint one automatically, and record whether an eligible unit was actually
 dispatched. The optional certified Gemma backend is configuration-selected,
-summarize-only, and pins the model digest plus both security-critical source
-files. Unsupported work refuses before queueing and never substitutes Qwen,
+carries `summarize` by default (an operator can enable the `extract` and
+`classify` pilot with `gemma_pilot_tasks`), and pins the model digest plus both
+security-critical source files. Unsupported work refuses before queueing and never substitutes Qwen,
 Apple, or a cloud provider. Calibration and the live executor heartbeat are
 also bound to the selected backend, so an old private-worker process cannot
 satisfy Gemma readiness after a configuration change; restart the connected
@@ -321,9 +346,9 @@ signed in can construct and run the execution lane in either direction
 without installing anything beyond this repository. Passing verification
 still needs this machine's own signed-in provider CLIs; it is not proven by
 source code existing. Local routing and consultation are unaffected. The
-execution worker's LaunchAgent has been live-tested on macOS only; continuous
-service setup for Linux and Windows is not offered, only portable
-registration and configuration.
+execution worker's LaunchAgent has been live-tested on macOS only. On Linux
+and Windows, automatic delegation is refused by `onboard`; consultation setup is
+unaffected.
 
 ## What it will not do
 
@@ -498,7 +523,7 @@ a newly cleared continuation to recover.
 - **Stopping a local process does not prove a provider stopped processing.**
   Process-tree cleanup is best effort. An interrupted call can leave a
   conversation held as indeterminate for explicit resolution; see the admin
-  commands in [INSTALL.md](INSTALL.md).
+  commands in [INSTALL.md](INSTALL.md#admin-commands).
 - **Offline CI is not a live installation test.** It uses stand-in provider
   programs. Your accounts, login, selected models and optional Ollama service
   still need verification on your computer.
@@ -519,9 +544,8 @@ a newly cleared continuation to recover.
 - **Advanced orchestration is not yet a portable service installer.** Its core
   queue and routing logic is tested offline, while the persistent execution
   worker and subscription-backed implementation lane are currently verified on
-  macOS only. Guided onboarding can register and configure it on any supported
-  platform; only the continuously-running macOS LaunchAgent is offered as an
-  installed service.
+  macOS only. Guided onboarding configures and registers it on macOS only; on
+  Windows and Linux it refuses the opt-in.
 - **The Codex execution harness's write confinement is Codex's own sandbox,
   not this project's.** `codex_task.py` runs `codex exec -s workspace-write`
   in a disposable worktree, pinning network access off; unlike the Claude

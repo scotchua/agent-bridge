@@ -37,10 +37,13 @@ where the provider rotates refresh tokens, one home's refresh can then
 invalidate the other. Run the login command inside each home instead.
 
 **What a fresh build gets you, and what it does not.** The reference
-implementation this brief is derived from is about 4,000 lines with 2,500 lines
-of tests, and it went through four adversarial review rounds that produced 40
-findings, including two separate cases where two correct-looking fixes defeated
-each other. A first build from this brief will be a working v1 with the known
+implementation this brief is derived from began at about 4,000 lines with
+2,500 lines of tests, and its first version went through four adversarial review
+rounds that produced 40 findings, including two separate cases where two
+correct-looking fixes defeated each other. The current repository is much
+larger, at roughly 50,000 lines of source and 65,000 lines of tests when counted
+with `wc -l` over `src/` and `tests/`, because it has since gained
+orchestration, the local lane and Windows work that this brief does not cover. A first build from this brief will be a working v1 with the known
 traps pre-avoided. It will not be as hardened. If you can get a copy of a
 working implementation and port it instead, do that: the concurrency section
 below describes weeks of findings in a few paragraphs, and reading a paragraph
