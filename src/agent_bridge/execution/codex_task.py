@@ -484,7 +484,7 @@ def _unlink_beneath(tree:Path,rel:str)->None:
             nxt=os.open(part,flags,dir_fd=fd); os.close(fd); fd=nxt
         name=parts[-1]
         if name in ("",".",".."): return
-        if stat.S_ISREG(os.lstat(name,dir_fd=fd).st_mode):
+        if stat.S_ISREG(os.stat(name,dir_fd=fd,follow_symlinks=False).st_mode):
             os.unlink(name,dir_fd=fd)
     finally:
         os.close(fd)
@@ -500,7 +500,8 @@ def _drop_caches(tree:Path,env)->None:
     are unlinked. Platforms without dir_fd support skip cleanup, leaving the
     unchanged refusal in force."""
     if (not hasattr(os,"O_NOFOLLOW") or os.unlink not in os.supports_dir_fd
-            or os.open not in os.supports_dir_fd or os.lstat not in os.supports_dir_fd): return
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks): return
     r=_run(_git_argv("ls-files","-z","--others","--ignored","--exclude-standard"),cwd=tree,env=env,timeout=30)
     if r.returncode: raise TaskError("git prerequisite failed")
     for raw in r.stdout.split(b"\0"):
