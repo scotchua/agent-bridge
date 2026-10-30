@@ -61,5 +61,5 @@ def assert_python_supported() -> None:
             + ". Install a newer Python and run with python3.11 or later.")
 
 
-assert_platform_supported()
 assert_python_supported()
+assert_platform_supported()
