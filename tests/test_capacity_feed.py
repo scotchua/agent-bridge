@@ -136,14 +136,43 @@ class CapacityFeedTests(unittest.TestCase):
 
     def test_a_stale_snapshot_writes_nothing(self):
         # Its one bucket is otherwise fresh, usable and over the ceiling.
-        self.write("codex", snapshot("codex", [codex_bucket(99)], received_at=NOW - 901))
+        self.write("codex", snapshot("codex", [codex_bucket(99)], received_at=NOW - 71 * 60))
         result = self.run_feed()["codex"]
         self.assertEqual((result["action"], result["reason"]), ("none", "snapshot_stale"))
         self.assertEqual(self.router.capacity_rows(), [])
 
+    def test_hour_old_codex_snapshot_refuses_with_bounded_freshness(self):
+        for age in (60 * 60, 70 * 60):
+            for resets_in in (600, MAX_FRESHNESS_SECONDS + 3600):
+                with self.subTest(age=age, resets_in=resets_in):
+                    self.write("codex", snapshot(
+                        "codex", [codex_bucket(99, age=age, resets_in=resets_in)],
+                        received_at=NOW - age))
+                    result = self.run_feed()["codex"]
+                    self.assertEqual((result["action"], result["reason"]),
+                                     ("refused", "over_ceiling"))
+                    row = self.row("codex")
+                    self.assertEqual((row["trusted"], row["available"]), (1, 0))
+                    self.assertEqual(row["fresh_until"],
+                                     NOW + min(resets_in, MAX_FRESHNESS_SECONDS))
+                    self.router.retract_capacity("codex", source=capacity_feed.FEED_SOURCE)
+
+    def test_twenty_minute_old_claude_snapshot_is_stale(self):
+        self.write("claude", snapshot("claude", [claude_bucket(99)],
+                                      received_at=NOW - 20 * 60))
+        result = self.run_feed()["claude"]
+        self.assertEqual((result["action"], result["reason"]), ("none", "snapshot_stale"))
+        self.assertEqual(self.router.capacity_rows(), [])
+
+    def test_claude_bucket_keeps_fifteen_minute_limit(self):
+        self.write("claude", snapshot("claude", [claude_bucket(99, age=901)]))
+        result = self.run_feed()["claude"]
+        self.assertEqual((result["action"], result["reason"]), ("none", "no_usable_window"))
+        self.assertEqual(self.router.capacity_rows(), [])
+
     def test_unusable_buckets_are_skipped(self):
         bad = {
-            "stale": codex_bucket(age=901),
+            "stale": codex_bucket(age=70 * 60 + 1),
             "future_fresh": codex_bucket(age=-301),
             "reset_passed": codex_bucket(resets_in=0),
             "no_window": codex_bucket(window_minutes=None),
@@ -184,7 +213,7 @@ class CapacityFeedTests(unittest.TestCase):
                 self.assertEqual(self.router.capacity_rows(), [])
 
     def test_one_bad_bucket_does_not_hide_a_good_one(self):
-        self.write("codex", snapshot("codex", [codex_bucket(99, age=901),
+        self.write("codex", snapshot("codex", [codex_bucket(99, age=70 * 60 + 1),
                                                codex_bucket(95, scope="secondary")]))
         self.assertEqual(self.run_feed()["codex"]["action"], "refused")
 

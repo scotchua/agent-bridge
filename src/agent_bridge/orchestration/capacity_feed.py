@@ -20,6 +20,9 @@ snapshot, or one whose window has already reset, writes nothing.  Nothing
 written means the ledger keeps whatever it had, and missing or stale capacity
 already blocks reassignment.
 
+Snapshots and buckets older than 15 minutes are stale, except that Codex
+refusals accept up to 70 minutes because its reader runs at most hourly.
+
 **No default ceiling.**  The ceiling is the operator's number.  The command
 refuses to run without one rather than invent it.
 
@@ -50,8 +53,10 @@ from .config import OrchestrationConfigError, load
 FEED_SOURCE = "quota:over-ceiling"
 #: The snapshot format this feeder understands.  Anything else is unknown.
 SNAPSHOT_SCHEMA = 1
-#: Matches the snapshot reader: a bucket older than this is stale.
+#: Default snapshot and bucket age limit; Codex refusals have an override.
 MAX_AGE_SECONDS = 15 * 60
+#: Codex's reader is rate-limited to one read per hour.
+MAX_AGE_SECONDS_BY_ROUTE = {"codex": 70 * 60}
 #: Matches the snapshot reader: tolerated clock disagreement.
 CLOCK_SKEW_SECONDS = 5 * 60
 #: The latest timestamp the snapshot reader accepts (9999-12-31).
@@ -91,13 +96,17 @@ def load_snapshot(snapshot_dir: Path, source: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str, list[dict]]:
+def usable_buckets(snapshot: dict | None, source: str, now: float, *,
+                   max_age_seconds: float = MAX_AGE_SECONDS) -> tuple[str, list[dict]]:
     """``(reason, buckets)``: the fresh, well-formed, unreset windows only.
 
     Any shape problem anywhere in the snapshot rejects the whole snapshot,
     including a value in an available bucket that is not a number in bounds,
     and so does a stale snapshot.  A bucket that is only absent, partial,
     stale, future-dated or reset is skipped on its own.
+
+    The feeder supplies its per-route age limit; other readers retain the
+    default 15-minute limit.
     """
     schema = snapshot.get("schema") if snapshot else None
     if type(schema) is not int or schema != SNAPSHOT_SCHEMA or snapshot.get("source") != source:
@@ -107,7 +116,7 @@ def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str,
     received = _number(snapshot.get("received_at"), low=0)
     if received is None or received > now + CLOCK_SKEW_SECONDS:
         return "snapshot_clock_anomaly", []
-    if now - received > MAX_AGE_SECONDS:
+    if now - received > max_age_seconds:
         return "snapshot_stale", []
     buckets = snapshot.get("buckets")
     if not isinstance(buckets, list) or any(not isinstance(b, dict) for b in buckets):
@@ -139,7 +148,7 @@ def usable_buckets(snapshot: dict | None, source: str, now: float) -> tuple[str,
         if any(value is None for value in values.values()):
             continue
         used, fresh, reset = values["used_percent"], values["freshness_at"], values["resets_at"]
-        if fresh > now + CLOCK_SKEW_SECONDS or now - fresh > MAX_AGE_SECONDS or reset <= now:
+        if fresh > now + CLOCK_SKEW_SECONDS or now - fresh > max_age_seconds or reset <= now:
             continue
         usable.append({"used_percent": used, "resets_at": float(reset)})
     return ("ok" if usable else "no_usable_window"), usable
@@ -161,7 +170,9 @@ def feed(router: StageRouter, snapshot_dir: Path, ceiling_percent: float, *,
     now = router.clock() if now is None else now
     results = []
     for source, route in sorted(SOURCES.items()):
-        reason, usable = usable_buckets(load_snapshot(snapshot_dir, source), source, now)
+        reason, usable = usable_buckets(
+            load_snapshot(snapshot_dir, source), source, now,
+            max_age_seconds=MAX_AGE_SECONDS_BY_ROUTE.get(route, MAX_AGE_SECONDS))
         over = [b for b in usable if b["used_percent"] >= ceiling_percent]
         result: dict[str, Any] = {"route": route, "action": "none", "reason": reason,
                                   "usable_windows": len(usable), "over_ceiling": len(over)}
