@@ -504,13 +504,6 @@ and refuses unless its hash matches the one you verified, so this works on a
 first install, before any live config exists. If you change the answers or
 the worker path after staging, run stage and verify again:
 
-> **Known issue.** On a machine where delegation has never been applied,
-> `orchestration.json` does not exist yet, so this verify step fails. Only
-> `onboard apply` writes that file, and apply needs this step's evidence first.
-> No supported command breaks the cycle today; a code fix is pending. Until it
-> lands, a first-time install cannot turn on automatic delegation by following
-> these steps.
-
 ```
 ./bin/agent-bridge-orchestration-verify \
   --config /absolute/private/candidate.json.orchestration.json \

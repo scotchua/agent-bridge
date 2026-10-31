@@ -11,11 +11,6 @@ install the macOS LaunchAgent, and gate all of it on the synthetic verification
 described here. On Windows and Linux it refuses the opt-in. See
 [INSTALL.md](../INSTALL.md#automatic-delegation-optional-opt-in).
 
-> **Known issue.** On a first-time install the guided path cannot finish yet.
-> Verification needs `orchestration.json`, only `onboard apply` writes it, and
-> apply needs verification evidence first. A code fix is pending; until it
-> lands, a fresh machine cannot turn on automatic delegation this way.
-
 The rest of this document is the manual/reference path and still applies
 verbatim if you prefer to wire it up by hand, or need to troubleshoot what the
 guided path generated.
