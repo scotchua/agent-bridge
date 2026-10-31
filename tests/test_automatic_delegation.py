@@ -523,6 +523,87 @@ class ApplyIntegrationTests(ApplyHarness):
             self.assertEqual(Path(paths["launch_agent"]).read_bytes(), edited)
 
 
+class FirstInstallStagingTests(ApplyHarness):
+    """Stage writes the orchestration config verify needs before apply exists.
+
+    Apply is the only writer of the live config and needs verify evidence for
+    it, so without a staged copy a first install could never enable delegation.
+    """
+
+    def _real_stage(self, tmp, choices):
+        home = os.path.join(tmp, "home")
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        candidate = os.path.join(tmp, "candidate.json")
+        with mock.patch.object(config, "load", return_value=active_in(tmp)), \
+             mock.patch.object(setup_cmd, "find_all", side_effect=lambda peer: [f"/{peer}"]), \
+             mock.patch.object(setup_cmd, "is_durable", return_value=True), \
+             mock.patch.object(setup_cmd, "version_of", side_effect=lambda path: path + " version"), \
+             mock.patch.object(setup_cmd, "claude_signed_in", return_value=True), \
+             mock.patch.object(setup_cmd, "codex_signed_in", return_value=True):
+            plan = onboard.stage(choices, candidate, str(ROOT), home=home)
+        return home, candidate, plan
+
+    def test_stage_writes_the_config_apply_will_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            home, candidate, plan = self._real_stage(tmp, choices)
+            staged_path = plan["delegation_config_path"]
+            self.assertEqual(staged_path, candidate + ".orchestration.json")
+            expected = delegation.build_config(home, str(ROOT), local_worker_executable=None)
+            with open(staged_path, "rb") as handle:
+                self.assertEqual(handle.read(), delegation.render_config_bytes(expected))
+            self.assertEqual(plan["delegation_config_sha256"], delegation.config_sha256(expected))
+            self.assertFalse(os.path.exists(onboard._paths(home)["delegation_config"]))
+            if os.name != "nt":
+                self.assertEqual(os.stat(staged_path).st_mode & 0o077, 0)
+
+    def test_evidence_for_the_staged_config_passes_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            home, candidate, plan = self._real_stage(tmp, choices)
+            _, _, results = self._stage(tmp, choices)
+            delegation_results = os.path.join(tmp, "delegation.json")
+            # What verify --config <staged path> reports: the staged document's hash.
+            store.atomic_write_json(delegation_results, evidence(store.read_json(plan["delegation_config_path"])))
+            patches = self._apply_patches(tmp)
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                onboard.apply(choices, candidate, results, str(ROOT), home=home,
+                             delegation_results=delegation_results)
+            with open(onboard._paths(home)["delegation_config"], "rb") as live, \
+                 open(plan["delegation_config_path"], "rb") as staged:
+                self.assertEqual(live.read(), staged.read())
+
+    def test_evidence_for_a_stale_stage_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            choices = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            home, candidate, plan = self._real_stage(tmp, choices)
+            _, _, results = self._stage(tmp, choices)
+            delegation_results = os.path.join(tmp, "delegation.json")
+            # Verified a config built from a different home than apply will use.
+            stale = delegation.build_config(os.path.join(tmp, "other-home"), str(ROOT),
+                                           local_worker_executable=None)
+            store.atomic_write_json(delegation_results, evidence(stale))
+            patches = self._apply_patches(tmp)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                 self.assertRaises(delegation.DelegationVerificationError):
+                onboard.apply(choices, candidate, results, str(ROOT), home=home,
+                             delegation_results=delegation_results)
+            self.assertFalse(os.path.exists(onboard._paths(home)["delegation_config"]))
+
+    def test_stage_writes_no_config_when_disabled_or_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            off = onboard.validate_answers(answers())
+            _, candidate, plan = self._real_stage(tmp, off)
+            self.assertNotIn("delegation_config_path", plan)
+            self.assertFalse(os.path.exists(candidate + ".orchestration.json"))
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(onboard, "delegation_platform_blocker", return_value="refused here"):
+            on = onboard.validate_answers(answers(automatic_delegation={"enabled": True}))
+            _, candidate, plan = self._real_stage(tmp, on)
+            self.assertNotIn("delegation_config_path", plan)
+            self.assertFalse(os.path.exists(candidate + ".orchestration.json"))
+
+
 class GateInstallationWiringTests(ApplyHarness):
     """Opting in must install the part that makes delegation automatic.
 

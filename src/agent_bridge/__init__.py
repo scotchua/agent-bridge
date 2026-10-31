@@ -53,4 +53,13 @@ def assert_platform_supported() -> None:
         platform=sys.platform, osname=os.name, requirements=requirements))
 
 
+def assert_python_supported() -> None:
+    if sys.version_info < (3, 11):
+        raise RuntimeError(
+            "agent-bridge requires Python 3.11 or newer; this is Python "
+            + ".".join(map(str, sys.version_info[:3]))
+            + ". Install a newer Python and run with python3.11 or later.")
+
+
+assert_python_supported()
 assert_platform_supported()
