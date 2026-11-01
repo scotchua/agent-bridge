@@ -1,0 +1,15 @@
+{
+  "name": "agent-bridge",
+  "version": "1.0.0",
+  "description": "Private Claude to Codex consultation bridge.",
+  "mcpServers": {
+    "codex-peer": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge-plugin-mcp",
+      "args": ["--caller", "claude"],
+      "env": {
+        "AGENT_BRIDGE_PACKAGED": "1",
+        "AGENT_BRIDGE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"
+      }
+    }
+  }
+}

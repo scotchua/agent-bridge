@@ -1,0 +1,18 @@
+#!/bin/sh
+# First-run launcher kept inside the plugin cache. It installs nothing.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+export AGENT_BRIDGE_PACKAGED=1
+export AGENT_BRIDGE_PLUGIN_ROOT="$REPO"
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+for CANDIDATE in python3 python; do
+  CANDIDATE=$(command -v "$CANDIDATE" 2>/dev/null || true)
+  [ -n "$CANDIDATE" ] || continue
+  if "$CANDIDATE" -P -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+    exec "$CANDIDATE" -P "$REPO/setup_bridge.py" setup --packaged --verify
+  fi
+done
+printf '%s\n' 'agent-bridge requires Python 3.11 or newer. Install Python 3.11+ and run /agent-bridge:setup again.' >&2
+exit 2

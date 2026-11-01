@@ -416,6 +416,21 @@ def load(path: str | None = None) -> Config:
         if _is_complete(raw):
             return Config(raw, explicit)
         return build_effective(explicit)
+    # Plugin caches are replaceable. Their local overlay is therefore kept in
+    # validated user state, never in the shipped package directory. Explicit
+    # config and AGENT_BRIDGE_CONFIG still win above this branch.
+    from . import packaged
+    if packaged.enabled():
+        packaged_path = packaged.config_path()
+        if os.path.lexists(packaged_path):
+            overlay = packaged.read_json(packaged_path)
+            if not isinstance(overlay, dict):
+                raise ValueError("packaged config must be a JSON object")
+            if _is_complete(overlay):
+                return Config(overlay, packaged_path)
+            return Config(_deep_merge(store.read_json(DEFAULT_CONFIG_PATH), overlay),
+                          packaged_path)
+        return build_effective()
     local = local_config_path()
     if os.path.isfile(local):
         overlay = store.read_json_or_none(local)

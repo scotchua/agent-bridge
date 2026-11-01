@@ -1,0 +1,34 @@
+#!/bin/sh
+# Claude Code plugin launcher.  It never installs Python or a provider CLI.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(dirname -- "$HERE")
+export AGENT_BRIDGE_PACKAGED=1
+export AGENT_BRIDGE_PLUGIN_ROOT="$REPO"
+export PYTHONPATH="$REPO/src"
+export PYTHONDONTWRITEBYTECODE=1
+CONFIG="${HOME:-}/.agent-bridge/packaged/config.json"
+STATE="${HOME:-}/.agent-bridge"
+STATE_DIR="$STATE/packaged"
+PY=""
+if [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] && [ ! -L "$STATE" ] && [ ! -L "$STATE_DIR" ]; then
+  OWNER=$(id -u 2>/dev/null || true)
+  SAFE=$(find "$CONFIG" "$STATE_DIR" "$STATE" -prune -user "$OWNER" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)
+  if [ "$SAFE" != "$CONFIG
+$STATE_DIR
+$STATE" ]; then SAFE=""; fi
+fi
+if [ "${SAFE:-}" ]; then
+  PY=$(sed -n 's/^[[:space:]]*"launcher_python"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' "$CONFIG" | head -n 1 || true)
+  case "$PY" in /*) ;; *) PY="" ;; esac
+fi
+for CANDIDATE in "$PY" python3 python; do
+  [ -n "$CANDIDATE" ] || continue
+  if [ "$CANDIDATE" = "python3" ] || [ "$CANDIDATE" = "python" ]; then CANDIDATE=$(command -v "$CANDIDATE" 2>/dev/null || true); fi
+  [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ] || continue
+  if "$CANDIDATE" -P -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+    exec "$CANDIDATE" -P -m agent_bridge.mcp_server "$@"
+  fi
+done
+printf '%s\n' 'agent-bridge requires Python 3.11 or newer. Install Python 3.11+ and run /agent-bridge:setup again.' >&2
+exit 2

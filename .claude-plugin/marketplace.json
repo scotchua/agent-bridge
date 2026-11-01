@@ -1,0 +1,7 @@
+{
+  "name": "agent-bridge",
+  "owner": {"name": "scotchua"},
+  "plugins": [
+    {"name": "agent-bridge", "source": "./", "description": "Private Claude to Codex consultation bridge."}
+  ]
+}
