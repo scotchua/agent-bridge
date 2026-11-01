@@ -252,6 +252,7 @@ class PluginInstallTests(unittest.TestCase):
         self.assertEqual(packaged_setup.find_competing_registration(self.home, cwd=project), mcp_json)
         self.assertIsNone(packaged_setup.find_competing_registration(self.home, cwd=self.tmp.name))
 
+    @unittest.skipIf(os.name == "nt", "POSIX launcher")
     def test_launcher_python_with_unsafe_characters_is_refused(self) -> None:
         for value in ('/usr/bin/py"thon', "/usr/bin/py\\thon", "/usr/bin/py\nthon", "python3",
                       "/usr/bin/pythön"):
