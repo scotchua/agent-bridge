@@ -33,6 +33,16 @@ def _git_environment() -> dict[str, str]:
 
 def current_code_revision(checkout: str | None = None) -> str | None:
     """Return the checkout HEAD, or ``None`` when it cannot be proved."""
+    if checkout is None:
+        # A packaged install intentionally has no git checkout. Its shipped
+        # version and complete content digest are its revision identity.
+        from . import packaged
+        if packaged.enabled():
+            try:
+                identity = packaged.package_identity()
+            except packaged.PackagedStateError:
+                return None
+            return "plugin:" + identity["version"] + ":" + identity["digest"]
     root = os.path.abspath(checkout or config.REPO_ROOT)
     now = time.monotonic()
     cached = _head_cache.get(root)

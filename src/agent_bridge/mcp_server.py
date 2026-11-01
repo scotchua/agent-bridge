@@ -443,6 +443,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", default=None, help="Path to a broker config file.")
     args = parser.parse_args(argv)
+    from . import packaged
+    if packaged.enabled():
+        verified, message = packaged.verification_status()
+        if not verified:
+            print(message, file=sys.stderr)
+            return 2
+        # A clone registration can be added after plugin setup.  Refuse the
+        # second server rather than letting two codex-peer instances race for
+        # the same private state root.  Only the key name is inspected.
+        from . import packaged_setup
+        try:
+            conflict = packaged_setup.find_competing_registration(
+                os.path.abspath(os.path.expanduser(os.environ.get("HOME", "~"))))
+        except ValueError:
+            # Fail closed, but say what actually happened: a damaged or
+            # half-written Claude config is not evidence of a second install.
+            print("the plugin's codex-peer could not read the Claude configuration to check for an existing codex-peer registration; fix or restore that file, then restart Claude Code", file=sys.stderr)
+            return 2
+        if conflict:
+            print("the plugin's codex-peer conflicts with an existing codex-peer registration; keep the clone install, or remove the old registration yourself", file=sys.stderr)
+            return 2
     cfg = load_config(args.config)
     for directory in ("ledger", "conversations", "jobs", "workspaces", "quarantine"):
         store.secure_mkdir(cfg.state(directory))

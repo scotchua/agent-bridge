@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
         print("agent-bridge requires Python 3.11 or newer.", file=sys.stderr)
         return 2
     if not raw or raw[0] in {"-h", "--help"}:
-        print("usage: setup_bridge.py {onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor,local-status,restart-worker} ...")
+        print("usage: setup_bridge.py {setup,onboard,upgrade,windows-setup,serve-peer,serve-local,serve-orchestration,doctor,local-status,restart-worker} ...")
         return 0
     command, rest = raw[0], raw[1:]
     # These commands are the durable setup and maintenance paths.  Preserve
@@ -28,6 +28,9 @@ def main(argv: list[str] | None = None) -> int:
         home = os.path.abspath(os.path.expanduser(os.environ.get("HOME", "~")))
         if python_runtime.record(home=home) is None:
             print("launcher_python_record_failed", file=sys.stderr)
+    if command == "setup":
+        from agent_bridge import packaged_setup
+        return packaged_setup.main(rest)
     if command == "onboard":
         from agent_bridge import onboard
         return onboard.main(rest)

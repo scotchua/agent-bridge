@@ -380,6 +380,30 @@ per side. Whatever you choose, including choosing nothing, is recorded on every
 consultation in the ledger, so you can always tell later how hard the model was
 asked to think about an answer you relied on.
 
+## Plugin install (Claude only)
+
+For a Claude Code plugin install, run these commands in Claude Code:
+
+```
+/plugin marketplace add scotchua/agent-bridge
+/plugin install agent-bridge@agent-bridge
+/agent-bridge:setup
+```
+
+The plugin sets up Claude to consult Codex. It runs on macOS, Linux, and WSL;
+on native Windows use the clone install below. It requires Python 3.11+ and an
+already installed Codex CLI. A Codex browser login may be needed. The setup
+does not use API keys and never installs Python or a CLI. It runs a synthetic
+live verification after you confirm it may use your Codex subscription.
+
+This is Claude to Codex only. It does not register the reverse Codex to Claude
+connection, migrate an existing clone install, or create a stable launcher.
+Use the clone instructions below when you need those features. If a
+`codex-peer` registration already exists at any scope (user, local for any
+project, the current project's `.mcp.json`, or Claude Desktop), plugin setup
+refuses and the plugin's server will not start, so the two instances cannot
+conflict. Keep the clone install or remove the old registration yourself.
+
 ## 5. Turn it on
 
 Only after step 4 passes. These two commands change your MCP configuration.
