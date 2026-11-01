@@ -14,8 +14,27 @@ CONFIG="${HOME:-}/.agent-bridge/packaged/config.json"
 STATE="${HOME:-}/.agent-bridge"
 STATE_DIR="$STATE/packaged"
 PY=""
-if [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] && [ ! -L "$STATE" ] && [ ! -L "$STATE_DIR" ]; then
-  OWNER=$(id -u 2>/dev/null || true)
+OWNER=$(id -u 2>/dev/null || true)
+# The same trust policy as packaged.py: the physical HOME is owned by this user
+# and not group or world writable, and every ancestor is owned by this user or
+# root and not group or world writable unless sticky.  Any doubt ignores the
+# recorded interpreter and falls back to PATH.
+TRUSTED=""
+HOME_REAL=$(CDPATH= cd -P -- "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || HOME_REAL=""
+if [ -n "$OWNER" ] && [ -n "$HOME_REAL" ] && [ "$HOME_REAL" != "/" ]; then
+  if [ "$(find "$HOME_REAL" -prune -type d -user "$OWNER" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)" = "$HOME_REAL" ]; then
+    TRUSTED=1
+    ANCESTOR=$HOME_REAL
+    while [ "$ANCESTOR" != "/" ]; do
+      ANCESTOR=$(dirname -- "$ANCESTOR")
+      if [ "$(find "$ANCESTOR" -prune -type d \( -user "$OWNER" -o -user 0 \) \( \( ! -perm -g=w ! -perm -o=w \) -o -perm -1000 \) -print 2>/dev/null || true)" != "$ANCESTOR" ]; then
+        TRUSTED=""
+        break
+      fi
+    done
+  fi
+fi
+if [ -n "$TRUSTED" ] && [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] && [ ! -L "$STATE" ] && [ ! -L "$STATE_DIR" ]; then
   SAFE=$(find "$CONFIG" "$STATE_DIR" "$STATE" -prune -user "$OWNER" ! -perm -g=r ! -perm -g=w ! -perm -g=x ! -perm -o=r ! -perm -o=w ! -perm -o=x -print 2>/dev/null || true)
   if [ "$SAFE" != "$CONFIG
 $STATE_DIR

@@ -134,9 +134,13 @@ def atomic_write_bytes(path: str, data: bytes, *, owner_only: bool = True) -> No
         pass
 
 
-def atomic_write_json(path: str, obj: Any) -> None:
+def json_bytes(obj: Any) -> bytes:
     payload = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
-    atomic_write_bytes(path, payload.encode("utf-8") + b"\n")
+    return payload.encode("utf-8") + b"\n"
+
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    atomic_write_bytes(path, json_bytes(obj))
 
 
 def read_json(path: str) -> Any:

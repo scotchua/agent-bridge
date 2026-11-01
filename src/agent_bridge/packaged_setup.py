@@ -67,8 +67,9 @@ def _pin_codex(active: config.Config) -> dict[str, Any]:
 
 def _check_launcher_python(python: str) -> None:
     # The POSIX launcher extracts this value from JSON with sed, so a quote,
-    # backslash or control character could change what it executes.
-    if (not os.path.isabs(python) or any(ch in python for ch in '"\\')
+    # backslash, control character, or a non-ASCII character (written as a
+    # \u escape by the JSON writer) could change what it executes.
+    if (not os.path.isabs(python) or not python.isascii() or any(ch in python for ch in '"\\')
             or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in python)):
         raise ValueError("the Python interpreter path contains characters the plugin launcher cannot use safely")
 
@@ -81,7 +82,7 @@ def build_overlay(active: config.Config, python: str) -> dict[str, Any]:
 
 def _verify_result(path: str, candidate: config.Config) -> None:
     """Validate the full Claude -> Codex live matrix without enabling reverse MCP."""
-    result = store.read_json(path)
+    result = packaged.read_json(path)
     if not isinstance(result, dict) or result.get("effective_config_sha256") != config.effective_config_sha256(candidate.raw):
         raise ValueError("live verification is not bound to the staged packaged config")
     if result.get("runner_arguments", {}).get("direction") != "claude-to-codex":

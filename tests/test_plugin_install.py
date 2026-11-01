@@ -79,7 +79,8 @@ class PluginInstallTests(unittest.TestCase):
             packaged.prepare()
             path = packaged.config_path()
             packaged.write_json(path, {"limits": {"max_jobs": 1}})
-            with mock.patch.object(store, "replace", side_effect=OSError("interrupted")):
+            target = (packaged, "_replace_at") if packaged._DESCRIPTORS else (store, "replace")
+            with mock.patch.object(*target, side_effect=OSError("interrupted")):
                 with self.assertRaises(OSError):
                     packaged.write_json(path, {"limits": {"max_jobs": 2}})
             self.assertEqual(packaged.read_json(path)["limits"]["max_jobs"], 1)
@@ -251,7 +252,8 @@ class PluginInstallTests(unittest.TestCase):
         self.assertIsNone(packaged_setup.find_competing_registration(self.home, cwd=self.tmp.name))
 
     def test_launcher_python_with_unsafe_characters_is_refused(self) -> None:
-        for value in ('/usr/bin/py"thon', "/usr/bin/py\\thon", "/usr/bin/py\nthon", "python3"):
+        for value in ('/usr/bin/py"thon', "/usr/bin/py\\thon", "/usr/bin/py\nthon", "python3",
+                      "/usr/bin/pythön"):
             with self.assertRaises(ValueError):
                 packaged_setup._check_launcher_python(value)
         packaged_setup._check_launcher_python("/usr/local/bin/python3")
@@ -269,11 +271,12 @@ class PluginInstallTests(unittest.TestCase):
                 "observed_versions": {"codex": ["1.0.0"]}}
 
     def _check_record(self, record: dict) -> None:
-        path = os.path.join(self.tmp.name, "canary-results.json")
-        store.atomic_write_json(path, record)
         candidate = mock.Mock(raw={})
         candidate.peer.return_value = {"allowed_versions": ["1.0.0"]}
-        with mock.patch.object(config, "effective_config_sha256", return_value="bound"):
+        with self.environment(packaged_mode=True), \
+             mock.patch.object(config, "effective_config_sha256", return_value="bound"):
+            path = packaged.private_path("canary-results.json")
+            packaged.write_json(path, record)
             packaged_setup._verify_result(path, candidate)
 
     def test_verification_accepts_a_complete_one_direction_record(self) -> None:
@@ -316,6 +319,57 @@ class PluginInstallTests(unittest.TestCase):
         untrusted = subprocess.run(command, env=env, text=True, capture_output=True, check=False,
                                  stdin=subprocess.DEVNULL, timeout=60)
         self.assertNotIn("FAKE", untrusted.stdout)
+        os.chmod(os.path.join(self.home, ".agent-bridge", "packaged", "config.json"), 0o600)
+        os.chmod(self.tmp.name, 0o777)
+        self.addCleanup(os.chmod, self.tmp.name, 0o700)
+        exposed = subprocess.run(command, env=env, text=True, capture_output=True, check=False,
+                                 stdin=subprocess.DEVNULL, timeout=60)
+        self.assertNotIn("FAKE", exposed.stdout)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ancestry policy")
+    def test_writable_ancestor_is_refused_unless_sticky(self) -> None:
+        self.addCleanup(os.chmod, self.tmp.name, 0o700)
+        with self.environment(packaged_mode=True):
+            os.chmod(self.tmp.name, 0o777)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "ancestors"):
+                packaged.prepare()
+            os.chmod(self.tmp.name, 0o1777)
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {"limits": {"max_jobs": 4}})
+            self.assertEqual(packaged.read_json(packaged.config_path())["limits"]["max_jobs"], 4)
+            os.chmod(self.tmp.name, 0o777)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "ancestors"):
+                packaged.read_json(packaged.config_path())
+
+    @unittest.skipIf(os.name == "nt", "POSIX ancestry policy")
+    def test_home_reached_through_an_owned_symlink_is_accepted(self) -> None:
+        link = os.path.join(self.tmp.name, "home-link")
+        os.symlink("home", link)
+        with self.environment(packaged_mode=True, extra={"HOME": link}):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {})
+        self.assertTrue(os.path.isfile(os.path.join(self.home, ".agent-bridge", "packaged", "config.json")))
+
+    @unittest.skipIf(os.name == "nt", "FIFOs and symlinks are POSIX here")
+    def test_read_refuses_fifo_and_symlinked_state_files(self) -> None:
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            os.mkfifo(packaged.config_path(), 0o600)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "file type"):
+                packaged.read_json(packaged.config_path())
+            os.remove(packaged.config_path())
+            decoy = os.path.join(self.tmp.name, "decoy.json")
+            store.atomic_write_json(decoy, {})
+            os.chmod(decoy, 0o600)
+            os.symlink(decoy, packaged.config_path())
+            with self.assertRaisesRegex(packaged.PackagedStateError, "symlink"):
+                packaged.read_json(packaged.config_path())
+            with self.assertRaisesRegex(packaged.PackagedStateError, "symlink"):
+                packaged.write_json(packaged.config_path(), {})
+
+    def test_state_path_must_sit_under_the_bridge_root(self) -> None:
+        with self.assertRaisesRegex(packaged.PackagedStateError, "invalid"):
+            packaged.state_root_for(os.path.join(self.tmp.name, "other", "packaged", "config.json"))
 
 
 if __name__ == "__main__":
