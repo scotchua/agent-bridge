@@ -398,10 +398,11 @@ live verification after you confirm it may use your Codex subscription.
 
 This is Claude to Codex only. It does not register the reverse Codex to Claude
 connection, migrate an existing clone install, or create a stable launcher.
-Use the clone instructions below when you need those features. If an existing
-user-scope or desktop `codex-peer` registration is present, plugin setup
-refuses so the two instances cannot conflict. Keep the clone install or remove
-the old registration yourself.
+Use the clone instructions below when you need those features. If a
+`codex-peer` registration already exists at any scope (user, local for any
+project, the current project's `.mcp.json`, or Claude Desktop), plugin setup
+refuses and the plugin's server will not start, so the two instances cannot
+conflict. Keep the clone install or remove the old registration yourself.
 
 ## 5. Turn it on
 

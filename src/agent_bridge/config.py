@@ -423,6 +423,11 @@ def load(path: str | None = None) -> Config:
     if packaged.enabled():
         packaged_path = packaged.config_path()
         if os.path.lexists(packaged_path):
+            # The overlay pins the Codex executable, so it is trusted only
+            # while this exact package (or a known rollback) stays verified.
+            verified, message = packaged.verification_status()
+            if not verified:
+                raise ValueError(message)
             overlay = packaged.read_json(packaged_path)
             if not isinstance(overlay, dict):
                 raise ValueError("packaged config must be a JSON object")

@@ -7,13 +7,16 @@ export AGENT_BRIDGE_PACKAGED=1
 export AGENT_BRIDGE_PLUGIN_ROOT="$REPO"
 export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
+# Never import bytecode from the plugin tree: it is outside the verified digest.
+# This directory is not created; the prefix only redirects the cache lookup.
+export PYTHONPYCACHEPREFIX="${HOME:-}/.agent-bridge/packaged/no-bytecode"
 CONFIG="${HOME:-}/.agent-bridge/packaged/config.json"
 STATE="${HOME:-}/.agent-bridge"
 STATE_DIR="$STATE/packaged"
 PY=""
 if [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] && [ ! -L "$STATE" ] && [ ! -L "$STATE_DIR" ]; then
   OWNER=$(id -u 2>/dev/null || true)
-  SAFE=$(find "$CONFIG" "$STATE_DIR" "$STATE" -prune -user "$OWNER" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)
+  SAFE=$(find "$CONFIG" "$STATE_DIR" "$STATE" -prune -user "$OWNER" ! -perm -g=r ! -perm -g=w ! -perm -g=x ! -perm -o=r ! -perm -o=w ! -perm -o=x -print 2>/dev/null || true)
   if [ "$SAFE" != "$CONFIG
 $STATE_DIR
 $STATE" ]; then SAFE=""; fi

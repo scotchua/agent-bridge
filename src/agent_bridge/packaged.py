@@ -80,14 +80,39 @@ def _validate(path: str, *, directory_expected: bool) -> os.stat_result:
         raise PackagedStateError(f"packaged state cannot be read safely: {path}") from exc
     if stat.S_ISLNK(observed.st_mode) or _is_reparse(observed):
         raise PackagedStateError("packaged state must not contain symlinks or reparse points")
-    if directory_expected != stat.S_ISDIR(observed.st_mode):
+    expected_type = stat.S_ISDIR if directory_expected else stat.S_ISREG
+    if not expected_type(observed.st_mode):
         raise PackagedStateError("packaged state has an unexpected file type")
     if os.name != "nt":
         if observed.st_uid != os.getuid():
             raise PackagedStateError("packaged state must be owned by the current user")
-        if observed.st_mode & 0o022:
-            raise PackagedStateError("packaged state must not be group or world writable")
+        # Owner-only, matching what this module creates.  Group or world read
+        # access would expose the recorded interpreter and canary transcripts.
+        if observed.st_mode & 0o077:
+            raise PackagedStateError("packaged state must not be readable or writable by group or others")
     return observed
+
+
+def _validate_home(path: str) -> None:
+    """The state root's parent must not let another account swap it out.
+
+    Only HOME itself is checked: the state root is created directly below it,
+    and system-owned parents above HOME are outside this feature's control.
+    Descriptor-relative no-follow opens would close the remaining
+    check-then-use window; that hardening is deferred and documented.
+    """
+    if os.name == "nt":
+        return
+    try:
+        observed = os.stat(path)
+    except OSError as exc:
+        raise PackagedStateError("home directory cannot be checked safely") from exc
+    if not stat.S_ISDIR(observed.st_mode):
+        raise PackagedStateError("home directory has an unexpected file type")
+    if observed.st_uid not in (os.getuid(), 0):
+        raise PackagedStateError("home directory must be owned by the current user")
+    if observed.st_mode & 0o022:
+        raise PackagedStateError("home directory must not be group or world writable")
 
 
 def _mkdir_checked(path: str) -> None:
@@ -107,6 +132,7 @@ def _mkdir_checked(path: str) -> None:
 
 def prepare(home: str | None = None) -> None:
     root = state_root(home)
+    _validate_home(os.path.dirname(root))
     _mkdir_checked(root)
     _mkdir_checked(directory(home))
 
@@ -114,6 +140,7 @@ def prepare(home: str | None = None) -> None:
 def validate_for_read(path: str) -> None:
     """Validate all state components under our control before opening a file."""
     root = state_root_for(path)
+    _validate_home(os.path.dirname(root))
     _validate(root, directory_expected=True)
     _validate(os.path.dirname(path), directory_expected=True)
     _validate(path, directory_expected=False)
@@ -135,8 +162,15 @@ def read_json(path: str) -> Any:
     return store.read_json(path)
 
 
+def private_path(name: str, home: str | None = None) -> str:
+    if name not in PRIVATE_FILES:
+        raise PackagedStateError("packaged state path is invalid")
+    return os.path.join(directory(home), name)
+
+
 def write_json(path: str, value: Any, *, home: str | None = None) -> None:
-    expected = config_path(home) if os.path.basename(path) == CONFIG_NAME else receipt_path(home)
+    """The one writer for every private file (config, receipt, candidate)."""
+    expected = private_path(os.path.basename(path), home)
     if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(expected)):
         raise PackagedStateError("packaged state must not be written outside its private directory")
     prepare(home)
@@ -151,6 +185,8 @@ def write_json(path: str, value: Any, *, home: str | None = None) -> None:
 
 
 def _files_for_digest(root: str) -> list[Path]:
+    # __pycache__ is excluded from the digest because the launchers point
+    # PYTHONPYCACHEPREFIX away from the source tree, so it is never imported.
     base = Path(root)
     ignored = {".git", "__pycache__", ".pytest_cache"}
     files: list[Path] = []
@@ -158,7 +194,11 @@ def _files_for_digest(root: str) -> list[Path]:
         relative = item.relative_to(base)
         if any(part in ignored for part in relative.parts):
             continue
-        if item.is_file() and not item.is_symlink():
+        # A symlink could point outside the package, so its target would run
+        # without being part of the verified identity.  Refuse, never skip.
+        if item.is_symlink():
+            raise PackagedStateError("agent-bridge plugin must not contain symlinks")
+        if item.is_file():
             files.append(item)
     return sorted(files, key=lambda item: item.relative_to(base).as_posix())
 

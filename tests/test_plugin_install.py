@@ -57,6 +57,7 @@ class PluginInstallTests(unittest.TestCase):
         store.atomic_write_json(two, {"limits": {"max_jobs": 22}})
         with self.environment(packaged_mode=True):
             packaged.prepare()
+            packaged.record_verified(packaged.package_identity())
             packaged.write_json(packaged.config_path(), {"limits": {"max_jobs": 33}})
             self.assertEqual(config.load().limit("max_jobs"), 33)
             explicit = os.path.join(self.tmp.name, "explicit.json")
@@ -193,6 +194,128 @@ class PluginInstallTests(unittest.TestCase):
     def test_windows_reparse_attribute_is_refused_by_the_shared_path_check(self) -> None:
         fake = mock.Mock(st_file_attributes=0x400)
         self.assertTrue(packaged._is_reparse(fake))
+
+    def test_unverified_overlay_is_refused_by_config_load(self) -> None:
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {"limits": {"max_jobs": 33}})
+            with self.assertRaises(ValueError):
+                config.load()
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not Windows ACL evidence")
+    def test_group_or_world_readable_state_is_refused(self) -> None:
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {})
+            os.chmod(packaged.config_path(), 0o644)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "readable"):
+                packaged.validate_for_read(packaged.config_path())
+            os.chmod(packaged.config_path(), 0o600)
+            os.chmod(packaged.directory(), 0o755)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "readable"):
+                packaged.prepare()
+
+    @unittest.skipIf(os.name == "nt", "FIFOs are POSIX only")
+    def test_fifo_in_place_of_state_file_is_refused(self) -> None:
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            os.mkfifo(packaged.config_path(), 0o600)
+            with self.assertRaisesRegex(packaged.PackagedStateError, "file type"):
+                packaged.validate_for_read(packaged.config_path())
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not Windows ACL evidence")
+    def test_group_writable_home_is_refused(self) -> None:
+        os.chmod(self.home, 0o770)
+        with self.environment(packaged_mode=True):
+            with self.assertRaisesRegex(packaged.PackagedStateError, "home directory"):
+                packaged.prepare()
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs privileges on Windows")
+    def test_plugin_digest_refuses_a_symlink(self) -> None:
+        os.symlink(os.path.join(self.plugin, "payload.py"), os.path.join(self.plugin, "linked.py"))
+        with self.environment(packaged_mode=True):
+            with self.assertRaisesRegex(packaged.PackagedStateError, "symlinks"):
+                packaged.package_identity()
+
+    def test_project_scoped_registrations_are_detected(self) -> None:
+        config_path = os.path.join(self.home, ".claude.json")
+        store.atomic_write_json(config_path, {"projects": {"/some/project": {
+            "mcpServers": {"codex-peer": {"command": "private"}}}}})
+        self.assertEqual(packaged_setup.find_competing_registration(self.home), config_path)
+        os.remove(config_path)
+        project = os.path.join(self.tmp.name, "project")
+        os.mkdir(project)
+        mcp_json = os.path.join(project, ".mcp.json")
+        store.atomic_write_json(mcp_json, {"mcpServers": {"codex-peer": {}}})
+        self.assertEqual(packaged_setup.find_competing_registration(self.home, cwd=project), mcp_json)
+        self.assertIsNone(packaged_setup.find_competing_registration(self.home, cwd=self.tmp.name))
+
+    def test_launcher_python_with_unsafe_characters_is_refused(self) -> None:
+        for value in ('/usr/bin/py"thon', "/usr/bin/py\\thon", "/usr/bin/py\nthon", "python3"):
+            with self.assertRaises(ValueError):
+                packaged_setup._check_launcher_python(value)
+        packaged_setup._check_launcher_python("/usr/local/bin/python3")
+
+    def _verification_record(self) -> dict:
+        ok = {"status": "complete", "contract_valid": True}
+        rows = [dict(ok, kind=f"one-turn {i}") for i in range(10)]
+        rows += [dict(ok, kind=f"multi-turn {i} t1") for i in range(3)]
+        rows.append({"kind": "schema-pressure", "status": "failed", "acceptable": True})
+        return {"effective_config_sha256": "bound",
+                "runner_arguments": {"direction": "claude-to-codex"},
+                "blocked": [], "skipped_controls": [],
+                "controls_requested": {"timeout": True}, "controls_executed": {"timeout": True},
+                "rows": rows, "timeouts": [{"status": "timed_out", "orphans": 0}],
+                "observed_versions": {"codex": ["1.0.0"]}}
+
+    def _check_record(self, record: dict) -> None:
+        path = os.path.join(self.tmp.name, "canary-results.json")
+        store.atomic_write_json(path, record)
+        candidate = mock.Mock(raw={})
+        candidate.peer.return_value = {"allowed_versions": ["1.0.0"]}
+        with mock.patch.object(config, "effective_config_sha256", return_value="bound"):
+            packaged_setup._verify_result(path, candidate)
+
+    def test_verification_accepts_a_complete_one_direction_record(self) -> None:
+        self._check_record(self._verification_record())
+
+    def test_verification_refuses_incomplete_evidence(self) -> None:
+        cases = {
+            "blocked": lambda r: r.update(blocked=["codex"]),
+            "skipped": lambda r: r.update(skipped_controls=["timeout"]),
+            "unexecuted control": lambda r: r.update(controls_executed={}),
+            "no controls": lambda r: r.update(controls_requested={}, controls_executed={}),
+            "schema pressure": lambda r: r["rows"][-1].update(acceptable=False),
+            "timeout status": lambda r: r["timeouts"][0].update(status="failed"),
+            "timeout orphans": lambda r: r["timeouts"][0].update(orphans=1),
+            "no timeouts": lambda r: r.update(timeouts=[]),
+        }
+        for name, mutate in cases.items():
+            record = self._verification_record()
+            mutate(record)
+            with self.subTest(name), self.assertRaises(ValueError):
+                self._check_record(record)
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher")
+    def test_launcher_ignores_recorded_python_when_state_is_not_private(self) -> None:
+        fake = os.path.join(self.tmp.name, "fake-python")
+        Path(fake).write_text('#!/bin/sh\ncase "$2" in -c) exit 0;; esac\necho FAKE\n',
+                              encoding="utf-8")
+        os.chmod(fake, 0o700)
+        empty = os.path.join(self.tmp.name, "empty-bin")
+        os.mkdir(empty)
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {"launcher_python": fake})
+        env = {"HOME": self.home, "PATH": empty + ":/usr/bin:/bin"}
+        command = ["/bin/sh", str(ROOT / "bin" / "agent-bridge-plugin-mcp")]
+        trusted = subprocess.run(command, env=env, text=True, capture_output=True, check=False,
+                                 stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(trusted.stdout.strip(), "FAKE")
+        os.chmod(os.path.join(self.home, ".agent-bridge", "packaged", "config.json"), 0o640)
+        untrusted = subprocess.run(command, env=env, text=True, capture_output=True, check=False,
+                                 stdin=subprocess.DEVNULL, timeout=60)
+        self.assertNotIn("FAKE", untrusted.stdout)
 
 
 if __name__ == "__main__":

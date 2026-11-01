@@ -78,9 +78,10 @@ tokens, or OAuth codes, and it does not install Python or either CLI.
 
 This first plugin phase does not install Codex to Claude, does not migrate a
 clone installation, and does not create a stable launcher outside the plugin
-cache. If you already have a `codex-peer` registration, setup refuses rather
-than creating a competing connection. Keep the clone install or remove the old
-registration yourself.
+cache. If you already have a `codex-peer` registration (user, local, project
+`.mcp.json`, or Claude Desktop), setup refuses rather than creating a competing
+connection, and the plugin's server stays off while one is present. Keep the
+clone install or remove the old registration yourself.
 
 ### Clone install, two-way and advanced use
 
