@@ -27,6 +27,21 @@ from . import store
 from .platform import platform as host_platform
 
 CACHE_SECONDS = 600.0
+# Synthetic operating notes: the headline fits the delegate's 10% summary
+# budget with room for punctuation. Keep the budget regression test in sync.
+GEMMA_CHECK_TEXT = (
+    "Systems ready. The synthetic queue accepts a small batch of test records. "
+    "Each record carries a fixed label for this operating exercise. "
+    "The worker reads one pending record at a time. "
+    "A temporary folder holds the generated receipt for inspection. "
+    "The validator checks the receipt before reporting success. "
+    "The next record stays queued until the current check finishes. "
+    "A timer records the duration of the synthetic operation. "
+    "The report lists the completed checks in their original order. "
+    "An empty response causes the operation to fail validation. "
+    "The test uses invented operating notes throughout the batch. "
+    "The temporary folder is removed after the check finishes."
+)
 QUICK_CHECK_TIMEOUT = 2
 _quick_cache: dict[tuple[str | None, str], tuple[float, dict[str, Any]]] = {}
 
@@ -564,7 +579,7 @@ def run_gemma_check(config_path: str) -> dict[str, Any]:
         delegate_hash, validator_hash = _sha256(str(cfg.gemma_delegate_executable)), _sha256(str(cfg.gemma_receipt_validator_executable))
         if not delegate_hash or not validator_hash: return {"ok": False, "reason": "configured_file_missing"}
         with tempfile.TemporaryDirectory(prefix="agent-bridge-drift-") as receipts:
-            result = gemma_child.invoke({"job_id": "drift-synthetic", "task_type": "summarize", "input": "Synthetic drift check.", "params": {"instruction": ""}}, delegate=str(cfg.gemma_delegate_executable), python=str(cfg.gemma_python_executable), receipt_root=receipts, receipt_validator=str(cfg.gemma_receipt_validator_executable), model_digest=str(cfg.gemma_model_digest), delegate_sha256=delegate_hash, validator_sha256=validator_hash, timeout=cfg.gemma_timeout_seconds)
+            result = gemma_child.invoke({"job_id": "drift-synthetic", "task_type": "summarize", "input": GEMMA_CHECK_TEXT, "params": {"instruction": ""}}, delegate=str(cfg.gemma_delegate_executable), python=str(cfg.gemma_python_executable), receipt_root=receipts, receipt_validator=str(cfg.gemma_receipt_validator_executable), model_digest=str(cfg.gemma_model_digest), delegate_sha256=delegate_hash, validator_sha256=validator_hash, timeout=cfg.gemma_timeout_seconds)
         return {"ok": True, "receipt_id": result.get("invocation_id")}
     except Exception as exc:
         return {"ok": False, "reason": str(exc) or type(exc).__name__}
