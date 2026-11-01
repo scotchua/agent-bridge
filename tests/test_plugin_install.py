@@ -326,6 +326,43 @@ class PluginInstallTests(unittest.TestCase):
                                  stdin=subprocess.DEVNULL, timeout=60)
         self.assertNotIn("FAKE", exposed.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX launcher")
+    def test_launcher_reads_state_through_the_checked_physical_home(self) -> None:
+        # HOME is a symlink retargeted to another home after the trust checks
+        # (by the first sed call, just before the config is read).  The
+        # launcher must keep using the home it checked.
+        def fake_python(path: str, label: str) -> None:
+            Path(path).write_text('#!/bin/sh\ncase "$2" in -c) exit 0;; esac\n'
+                                  f'echo {label} "$PYTHONPYCACHEPREFIX"\n', encoding="utf-8")
+            os.chmod(path, 0o700)
+        good = os.path.join(self.tmp.name, "good-python")
+        evil = os.path.join(self.tmp.name, "evil-python")
+        fake_python(good, "FAKE")
+        fake_python(evil, "EVIL")
+        other = os.path.join(self.tmp.name, "other-home")
+        os.mkdir(other, 0o700)
+        with self.environment(packaged_mode=True):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {"launcher_python": good})
+        with self.environment(packaged_mode=True, extra={"HOME": other}):
+            packaged.prepare()
+            packaged.write_json(packaged.config_path(), {"launcher_python": evil})
+        link = os.path.join(self.tmp.name, "home-link")
+        os.symlink(self.home, link)
+        wrappers = os.path.join(self.tmp.name, "wrappers")
+        os.mkdir(wrappers, 0o700)
+        Path(os.path.join(wrappers, "sed")).write_text(
+            f'#!/bin/sh\nln -sfn "{other}" "{link}"\nexec /usr/bin/sed "$@"\n', encoding="utf-8")
+        os.chmod(os.path.join(wrappers, "sed"), 0o700)
+        env = {"HOME": link, "PATH": wrappers + ":/usr/bin:/bin"}
+        result = subprocess.run(["/bin/sh", str(ROOT / "bin" / "agent-bridge-plugin-mcp")],
+                                env=env, text=True, capture_output=True, check=False,
+                                stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(os.readlink(link), other)
+        label, prefix = result.stdout.split()
+        self.assertEqual(label, "FAKE")
+        self.assertTrue(prefix.startswith("/dev/null/"))
+
     @unittest.skipIf(os.name == "nt", "POSIX ancestry policy")
     def test_writable_ancestor_is_refused_unless_sticky(self) -> None:
         self.addCleanup(os.chmod, self.tmp.name, 0o700)

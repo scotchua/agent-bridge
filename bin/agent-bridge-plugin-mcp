@@ -7,12 +7,9 @@ export AGENT_BRIDGE_PACKAGED=1
 export AGENT_BRIDGE_PLUGIN_ROOT="$REPO"
 export PYTHONPATH="$REPO/src"
 export PYTHONDONTWRITEBYTECODE=1
-# Never import bytecode from the plugin tree: it is outside the verified digest.
-# This directory is not created; the prefix only redirects the cache lookup.
-export PYTHONPYCACHEPREFIX="${HOME:-}/.agent-bridge/packaged/no-bytecode"
-CONFIG="${HOME:-}/.agent-bridge/packaged/config.json"
-STATE="${HOME:-}/.agent-bridge"
-STATE_DIR="$STATE/packaged"
+# Never import bytecode: it is outside the verified digest.  Nothing can exist
+# under /dev/null, so every cache lookup misses and Python reads the source.
+export PYTHONPYCACHEPREFIX=/dev/null/agent-bridge-no-bytecode
 PY=""
 OWNER=$(id -u 2>/dev/null || true)
 # The same trust policy as packaged.py: the physical HOME is owned by this user
@@ -21,6 +18,12 @@ OWNER=$(id -u 2>/dev/null || true)
 # recorded interpreter and falls back to PATH.
 TRUSTED=""
 HOME_REAL=$(CDPATH= cd -P -- "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || HOME_REAL=""
+# Every later path is built from the checked physical HOME, never from HOME
+# itself: a symlink in HOME could be retargeted after the checks.  Only this
+# user or root can change a checked component.
+STATE="$HOME_REAL/.agent-bridge"
+STATE_DIR="$STATE/packaged"
+CONFIG="$STATE_DIR/config.json"
 if [ -n "$OWNER" ] && [ -n "$HOME_REAL" ] && [ "$HOME_REAL" != "/" ]; then
   if [ "$(find "$HOME_REAL" -prune -type d -user "$OWNER" ! -perm -g=w ! -perm -o=w -print 2>/dev/null || true)" = "$HOME_REAL" ]; then
     TRUSTED=1

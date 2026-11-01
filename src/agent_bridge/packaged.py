@@ -388,7 +388,8 @@ def write_json(path: str, value: Any, *, home: str | None = None) -> None:
 
 def _files_for_digest(root: str) -> list[Path]:
     # __pycache__ is excluded from the digest because the launchers point
-    # PYTHONPYCACHEPREFIX away from the source tree, so it is never imported.
+    # PYTHONPYCACHEPREFIX under /dev/null, where no cache can exist, so
+    # bytecode is never imported.
     base = Path(root)
     ignored = {".git", "__pycache__", ".pytest_cache"}
     files: list[Path] = []
