@@ -60,6 +60,31 @@ agreed” can be checked against the exchange.
 
 ## Getting started
 
+### Claude Code plugin, Claude to Codex
+
+In Claude Code, install the public marketplace and plugin:
+
+```
+/plugin marketplace add scotchua/agent-bridge
+/plugin install agent-bridge@agent-bridge
+```
+
+Then run `/agent-bridge:setup`. It sets up Claude to consult Codex only. It
+runs on macOS, Linux, and WSL; on native Windows use the clone install. It
+requires Python 3.11 or newer and an installed Codex CLI. Complete any Codex
+browser login yourself. The setup asks before its synthetic live verification,
+which uses your Codex subscription. It never asks for passwords, API keys,
+tokens, or OAuth codes, and it does not install Python or either CLI.
+
+This first plugin phase does not install Codex to Claude, does not migrate a
+clone installation, and does not create a stable launcher outside the plugin
+cache. If you already have a `codex-peer` registration (user, local, project
+`.mcp.json`, or Claude Desktop), setup refuses rather than creating a competing
+connection, and the plugin's server stays off while one is present. Keep the
+clone install or remove the old registration yourself.
+
+### Clone install, two-way and advanced use
+
 Use **Claude Code or Codex with access to local files and programs**, and give
 it this request:
 
