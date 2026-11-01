@@ -142,6 +142,7 @@ class PluginInstallTests(unittest.TestCase):
             value = revision.capture()
             self.assertTrue(value.startswith("plugin:1.0.0:"))
 
+    @unittest.skipIf(os.name == "nt", "POSIX launcher")
     def test_launcher_fails_closed_without_a_supported_interpreter(self) -> None:
         empty = os.path.join(self.tmp.name, "empty-bin")
         os.mkdir(empty)
