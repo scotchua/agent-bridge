@@ -615,6 +615,18 @@ a newly cleared continuation to recover.
 
 ## Checking it yourself
 
+`python3 setup_bridge.py local-status` reads the configured local queue and
+routing databases in SQLite read-only mode. Use `--config PATH` to select an
+orchestration config, `--days N` (default 7), and `--json` for structured output.
+The window covers today and the preceding N−1 local calendar days. Job counts
+use submission day and current outcome, separating dependency-held jobs from
+other queued jobs. Feedback covers completed work submitted in that window;
+rework and discard rates divide by reviewed work, with unreviewed work counted
+separately and rates shown as unavailable when nothing is reviewed. Checkpoint
+totals use creation time. The report includes metadata only, with no job
+content or raw errors. Missing databases produce a fixed error class and are
+never created by the command.
+
 CI runs the offline tests on **macOS, Linux and Windows**, with Python **3.11
 and 3.13**. The badge above links to current results. Windows fixes have also
 been exercised in an ordinary interactive Windows 11 VM account.
