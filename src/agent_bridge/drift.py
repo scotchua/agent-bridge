@@ -1012,7 +1012,8 @@ ALERT_REPEAT_SECONDS = 24 * 3600
 
 
 def report_attention(home: str | None, report: dict[str, Any]) -> None:
-    """Persist drift state when it changes and alert at most once per change.
+    """Persist drift state when it changes and alert at most once per change
+    that needs the person.
 
     Many processes call this on every loop.  The read, compare, write and the
     alert decision happen under one lock, so two of them cannot both see a new
@@ -1025,7 +1026,6 @@ def report_attention(home: str | None, report: dict[str, Any]) -> None:
     attention = report.get("attention", report.get("needs_you", []))
     signature = json.dumps({"changed": sorted(report.get("changed", [])),
                             "needs_you": sorted(attention)}, sort_keys=True)
-    clear = bool(report.get("ok", False)) and not attention
     try:
         store.secure_mkdir(locations["root"])
         with store.file_lock(locations["attention_lock"], timeout=2.0):
@@ -1035,7 +1035,10 @@ def report_attention(home: str | None, report: dict[str, Any]) -> None:
                 store.atomic_write_json(locations["attention"],
                                         {**report, "signature": signature,
                                          "signature_since": time.time()})
-            if clear:
+            # A version change the bridge absorbed on its own is recorded
+            # above for the doctor's probe, but only a line that needs the
+            # person earns a desktop alert.
+            if not attention:
                 return
             now = time.time()
             alerts = store.read_json_or_none(locations["alerts"])
