@@ -326,6 +326,46 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertEqual(report["attention"], ["Run setup_bridge.py doctor once to record a baseline."])
         self.assertTrue(report["ok"])
 
+    def quick_with_baseline(self, current: dict, baseline: dict, *, config: str) -> dict:
+        drift._quick_cache.clear()
+        with mock.patch.object(drift, "inventory", return_value=current), \
+             mock.patch.object(drift, "_read_baseline", return_value=baseline), \
+             mock.patch.object(drift, "discover_config", return_value=config):
+            return drift.quick_check(str(self.config), home=str(self.home))
+
+    def test_quick_check_version_change_alone_needs_no_attention(self) -> None:
+        baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        current = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        current["executables"]["codex"]["version"] = "2"
+        report = self.quick_with_baseline(current, baseline, config=str(self.config))
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["changed"], ["codex"])
+        self.assertEqual(report["attention"], [])
+
+    def test_quick_check_conditions_that_cannot_repair_themselves_need_attention(self) -> None:
+        baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        config = str(self.config)
+        cases = {}
+        missing_path = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        missing_path["paths"] = {"state_root": {"path": str(self.home / "gone"), "exists": False}}
+        cases["missing_path"] = (missing_path, config, "Configured path state_root is missing")
+        cases["missing_config"] = (self.inventory(codex=self.home / "codex", claude=self.home / "claude"),
+                                   None, "No installed orchestration config")
+        for name in ("delegate", "validator"):
+            pin = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+            pin["gemma"][name] = {"path": "/configured/gemma", "pin_matches": False}
+            cases["pin_" + name] = (pin, config, f"Gemma {name} no longer matches its pinned checksum")
+        for name in ("claude", "codex"):
+            gone = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+            gone["executables"][name]["path"] = None
+            cases["uninstalled_" + name] = (gone, config, f"{name.capitalize()} is no longer installed")
+        for label, (current, resolved, message) in cases.items():
+            with self.subTest(label=label):
+                report = self.quick_with_baseline(current, baseline, config=resolved)
+                self.assertFalse(report["ok"])
+                self.assertEqual(len(report["attention"]), 1)
+                self.assertIn(message, report["attention"][0])
+
     def test_scheduled_baseline_uses_only_free_checks(self) -> None:
         current = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
         calls: list[list[str]] = []

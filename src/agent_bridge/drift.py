@@ -713,15 +713,26 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
     # of drift.  Holding every provider on a fresh install would make it
     # impossible for the bridge to work until someone happened to run doctor.
     names = changes(current, baseline) if baseline else []
-    if not resolved: names.append("orchestration_config")
+    # A version change alone is absorbed by the bridge's own requalification
+    # and stays quiet.  Each condition below cannot repair itself, so it
+    # carries an attention line and therefore a desktop alert.
+    attention = (["Run setup_bridge.py doctor once to record a baseline."]
+                 if baseline is None else [])
+    if not resolved:
+        names.append("orchestration_config")
+        attention.append("No installed orchestration config was found; install the gate, then run setup_bridge.py doctor.")
     for name, state in current["paths"].items():
-        if not state["exists"]: names.append(name)
+        if not state["exists"]:
+            names.append(name)
+            attention.append(f"Configured path {name} is missing; repair the orchestration config and run setup_bridge.py doctor.")
+    for name in ("claude", "codex"):
+        if name in names and not current["executables"][name].get("path"):
+            attention.append(f"{name.capitalize()} is no longer installed where the bridge found it; reinstall it, then run setup_bridge.py doctor.")
     for key_name in ("delegate", "validator"):
         state = current["gemma"][key_name]
         if state.get("path") and not state.get("pin_matches"):
             names.append("gemma_" + key_name)
-    attention = (["Run setup_bridge.py doctor once to record a baseline."]
-                 if baseline is None else [])
+            attention.append(f"Gemma {key_name} no longer matches its pinned checksum; repair it and run setup_bridge.py doctor.")
     result = {"ok": not names, "changed": sorted(set(names)), "inventory": current,
               "baseline": "missing" if baseline is None else "recorded",
               "attention": attention, "checked_at": time.time()}
@@ -1012,7 +1023,8 @@ ALERT_REPEAT_SECONDS = 24 * 3600
 
 
 def report_attention(home: str | None, report: dict[str, Any]) -> None:
-    """Persist drift state when it changes and alert at most once per change.
+    """Persist drift state when it changes and alert at most once per change
+    that needs the person.
 
     Many processes call this on every loop.  The read, compare, write and the
     alert decision happen under one lock, so two of them cannot both see a new
@@ -1025,7 +1037,6 @@ def report_attention(home: str | None, report: dict[str, Any]) -> None:
     attention = report.get("attention", report.get("needs_you", []))
     signature = json.dumps({"changed": sorted(report.get("changed", [])),
                             "needs_you": sorted(attention)}, sort_keys=True)
-    clear = bool(report.get("ok", False)) and not attention
     try:
         store.secure_mkdir(locations["root"])
         with store.file_lock(locations["attention_lock"], timeout=2.0):
@@ -1035,7 +1046,10 @@ def report_attention(home: str | None, report: dict[str, Any]) -> None:
                 store.atomic_write_json(locations["attention"],
                                         {**report, "signature": signature,
                                          "signature_since": time.time()})
-            if clear:
+            # A version change the bridge absorbed on its own is recorded
+            # above for the doctor's probe, but only a line that needs the
+            # person earns a desktop alert.
+            if not attention:
                 return
             now = time.time()
             alerts = store.read_json_or_none(locations["alerts"])

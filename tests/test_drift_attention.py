@@ -15,8 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_bridge import drift, store
 
-DRIFTED = {"ok": False, "changed": ["ollama"], "attention": []}
-OTHER = {"ok": False, "changed": ["gemma_delegate", "ollama"], "attention": []}
+DRIFTED = {"ok": False, "changed": ["ollama"], "attention": ["Run setup_bridge.py doctor."]}
+OTHER = {"ok": False, "changed": ["gemma_delegate", "ollama"], "attention": ["Run setup_bridge.py doctor."]}
+ABSORBED = {"ok": False, "changed": ["ollama"], "attention": []}
 CLEAR = {"ok": True, "changed": [], "attention": []}
 
 
@@ -57,6 +58,12 @@ class AttentionTests(unittest.TestCase):
         drift.report_attention(self.home, dict(CLEAR))
         self.assertEqual(self.alerts(), 0)
         self.assertTrue(self.state()["ok"])
+
+    def test_a_change_with_nothing_for_the_person_records_state_without_alerting(self) -> None:
+        for changed in (["ollama"], ["codex", "ollama"], ["claude", "codex", "ollama"]):
+            drift.report_attention(self.home, {**ABSORBED, "changed": changed})
+        self.assertEqual(self.alerts(), 0)
+        self.assertEqual(self.state()["changed"], ["claude", "codex", "ollama"])
 
     def test_alert_memory_survives_a_brief_recovery(self) -> None:
         for report in (DRIFTED, CLEAR, DRIFTED, CLEAR, DRIFTED):
