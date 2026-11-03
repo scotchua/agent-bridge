@@ -145,14 +145,24 @@ Also measured:
 Claude peer: `--safe-mode`, plus `--strict-mcp-config` with
 `--mcp-config '{"mcpServers":{}}'`, plus `--tools ""`, plus
 `--setting-sources ''`, plus `--max-budget-usd`. The empty strict MCP config is
-what stops the peer loading this bridge and calling back into it.
+what stops the peer loading this bridge and calling back into it. Web access is
+off with that empty tool set. If you offer a per-call research option, switch
+only that turn to `--tools "WebSearch,WebFetch"` plus
+`--allowedTools "WebSearch,WebFetch"` (print mode has no one to answer a
+permission prompt) and leave every other flag alone.
 
 Codex peer: `--ignore-user-config`, `--ignore-rules`, `--strict-config`,
 `--skip-git-repo-check`, sandbox read-only, in a dedicated empty working
 directory under a dedicated `CODEX_HOME`. `--ignore-user-config` blocks
 `$CODEX_HOME/config.toml`, which is where `codex mcp add` writes and therefore
 the one recursion vector that matters. Additionally refuse to run if that file
-ever appears in the isolated home.
+ever appears in the isolated home. Pin web search explicitly with
+`-c web_search="disabled"` on every start and resume rather than trusting the
+CLI default, and use `"live"` only for a turn the caller marked as research.
+
+Make research a per-call boolean that defaults to off, validate it as a real
+boolean, and refuse it for client-derived material at both the broker and the
+worker. Tell callers that web results are untrusted data.
 
 State the limits honestly in code comments, in the tool descriptions, and in the
 prompt you send:

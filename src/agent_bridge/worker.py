@@ -66,6 +66,7 @@ def _run_peer(
     workspace: str,
     attempt_dir: str,
     deadline: float,
+    research: bool = False,
 ) -> PeerOutcome:
     # Backends accept text; their pipe writers encode UTF-8 without translation.
     if isinstance(prompt, bytes):
@@ -75,13 +76,13 @@ def _run_peer(
         return claude_backend.run_consultation(
             cfg, prompt=prompt, schema=schema, session_id=session_id,
             resume=resume, workspace=workspace, attempt_dir=attempt_dir,
-            deadline=deadline,
+            deadline=deadline, research=research,
         )
     return codex_backend.run_consultation(
         cfg, prompt=prompt, schema_file=schema_file,
         thread_id=peer_session_id if resume else None,
         workspace=workspace, attempt_dir=attempt_dir,
-        deadline=deadline,
+        deadline=deadline, research=research,
     )
 
 
@@ -134,6 +135,8 @@ def execute(job_dir: str) -> int:
     peer = request["peer"]
     caller = request["caller"]
     resume = bool(request["resume"])
+    # Absent in a request written before research mode existed: off.
+    research = request.get("research", False) is True
     budget_started = request.get("budget_started_monotonic", worker_started)
     deadline = request.get("deadline_monotonic", budget_started + cfg.request_timeout(peer))
     stages = [{"stage": "admission_and_queue", "elapsed_seconds": round(
@@ -264,6 +267,11 @@ def execute(job_dir: str) -> int:
                     cfg, request, published.get("redaction_handoff"), prompt_text,
                     schema, schema_file, peer_session_id, resume,
                 )
+            # Defence in depth behind the broker: web access is never allowed
+            # for client-derived material, checked before any peer is spawned.
+            if research and request["source_classification"].strip().lower() in send_binding.CLIENT_DERIVED:
+                category = ErrorCategory.SOURCE_CLASSIFICATION_REFUSED
+                break
             try:
                 # U3: bind this attempt's exact bytes and release them just
                 # before the backend starts. Client-derived only.
@@ -281,7 +289,7 @@ def execute(job_dir: str) -> int:
                 cfg, peer, prompt=send_prompt, schema=schema, schema_file=schema_file,
                 peer_session_id=peer_session_id, resume=resume,
                 workspace=workspace, attempt_dir=attempt_dir,
-                deadline=deadline,
+                deadline=deadline, research=research,
             )
             stages.extend({**stage, "attempt": attempt} for stage in outcome.elapsed_stages)
             validation_started = time.monotonic()
@@ -413,6 +421,7 @@ def execute(job_dir: str) -> int:
         # check this field can support (a receipt that actually routed
         # locally) before this job was ever admitted.
         "local_first": request.get("local_first"),
+        "research": research,
         "resume": bool(request["resume"]),
         "status": status,
         "error_category": category.value,

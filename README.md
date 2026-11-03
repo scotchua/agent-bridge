@@ -182,6 +182,35 @@ retained by the providers.
 See [Data retention](docs/DATA-RETENTION.md) for what is stored locally, how the
 30-day defaults work, and what cleanup and uninstall leave behind.
 
+## Research mode
+
+Research mode lets a peer search and read the public web for one turn.
+
+- **Off by default.** Without it, web access is disabled for both peers. Claude
+  runs with `--tools ""`. Codex runs with `-c web_search="disabled"`, pinned on
+  every start and resume. Before this option existed Codex consultations did not
+  pin web search at all, so this is a behaviour change: they now have it pinned
+  off unless you ask for research.
+- **How to ask.** Pass `research: true` to `claude_start`, `claude_continue`,
+  `codex_start` or `codex_continue`. It applies to that one turn only. A later
+  continuation without it is off again.
+- **What it changes.** For Claude, the only built-in tools enabled are
+  `WebSearch` and `WebFetch`, and every other isolation flag is unchanged. For
+  Codex, web search is set to `live`. The peer still has no repository, no
+  files and no MCP servers.
+- **Client-derived material is refused.** `research: true` with a
+  `client-derived` or `client_derived` classification is rejected at the broker
+  and again in the worker before the peer starts, even when the operator has
+  opted client-derived material into the peer route. A value that is not a real
+  boolean (`1`, `"true"`) is refused as `input_schema_invalid`.
+- **Web results are untrusted data.** Pages can carry instructions aimed at the
+  peer, and the peer's reply can repeat or be shaped by them. Treat the reply as
+  evidence to check, as with any peer reply. Put nothing in a research prompt
+  that you would not want in a search query.
+- **Recorded.** The `research` flag appears in `request.json`, `provenance.json`,
+  the ledger record, each attempt's notes and the provenance returned by
+  `claude_read` and `codex_read`.
+
 ## Optional local model
 
 If you already have a model installed in Ollama, setup can connect it using its
@@ -536,7 +565,8 @@ a newly cleared continuation to recover.
   confined. File content read this way can reach the provider and appear in
   replies, regardless of the request label. Built-in assets can remain available. Privacy labels do not repair
   this boundary; do not use this setup where enforced read confinement is required.
-  The Claude peer runs with tools and customizations disabled.
+  The Claude peer runs with tools and customizations disabled, except that a
+  call with `research: true` enables only `WebSearch` and `WebFetch`.
 - **Model and effort settings are separate from your interactive session.**
   Choose peer settings deliberately using [INSTALL.md](INSTALL.md). Records
   distinguish requested settings from observed information where available;

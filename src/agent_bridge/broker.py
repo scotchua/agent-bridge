@@ -28,7 +28,8 @@ CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
 HANDOFF_FIELDS = {"preparation_dir", "clearance_sha256"}
-START_FIELDS = {"prompt", "source_classification", "label", "local_first", "exception_id"} | HANDOFF_FIELDS
+START_FIELDS = {"prompt", "source_classification", "label", "local_first", "exception_id",
+                "research"} | HANDOFF_FIELDS
 CONTINUE_FIELDS = START_FIELDS | {"conversation_id"}
 
 #: local_first.bypass's closed vocabulary (design section 2.8).
@@ -96,6 +97,16 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
     accepted = {c.lower() for c in cfg.peer_allowed_classifications(peer)}
     if normalized not in accepted and not (client_derived and "client_derived" in accepted):
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+
+    # Research mode lets the peer search and read the public web for one turn.
+    # It is off unless the caller sets a real boolean (an int or string is a
+    # schema error, not a truthy value) and is never allowed for client-derived
+    # material, whichever spelling the classification uses.
+    if "research" in args:
+        if type(args["research"]) is not bool:
+            raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+        if args["research"] and client_derived:
+            raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
 
     label = args.get("label")
     if label is not None:
@@ -797,6 +808,7 @@ def _prepare_job(
         "source_classification": args["source_classification"].strip().lower(),
         "label": args.get("label"),
         "local_first": args.get("local_first"),
+        "research": bool(args.get("research", False)),
         "resume": resume,
         "budget_started_monotonic": budget_started,
         "deadline_monotonic": budget_started + cfg.request_timeout(peer),
@@ -926,6 +938,7 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
             "peer_observed_model": prov.get("peer_observed_model"),
             "peer_session_id": prov.get("peer_session_id"),
             "source_classification": prov.get("source_classification"),
+            "research": prov.get("research"),
             "prompt_sha256": prov.get("prompt_sha256"),
             "response_sha256": prov.get("response_sha256"),
             "attempt_count": prov.get("attempt_count"),
