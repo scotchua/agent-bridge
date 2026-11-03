@@ -364,6 +364,120 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(send_binding.CLIENT_DERIVED, frozenset({"client_derived", "client-derived"}))
 
 
+class ConversationExposureTests(unittest.TestCase):
+    """A conversation that ever carried client data never turns research on."""
+
+    def setUp(self) -> None:
+        self.sb = Sandbox()
+        self.addCleanup(self.sb.cleanup)
+
+    def finished_internal(self) -> str:
+        started, status, _ = self.sb.run_to_completion("codex")
+        self.assertEqual(status["status"], "complete", json.dumps(status))
+        return started["conversation_id"]
+
+    def continue_(self, cid: str, **extra) -> dict:
+        args = {"conversation_id": cid, "prompt": "Next turn.",
+                "source_classification": "internal", **extra}
+        return broker.continue_(self.sb.cfg, "codex", args)
+
+    def test_start_records_whether_the_first_turn_was_client_derived(self) -> None:
+        self.sb.cfg.raw["client_derived_routes"] = ["peer"]
+        with patch.object(broker, "_dispatch", side_effect=lambda cfg, peer, cid, job: {
+                "job_id": job, "conversation_id": cid}):
+            for label, expected in (("internal", False), ("client_derived", True),
+                                    ("client-derived", True)):
+                with self.subTest(label=label):
+                    cid = self.sb.consult("codex", classification=label)["conversation_id"]
+                    record = registry.load_conversation(self.sb.cfg, cid)
+                    self.assertIs(record["client_derived_seen"], expected)
+
+    def test_broker_refuses_research_after_any_client_derived_turn(self) -> None:
+        cid = self.finished_internal()
+        registry.update_conversation(self.sb.cfg, cid, client_derived_seen=True)
+        with patch.object(registry, "claim_conversation_slot") as claim:
+            with self.assertRaises(BrokerError) as caught:
+                self.continue_(cid, research=True)
+        claim.assert_not_called()
+        self.assertIs(caught.exception.category, ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+        # Research off still works on the same conversation.
+        self.assertEqual(self.sb.wait(self.continue_(cid)["job_id"])["status"], "complete")
+
+    def test_legacy_record_without_the_field_refuses_research(self) -> None:
+        cid = self.finished_internal()
+        path = self.sb.cfg.conversation_path(cid)
+        record = store.read_json_atomic(path)
+        del record["client_derived_seen"]
+        store.atomic_write_json(path, record)
+        with self.assertRaises(BrokerError) as caught:
+            self.continue_(cid, research=True)
+        self.assertIs(caught.exception.category, ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+        self.assertEqual(self.sb.wait(self.continue_(cid)["job_id"])["status"], "complete")
+
+    def test_claim_refuses_research_under_the_lock_and_leaves_the_slot_free(self) -> None:
+        cid = self.finished_internal()
+        registry.update_conversation(self.sb.cfg, cid, client_derived_seen=True)
+        with self.assertRaises(BrokerError) as caught:
+            registry.claim_conversation_slot(
+                self.sb.cfg, cid, "codex", "job-forged", 10, research=True)
+        self.assertIs(caught.exception.category, ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+        self.assertNotEqual(
+            registry.load_conversation(self.sb.cfg, cid).get("active_job_id"), "job-forged")
+
+    def test_a_client_derived_continuation_marks_the_conversation_for_good(self) -> None:
+        cid = self.finished_internal()
+        self.assertIs(registry.load_conversation(self.sb.cfg, cid)["client_derived_seen"], False)
+        registry.claim_conversation_slot(
+            self.sb.cfg, cid, "codex", "job-client", 10, client_derived=True)
+        self.assertIs(registry.load_conversation(self.sb.cfg, cid)["client_derived_seen"], True)
+        # Sticky: a later internal claim does not clear it.
+        registry.release_conversation_slot(self.sb.cfg, cid, "job-client")
+        registry.claim_conversation_slot(self.sb.cfg, cid, "codex", "job-internal", 10)
+        self.assertIs(registry.load_conversation(self.sb.cfg, cid)["client_derived_seen"], True)
+
+    def test_internal_only_conversation_keeps_per_turn_research(self) -> None:
+        cid = self.finished_internal()
+        self.assertEqual(
+            self.sb.wait(self.continue_(cid, research=True)["job_id"])["status"], "complete")
+        self.assertIs(registry.load_conversation(self.sb.cfg, cid)["client_derived_seen"], False)
+
+    def test_worker_refuses_research_when_the_record_shows_exposure(self) -> None:
+        for state in ("exposed", "legacy"):
+            with self.subTest(state=state):
+                sb = Sandbox()
+                self.addCleanup(sb.cleanup)
+                with patch.object(broker, "_dispatch", side_effect=lambda cfg, peer, cid, job: {
+                        "job_id": job, "conversation_id": cid}):
+                    started = sb.consult("codex")
+                job_dir = sb.cfg.job_dir(started["job_id"])
+                request_path = os.path.join(job_dir, "request.json")
+                request = store.read_json_atomic(request_path)
+                # A request that bypassed the broker's exposure check.
+                request["research"] = True
+                store.atomic_write_json(request_path, request)
+                path = sb.cfg.conversation_path(started["conversation_id"])
+                record = store.read_json_atomic(path)
+                if state == "exposed":
+                    record["client_derived_seen"] = True
+                else:
+                    del record["client_derived_seen"]
+                store.atomic_write_json(path, record)
+                with patch.object(worker, "_run_peer") as run_peer:
+                    code = worker.execute(job_dir)
+                run_peer.assert_not_called()
+                self.assertEqual(code, 1)
+                self.assertEqual(sb.provenance(started["job_id"])["error_category"],
+                                 ErrorCategory.SOURCE_CLASSIFICATION_REFUSED.value)
+
+    def test_worker_exposure_check_fails_closed(self) -> None:
+        self.assertTrue(worker._conversation_refuses_research(self.sb.cfg, "no-such-conversation"))
+        cid = self.finished_internal()
+        self.assertFalse(worker._conversation_refuses_research(self.sb.cfg, cid))
+        with open(self.sb.cfg.conversation_path(cid), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertTrue(worker._conversation_refuses_research(self.sb.cfg, cid))
+
+
 class ClearedPromptRetryTests(unittest.TestCase):
     """A handoff job re-validates its bytes through _cleared_prompt on a retry."""
 

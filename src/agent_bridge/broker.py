@@ -65,6 +65,10 @@ def ok_response(**fields: Any) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- validation
+def _client_derived(args: dict[str, Any]) -> bool:
+    return args["source_classification"].strip().lower() in send_binding.CLIENT_DERIVED
+
+
 def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
                      peer: str, operation: str = "start") -> None:
     if not isinstance(args, dict):
@@ -673,6 +677,9 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
                 "peer": peer,
                 "label": args.get("label"),
                 "source_classification": args["source_classification"].strip().lower(),
+                # Sticky: once any turn is client-derived, research stays off
+                # for the rest of the conversation.
+                "client_derived_seen": _client_derived(args),
                 "peer_session_id": peer_session_id,
                 "workspace": workspace,
                 "turns": 0,
@@ -706,6 +713,10 @@ def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     conversation = registry.load_conversation(cfg, conversation_id)
     if conversation.get("peer") != peer:
         raise BrokerError(ErrorCategory.CONVERSATION_NOT_FOUND)
+    research = args.get("research", False) is True
+    # Early refusal before preflight; the claim below re-checks under lock.
+    if research and registry.research_refused(conversation):
+        raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
     if HANDOFF_FIELDS & set(args):
         validate_handoff(cfg, args, peer, conversation_id,
                          conversation.get("peer_session_id"), resume=True)
@@ -725,6 +736,7 @@ def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
             registry.claim_conversation_slot(
                 cfg, conversation_id, caller, job_id, cfg.limit("max_turns_per_conversation"),
                 timeout=min(10.0, max(0.0, deadline - time.monotonic())),
+                client_derived=_client_derived(args), research=research,
             )
             _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=True,
                          budget_started=budget_started)

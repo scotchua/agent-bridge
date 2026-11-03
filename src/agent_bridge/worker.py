@@ -125,6 +125,14 @@ def _cleared_prompt(
         raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID) from exc
 
 
+def _conversation_refuses_research(cfg: Config, conversation_id: str) -> bool:
+    # A record that cannot be read gives no proof the history is clean.
+    try:
+        return registry.research_refused(registry.load_conversation(cfg, conversation_id))
+    except (BrokerError, OSError, ValueError):
+        return True
+
+
 def execute(job_dir: str) -> int:
     worker_started = time.monotonic()
     store.set_umask()
@@ -268,8 +276,11 @@ def execute(job_dir: str) -> int:
                     schema, schema_file, peer_session_id, resume,
                 )
             # Defence in depth behind the broker: web access is never allowed
-            # for client-derived material, checked before any peer is spawned.
-            if research and request["source_classification"].strip().lower() in send_binding.CLIENT_DERIVED:
+            # for client-derived material, in this turn or any earlier turn of
+            # the conversation, checked before any peer is spawned.
+            if research and (
+                    request["source_classification"].strip().lower() in send_binding.CLIENT_DERIVED
+                    or _conversation_refuses_research(cfg, conversation_id)):
                 category = ErrorCategory.SOURCE_CLASSIFICATION_REFUSED
                 break
             try:
