@@ -713,15 +713,26 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
     # of drift.  Holding every provider on a fresh install would make it
     # impossible for the bridge to work until someone happened to run doctor.
     names = changes(current, baseline) if baseline else []
-    if not resolved: names.append("orchestration_config")
+    # A version change alone is absorbed by the bridge's own requalification
+    # and stays quiet.  Each condition below cannot repair itself, so it
+    # carries an attention line and therefore a desktop alert.
+    attention = (["Run setup_bridge.py doctor once to record a baseline."]
+                 if baseline is None else [])
+    if not resolved:
+        names.append("orchestration_config")
+        attention.append("No installed orchestration config was found; install the gate, then run setup_bridge.py doctor.")
     for name, state in current["paths"].items():
-        if not state["exists"]: names.append(name)
+        if not state["exists"]:
+            names.append(name)
+            attention.append(f"Configured path {name} is missing; repair the orchestration config and run setup_bridge.py doctor.")
+    for name in ("claude", "codex"):
+        if name in names and not current["executables"][name].get("path"):
+            attention.append(f"{name.capitalize()} is no longer installed where the bridge found it; reinstall it, then run setup_bridge.py doctor.")
     for key_name in ("delegate", "validator"):
         state = current["gemma"][key_name]
         if state.get("path") and not state.get("pin_matches"):
             names.append("gemma_" + key_name)
-    attention = (["Run setup_bridge.py doctor once to record a baseline."]
-                 if baseline is None else [])
+            attention.append(f"Gemma {key_name} no longer matches its pinned checksum; repair it and run setup_bridge.py doctor.")
     result = {"ok": not names, "changed": sorted(set(names)), "inventory": current,
               "baseline": "missing" if baseline is None else "recorded",
               "attention": attention, "checked_at": time.time()}
