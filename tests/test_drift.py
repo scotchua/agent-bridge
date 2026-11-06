@@ -282,6 +282,38 @@ class IsolatedDriftTests(unittest.TestCase):
             drift.doctor(str(self.config), home=str(self.home)); first = drift.doctor(str(self.config), home=str(self.home)); second = drift.doctor(str(self.config), home=str(self.home))
         self.assertIn("codex", first["changed"]); self.assertIn("codex", second["changed"])
 
+    def test_passing_gemma_check_records_ollama_inventory(self) -> None:
+        old, current = self.inventory(), self.inventory()
+        current["ollama"] = {"version": "1", "model_present": True}
+        drift._write_baseline(str(self.home), old)
+        with mock.patch.object(drift, "inventory", return_value=current), \
+             mock.patch.object(drift, "run_gemma_check", return_value={"ok": True}) as gemma:
+            report = drift.doctor(str(self.config), home=str(self.home),
+                                  bridge=self.bridge(self.home / "codex"))
+        gemma.assert_called_once_with(str(self.config))
+        self.assertIn("gemma", report["requalified"])
+        baseline = drift._read_baseline(str(self.home))
+        self.assertEqual(baseline["ollama"], current["ollama"])
+        self.assertNotIn("ollama", drift.changes(current, baseline))
+
+    def test_failed_gemma_check_preserves_ollama_baseline(self) -> None:
+        old, current = self.inventory(), self.inventory()
+        current["ollama"] = {"version": "1", "model_present": True}
+        # A passing CLI check forces a baseline merge despite Gemma's failure.
+        current["executables"]["claude"]["sha256"] = "new"
+        drift._write_baseline(str(self.home), old)
+        with mock.patch.object(drift, "inventory", return_value=current), \
+             mock.patch.object(drift, "run_cli_check", return_value={"ok": True}), \
+             mock.patch.object(drift, "run_gemma_check", return_value={"ok": False}) as gemma:
+            report = drift.doctor(str(self.config), home=str(self.home),
+                                  bridge=self.bridge(self.home / "codex"))
+        gemma.assert_called_once_with(str(self.config))
+        self.assertNotIn("gemma", report["requalified"])
+        baseline = drift._read_baseline(str(self.home))
+        self.assertEqual(baseline["executables"]["claude"], current["executables"]["claude"])
+        self.assertEqual(baseline["ollama"], old["ollama"])
+        self.assertIn("ollama", drift.changes(current, baseline))
+
     def test_schedule_is_nightly_and_uses_launchctl_wrapper(self) -> None:
         with mock.patch.object(drift, "_schedule_launchctl") as launcher, mock.patch.object(drift, "discover_config", return_value=str(self.config)):
             path = drift.install_schedule(home=str(self.home)); data = plistlib.loads(Path(path).read_bytes()); drift.remove_schedule(home=str(self.home))
