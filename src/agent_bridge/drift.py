@@ -384,7 +384,7 @@ def _merge_good_baseline(old: dict[str, Any] | None, current: dict[str, Any], pa
     for name in ("claude", "codex"):
         if name not in {"claude", "codex"} or name in passed or current["executables"][name] == old.get("executables", {}).get(name):
             merged.setdefault("executables", {})[name] = current["executables"][name]
-    if "ollama" in passed or current["ollama"] == old.get("ollama"):
+    if "gemma" in passed or current["ollama"] == old.get("ollama"):
         merged["ollama"] = current["ollama"]
     for name in ("delegate", "validator"):
         component = "gemma_" + name
