@@ -186,7 +186,16 @@ class OutputRouterMutationTests(unittest.TestCase):
         with mock.patch.object(output_router, "run_command", return_value=7) as run:
             code = output_router.main(["run", "--config", "invented-config", "--", "invented-command"])
         self.assertEqual(code, 7)
-        run.assert_called_once_with(["invented-command"], config_path="invented-config")
+        run.assert_called_once_with(["invented-command"], config_path="invented-config", caller="claude")
+
+    def test_main_passes_codex_caller_and_rejects_unknown_callers(self):
+        with mock.patch.object(output_router, "run_command", return_value=0) as run:
+            self.assertEqual(output_router.main(["run", "--config", "invented-config", "--caller", "codex",
+                                                 "--", "invented-command"]), 0)
+        run.assert_called_once_with(["invented-command"], config_path="invented-config", caller="codex")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            output_router.main(["run", "--config", "invented-config", "--caller", "unknown",
+                                "--", "invented-command"])
 
     def test_main_rejects_empty_command(self):
         with contextlib.redirect_stderr(io.StringIO()):

@@ -1998,13 +1998,13 @@ def hook_output(decision: Decision, updated_input: dict[str, Any] | None = None)
 
 def inline_output_update(client: str, payload: dict[str, Any], decision: Decision, *,
                          state_root: str, config_path: str) -> dict[str, Any] | None:
-    """Return Claude's ``updatedInput`` for one eligible original Bash call.
+    """Return either host's ``updatedInput`` for one eligible original Bash call.
 
     This runs after :func:`run_hook`: the write/protected-path gate judges
     the original command and remains the only authority on allow or deny.
     The returned mapping changes only the command field.
     """
-    if client != "claude" or not decision.allowed or payload.get("tool_name") != "Bash":
+    if client not in CLIENTS or not decision.allowed or payload.get("tool_name") != "Bash":
         return None
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -2017,7 +2017,7 @@ def inline_output_update(client: str, payload: dict[str, Any], decision: Decisio
 
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
         repo = repo_key(cwd)
-        if repo is None or not output_router.is_routable_command(command):
+        if repo is None or not output_router.is_routable_command(command, cwd=cwd):
             return None
         policy = autoroute.load_policy(state_root)
         repo_policy = policy.for_repo(repo)
@@ -2026,14 +2026,16 @@ def inline_output_update(client: str, payload: dict[str, Any], decision: Decisio
                 or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS):
             return None
         updated = dict(tool_input)
-        key = "command" if "command" in tool_input else "cmd"
+        # Codex's PreToolUse contract requires a string command field, even
+        # if a compatibility payload supplied cmd. Claude retains its key.
+        key = "command" if client == "codex" or "command" in tool_input else "cmd"
         # The host shell has no agent_bridge on its path: name this checkout's
         # src explicitly, or the wrapper fails to import and the original
         # command never runs at all.
         src_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         updated[key] = (f"/usr/bin/env PYTHONPATH={shlex.quote(src_root)} PYTHONDONTWRITEBYTECODE=1 "
                         f"{shlex.quote(sys.executable)} -P -m agent_bridge.orchestration.output_router run "
-                        f"--config {shlex.quote(os.path.realpath(config_path))} -- /bin/sh -c "
+                        f"--config {shlex.quote(os.path.realpath(config_path))} --caller {client} -- /bin/sh -c "
                         f"{shlex.quote(command)}")
         return updated
     except Exception:

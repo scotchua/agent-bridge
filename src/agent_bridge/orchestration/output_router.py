@@ -1,7 +1,7 @@
 """Pre-context local routing for large, read-only command output.
 
 This module deliberately has no provider client or network path.  The gate
-rewrites an eligible Claude Bash input to this module *before* the command
+rewrites an eligible Claude or Codex Bash input to this module *before* the command
 runs, so the original output is captured locally instead of first entering
 the assistant context.  Any refusal, deferral, timeout, or internal failure
 falls back to the original bytes with one visible waiver line.
@@ -54,9 +54,11 @@ def _git_routable(words: list[str]) -> bool:
             rest = rest[2:]
         else:
             rest = rest[1:]
-    if not rest or rest[0] not in {"log", "diff", "show"}:
+    if not rest or rest[0] not in {"log", "diff", "show", "status"}:
         return False
     subcommand, arguments = rest[0], rest[1:]
+    if subcommand == "status":
+        return True
     if subcommand == "log":
         return True
     if "--stat" in arguments or "--" in arguments:
@@ -67,11 +69,47 @@ def _git_routable(words: list[str]) -> bool:
                    for value in arguments)
 
 
-def is_routable_command(command: str) -> bool:
+def _single_file_reader(program: str, arguments: list[str], cwd: str | None) -> bool:
+    """Accept bounded reader options and exactly one existing regular file."""
+    paths = []
+    options = True
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        index += 1
+        if options and value == "--":
+            options = False
+            continue
+        if options and value.startswith("-"):
+            if program == "cat":
+                if not re.fullmatch(r"-[AbEnstTeuv]+", value):
+                    return False
+            elif value in {"-n", "-c", "--lines", "--bytes"}:
+                if index == len(arguments) or not re.fullmatch(r"[+-]?\d+", arguments[index]):
+                    return False
+                index += 1
+            elif not re.fullmatch(r"(?:-[nc][+-]?\d+|-\d+|--(?:lines|bytes)=[+-]?\d+|-[qv])", value):
+                return False
+        else:
+            paths.append(value)
+    if len(paths) != 1 or paths[0] == "-" or any(char in paths[0] for char in "*?[]{}~"):
+        return False
+    path = Path(paths[0])
+    if not path.is_absolute() and cwd is not None:
+        path = Path(cwd) / path
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def is_routable_command(command: str, *, cwd: str | None = None) -> bool:
     """Narrow, side-effect-free command classes worth pre-context routing."""
     if not isinstance(command, str) or not command.strip() or is_wrapped_command(command):
         return False
-    if re.search(r"\|[^|]|<<|(?<![<>])>{1,2}(?!&)|(?:^|[\s;])tee(?:\s|$)", command):
+    # Only a single simple command: no shell composition, substitution, or
+    # redirection can hide a second operation inside an eligible reader.
+    if re.search(r"[|;&<>`$\r\n]|(?:^|\s)tee(?:\s|$)", command):
         return False
     try:
         import shlex
@@ -80,6 +118,16 @@ def is_routable_command(command: str) -> bool:
         return False
     if not words or any(token in {"watch", "sleep", "-f", "--watch", "--watchAll"} for token in words):
         return False
+    program = os.path.basename(words[0]).lower()
+    if program in {"cat", "head", "tail"}:
+        return _single_file_reader(program, words[1:], cwd)
+    if program == "find":
+        return not any(word in {"-exec", "-execdir", "-delete", "-ok", "-okdir",
+                                "-fprint", "-fprint0", "-fprintf", "-fls"}
+                       for word in words[1:])
+    if program == "ls":
+        return any(word == "--recursive" or re.fullmatch(r"-[a-zA-Z]*R[a-zA-Z]*", word)
+                   for word in words[1:])
     lowered = [word.lower() for word in words]
     if _git_routable(words):
         return True
@@ -92,7 +140,6 @@ def is_routable_command(command: str) -> bool:
         return True
     if re.search(r"(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|lint)(?:\s|$)|(?:^|\s)(?:make|cargo|go)\s+(?:build|lint|clippy|vet)(?:\s|$)|(?:^|\s)(?:ruff|mypy|eslint|tsc|gradle|mvn)(?:\s|$)", joined):
         return True
-    program = os.path.basename(words[0]).lower()
     if program in {"grep", "rg"}:
         recursive = program == "rg" or any(word in {"-r", "-R", "--recursive"} for word in words[1:])
         bounded = any(word == "-n" or word.startswith("-n") or word in {"-m", "--max-count"}
@@ -179,13 +226,14 @@ def _digest_text(result: dict[str, Any]) -> str | None:
     return None
 
 
-def _record(state_root: str, *, bytes_count: int, repo: str, classification: str,
+def _record(state_root: str, *, bytes_count: int, repo: str, classification: str, caller: str,
             routed: bool, waiver_reason: str | None, job_id: str | None,
             duration: float) -> None:
     # Content-free by construction: no command, output, hash, prompt, or
     # digest is permitted in this ledger.
     try:
         store.append_ledger(ledger_path(state_root), {
+            "at": time.time(), "caller": caller,
             "bytes": bytes_count, "repo": repo, "classification": classification,
             "routed": routed, "waiver_reason": waiver_reason, "job_id": job_id,
             "duration": duration,
@@ -198,6 +246,7 @@ def _record(state_root: str, *, bytes_count: int, repo: str, classification: str
 
 def route_output(output: bytes, *, state_root: str, repo: str, classification: str,
                  intake: AutomaticIntake, executor: Callable[[], Any] | None = None,
+                 caller: str = "claude",
                  exit_code: int = 0, wait_seconds: float = WAIT_SECONDS,
                  clock: Callable[[], float] = time.monotonic) -> int:
     """Print the context-safe response for a captured command and return 0.
@@ -214,7 +263,7 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
         full_path = capture_output(state_root, output)
         if len(output) < SMALL_OUTPUT_BYTES:
             _raw(output)
-            _record(state_root, bytes_count=len(output), repo=repo, classification=classification,
+            _record(state_root, bytes_count=len(output), repo=repo, classification=classification, caller=caller,
                     routed=False, waiver_reason="below_threshold", job_id=None,
                     duration=clock() - started)
             return 0
@@ -223,19 +272,21 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
         intake.queue.admit("interactive")
         local_bytes, clipped = _fit_for_queue(output, intake.queue.caps.max_input_bytes)
         text = local_bytes.decode("utf-8", "replace")
-        # Identity is the whole output: two outputs sharing a head and tail
-        # must never collapse into one job.
-        task_id = "inline-output:" + hashlib.sha256(output).hexdigest()
+        # Identity is the whole output, scoped by caller so matching output
+        # from the two hosts cannot conflict on checkpoint provenance. Keep
+        # Claude's historical key so existing jobs still deduplicate.
+        prefix = "inline-output:" if caller == "claude" else "inline-output:" + caller + ":"
+        task_id = prefix + hashlib.sha256(output).hexdigest()
         checkpoint = intake.checkpoint(
             task_id=task_id, task_type="summarize", classification=classification,
-            caller="claude", input_bytes=len(local_bytes),
+            caller=caller, input_bytes=len(local_bytes),
             nonblank_lines=sum(1 for line in text.splitlines() if line.strip()),
             risk_flags=[], idempotency_key=task_id)
         params = ({} if intake.queue.backend_id == "gemma_certified"
                   else {"instruction": DIGEST_PROMPT})
         receipt = intake.route(
             task_type="summarize", input=text, params=params,
-            priority="interactive", classification=classification, caller="claude",
+            priority="interactive", classification=classification, caller=caller,
             purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
         job_id = receipt.get("job_id") if isinstance(receipt.get("job_id"), str) else None
         if receipt.get("decision") != "local" or not job_id:
@@ -261,7 +312,9 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
                     tail = _failure_tail(output)
                     if tail:
                         sys.stdout.write(tail + "\n")
-                    _record(state_root, bytes_count=len(output), repo=repo, classification=classification,
+                    sys.stdout.write(f"[Job {job_id}: after relying on or rejecting this digest, "
+                                     "record feedback with work_feedback: used, reworked or discarded.]\n")
+                    _record(state_root, bytes_count=len(output), repo=repo, classification=classification, caller=caller,
                             routed=True, waiver_reason=None, job_id=job_id,
                             duration=clock() - started)
                     return 0
@@ -279,12 +332,12 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
         waiver = waiver or "routing_failure:" + type(exc).__name__
     sys.stdout.write(f"[local output routing waived: {waiver}]\n")
     _raw(output)
-    _record(state_root, bytes_count=len(output), repo=repo, classification=classification,
+    _record(state_root, bytes_count=len(output), repo=repo, classification=classification, caller=caller,
             routed=routed, waiver_reason=waiver, job_id=job_id, duration=clock() - started)
     return 0
 
 
-def run_command(command: list[str], *, config_path: str) -> int:
+def run_command(command: list[str], *, config_path: str, caller: str = "claude") -> int:
     """Execute original argv, then route its captured output without changing its code."""
     try:
         # One combined pipe preserves command output ordering, unlike two
@@ -310,7 +363,7 @@ def run_command(command: list[str], *, config_path: str) -> int:
         repo_policy = policy.for_repo(repo or os.getcwd())
         service = Service.for_config(cfg)
         route_output(output, state_root=state_root, repo=repo or os.getcwd(),
-                     classification=repo_policy.classification,
+                     classification=repo_policy.classification, caller=caller,
                      # The local queue service owns execution.  Running it
                      # here could let one 60-second queue job overrun this
                      # wrapper's 45-second wait bound.
@@ -328,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")
     run.add_argument("--config", required=True)
+    # Retain compatibility with wrappers emitted before caller parity.
+    run.add_argument("--caller", choices=("claude", "codex"), default="claude")
     run.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.argv)
@@ -335,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         command = command[1:]
     if not command:
         parser.error("run requires an original command after --")
-    return run_command(command, config_path=args.config)
+    return run_command(command, config_path=args.config, caller=args.caller)
 
 
 if __name__ == "__main__":

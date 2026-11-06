@@ -314,10 +314,9 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
   context.** That produces no tool call, so no local mechanism intercepts it.
   This is a limit of the hook surface. An instruction file does not fix it
   and we do not describe one as if it did.
-* **It cannot compel a digest of text that was never read from disk.** The
-  read gate (below) judges `Read` calls and recognised shell readers; inline
-  test and build output an assistant never captures to a file is the largest
-  mechanical stream and none of it is covered.
+* **It cannot digest output from arbitrary commands.** The inline output
+  router below covers an allowlist of command classes; other command output
+  follows the host's usual path into context.
 * **On Codex the read gate is a text heuristic**, exactly the same strength
   limit the write heuristic already has, and for the same reason: shell
   commands are read as text, not executed and observed. `gate report`'s
@@ -330,6 +329,41 @@ An unreadable stage router is **not** treated as overtaken. That stays a deny
 repository with no receipt is refused outright and an assistant must claim a
 route explicitly. Stricter, and more friction. The audit reports which
 posture each installed client is running under.
+
+## Inline command output
+
+With the operator's `local_first.inline_output_router` enabled, the gate
+rewrites eligible `Bash` calls for both Claude and Codex before execution.
+The original call must already be allowed, and its repository policy must
+permit `local`, set `mechanical_ok`, and name a local-eligible classification.
+An unreadable policy never authorizes a rewrite. The wrapper passes the real
+caller to both the checkpoint and local intake; classification, admission,
+and client-data health checks remain authoritative. There is no API fallback.
+
+Eligible classes include the existing test, lint, build, git history/diff,
+and recursive search commands, plus `git status` (including untracked files),
+read-only `find`, `ls -R`, and `cat`/`head`/`tail` of one existing regular
+file. Shell composition, pipes, redirection, heredocs, `tee`, watch/follow
+modes, and destructive or file-writing `find` actions are excluded. Single
+file readers also exclude globs and stdin. Output below 4 KiB remains raw;
+larger output can return a local digest or a visible waiver with original
+bytes. The original command's exit status is preserved.
+
+Each successful digest names its job and asks the reading assistant to call
+`work_feedback` with `used`, `reworked`, or `discarded` after relying on or
+rejecting it. Feedback is never inferred or recorded automatically. The
+content-free `routing/inline-output-routing.jsonl` ledger includes caller
+and timestamp. `local-status --days N` groups routed and waived counts by
+caller and waiver reason for the same local-calendar window as queue work.
+Missing callers are shown as `unknown`; undated historical records are
+reported separately and excluded from window counts.
+
+Codex's [documented PreToolUse contract](https://learn.chatgpt.com/docs/hooks)
+uses `permissionDecision: "allow"` and `updatedInput.command`. The installed
+`codex-cli 0.160.1` binary was inspected for this change: it contains the
+rewrite parser and the diagnostic `hook returned updatedInput without string
+field` for `command`. This is static compatibility evidence; offline tests
+exercise the emitted wire shape and wrapper, without a live inference turn.
 
 ## Read gate
 
