@@ -109,6 +109,67 @@ class LocalStatusTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 db.execute("DELETE FROM jobs")
 
+    def test_inline_output_counts_by_caller_reason_and_window(self):
+        ledger = self.home / "state" / "routing" / "inline-output-routing.jsonl"
+        ledger.parent.mkdir(parents=True)
+        rows = [
+            {"at": self.start, "caller": "claude", "routed": True, "waiver_reason": None},
+            {"at": self.now, "caller": "codex", "routed": True, "waiver_reason": None},
+            {"at": self.now, "caller": "codex", "routed": False, "waiver_reason": "below_threshold"},
+            {"at": self.now, "caller": "codex", "routed": False, "waiver_reason": "below_threshold"},
+            {"at": self.now, "caller": "claude", "routed": False, "waiver_reason": "timeout"},
+            {"at": self.now, "caller": "codex", "routed": False,
+             "waiver_reason": "admission_deferred:client_data_health_unverified"},
+            {"at": self.now, "routed": False, "waiver_reason": "local_failed"},
+            {"at": self.start - 1, "caller": "codex", "routed": True, "waiver_reason": None},
+            {"at": self.now + 1, "caller": "codex", "routed": True, "waiver_reason": None},
+            {"routed": True, "waiver_reason": None},
+        ]
+        ledger.write_text("".join(json.dumps({**row, "command": "SECRET COMMAND", "output": "SECRET OUTPUT",
+                                              "job_id": "SECRET ID", "repo": "SECRET PATH"}) + "\n"
+                                  for row in rows))
+        before = ledger.read_bytes()
+        result = local_status.report(str(self.config), now=self.now)
+        self.assertEqual(result["inline_output_routing"], [
+            {"caller": "claude", "routed": False, "waiver_reason": "timeout", "count": 1},
+            {"caller": "claude", "routed": True, "waiver_reason": None, "count": 1},
+            {"caller": "codex", "routed": False,
+             "waiver_reason": "admission_deferred:client_data_health_unverified", "count": 1},
+            {"caller": "codex", "routed": False, "waiver_reason": "below_threshold", "count": 2},
+            {"caller": "codex", "routed": True, "waiver_reason": None, "count": 1},
+            {"caller": "unknown", "routed": False, "waiver_reason": "local_failed", "count": 1},
+        ])
+        self.assertEqual(result["inline_output_undated_records"], 1)
+        self.assertNotIn("SECRET", json.dumps(result))
+        with mock.patch.object(local_status.time, "time", return_value=self.now):
+            for flags in ([], ["--json"]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(local_status.main(["--config", str(self.config), *flags]), 0)
+                self.assertNotIn("SECRET", out.getvalue())
+                if flags:
+                    self.assertEqual(json.loads(out.getvalue()), result)
+                else:
+                    self.assertIn("codex\twaived\tbelow_threshold\t2", out.getvalue())
+                    self.assertIn("codex\trouted\t-\t1", out.getvalue())
+                    self.assertIn("Undated inline output records excluded from window: 1", out.getvalue())
+        self.assertEqual(ledger.read_bytes(), before)
+
+    def test_missing_inline_ledger_is_empty_and_never_created(self):
+        result = local_status.report(str(self.config), now=self.now)
+        self.assertEqual(result["inline_output_routing"], [])
+        self.assertEqual(result["inline_output_undated_records"], 0)
+        self.assertFalse((self.home / "state").exists())
+
+    def test_invalid_inline_ledger_is_a_fixed_report_error(self):
+        ledger = self.home / "state" / "routing" / "inline-output-routing.jsonl"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text("SECRET INVALID LEDGER")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(local_status.main(["--config", str(self.config), "--json"]), 1)
+        self.assertEqual(json.loads(out.getvalue()), {"error": "local_status:report_error"})
+
     def test_missing_databases_are_fixed_errors_and_never_created(self):
         for filename in ("routing.sqlite3", "localq.sqlite3"):
             (self.queue / filename).unlink()

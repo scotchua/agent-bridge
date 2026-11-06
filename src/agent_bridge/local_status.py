@@ -20,6 +20,37 @@ def _connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
 
 
+def _inline_output_counts(state_root: Path, start: float, now: float) -> tuple[list[dict[str, Any]], int]:
+    counts: Counter = Counter()
+    undated = 0
+    path = state_root / "routing" / "inline-output-routing.jsonl"
+    try:
+        stream = path.open(encoding="utf-8")
+    except FileNotFoundError:
+        return [], 0
+    with stream:
+        for line in stream:
+            row = json.loads(line)
+            at = row.get("at")
+            # Earlier router versions wrote no timestamp. Never invent a
+            # date or silently count those records in the selected window.
+            if not isinstance(at, (int, float)) or isinstance(at, bool):
+                undated += 1
+                continue
+            if not start <= at <= now:
+                continue
+            caller = row.get("caller", "unknown")
+            if caller not in {"claude", "codex"}:
+                caller = "unknown"
+            routed = row.get("routed")
+            reason = None if routed else row.get("waiver_reason")
+            if not isinstance(routed, bool) or (not routed and not isinstance(reason, str)):
+                raise ValueError("inline_output_record_invalid")
+            counts[(caller, routed, reason)] += 1
+    return [{"caller": caller, "routed": routed, "waiver_reason": reason, "count": count}
+            for (caller, routed, reason), count in sorted(counts.items())], undated
+
+
 def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict[str, Any]:
     """Group current outcomes by submission day, within N local calendar days.
 
@@ -65,12 +96,14 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                               **{key: counts[key] for key in ("used", "reworked", "discarded", "unreviewed")},
                               "rework_rate": counts["reworked"] / reviewed if reviewed else None,
                               "discard_rate": counts["discarded"] / reviewed if reviewed else None})
+    inline_output, undated = _inline_output_counts(cfg.state_root, start, now)
     return {"days": days, "first_local_day": first.isoformat(),
             "last_local_day": today.isoformat(),
             "jobs": [{"day": day, "caller": caller, "purpose": purpose,
                       "outcome": outcome, "count": count}
                      for (day, caller, purpose, outcome), count in sorted(jobs.items())],
-            "feedback": feedback_rows, "checkpoints": checkpoints}
+            "feedback": feedback_rows, "checkpoints": checkpoints,
+            "inline_output_routing": inline_output, "inline_output_undated_records": undated}
 
 
 def _days(value: str) -> int:
@@ -123,4 +156,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Checkpoints by caller and status:")
         for row in result["checkpoints"]:
             print("{caller}\t{status}\t{count}".format(**row))
+        print("Inline output routing by caller and waiver reason:")
+        for row in result["inline_output_routing"]:
+            outcome = "routed" if row["routed"] else "waived"
+            reason = row["waiver_reason"] or "-"
+            print(f"{row['caller']}\t{outcome}\t{reason}\t{row['count']}")
+        if result["inline_output_undated_records"]:
+            print(f"Undated inline output records excluded from window: {result['inline_output_undated_records']}")
     return 0

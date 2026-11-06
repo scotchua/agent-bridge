@@ -7,11 +7,13 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -63,10 +65,108 @@ class OutputRouterTests(unittest.TestCase):
                         "cargo test", "git log --oneline", "git diff", "git show HEAD",
                         "grep -r token .", "rg token .", "npm run build", "ruff check ."):
             self.assertTrue(output_router.is_routable_command(command), command)
-        for command in ("sed -n '1,20p' a", "head a", "tail a", "cat a", "grep -n x a",
+        for command in ("sed -n '1,20p' a", "head missing", "tail missing", "cat missing", "grep -n x a",
                         "git diff -- a", "git show -- a", "pytest -q | tee out", "pytest > out",
                         "cat <<'EOF'", "tail -f log"):
             self.assertFalse(output_router.is_routable_command(command), command)
+
+    def test_new_read_only_classes_and_dangerous_variants(self):
+        regular = self.repo / "output file.txt"
+        regular.write_text("synthetic output\n")
+        accepted = ("python3 -m pytest -q", "python3 -m unittest discover",
+                    "python3 -m ruff check .", "python3 -m mypy src",
+                    "git status", "git status --untracked-files=all", "git status -uall",
+                    "find . -type f", "find . -name '*.py'", "ls -R", "ls -laR .",
+                    "cat 'output file.txt'", "cat -n -- 'output file.txt'",
+                    "head -n 20 'output file.txt'", "tail -c +10 'output file.txt'",
+                    "tail --lines=20 'output file.txt'", "head " + shlex.quote(str(regular)))
+        rejected = ("python3 -m arbitrary_module", "ls .", "ls -R | head",
+                    "find . -exec rm {} +", "find . -execdir echo {} +", "find . -delete",
+                    "find . -ok echo {} +", "find . -okdir echo {} +",
+                    "find . -fprint listing", "find . -fprintf listing '%p'", "find . -fls listing",
+                    "find .; touch marker", "find . && touch marker", "find . > listing",
+                    "cat 'output file.txt' | head", "cat 'output file.txt' > copy",
+                    "cat 'output file.txt' < input", "cat *.txt", "cat 'output*.txt'",
+                    "cat output?.txt", "cat '[ab].txt'", "cat {a,b}.txt", "cat .", "cat missing",
+                    "cat -", "cat", "cat 'output file.txt' 'output file.txt'",
+                    "cat $(touch marker)", "cat `touch marker`", "cat 'output file.txt' &",
+                    "head 'output file.txt'\ntouch marker", "tail -f 'output file.txt'",
+                    "tail -F 'output file.txt'", "tail --follow=name 'output file.txt'",
+                    "tail -nf 20 'output file.txt'", "watch ls -R", "sleep 1", "ls -R -f")
+        for command in accepted:
+            with self.subTest(command=command):
+                self.assertTrue(output_router.is_routable_command(command, cwd=str(self.repo)))
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command, cwd=str(self.repo)))
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(self.repo / "fifo")
+            self.assertFalse(output_router.is_routable_command("cat fifo", cwd=str(self.repo)))
+
+    def test_codex_rewrite_wire_shape_and_caller(self):
+        allowed = gate.Decision("allow", "shell_read_only_heuristic", "ok")
+        for client in ("claude", "codex"):
+            for key in ("command", "cmd"):
+                with self.subTest(client=client, key=key):
+                    payload = {"tool_name": "Bash", "cwd": str(self.repo),
+                               "tool_input": {key: "git status -uall", "timeout": 10}}
+                    updated = gate.inline_output_update(client, payload, allowed,
+                                                        state_root=str(self.state), config_path="/tmp/config")
+                    wire = gate.hook_output(allowed, updated)["hookSpecificOutput"]
+                    self.assertEqual(wire["hookEventName"], "PreToolUse")
+                    self.assertEqual(wire["permissionDecision"], "allow")
+                    command_key = "command" if client == "codex" else key
+                    command = wire["updatedInput"][command_key]
+                    self.assertIsInstance(command, str)
+                    self.assertEqual(wire["updatedInput"]["timeout"], 10)
+                    words = shlex.split(command)
+                    self.assertEqual(words[words.index("--caller") + 1], client)
+                    self.assertEqual(words[-1], "git status -uall")
+                    self.assertIsNone(gate.inline_output_update(client, payload,
+                        gate.Decision("deny", "routed_elsewhere", "no"),
+                        state_root=str(self.state), config_path="/tmp/config"))
+                    payload["tool_input"] = updated
+                    self.assertIsNone(gate.inline_output_update(client, payload, allowed,
+                        state_root=str(self.state), config_path="/tmp/config"))
+
+    def test_codex_rewrite_retains_policy_and_privacy_requirements(self):
+        payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "pytest -q"}}
+        allowed = gate.Decision("allow", "shell_read_only_heuristic", "ok")
+        for repo_policy in (None,
+                            {"classification": "client_derived", "allowed_routes": ["codex"], "mechanical_ok": True},
+                            {"classification": "internal_nonclient", "allowed_routes": ["codex"], "mechanical_ok": True},
+                            {"classification": "internal_nonclient", "allowed_routes": ["local"], "mechanical_ok": False}):
+            with self.subTest(policy=repo_policy):
+                self.policy_path.write_text(json.dumps({"version": 1,
+                    "local_first": {"inline_output_router": True},
+                    "repos": {} if repo_policy is None else {str(self.repo): repo_policy}}))
+                self.assertIsNone(gate.inline_output_update("codex", payload, allowed,
+                    state_root=str(self.state), config_path="/tmp/config"))
+        self.policy_path.write_text("unreadable policy")
+        self.assertIsNone(gate.inline_output_update("codex", payload, allowed,
+            state_root=str(self.state), config_path="/tmp/config"))
+
+    def test_file_rewrite_uses_payload_cwd(self):
+        (self.repo / "output.txt").write_text("synthetic output")
+        payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "cat output.txt"}}
+        self.assertIsNotNone(gate.inline_output_update("codex", payload, gate.Decision("allow", "x", "x"),
+            state_root=str(self.state), config_path="/tmp/config"))
+
+    def test_gate_cli_emits_a_rewrite_for_both_callers(self):
+        import subprocess
+
+        payload = {"tool_name": "Bash", "cwd": str(self.repo),
+                   "tool_input": {"command": "git status --untracked-files=all"}}
+        env = dict(os.environ, PYTHONPATH=str(Path(gate.__file__).resolve().parents[2]))
+        for caller in ("claude", "codex"):
+            done = subprocess.run([sys.executable, "-m", "agent_bridge.orchestration.gate",
+                "--client", caller, "--state-root", str(self.state), "--config", str(self.base / "config.json"),
+                "--no-automatic-routing"], input=json.dumps(payload), capture_output=True, text=True, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            wire = json.loads(done.stdout)["hookSpecificOutput"]
+            self.assertEqual(wire["permissionDecision"], "allow")
+            self.assertEqual(wire["hookEventName"], "PreToolUse")
+            self.assertIn(f"--caller {caller}", wire["updatedInput"]["command"])
 
     def test_update_requires_opt_in_admission_and_an_allowed_gate_decision(self):
         payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "pytest -q", "timeout": 10}}
@@ -150,7 +250,7 @@ class OutputRouterTests(unittest.TestCase):
                 captured = io.StringIO()
                 with contextlib.redirect_stdout(captured):
                     code = output_router.run_command(["/bin/sh", "-c", "printf small; exit 4"],
-                                                     config_path=str(self.base / "config.json"))
+                                                     config_path=str(self.base / "config.json"), caller="codex")
         finally:
             os.chdir(previous)
         self.assertEqual(code, 4)
@@ -158,6 +258,7 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["repo"], os.path.realpath(self.repo))
         self.assertEqual(calls[0]["classification"], "internal_nonclient")
+        self.assertEqual(calls[0]["caller"], "codex")
 
     def test_routed_output_has_header_digest_failure_tail_and_private_capture(self):
         queue, intake = self.queue()
@@ -176,6 +277,34 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), source)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertTrue(self.rows()[-1]["routed"])
+        row = self.rows()[-1]
+        self.assertIn(f"Job {row['job_id']}", text)
+        self.assertIn("work_feedback: used, reworked or discarded", text)
+        self.assertIsNone(queue.result(row["job_id"])["feedback"])
+        self.assertEqual(set(row), {"at", "caller", "bytes", "repo", "classification", "routed",
+                                    "waiver_reason", "job_id", "duration"})
+        self.assertEqual(row["caller"], "claude")
+        self.assertIsInstance(row["at"], float)
+
+    def test_caller_reaches_checkpoint_route_and_ledger_without_duplicate_jobs(self):
+        queue, intake = self.queue()
+        source = b"synthetic output\n" * 400
+        with mock.patch.object(intake, "checkpoint", wraps=intake.checkpoint) as checkpoint, \
+                mock.patch.object(intake, "route", wraps=intake.route) as route:
+            jobs = []
+            for caller in ("claude", "codex", "codex"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output_router.route_output(source, state_root=str(self.state), repo=str(self.repo),
+                        classification="internal_nonclient", caller=caller, intake=intake,
+                        executor=lambda: queue.run_once("test"))
+                self.assertEqual(checkpoint.call_args.kwargs["caller"], caller)
+                self.assertEqual(route.call_args.kwargs["caller"], caller)
+                row = self.rows()[-1]
+                self.assertTrue(row["routed"])
+                self.assertEqual(row["caller"], caller)
+                jobs.append(row["job_id"])
+            self.assertNotEqual(jobs[0], jobs[1])
+            self.assertEqual(jobs[1], jobs[2])
 
     def test_deferral_and_timeout_waive_to_raw_output(self):
         source = b"x\n" * 3000
@@ -186,14 +315,36 @@ class OutputRouterTests(unittest.TestCase):
                                        classification="internal_nonclient", intake=intake)
         self.assertTrue(captured.getvalue().endswith(source.decode()))
         self.assertIn("admission_deferred", captured.getvalue())
+        self.assertNotIn("work_feedback", captured.getvalue())
         self.assertIn("admission_deferred", self.rows()[-1]["waiver_reason"])
         queue, intake = self.queue()
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
             output_router.route_output(source, state_root=str(self.state), repo=str(self.repo),
-                                       classification="internal_nonclient", intake=intake, wait_seconds=0)
+                                       classification="internal_nonclient", intake=intake, wait_seconds=0,
+                                       caller="codex")
         self.assertTrue(captured.getvalue().endswith(source.decode()))
         self.assertEqual(self.rows()[-1]["waiver_reason"], "timeout")
+        self.assertEqual(self.rows()[-1]["caller"], "codex")
+        self.assertNotIn("work_feedback", captured.getvalue())
+
+    def test_client_data_health_deferral_is_preserved_for_both_callers(self):
+        queue = LocalQueue(self.base / "health-queue", sampler=GoodSampler(), backend=FakeBackend(),
+                           backend_id="gemma_certified", clock=lambda: 0.0)
+        intake = AutomaticIntake(queue, policy=IntakePolicy(min_input_chars=1, min_nonblank_lines=1),
+                                 clock=lambda: 0.0)
+        source = b"synthetic stand-in for client output\n" * 200
+        for caller in ("claude", "codex"):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                output_router.route_output(source, state_root=str(self.state), repo=str(self.repo),
+                    classification="client_derived", caller=caller, intake=intake)
+            self.assertIn("admission_deferred:client_data_health_unverified", captured.getvalue())
+            self.assertTrue(captured.getvalue().endswith(source.decode()))
+            self.assertNotIn("work_feedback", captured.getvalue())
+            self.assertEqual(self.rows()[-1]["caller"], caller)
+            self.assertFalse(self.rows()[-1]["routed"])
+        self.assertEqual(queue.state_report()["counts"], {})
 
     def test_emitted_command_runs_from_a_plain_shell_without_agent_bridge_on_its_path(self):
         import subprocess
