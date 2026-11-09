@@ -69,6 +69,81 @@ class InvokePreflightTests(unittest.TestCase):
             self.invoke({"task_type": "invent", "input": "Aurora invoice",
                          "params": {}, "job_id": "job-synthetic"})
 
+    def test_log_triage_invalid_input_refuses_before_file_access(self):
+        with mock.patch.object(gemma_child, "_existing_file") as files:
+            with self.assertRaisesRegex(ValueError, "^log_triage_input_invalid$"):
+                self.invoke({"task_type": "log_triage", "input": "private content without ID",
+                             "params": {}, "job_id": "job-synthetic"})
+            files.assert_not_called()
+
+
+class LogTriageTests(unittest.TestCase):
+    def test_params_contract_is_empty(self):
+        self.assertIsNone(gemma_child.params_refusal({}, "log_triage"))
+        self.assertEqual(gemma_child.params_refusal({"instruction": ""}, "log_triage"),
+                         "params_invalid_for_gemma_certified")
+
+    def test_sections_and_id_matching_are_case_sensitive(self):
+        for candidate in ("act\n- [A1] Record\nWATCH\nNOISE\n",
+                          "ACT\n- [a1] Record\nWATCH\nNOISE\n"):
+            with self.subTest(candidate=candidate):
+                call = {"output": {"task": "triage", "text": candidate}}
+                with mock.patch.object(gemma_child, "_invoke_validated", return_value=call):
+                    with self.assertRaisesRegex(gemma_child.GemmaRefusal,
+                                                "^log_triage_output_invalid$"):
+                        gemma_child._log_triage("[A1] Record", "job", Path("/delegate"),
+                                               Path("/python"), Path("/receipts"),
+                                               "a" * 64, 1.0, object())
+
+    def test_markdown_headings_and_empty_sections_are_valid(self):
+        candidate = "## ACT:\n- [A1] Record\n\n## WATCH\n\n## NOISE\n"
+        call = {"task": "triage", "output": {"task": "triage", "text": candidate}}
+        with mock.patch.object(gemma_child, "_invoke_validated", return_value=call) as delegate:
+            result = gemma_child._log_triage("\n[A1] Record\n", "job", Path("/delegate"),
+                                            Path("/python"), Path("/receipts"),
+                                            "a" * 64, 1.0, object())
+        self.assertEqual(delegate.call_args.args[-1], "triage")
+        self.assertEqual(result["output"], {"task": "log_triage", "text": candidate})
+
+    def test_empty_bucket_marker_is_valid_in_each_section(self):
+        for occupied in ("ACT", "WATCH", "NOISE"):
+            with self.subTest(occupied=occupied):
+                candidate = "\n\n".join(
+                    bucket + "\n" + ("- [L1] Record" if bucket == occupied else "- none")
+                    for bucket in ("ACT", "WATCH", "NOISE")) + "\n"
+                call = {"output": {"task": "triage", "text": candidate}}
+                with mock.patch.object(gemma_child, "_invoke_validated", return_value=call):
+                    result = gemma_child._log_triage("[L1] Record", "job", Path("/delegate"),
+                                                   Path("/python"), Path("/receipts"),
+                                                   "a" * 64, 1.0, object())
+                self.assertEqual(result["output"]["text"], candidate)
+
+    def test_empty_bucket_marker_cannot_be_mixed_repeated_or_malformed(self):
+        for rows in ("- none\n- [L1] Record", "- [L1] Record\n- none",
+                     "- none\n- none\n- [L1] Record", "- None\n- [L1] Record",
+                     " - none\n- [L1] Record", "- none \n- [L1] Record"):
+            with self.subTest(rows=rows):
+                call = {"output": {"task": "triage", "text":
+                    f"ACT\n{rows}\n\nWATCH\n- none\n\nNOISE\n- none\n"}}
+                with mock.patch.object(gemma_child, "_invoke_validated", return_value=call):
+                    with self.assertRaisesRegex(gemma_child.GemmaRefusal,
+                                                "^log_triage_output_invalid$"):
+                        gemma_child._log_triage("[L1] Record", "job", Path("/delegate"),
+                                               Path("/python"), Path("/receipts"),
+                                               "a" * 64, 1.0, object())
+
+    def test_empty_bucket_marker_cannot_repeat_in_an_empty_section_or_precede_header(self):
+        for prefix in ("ACT\n- none\n- none\n", "- none\nACT\n- none\n"):
+            with self.subTest(prefix=prefix):
+                call = {"output": {"task": "triage", "text":
+                    prefix + "\nWATCH\n- [L1] Record\n\nNOISE\n- none\n"}}
+                with mock.patch.object(gemma_child, "_invoke_validated", return_value=call):
+                    with self.assertRaisesRegex(gemma_child.GemmaRefusal,
+                                                "^log_triage_output_invalid$"):
+                        gemma_child._log_triage("[L1] Record", "job", Path("/delegate"),
+                                               Path("/python"), Path("/receipts"),
+                                               "a" * 64, 1.0, object())
+
 
 class DocumentParameterTests(unittest.TestCase):
     def test_exact_document_limit_is_valid(self):

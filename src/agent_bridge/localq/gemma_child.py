@@ -4,7 +4,7 @@ The local queue speaks JSON to child adapters. The installed delegate reads
 the exact document as UTF-8 stdin, writes the draft as plain stdout bytes,
 and writes a ``local-delegate/v2`` receipt. This bridges those contracts
 without selecting another provider, retrying another model, or creating a
-second quarantine mechanism. Only ``summarize`` is certified here.
+second quarantine mechanism. Pilot tasks require explicit operator opt-in.
 
 Repository tests exercise this adapter against contract fakes; they do not
 prove compatibility with the installed delegate and validator. Before an
@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tempfile
 import sys
@@ -42,7 +43,8 @@ except ImportError:  # The local queue invokes this adapter as a script.
 
 
 RECEIPT_CONTRACT = "local-delegate/v2"
-SUPPORTED_TASKS = frozenset({"summarize", "extract", "classify"})
+SUPPORTED_TASKS = frozenset({"summarize", "extract", "classify", "log_triage"})
+TRIAGE_RECORD_ID_RE = re.compile(r"\[([A-Za-z]{1,6}\d{1,4})\]")
 CERTIFIED_SUMMARIZE_INSTRUCTION = "Summarize in one sentence."
 UNSUPPORTED_KIND_REASON = "unsupported_kind"
 EXTRACT_FIELDS = ("party", "date", "doc_type", "reference", "description",
@@ -164,7 +166,7 @@ def params_refusal(params: dict[str, Any], task: str = "summarize") -> str | Non
     """
     if task == "extract":
         return None if set(params) == {"documents"} else "params_invalid_for_gemma_certified"
-    if task == "classify":
+    if task in {"classify", "log_triage"}:
         return None if not params else "params_invalid_for_gemma_certified"
     if set(params) - {"instruction"}:
         return "params_invalid_for_gemma_certified"
@@ -192,6 +194,8 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
         raise GemmaRefusal(reason)
     if reason is not None:
         raise ValueError(reason)
+    if task == "log_triage":
+        _triage_input_ids(text)
     job_id = payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("job_id_invalid")
@@ -221,6 +225,9 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
         if task == "classify":
             return _classify(text, job_id, delegate_path, python_path, receipt_root_path,
                              model_digest, timeout, validator)
+        if task == "log_triage":
+            return _log_triage(text, job_id, delegate_path, python_path, receipt_root_path,
+                               model_digest, timeout, validator)
         return _extract(text, params["documents"], job_id, delegate_path, python_path,
                         receipt_root_path, model_digest, timeout, validator)
 
@@ -439,6 +446,58 @@ def _classify(text: str, job_id: str, delegate: Path, python: Path, receipt_root
             "model_digest": call["model_digest"], "invocation_id": call["invocation_id"],
             "input_sha256": call["input_sha256"],
             "result_status": "success"}
+
+
+def _triage_input_ids(text: str) -> set[str]:
+    """Require caller-supplied record identities without changing source bytes."""
+    ids: set[str] = set()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(TRIAGE_RECORD_ID_RE.pattern + r"[ \t]+(\S.*)", line)
+        if match is None or match[1] in ids or len(TRIAGE_RECORD_ID_RE.findall(line)) != 1:
+            raise ValueError("log_triage_input_invalid")
+        ids.add(match[1])
+    if not ids:
+        raise ValueError("log_triage_input_invalid")
+    return ids
+
+
+def _log_triage(text: str, job_id: str, delegate: Path, python: Path, receipt_root: Path,
+                model_digest: str, timeout: float, validator: Any) -> dict[str, Any]:
+    ids = _triage_input_ids(text)
+    call = _invoke_validated(text, job_id, delegate, python, receipt_root, model_digest,
+                             timeout, validator, "triage")
+    # A success receipt binds bytes and invocation, not record completeness.
+    # Independently require sections and a bijection with the input ids.
+    sections: set[str] = set()
+    seen: set[str] = set()
+    section_contents: str | None = None
+    for line in call["output"]["text"].splitlines():
+        if not line.strip():
+            continue
+        header = re.fullmatch(r"(?:#{1,6} )?(ACT|WATCH|NOISE):?", line.strip())
+        if header is not None:
+            if header[1] in sections:
+                raise GemmaRefusal("log_triage_output_invalid")
+            sections.add(header[1])
+            section_contents = None
+            continue
+        if line == "- none":
+            if not sections or section_contents is not None:
+                raise GemmaRefusal("log_triage_output_invalid")
+            section_contents = "empty"
+            continue
+        record = re.fullmatch(r"- " + TRIAGE_RECORD_ID_RE.pattern + r"[ \t]+(\S.*)", line)
+        if (not sections or section_contents == "empty" or record is None
+                or record[1] not in ids or record[1] in seen):
+            raise GemmaRefusal("log_triage_output_invalid")
+        seen.add(record[1])
+        section_contents = "records"
+    if sections != {"ACT", "WATCH", "NOISE"} or seen != ids:
+        raise GemmaRefusal("log_triage_output_invalid")
+    call["task"] = call["output"]["task"] = "log_triage"
+    return call
 
 
 def main(argv: list[str] | None = None) -> int:

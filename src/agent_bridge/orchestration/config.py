@@ -217,7 +217,8 @@ def _gemma_paths(raw: dict[str, Any]) -> dict[str, Any]:
         raise OrchestrationConfigError("gemma_timeout_seconds_below_certified_budget")
     pilot_tasks = raw.get("gemma_pilot_tasks", [])
     if (not isinstance(pilot_tasks, list)
-            or any(task not in {"extract", "classify"} for task in pilot_tasks)
+            or any(not isinstance(task, str) or task not in {"extract", "classify", "log_triage"}
+                   for task in pilot_tasks)
             or len(set(pilot_tasks)) != len(pilot_tasks)):
         raise OrchestrationConfigError("gemma_pilot_tasks_invalid")
     return {"local_backend": local_backend, "gemma_delegate_executable": delegate,
