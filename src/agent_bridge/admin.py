@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import sqlite3
 import sys
 from typing import Any
 
@@ -518,12 +519,52 @@ def cmd_indeterminate(cfg: Config, _: argparse.Namespace) -> int:
     return 0
 
 
-def _archive_router() -> StageRouter:
+def _archive_router(*, read_only: bool = False) -> StageRouter:
     """Open the configured orchestration ledger, not a guessed state path."""
     path = drift.discover_config()
     if path is None:
         raise RoutingError("orchestration_config_not_found")
-    return StageRouter(orchestration_config.load(path).capacity_db)
+    return StageRouter(orchestration_config.load(path).capacity_db, read_only=read_only)
+
+
+def cmd_stage_reconcile(_: Config, args: argparse.Namespace) -> int:
+    """List expired owners or plan one explicitly checked release."""
+    selectors = (args.item, args.stage, args.expected_revision, args.owner_inactive, args.evidence)
+    selected = args.apply or any(value is not None and value is not False for value in selectors)
+    try:
+        if selected and (args.item is None or args.stage is None
+                         or args.expected_revision is None or not args.owner_inactive
+                         or args.evidence is None):
+            raise RoutingError("selector_incomplete")
+        if selected and not args.evidence.strip():
+            raise RoutingError("liveness_evidence_required")
+        router = _archive_router(read_only=True)
+        if not selected:
+            result = router.reconciliation_stages()
+        else:
+            row = router.get(args.item, args.stage)
+            if row["archived_at"] is not None:
+                raise RoutingError("stage_archived")
+            if row["revision"] != args.expected_revision:
+                raise RoutingError("revision_conflict")
+            if row["state"] != "reconcile_required":
+                raise RoutingError("reconciliation_not_required")
+            if args.apply:
+                row = _archive_router().reconcile_release(
+                    args.item, args.stage, actor="operator",
+                    expected_revision=args.expected_revision, owner_checked_inactive=True,
+                    liveness_evidence=args.evidence)
+            result = {key: row[key] for key in (
+                "item_id", "stage", "revision", "owner_id", "owner_route",
+                "lease_until", "updated_at", "state")}
+            result["seconds_since_expiry"] = (max(0.0, router.clock() - row["lease_until"])
+                                               if row["lease_until"] is not None else None)
+            result["applied"] = bool(args.apply)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 def cmd_archive(_: Config, args: argparse.Namespace) -> int:
@@ -747,6 +788,15 @@ def main(argv: list[str] | None = None) -> int:
     archive.add_argument("--stage", help="Archive only this stage for each --item.")
     archive.add_argument("--reason", default="operator_archive", help="Reason recorded in the event ledger.")
     archive.add_argument("--apply", action="store_true", help="Actually archive the planned stages.")
+    reconcile = sub.add_parser(
+        "stage-reconcile", help="List expired stage owners or plan one release. Dry run unless --apply.")
+    reconcile.add_argument("--item", help="Item whose stage will be released.")
+    reconcile.add_argument("--stage", help="Stage to release.")
+    reconcile.add_argument("--expected-revision", type=int)
+    reconcile.add_argument("--owner-inactive", action="store_true",
+                           help="Confirm the previous owner is no longer running.")
+    reconcile.add_argument("--evidence", help="How the owner's inactivity was checked.")
+    reconcile.add_argument("--apply", action="store_true", help="Actually release the planned stage.")
     settings = sub.add_parser(
         "operator-settings", help="The one file that decides client-derived cloud routes.")
     settings_sub = settings.add_subparsers(dest="settings_command", required=True)
@@ -765,7 +815,8 @@ def main(argv: list[str] | None = None) -> int:
         return {"health": cmd_health, "status": cmd_status, "cleanup": cmd_cleanup, "ledger": cmd_ledger,
                 "reporting": cmd_reporting, "local-first": cmd_local_first,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve,
-                "archive": cmd_archive, "operator-settings": cmd_operator_settings}[
+                "archive": cmd_archive, "stage-reconcile": cmd_stage_reconcile,
+                "operator-settings": cmd_operator_settings}[
             args.command](cfg, args)
     except BrokerError as exc:
         print(json.dumps(error_response(exc.category), sort_keys=True))

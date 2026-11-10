@@ -87,16 +87,23 @@ class StageRouter:
     """
 
     def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time,
-                 harness_probe: Callable[[str], bool] | None = None):
+                 harness_probe: Callable[[str], bool] | None = None,
+                 read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.read_only = read_only
         self.clock = clock
         # Injected only by the broker's composition root, never from a tool.
         self._harness_probe = harness_probe
-        self._init_db()
+        if not read_only:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+        if self.read_only:
+            target = self.path.resolve().as_uri() + "?mode=ro"
+            db = sqlite3.connect(target, timeout=5.0, isolation_level=None, uri=True)
+        else:
+            db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         return db
 
@@ -492,6 +499,17 @@ class StageRouter:
         result["preferred_routes"] = json.loads(result["preferred_routes"])
         result["is_review"] = bool(result["is_review"])
         return result
+
+    def reconciliation_stages(self) -> list[dict]:
+        """Content-free live stages requiring an operator's liveness check."""
+        now = self.clock()
+        with self._db() as db:
+            rows = db.execute("""SELECT item_id,stage,revision,owner_id,owner_route,
+                lease_until,updated_at FROM stages
+                WHERE state='reconcile_required' AND archived_at IS NULL
+                ORDER BY item_id,stage""").fetchall()
+        return [{**dict(row), "seconds_since_expiry": max(0.0, now - row["lease_until"])
+                 if row["lease_until"] is not None else None} for row in rows]
 
     def live_item_ids(self) -> list[str]:
         """Item identifiers with at least one live stage, in stable order."""
