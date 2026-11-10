@@ -108,7 +108,9 @@ def build_backend_and_caps(cfg: Any, queue_root: str) -> "tuple[Backend, QueueCa
     # Config validation owns this vocabulary.  Keep this defensive check so a
     # hand-built config object cannot activate an unreviewed task type.
     if (not isinstance(pilot_tasks, (tuple, list))
-            or any(task not in {"extract", "classify"} for task in pilot_tasks)):
+            or any(not isinstance(task, str) or task not in {"extract", "classify", "log_triage"}
+                   for task in pilot_tasks)
+            or len(set(pilot_tasks)) != len(pilot_tasks)):
         raise BackendSelectionError("gemma_pilot_tasks_invalid")
     return (SubprocessBackend(command), gemma_queue_caps_for(cfg),
             frozenset({"summarize", *pilot_tasks}))

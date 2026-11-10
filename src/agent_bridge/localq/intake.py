@@ -239,6 +239,9 @@ class AutomaticIntake:
         """
         if classification not in ALLOWED_CLASSIFICATIONS:
             return "refused", "classification_refused"
+        if (self.queue.backend_id == "gemma_certified" and task_type == "log_triage"
+                and classification not in {"synthetic", "public", "internal_nonclient"}):
+            return "refused", "classification_refused"
         unknown = set(flags) - PROHIBITED_FLAGS - PERMITTED_FLAGS
         if unknown:
             return "refused", "risk_flags_invalid"
@@ -252,8 +255,8 @@ class AutomaticIntake:
         if task_type not in MECHANICAL_TASKS:
             return "refused", "task_requires_cloud_or_human_judgment"
         # A configured backend may intentionally support a strict subset of
-        # mechanical work. The certified Gemma lane currently supports only
-        # summarize; refuse other kinds before a job can enter the queue.
+        # mechanical work. The certified Gemma lane supports summarize by
+        # default; refuse disabled kinds before a job can enter the queue.
         if task_type not in self.queue.allowed_task_types:
             return "refused", UNSUPPORTED_KIND_REASON
         if input_bytes < self.policy.byte_threshold and nonblank_lines < self.policy.min_nonblank_lines:
@@ -494,10 +497,10 @@ class AutomaticIntake:
                     gemma_child._document_params(actual_params["documents"])
                 except ValueError as exc:
                     raise AdmissionError(str(exc)) from exc
-            # The spool has one physical cap.  Keep the certified summarize
-            # and classify contracts at their historical 24 KB limit while
-            # allowing an extract manifest to use the wider spool cap.
-            if (task_type in {"summarize", "classify"}
+            # The spool has one physical cap. Keep single-call contracts
+            # at the certified 24 KB limit while allowing an extract
+            # manifest to use the wider spool cap.
+            if (task_type in {"summarize", "classify", "log_triage"}
                     and len(input.encode("utf-8")) > QueueCaps().max_input_bytes):
                 raise AdmissionError("input_too_large")
         flags = self._validated_flags(risk_flags)

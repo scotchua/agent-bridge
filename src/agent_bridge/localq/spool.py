@@ -33,7 +33,7 @@ MECHANICAL_TASKS = frozenset({"summarize", "extract", "classify", "checklist", "
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 #: Fixed refusal reason for a mechanical task type that is real (it is in
 #: ``MECHANICAL_TASKS``) but not carried by the queue's *currently configured*
-#: backend -- e.g. every kind but ``summarize`` when the backend is
+#: backend -- e.g. disabled pilot kinds when the backend is
 #: ``gemma_certified``. Kept separate from ``task_type_refused`` (a task type
 #: that is not mechanical at all): one is "this queue never does that kind of
 #: work"; this one is "this backend does not, today". Both refuse before
@@ -124,7 +124,7 @@ _GEMMA_VALUE_REASONS = frozenset({
     "unsupported_kind", "input_invalid", "params_invalid",
     "params_invalid_for_gemma_certified", "job_id_invalid", "timeout_invalid",
     "model_digest_invalid", "delegate_sha256_invalid", "validator_sha256_invalid",
-    "extract_documents_invalid", "payload_invalid",
+    "extract_documents_invalid", "payload_invalid", "log_triage_input_invalid",
     "delegate must be an existing absolute regular file",
     "python must be an existing absolute regular file",
     "receipt_validator must be an existing absolute regular file",
@@ -134,7 +134,7 @@ _GEMMA_REFUSAL_REASONS = frozenset({
     "custom_instruction_unsupported", "delegate_source_changed",
     "receipt_validator_source_changed", "gemma_delegate_timeout",
     "gemma_delegate_unavailable", "gemma_delegate_output_overflow",
-    "classify_line_count_mismatch",
+    "classify_line_count_mismatch", "log_triage_output_invalid",
 })
 _GEMMA_RECEIPT_REASONS = frozenset({
     "receipt_validator_unloadable", "receipt_validator_contract_missing",
@@ -336,7 +336,7 @@ class LocalQueue:
         # The kinds *this* backend actually carries. Defaults to every
         # mechanical task, unchanged from before this existed. A backend
         # that supports fewer kinds (``gemma_certified`` supports only
-        # ``summarize`` today) passes a narrower set here so an unsupported
+        # ``summarize`` by default) passes a narrower set here so an unsupported
         # kind is refused at submission, before anything is queued, rather
         # than discovered only when the executor finally runs it.
         self.allowed_task_types = (MECHANICAL_TASKS if allowed_task_types is None
@@ -473,6 +473,9 @@ class LocalQueue:
             raise AdmissionError(UNSUPPORTED_KIND_REASON)
         if classification not in ALLOWED_CLASSIFICATIONS:
             raise AdmissionError("classification_refused")
+        if (self.backend_id == "gemma_certified" and task_type == "log_triage"
+                and classification not in {"synthetic", "public", "internal_nonclient"}):
+            raise AdmissionError("classification_refused")
         if classification == "client_derived":
             reason = self._client_data_health_refusal()
             if reason is not None:
@@ -490,6 +493,11 @@ class LocalQueue:
                 raise AdmissionError(reason)
         if not isinstance(input, str):
             raise AdmissionError("input_invalid")
+        if self.backend_id == "gemma_certified" and task_type == "log_triage":
+            try:
+                gemma_child._triage_input_ids(input)
+            except ValueError as exc:
+                raise AdmissionError(str(exc)) from exc
         payload = {"task_type": task_type, "input": input, "params": params or {},
                    "priority": priority, "classification": classification,
                    "caller": caller, "purpose": purpose}
@@ -498,8 +506,8 @@ class LocalQueue:
             raise AdmissionError("input_too_large")
         # ``gemma_queue_caps_for`` widens the common spool only for extract
         # manifests.  Direct queue users bypass AutomaticIntake, so retain
-        # the old certified cap here too for the other two task contracts.
-        if (self.backend_id == "gemma_certified" and task_type in {"summarize", "classify"}
+        # the old certified cap here too for the single-call task contracts.
+        if (self.backend_id == "gemma_certified" and task_type in {"summarize", "classify", "log_triage"}
                 and len(normalized.encode("utf-8")) > QueueCaps().max_input_bytes):
             raise AdmissionError("input_too_large")
         content_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()

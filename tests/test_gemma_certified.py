@@ -24,7 +24,7 @@ from agent_bridge.localq.intake import AutomaticIntake, IntakePolicy
 from agent_bridge.localq.service import Service
 from agent_bridge.localq.spool import (FakeBackend, LocalQueue, QueueCaps,
                                        ResourceSnapshot, SubprocessBackend,
-                                       UNSUPPORTED_KIND_REASON)
+                                       UNSUPPORTED_KIND_REASON, AdmissionError)
 from agent_bridge.orchestration.config import OrchestrationConfigError, load
 from agent_bridge.orchestration import audit, autoroute, delegation_verify, gate, localfirst, mcp
 
@@ -186,25 +186,140 @@ class ConfigAndSelectionTests(unittest.TestCase):
         self.assertEqual(result["result"]["provider"], "gemma_certified")
 
     def test_explicit_pilot_opt_in_selects_only_named_tasks(self):
-        doc = config_doc(self.root, self.fx)
-        doc["gemma_pilot_tasks"] = ["extract"]
-        cfg = load(self.write(doc))
-        if os.name != "posix":
-            return
-        _, _, allowed = backend_select.build_backend_and_caps(cfg, str(self.root / "queue"))
-        self.assertEqual(allowed, frozenset({"summarize", "extract"}))
+        for tasks in (["extract"], ["log_triage"], ["extract", "classify", "log_triage"]):
+            with self.subTest(tasks=tasks):
+                doc = config_doc(self.root, self.fx)
+                doc["gemma_pilot_tasks"] = tasks
+                path = self.write(doc)
+                cfg = load(path)
+                self.assertEqual(gate.gemma_pilot_tasks_from_config(str(path)), frozenset(tasks))
+                if os.name == "posix":
+                    _, _, allowed = backend_select.build_backend_and_caps(cfg, str(self.root / "queue"))
+                    self.assertEqual(allowed, frozenset({"summarize", *tasks}))
 
     def test_pilot_config_rejects_unknown_duplicate_and_private_worker_values(self):
-        for value in (["extract", "extract"], ["summarize"], "extract"):
+        for value in (["extract", "extract"], ["log_triage", "log_triage"],
+                      ["summarize"], ["unknown"], ["test_draft"], ["checklist"],
+                      [[]], [{}], "extract"):
             with self.subTest(value=value):
                 doc = config_doc(self.root, self.fx)
                 doc["gemma_pilot_tasks"] = value
                 with self.assertRaisesRegex(OrchestrationConfigError, "gemma_pilot_tasks_invalid"):
                     load(self.write(doc))
+                self.assertEqual(gate.gemma_pilot_tasks_from_config(str(self.write(doc))), frozenset())
+                if os.name == "posix":
+                    cfg = SimpleNamespace(**config_doc(self.root, self.fx), gemma_pilot_tasks=value)
+                    with self.assertRaisesRegex(backend_select.BackendSelectionError,
+                                                "gemma_pilot_tasks_invalid"):
+                        backend_select.build_backend_and_caps(cfg, str(self.root / "queue"))
         doc = config_doc(self.root, self.fx, "private_worker")
         doc["gemma_pilot_tasks"] = []
         with self.assertRaisesRegex(OrchestrationConfigError, "configuration_must_be_absent"):
             load(self.write(doc))
+
+    @unittest.skipUnless(os.name == "posix", "certified Gemma backend requires POSIX process groups")
+    def test_log_triage_opt_in_controls_queue_intake_and_digest_surface(self):
+        source = "[L1] Synthetic warning\n[L2] Synthetic debug\n"
+        for enabled in (False, True):
+            doc = config_doc(self.root, self.fx)
+            doc["gemma_pilot_tasks"] = ["log_triage"] if enabled else []
+            service = Service.for_config(load(self.write(doc)),
+                                         root=str(self.root / f"queue-{enabled}"), sampler=Sampler())
+            intake = AutomaticIntake(service.queue, policy=IntakePolicy(min_input_chars=1))
+            tools = mcp.build_tools("codex", StageRouter(str(self.root / "router.sqlite3")),
+                                    service.queue, intake, state_root=str(self.root / "state"))
+            advertised = tools["work_digest_file"]["inputSchema"]["properties"]["task_type"]["enum"]
+            self.assertEqual("log_triage" in advertised, enabled)
+            if not enabled:
+                with self.assertRaisesRegex(AdmissionError, "^unsupported_kind$"):
+                    service.queue.submit(task_type="log_triage", input=source, params={},
+                                         priority="interactive", classification="synthetic",
+                                         caller="codex", purpose="work")
+                refused = intake.route(task_type="log_triage", input=source, params={},
+                                       priority="interactive", classification="synthetic",
+                                       caller="codex", purpose="test")
+                self.assertEqual(refused["reason"], "unsupported_kind")
+                self.assertIsNone(refused["job_id"])
+                continue
+            for bad_input, params, reason in (
+                    ("Missing identity", {}, "log_triage_input_invalid"),
+                    (source, {"instruction": ""}, "params_invalid_for_gemma_certified")):
+                with self.subTest(reason=reason):
+                    with self.assertRaisesRegex(AdmissionError, "^" + reason + "$"):
+                        intake.route(task_type="log_triage", input=bad_input, params=params,
+                                     priority="interactive", classification="synthetic",
+                                     caller="codex", purpose="test")
+            self.assertEqual(service.queue.state_report()["counts"], {})
+            # A passing client health check must never widen this pilot.
+            service.queue.client_data_health_gate = SimpleNamespace(check=lambda: None)
+            for classification in ("client_derived", "unclassified"):
+                with self.subTest(classification=classification):
+                    checkpoint = intake.checkpoint(
+                        task_id=classification, task_type="log_triage", classification=classification,
+                        caller="codex", input_bytes=len(source.encode()), nonblank_lines=2)
+                    self.assertEqual(checkpoint["reason"], "classification_refused")
+                    with self.assertRaisesRegex(AdmissionError, "^classification_refused$"):
+                        service.queue.submit(task_type="log_triage", input=source, params={},
+                                             priority="interactive", classification=classification,
+                                             caller="codex", purpose="work")
+            for classification in ("synthetic", "public", "internal_nonclient"):
+                checkpoint = intake.checkpoint(
+                    task_id=classification, task_type="log_triage", classification=classification,
+                    caller="codex", input_bytes=len(source.encode()), nonblank_lines=2)
+                routed = intake.route(task_type="log_triage", input=source, params={},
+                                      priority="interactive", classification=classification,
+                                      caller="codex", purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
+                self.assertEqual(routed["decision"], "local")
+                result = service.once()["last_result"]
+                self.assertEqual(result["status"], "complete", result)
+                self.assertEqual(result["result"]["output"]["task"], "log_triage")
+
+            repo = self.root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            target = repo / "synthetic.log"
+            target.write_text(source, encoding="utf-8")
+            policy_path = Path(autoroute.policy_path(str(self.root / "state")))
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+            policy_path.write_text(json.dumps({"version": 1, "local_first": {"enabled": True},
+                "repos": {str(repo): {"classification": "internal_nonclient",
+                                      "allowed_routes": ["local"], "mechanical_ok": True,
+                                      "mechanical_globs": ["**/*.log"]}}}), encoding="utf-8")
+            routed = tools["work_digest_file"]["handler"]({"path": str(target), "task_type": "log_triage"})
+            self.assertTrue(routed["ok"], routed)
+            self.assertTrue(routed["job_id"], routed)
+            service.once()
+            result = tools["work_result"]["handler"]({"job_id": routed["job_id"]})
+            self.assertEqual(result["status"], "complete", result)
+            self.assertEqual(result["result"]["output"]["task"], "log_triage")
+
+    def test_gate_offers_log_triage_only_when_enabled_and_nonclient(self):
+        state, repo = self.root / "state", self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        policy_path = Path(autoroute.policy_path(str(state)))
+        policy_path.parent.mkdir(parents=True)
+        ready = SimpleNamespace(ready=True, code="ready", reason="ready", considered={})
+        for classification in ("internal_nonclient", "client_derived"):
+            policy_path.write_text(json.dumps({"version": 1, "local_first": {"enabled": True},
+                "repos": {str(repo): {"classification": classification, "allowed_routes": ["local"],
+                                      "mechanical_ok": True, "mechanical_globs": ["**/*.log"]}}}))
+            for enabled in (False, True):
+                for client in ("claude", "codex"):
+                    with self.subTest(classification=classification, enabled=enabled, client=client):
+                        target = repo / f"{classification}-{enabled}-{client}.log"
+                        target.write_text("[synthetic] Warning\n" * 500, encoding="utf-8")
+                        payload = ({"file_path": str(target)} if client == "claude"
+                                   else {"command": f"cat {target}"})
+                        with mock.patch.object(gate.localfirst, "readiness", return_value=ready):
+                            decision = gate.judge(
+                                client, "Read" if client == "claude" else "Bash", payload, str(repo),
+                                state_root=str(state), local_queue_root=str(self.root / "queue"),
+                                worker_executable="fixture",
+                                allowed_pilot_tasks=frozenset({"log_triage"}) if enabled else frozenset())
+                        self.assertEqual(decision.code, "local_digest_required")
+                        self.assertEqual("summarize|log_triage" in decision.reason,
+                                         enabled and classification == "internal_nonclient")
+                        if enabled and classification == "internal_nonclient":
+                            self.assertIn("1-6 ASCII letters then 1-4 digits, e.g. [L1]", decision.reason)
 
     def test_audit_selects_gemma_delegate_for_readiness(self):
         doc = config_doc(self.root, self.fx)
@@ -413,6 +528,71 @@ class GemmaInvokeTests(unittest.TestCase):
         self.assertEqual([row["label"] for row in result["output"]["lines"]],
                          ["UNSURE", "UNSURE", "UNSURE"])
 
+    def test_log_triage_uses_triage_argv_raw_input_and_receipt_bindings(self):
+        source = "[A1] Synthetic café warning\r\n\r\n[B2] Synthetic debug\r\n"
+        candidate = "ACT:\n- [B2] Check debug\nWATCH:\n- [A1] Check warning\nNOISE:\n"
+        # Write bytes: write_text would translate newlines to CRLF on Windows.
+        (self.fx["install"] / "triage_output.txt").write_bytes(candidate.encode("utf-8"))
+        result = self.invoke(source, task_type="log_triage")
+        self.assertEqual(result["task"], "log_triage")
+        self.assertEqual(result["output"], {"task": "log_triage", "text": candidate})
+        self.assertEqual(result["input_sha256"], hashlib.sha256(source.encode()).hexdigest())
+        self.assertEqual(result["output_sha256"], hashlib.sha256(candidate.encode()).hexdigest())
+        self.assertEqual((self.fx["install"] / "observed-stdin.bin").read_bytes(), source.encode())
+        argv = json.loads((self.fx["install"] / "observed-argv.json").read_text())
+        self.assertEqual(argv, ["--task", "triage", "--invocation-id", result["invocation_id"],
+                                "--parent-task-id", "job-1", "--job-timeout", "5.0"])
+        receipt = json.loads((self.fx["receipts"] / f"local-delegate-{result['invocation_id']}.json").read_text())
+        self.assertEqual(receipt["task"], "triage")
+
+    def test_log_triage_bad_input_and_nonempty_params_never_spawn(self):
+        for source in ("no identity", "[A1] First\n[A1] Duplicate", "[] Empty id",
+                       "[broken Missing bracket", "[[nested]] Bad", "[two words] Bad",
+                       " [A1] Bad", "[A1]", "[A1]   ", "\n \t\n",
+                       "[A1] First\nmissing continuation", "[alpha] Bad", "[A12345] Bad",
+                       "[ABCDEFG1] Bad", "[Á1] Bad", "[A1] Contains [B2] token"):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "^log_triage_input_invalid$"):
+                    self.invoke(source, task_type="log_triage")
+        for params in ({"instruction": ""}, {"documents": []}, {"provider": "auto"}):
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(ValueError, "^params_invalid_for_gemma_certified$"):
+                    self.invoke("[A1] Synthetic", task_type="log_triage", params=params)
+        self.assertFalse((self.fx["install"] / "calls.txt").exists())
+
+    def test_log_triage_default_output_matches_delegate_empty_buckets(self):
+        source = "[L1] Synthetic warning\n\n[AbCdEf1234] Synthetic debug\n"
+        result = self.invoke(source, task_type="log_triage")
+        self.assertEqual(result["output"], {"task": "log_triage", "text":
+            "ACT\n- none\n\nWATCH\n- none\n\nNOISE\n"
+            "- [L1] Synthetic warning\n- [AbCdEf1234] Synthetic debug\n"})
+
+    def test_log_triage_rejects_bad_output_even_with_valid_success_receipt(self):
+        for candidate in (
+                "ACT\n- [A1] First\nWATCH\nNOISE\n",  # missing two
+                "ACT\n- [A1] First\nWATCH\n- [A1] Duplicate\n- [B2] Second\nNOISE\n",
+                "ACT\n- [A1] First\n- [B2] Second\nWATCH\nNOISE\n- [Z9] Extra\n",
+                "ACT\n- [A1] First\n- [B2] Second\nWATCH\n",  # missing section
+                "ACT\n- [A1] First\nWATCH\n- [B2] Second\nNOISE\nNOISE\n",
+                "- [A1] First\nACT\nWATCH\n- [B2] Second\nNOISE\n",
+                "ACT\n[A1] Malformed\nWATCH\n- [B2] Second\nNOISE\n",
+                "ACT\n- [A1] First\nWATCH\n- [B2] Second\nNOISE\nextra prose",
+                "incomplete"):
+            with self.subTest(candidate=candidate):
+                (self.fx["install"] / "triage_output.txt").write_text(candidate, encoding="utf-8")
+                with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^log_triage_output_invalid$"):
+                    self.invoke("[A1] Synthetic first\n[B2] Synthetic second", task_type="log_triage")
+
+    def test_log_triage_receipt_task_must_be_delegate_triage(self):
+        for field, value, reason in (("task", "log_triage", "receipt_task_mismatch"),
+                                     ("result_status", "incomplete", "receipt_invalid"),
+                                     ("input_sha256", "0" * 64, "receipt_invalid")):
+            with self.subTest(field=field):
+                self.override({field: value})
+                with self.assertRaisesRegex(gemma_child.GemmaReceiptError, reason):
+                    self.invoke("[A1] Synthetic", task_type="log_triage")
+                (self.fx["install"] / "receipt_override.json").unlink()
+
     def test_changed_delegate_or_validator_source_refuses_before_spawn(self):
         delegate_digest = file_sha256(self.fx["delegate"])
         validator_digest = file_sha256(self.fx["validator"])
@@ -539,6 +719,20 @@ class QueueIntegrationTests(unittest.TestCase):
         self.assertEqual(terminal["job_id"], job["job_id"])
         self.assertEqual(terminal["status"], "complete")
         self.assertEqual(terminal["result"]["provider"], "gemma_certified")
+
+    def test_log_triage_bad_output_fails_job_with_fixed_reason(self):
+        (self.fx["install"] / "triage_output.txt").write_text(
+            "ACT\n- [A1] Synthetic first\nWATCH\nNOISE\n", encoding="utf-8")
+        queue = LocalQueue(self.root, sampler=Sampler(),
+                           backend=SubprocessBackend(self.command()), backend_id="gemma_certified",
+                           allowed_task_types=frozenset({"summarize", "log_triage"}))
+        queue.submit(task_type="log_triage", input="[A1] Synthetic first\n[B2] Private second",
+                     params={}, priority="interactive", classification="synthetic",
+                     caller="codex", purpose="work")
+        terminal = queue.run_once("runner")
+        self.assertEqual(terminal["status"], "failed", terminal)
+        self.assertIn("log_triage_output_invalid", terminal["error"])
+        self.assertNotIn("Private second", terminal["error"])
 
     @unittest.skipUnless(os.name == "posix", "process-group termination is POSIX-only")
     def test_outer_timeout_kills_adapter_and_delegate_group(self):

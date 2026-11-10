@@ -348,12 +348,12 @@ never applies, commits, pushes, merges, downloads a model, or enables paid
 fallback, and it refuses to run against a result path inside a temporary
 directory.
 
-## Certified extract and classify pilot
+## Certified extract, classify, and log_triage pilot
 
 The certified Gemma lane carries `summarize` by default. An operator enables
-the `extract` and/or `classify` pilot explicitly with the orchestration
+the `extract`, `classify`, and/or `log_triage` pilot explicitly with the orchestration
 configuration's `gemma_pilot_tasks` list. Its only allowed values are
-`extract` and `classify`; the default is an empty list.
+`extract`, `classify`, and `log_triage`; the default is an empty list.
 `extract` takes `params.documents`, an ordered list of unique non-empty ids
 and UTF-8 text. The adapter invokes the delegate once per document, never
 batches documents, and returns every candidate record with `ok`, `no_record`,
@@ -368,6 +368,32 @@ receipt mismatch, deadline, or count mismatch fails the entire durable job;
 there is no partial result or cloud fallback. During this pilot extract and
 classify accept only synthetic, public, and internal_nonclient material.
 Summarize retains its existing classification behavior.
+
+`log_triage` takes empty params and calls the pinned delegate with `--task
+triage`. Input must contain one record per nonblank line, starting at column
+one with a unique `[ID]`, a space or tab, and nonblank record text. IDs match
+`[A-Za-z]{1,6}\d{1,4}`: 1–6 ASCII letters followed by 1–4 digits, for example
+`[L1]`; matching is case-sensitive. Each line must contain exactly one match
+of that bracketed-ID pattern, so record text cannot contain a second `[B2]`.
+Blank lines are ignored for validation but the adapter sends the original
+UTF-8 input unchanged. Missing, duplicate, or malformed IDs are refused with
+the fixed reason `log_triage_input_invalid`; the adapter never adds IDs.
+The output must contain ACT, WATCH, and NOISE sections (plain or Markdown
+headings, with an optional colon), containing `- [ID] text` records using the
+same ID grammar. An empty section may contain exactly `- none` as its sole
+nonblank line; it cannot be repeated or mixed with records in that section.
+After receipt validation, the adapter independently checks that every input
+ID appears exactly once and no unknown ID appears. Malformed sections,
+missing, duplicate, or unknown output IDs fail the whole job with
+`log_triage_output_invalid`. This pilot admits only `synthetic`, `public`,
+and `internal_nonclient`; `client_derived` and unclassified input are refused
+even with a passing client-data health check. It stays off until the operator
+adds `log_triage` to `gemma_pilot_tasks`. The routing offer includes it only
+after that opt-in; callers must provide the ID contract themselves.
+
+`test_draft` and `checklist` are outside this certification: the installed
+delegate has no corresponding tasks. Certifying them requires a reviewed
+change to the separate firm-tools plugin first.
 
 An operator may opt individual repository files in with `extract_globs` and
 `classify_globs`; both default empty. `extract_document_separator`, when set,

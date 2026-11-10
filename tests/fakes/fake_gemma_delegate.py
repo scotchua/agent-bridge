@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,17 @@ def main(argv: list[str] | None = None) -> int:
         output = records.encode("utf-8") if records else json.dumps([fields]).encode("utf-8")
     elif args.task == "classify":
         output = b"\n".join(b"UNSURE | " + line[:60] for line in input_bytes.splitlines())
+    elif args.task == "triage":
+        candidate = here / "triage_output.txt"
+        if candidate.is_file():
+            output = candidate.read_bytes()
+        else:
+            # Mirror _format_triage, assigning every synthetic record to NOISE.
+            rows = [f"- [{match[1]}] {match[2]}"
+                    for line in input_bytes.decode("utf-8").splitlines()
+                    if (match := re.fullmatch(r"\s*\[([A-Za-z]{1,6}\d{1,4})\] ?(.*)", line))]
+            output = ("ACT\n- none\n\nWATCH\n- none\n\nNOISE\n"
+                      + "\n".join(rows or ["- none"]) + "\n").encode("utf-8")
     else:
         output = b"SUMMARY: " + input_bytes[:80]
     sys.stdout.buffer.write(output)

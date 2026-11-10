@@ -1536,12 +1536,17 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
         matched_glob=matched_glob, classification=repo_policy.classification, client=client,
         readiness_info=readiness_info, digest_grace_seconds=policy.local_first.digest_grace_seconds,
         clock=clock)
+    task_offer = ""
+    if (task_type == "summarize" and "log_triage" in allowed_pilot_tasks
+            and repo_policy.classification in {"synthetic", "public", "internal_nonclient"}):
+        task_offer = (", task_type one of summarize|log_triage (log_triage requires unique leading [ID] records: "
+                      "1-6 ASCII letters then 1-4 digits, e.g. [L1], with nonblank text and no second ID per line)")
     return Decision(
         "deny", "local_digest_required",
         f"delegation-first gate: {real_path} is a mechanical artifact ({size:,} bytes, "
         f"matches {matched_glob}) in a repository the operator marked mechanical_ok, and "
         f"the local lane is ready ({readiness.reason}). Call {next_call} with "
-        f"path={real_path!r}, then "
+        f"path={real_path!r}{task_offer}, then "
         f"work_result on the returned job_id; this read is allowed once the digest completes. "
         f"Exact tools (grep, rg, tail -n) are allowed now.",
         (repo_root,), logged=True, extra={"bytes_estimate": size, "matched_glob": matched_glob,
@@ -2312,7 +2317,8 @@ def gemma_pilot_tasks_from_config(config_path: str) -> frozenset[str]:
         return frozenset()
     tasks = loaded.get("gemma_pilot_tasks", [])
     if (loaded.get("local_backend") != "gemma_certified" or not isinstance(tasks, list)
-            or any(task not in {"extract", "classify"} for task in tasks)
+            or any(not isinstance(task, str) or task not in {"extract", "classify", "log_triage"}
+                   for task in tasks)
             or len(set(tasks)) != len(tasks)):
         return frozenset()
     return frozenset(tasks)
