@@ -1,5 +1,6 @@
 """Focused tests for conservative capacity-aware stage binding."""
 
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -102,6 +103,51 @@ class CapacityRouterTests(unittest.TestCase):
         reassigned = self.router.assign("a", "build", owner_id="second",
                                         lease_seconds=10, expected_revision=3)
         self.assertEqual(reassigned["owner_id"], "second")
+
+    def test_reconciliation_listing_filters_archived_and_sorts(self):
+        self.capacity("codex", lifetime=300)
+        for item in ("z", "a", "archived"):
+            self.router.register(item, "build", allowed_routes=["codex"])
+            self.router.assign(item, "build", owner_id="worker", lease_seconds=10,
+                               expected_revision=0)
+        self.clock.now += 15
+        for item in ("z", "a", "archived"):
+            with self.assertRaisesRegex(RoutingError, "liveness_reconciliation_required"):
+                self.router.assign(item, "build", owner_id="second", lease_seconds=10,
+                                   expected_revision=1)
+        # Synthetic historical row: archived reconciliation must stay invisible.
+        with self.router._db() as db:
+            db.execute("UPDATE stages SET archived_at=? WHERE item_id='archived'",
+                       (self.clock(),))
+        reader = StageRouter(self.router.path, clock=self.clock, read_only=True)
+        with reader._db() as db:
+            before = list(db.iterdump())
+        rows = reader.reconciliation_stages()
+        self.assertEqual([row["item_id"] for row in rows], ["a", "z"])
+        self.assertEqual(rows[0], {
+            "item_id": "a", "stage": "build", "revision": 2, "owner_id": "worker",
+            "owner_route": "codex", "lease_until": 1010.0, "updated_at": 1015.0,
+            "seconds_since_expiry": 5.0})
+        with reader._db() as db:
+            self.assertEqual(list(db.iterdump()), before)
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("DELETE FROM stages")
+
+    def test_read_only_router_does_not_create_or_migrate(self):
+        missing = os.path.join(self.temp.name, "missing", "router.sqlite3")
+        reader = StageRouter(missing, read_only=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            reader.reconciliation_stages()
+        self.assertFalse(os.path.exists(os.path.dirname(missing)))
+        legacy = os.path.join(self.temp.name, "legacy.sqlite3")
+        with closing(sqlite3.connect(legacy)) as db:
+            db.execute("CREATE TABLE sentinel (value TEXT)")
+        reader = StageRouter(legacy, read_only=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            reader.reconciliation_stages()
+        with closing(sqlite3.connect(legacy)) as db:
+            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
+                             [("sentinel",)])
 
     def test_paid_fallback_is_forbidden_and_blocked_is_terminal(self):
         self.capacity("local")

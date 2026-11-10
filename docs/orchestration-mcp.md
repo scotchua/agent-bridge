@@ -36,6 +36,20 @@ Caller identity comes from `--caller`; it is not accepted from tool input.
 Expired stage leases require reconciliation outside this MCP surface, so a
 caller cannot seize a stage merely because time passed.
 
+## Operator stage reconciliation
+
+Run `agent-bridge-admin stage-reconcile` to list live stages requiring
+reconciliation, without task text. Before releasing one, confirm that its
+previous owner is no longer running and state how you checked:
+
+```text
+agent-bridge-admin stage-reconcile --item ITEM --stage STAGE --expected-revision N --owner-inactive --evidence "Confirmed the previous worker exited using the supervisor's process status"
+```
+
+This plans one release and is a dry run by default. Add `--apply` to release
+that stage to `pending` with no owner; it does not claim the stage. Use the
+revision from the listing. There is no bulk release.
+
 ## Configuration preview
 
 Copy `config/orchestration.example.json` to a private location and replace all
