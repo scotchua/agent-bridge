@@ -531,7 +531,8 @@ class GemmaInvokeTests(unittest.TestCase):
     def test_log_triage_uses_triage_argv_raw_input_and_receipt_bindings(self):
         source = "[A1] Synthetic café warning\r\n\r\n[B2] Synthetic debug\r\n"
         candidate = "ACT:\n- [B2] Check debug\nWATCH:\n- [A1] Check warning\nNOISE:\n"
-        (self.fx["install"] / "triage_output.txt").write_text(candidate, encoding="utf-8")
+        # Write bytes: write_text would translate newlines to CRLF on Windows.
+        (self.fx["install"] / "triage_output.txt").write_bytes(candidate.encode("utf-8"))
         result = self.invoke(source, task_type="log_triage")
         self.assertEqual(result["task"], "log_triage")
         self.assertEqual(result["output"], {"task": "log_triage", "text": candidate})
