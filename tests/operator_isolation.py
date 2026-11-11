@@ -16,6 +16,8 @@ import shutil
 import tempfile
 
 STATE_ENV = "CODEX_JOB_RUNNER_STATE"
+# Suppress desktop alerts in tests, including subprocesses that inherit this environment.
+os.environ["AGENT_BRIDGE_NO_DESKTOP_ALERTS"] = "1"
 
 if STATE_ENV not in os.environ:
     _root = tempfile.mkdtemp(prefix="ab-operator-state-")
