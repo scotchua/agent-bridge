@@ -27,6 +27,8 @@ from . import store
 from .platform import platform as host_platform
 
 CACHE_SECONDS = 600.0
+# Test suites set this opt-out; production services never do.
+NO_DESKTOP_ALERTS_ENV = "AGENT_BRIDGE_NO_DESKTOP_ALERTS"
 # Synthetic operating notes: the headline fits the delegate's 10% summary
 # budget with room for punctuation. Keep the budget regression test in sync.
 GEMMA_CHECK_TEXT = (
@@ -1022,6 +1024,14 @@ def update(config_path: str | None = None, *, home: str | None = None,
 ALERT_REPEAT_SECONDS = 24 * 3600
 
 
+def _desktop_notify(message: str, title: str) -> None:
+    if os.environ.get(NO_DESKTOP_ALERTS_ENV) == "1":
+        return
+    try:
+        subprocess.run(["osascript", "-e", f'display notification "{message}" with title "{title}"'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False)
+    except (OSError, subprocess.SubprocessError): pass
+
+
 def report_attention(home: str | None, report: dict[str, Any]) -> None:
     """Persist drift state when it changes and alert at most once per change
     that needs the person.
@@ -1066,8 +1076,7 @@ def report_attention(home: str | None, report: dict[str, Any]) -> None:
         # already deciding.  The queue-hold decision does not depend on this
         # optional notification state.
         return
-    try: subprocess.run(["osascript", "-e", "display notification \"Run setup_bridge.py doctor\" with title \"agent-bridge needs attention\""], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError): pass
+    _desktop_notify("Run setup_bridge.py doctor", "agent-bridge needs attention")
 
 
 def _notify_attention(home: str, report: dict[str, Any]) -> None:
@@ -1075,9 +1084,7 @@ def _notify_attention(home: str, report: dict[str, Any]) -> None:
 
 
 def _notify_updated(version: str) -> None:
-    try:
-        subprocess.run(["osascript", "-e", f'display notification "Codex updated to {version}; all checks passed" with title "agent-bridge"'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError): pass
+    _desktop_notify(f"Codex updated to {version}; all checks passed", "agent-bridge")
 
 
 def main(argv: list[str] | None = None) -> int:

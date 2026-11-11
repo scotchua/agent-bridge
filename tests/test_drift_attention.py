@@ -29,6 +29,10 @@ class AttentionTests(unittest.TestCase):
         patcher = mock.patch.object(drift.subprocess, "run")
         self.run_mock = patcher.start()
         self.addCleanup(patcher.stop)
+        env_patcher = mock.patch.dict(os.environ)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop(drift.NO_DESKTOP_ALERTS_ENV, None)
 
     def alerts(self) -> int:
         return sum("osascript" in call.args[0] for call in self.run_mock.call_args_list)
@@ -40,6 +44,12 @@ class AttentionTests(unittest.TestCase):
         for _ in range(5):
             drift.report_attention(self.home, dict(DRIFTED))
         self.assertEqual(self.alerts(), 1)
+
+    def test_opt_out_env_suppresses_desktop_alerts(self) -> None:
+        os.environ[drift.NO_DESKTOP_ALERTS_ENV] = "1"
+        drift.report_attention(self.home, DRIFTED)
+        drift._notify_updated("1.2.3")
+        self.assertEqual(self.alerts(), 0)
 
     def test_state_is_rewritten_only_when_the_signature_changes(self) -> None:
         drift.report_attention(self.home, {**DRIFTED, "checked_at": 1.0})
