@@ -58,9 +58,18 @@ def load_conversation(cfg: Config, conversation_id: str) -> dict[str, Any]:
     return data
 
 
+def research_refused(record: dict[str, Any]) -> bool:
+    """True when any turn of this conversation may have carried client data.
+
+    A record written before research mode existed has no exposure field, so
+    its history is unknown and research stays off for it.
+    """
+    return record.get("client_derived_seen", True) is not False
+
+
 def claim_conversation_slot(
     cfg: Config, conversation_id: str, caller: str, job_id: str, max_turns: int,
-    *, timeout: float = 10.0,
+    *, timeout: float = 10.0, client_derived: bool = False, research: bool = False,
 ) -> dict[str, Any]:
     """Admit one continuation, atomically.
 
@@ -123,6 +132,12 @@ def claim_conversation_slot(
                 record["indeterminate_reaped"] = reap_orphaned_peers(cfg, str(active))
                 store.atomic_write_json(path, record)   # outcome, second write
                 raise BrokerError(ErrorCategory.CONVERSATION_INDETERMINATE)
+        # Exposure is checked and recorded under the same lock as the claim,
+        # so a research turn cannot slip in beside a client-derived one.
+        if research and research_refused(record):
+            raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+        if client_derived:
+            record["client_derived_seen"] = True
         record["active_job_id"] = job_id
         record["active_job_claimed_at"] = store.utc_now()
         record["updated_at"] = store.utc_now()

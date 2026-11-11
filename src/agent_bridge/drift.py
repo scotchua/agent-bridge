@@ -61,7 +61,7 @@ CLAUDE_FLAGS = (
     "--setting-sources", "--settings", "--mcp-config", "--strict-mcp-config",
     "--tools", "--system-prompt", "--session-id", "--resume",
     "--no-session-persistence", "--json-schema", "--max-budget-usd",
-    "--safe-mode",
+    "--safe-mode", "--allowedTools",
 )
 DEFAULT_QUARANTINE_HOURS = 72.0
 _VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?$")

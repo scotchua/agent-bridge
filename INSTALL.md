@@ -380,6 +380,16 @@ per side. Whatever you choose, including choosing nothing, is recorded on every
 consultation in the ledger, so you can always tell later how hard the model was
 asked to think about an answer you relied on.
 
+## 4d. Web access (research mode)
+
+Nothing to configure. Both peers run with web access disabled, and a caller can
+pass `research: true` on a single `*_start` or `*_continue` call to let the peer
+search and read public web pages for that turn. It is refused for client-derived
+material. See [Research mode](README.md#research-mode).
+
+Upgrade note: Codex consultations now carry `-c web_search="disabled"` on every
+call. Earlier versions left web search to the Codex CLI's own default.
+
 ## Plugin install (Claude only)
 
 For a Claude Code plugin install, run these commands in Claude Code:

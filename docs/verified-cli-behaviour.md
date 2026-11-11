@@ -90,6 +90,15 @@ The brief asserted four things that do not hold. All four are handled.
   commands and agents, while auth, model selection and permissions keep
   working.** Read from its own help text. Layered with `--strict-mcp-config`
   plus an empty `--mcp-config`, `--tools ""` and `--setting-sources ''`.
+- **`claude --tools "WebSearch,WebFetch"` enables only those two built-in
+  tools, and `--allowedTools "WebSearch,WebFetch"` stops the permission prompt
+  blocking them in `-p` mode.** Research mode uses both flags together, and only
+  for a turn the caller marked `research`. Every other turn keeps `--tools ""`.
+  Checked by the coordinator against the installed Claude Code CLI.
+- **Codex accepts `-c web_search=<mode>` on both `exec` and `exec resume`, with
+  modes `disabled`, `cached`, `indexed` and `live`.** The bridge pins
+  `web_search="disabled"` on every call and `web_search="live"` for a research
+  turn. Checked by the coordinator against codex-cli 0.160.1.
 - **`--bare` was rejected as the isolation mechanism.** Its help states auth
   becomes strictly `ANTHROPIC_API_KEY` or `apiKeyHelper`, with OAuth and
   keychain never read, which would break a subscription peer.

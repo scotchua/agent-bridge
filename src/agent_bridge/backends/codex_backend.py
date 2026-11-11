@@ -16,6 +16,9 @@ Isolation: `--ignore-user-config` means $CODEX_HOME/config.toml is not loaded,
 so the bridge's own MCP server cannot be registered for a peer run.  That is
 what blocks Claude -> Codex -> Claude recursion on this side.
 
+Web search is pinned with `-c web_search="disabled"` on every call and set to
+"live" only for a turn the caller marked as research.
+
 The read-only sandbox restricts writes, not reads.  This is not a filesystem
 read boundary and is not claimed as one.  The controls that matter here are
 the refusal of client-derived content, an empty isolated workspace, no user
@@ -53,6 +56,7 @@ def build_argv(
     last_message_file: str,
     thread_id: str | None,
     workspace: str,
+    research: bool = False,
 ) -> list[str]:
     spec = cfg.peer(PEER)
     sandbox = str(spec.get("sandbox_mode", "read-only"))
@@ -76,8 +80,10 @@ def build_argv(
         # Accepted on both `exec` and `exec resume`, verified against 0.147.0
         # under --strict-config.
         argv += ["-c", f'model_reasoning_effort="{effort}"']
-    argv += [
-    ]
+    # Web search is pinned on every call, never left to the CLI's default, and
+    # `-c` is accepted by both `exec` and `exec resume`. Only a research turn
+    # turns it on.
+    argv += ["-c", f'web_search="{"live" if research else "disabled"}"']
     if not thread_id:
         # Only `exec` accepts these two; `exec resume` rejects them.
         argv += ["-s", sandbox, "-C", workspace]
@@ -141,6 +147,7 @@ def run_consultation(
     workspace: str,
     attempt_dir: str,
     deadline: float | None = None,
+    research: bool = False,
 ) -> PeerOutcome:
     spec = cfg.peer(PEER)
     codex_home = os.path.expanduser(str(spec.get("codex_home")))
@@ -155,6 +162,7 @@ def run_consultation(
         last_message_file=last_message_file,
         thread_id=thread_id,
         workspace=workspace,
+        research=research,
     )
     env = runner.scrubbed_env(
         {**cfg.peer_extra_env(PEER), "CODEX_HOME": codex_home}
@@ -181,7 +189,7 @@ def run_consultation(
         group_kill=result.group_kill,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
-        notes={"credential_context": runner.credential_context(env)},
+        notes={"credential_context": runner.credential_context(env), "research": research},
     )
 
     if result.spawn_failed:

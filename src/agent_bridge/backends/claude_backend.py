@@ -6,7 +6,9 @@ Isolation is layered, because no single flag is load-bearing:
   --strict-mcp-config      only MCP servers from --mcp-config are considered,
   --mcp-config '{}'        and that set is empty. The peer therefore cannot
                            load this bridge and call back into it.
-  --tools ""               no built-in tools.
+  --tools ""               no built-in tools. A research turn instead names
+                           only WebSearch and WebFetch (and allows them, since
+                           -p mode has nobody to answer a permission prompt).
   --setting-sources ''     no user/project/local settings.
   --max-budget-usd         hard per-call spend ceiling.
 
@@ -41,7 +43,12 @@ def new_session_id() -> str:
     return str(uuid.uuid4())
 
 
-def build_argv(cfg: Config, schema: dict[str, Any], session_id: str, resume: bool) -> list[str]:
+#: The only built-in tools a research turn enables. Everything else stays off.
+RESEARCH_TOOLS = "WebSearch,WebFetch"
+
+
+def build_argv(cfg: Config, schema: dict[str, Any], session_id: str, resume: bool,
+               research: bool = False) -> list[str]:
     spec = cfg.peer(PEER)
     argv: list[str] = [
         _executable(cfg),
@@ -65,8 +72,11 @@ def build_argv(cfg: Config, schema: dict[str, Any], session_id: str, resume: boo
         "--strict-mcp-config",
         "--mcp-config", '{"mcpServers":{}}',
         "--setting-sources", "",
-        "--tools", "",
     ]
+    if research:
+        argv += ["--tools", RESEARCH_TOOLS, "--allowedTools", RESEARCH_TOOLS]
+    else:
+        argv += ["--tools", ""]
     return argv
 
 
@@ -101,9 +111,10 @@ def run_consultation(
     workspace: str,
     attempt_dir: str | None = None,
     deadline: float | None = None,
+    research: bool = False,
 ) -> PeerOutcome:
     spec = cfg.peer(PEER)
-    argv = build_argv(cfg, schema, session_id, resume)
+    argv = build_argv(cfg, schema, session_id, resume, research=research)
     env = runner.scrubbed_env(cfg.peer_extra_env(PEER))
     result = runner.run(
         argv,
@@ -127,7 +138,7 @@ def run_consultation(
         group_kill=result.group_kill,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
-        notes={"credential_context": runner.credential_context(env)},
+        notes={"credential_context": runner.credential_context(env), "research": research},
     )
 
     if result.spawn_failed:

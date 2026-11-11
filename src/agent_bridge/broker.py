@@ -28,7 +28,8 @@ CALLERS = ("claude", "codex")
 PEER_OF = {"codex": "claude", "claude": "codex"}
 
 HANDOFF_FIELDS = {"preparation_dir", "clearance_sha256"}
-START_FIELDS = {"prompt", "source_classification", "label", "local_first", "exception_id"} | HANDOFF_FIELDS
+START_FIELDS = {"prompt", "source_classification", "label", "local_first", "exception_id",
+                "research"} | HANDOFF_FIELDS
 CONTINUE_FIELDS = START_FIELDS | {"conversation_id"}
 
 #: local_first.bypass's closed vocabulary (design section 2.8).
@@ -64,6 +65,10 @@ def ok_response(**fields: Any) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- validation
+def _client_derived(args: dict[str, Any]) -> bool:
+    return args["source_classification"].strip().lower() in send_binding.CLIENT_DERIVED
+
+
 def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
                      peer: str, operation: str = "start") -> None:
     if not isinstance(args, dict):
@@ -96,6 +101,16 @@ def _validate_common(cfg: Config, args: dict[str, Any], allowed: set[str],
     accepted = {c.lower() for c in cfg.peer_allowed_classifications(peer)}
     if normalized not in accepted and not (client_derived and "client_derived" in accepted):
         raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
+
+    # Research mode lets the peer search and read the public web for one turn.
+    # It is off unless the caller sets a real boolean (an int or string is a
+    # schema error, not a truthy value) and is never allowed for client-derived
+    # material, whichever spelling the classification uses.
+    if "research" in args:
+        if type(args["research"]) is not bool:
+            raise BrokerError(ErrorCategory.INPUT_SCHEMA_INVALID)
+        if args["research"] and client_derived:
+            raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
 
     label = args.get("label")
     if label is not None:
@@ -662,6 +677,9 @@ def start(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
                 "peer": peer,
                 "label": args.get("label"),
                 "source_classification": args["source_classification"].strip().lower(),
+                # Sticky: once any turn is client-derived, research stays off
+                # for the rest of the conversation.
+                "client_derived_seen": _client_derived(args),
                 "peer_session_id": peer_session_id,
                 "workspace": workspace,
                 "turns": 0,
@@ -695,6 +713,10 @@ def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
     conversation = registry.load_conversation(cfg, conversation_id)
     if conversation.get("peer") != peer:
         raise BrokerError(ErrorCategory.CONVERSATION_NOT_FOUND)
+    research = args.get("research", False) is True
+    # Early refusal before preflight; the claim below re-checks under lock.
+    if research and registry.research_refused(conversation):
+        raise BrokerError(ErrorCategory.SOURCE_CLASSIFICATION_REFUSED)
     if HANDOFF_FIELDS & set(args):
         validate_handoff(cfg, args, peer, conversation_id,
                          conversation.get("peer_session_id"), resume=True)
@@ -714,6 +736,7 @@ def continue_(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
             registry.claim_conversation_slot(
                 cfg, conversation_id, caller, job_id, cfg.limit("max_turns_per_conversation"),
                 timeout=min(10.0, max(0.0, deadline - time.monotonic())),
+                client_derived=_client_derived(args), research=research,
             )
             _prepare_job(cfg, caller, peer, conversation_id, job_id, args, resume=True,
                          budget_started=budget_started)
@@ -797,6 +820,7 @@ def _prepare_job(
         "source_classification": args["source_classification"].strip().lower(),
         "label": args.get("label"),
         "local_first": args.get("local_first"),
+        "research": bool(args.get("research", False)),
         "resume": resume,
         "budget_started_monotonic": budget_started,
         "deadline_monotonic": budget_started + cfg.request_timeout(peer),
@@ -926,6 +950,7 @@ def read(cfg: Config, caller: str, args: dict[str, Any]) -> dict[str, Any]:
             "peer_observed_model": prov.get("peer_observed_model"),
             "peer_session_id": prov.get("peer_session_id"),
             "source_classification": prov.get("source_classification"),
+            "research": prov.get("research"),
             "prompt_sha256": prov.get("prompt_sha256"),
             "response_sha256": prov.get("response_sha256"),
             "attempt_count": prov.get("attempt_count"),

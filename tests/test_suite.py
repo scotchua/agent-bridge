@@ -4806,6 +4806,7 @@ def main() -> int:
     import test_registry_mutations
     import test_codex_backend_mutation
     import test_receipts_mutation
+    import test_research_mode
     health_results = unittest.TextTestRunner(verbosity=1).run(
         unittest.defaultTestLoader.loadTestsFromModule(test_health))
     check("Health and authentication regressions", health_results.wasSuccessful())
@@ -4818,6 +4819,9 @@ def main() -> int:
     receipt_results = unittest.TextTestRunner(verbosity=1).run(
         unittest.defaultTestLoader.loadTestsFromModule(test_receipts_mutation))
     check("Failure receipt regressions", receipt_results.wasSuccessful())
+    research_results = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_research_mode))
+    check("Research mode regressions", research_results.wasSuccessful())
     test_worker_quarantine_mutations()
     test_worker_run_peer_mutations()
     test_worker_cleared_prompt_mutations()
