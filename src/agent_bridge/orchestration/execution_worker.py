@@ -421,6 +421,13 @@ def run(config_path: str, *, once: bool, interval: float,
                 status = drift.quick_check(config_path, force_refresh=force_refresh)
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
+                # This only schedules the existing doctor path after explicit
+                # consent.  It is non-blocking and every error leaves these
+                # conservative holds unchanged.
+                try:
+                    drift.requalify_on_detect(config_path, status)
+                except Exception:
+                    pass
                 holds: dict[str, str] = {}
                 if "codex" in changed:
                     holds["codex"] = "codex"
@@ -456,6 +463,10 @@ def run(config_path: str, *, once: bool, interval: float,
                 status = drift.quick_check(config_path, force_refresh=True)
                 changed = set(status["changed"])
                 drift.report_attention(None, status)
+                try:
+                    drift.requalify_on_detect(config_path, status)
+                except Exception:
+                    pass
                 holds = {name: name for name in ("codex", "claude") if name in changed}
                 # hold_dependencies replaces every queued job's hold, so a
                 # refresh rechecks readiness too; otherwise it would release a

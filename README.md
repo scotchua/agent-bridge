@@ -241,10 +241,25 @@ the command line but currently changes nothing. `--requalify-only` (with
 `--scheduled` or `--install-schedule`) re-runs those checks and records a new
 baseline but never installs a Codex update.
 
+During the upgrade guide you can opt in to automatic requalification. Once
+enabled, the worker that notices a changed Claude, Codex, Ollama, or certified
+Gemma dependency starts one detached `doctor --requalify-only` run right away.
+The affected provider stays held until the same existing doctor checks pass;
+other providers keep running. It never installs or updates a provider, and it
+does not enable an API-key or paid fallback. Each identity gets two attempts,
+with a 15 minute backoff, and each provider has three automatic runs per local
+day by default. `~/.agent-bridge/drift/settings.json` can set
+`auto_requalify`, `auto_requalify_max_attempts`,
+`auto_requalify_daily_budget`, and `auto_requalify_backoff_seconds`. A failed
+final attempt gives one attention item with the next step, `setup_bridge.py doctor`.
+The doctor output lists automatic-requalification attempts and today's budget.
+
 You can also install one per-user LaunchAgent with
 `python3 setup_bridge.py doctor --install-schedule` (macOS only; elsewhere it
 writes the plist but nothing loads it). Remove it with `--remove-schedule`.
-It checks at login and each night at 03:30 local time. The nightly run waits
+Installing that schedule is consent for automatic requalification only when
+`auto_requalify` is absent; `auto_requalify: false` overrides it and `true`
+enables it. It checks at login and each night at 03:30 local time. The nightly run waits
 72 hours after a Codex release before considering it (change this with
 `--quarantine-hours` or `~/.agent-bridge/drift/settings.json`), installs that
 exact version in a private staging prefix, and runs the free flag and model

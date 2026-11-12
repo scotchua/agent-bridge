@@ -220,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         from .. import drift
         status = drift.quick_check(args.config)
         drift.report_attention(None, status)
+        try:
+            drift.requalify_on_detect(args.config, status)
+        except Exception:
+            pass
         changed = set(status["changed"])
         for name in ("ollama", "gemma_delegate", "gemma_validator"):
             if name in changed:

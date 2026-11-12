@@ -185,13 +185,16 @@ class LocalStatusTests(unittest.TestCase):
         with sqlite3.connect(self.queue / "localq.sqlite3") as db:
             db.execute("UPDATE jobs SET feedback_json='SECRET MALFORMED JSON'")
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # Keep the CLI's default seven-day window aligned with this fixture's
+        # synthetic timestamps.  Without this, the malformed row ages out as
+        # calendar time advances and the test stops exercising its error path.
+        with mock.patch.object(local_status.time, "time", return_value=self.now), contextlib.redirect_stdout(out):
             self.assertEqual(local_status.main(["--config", str(self.config), "--json"]), 1)
         self.assertEqual(json.loads(out.getvalue()), {"error": "local_status:report_error"})
         with sqlite3.connect(self.queue / "localq.sqlite3") as db:
             db.execute("DROP TABLE jobs")
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(local_status.time, "time", return_value=self.now), contextlib.redirect_stdout(out):
             self.assertEqual(local_status.main(["--config", str(self.config), "--json"]), 1)
         self.assertEqual(json.loads(out.getvalue()), {"error": "local_status:database_error"})
 

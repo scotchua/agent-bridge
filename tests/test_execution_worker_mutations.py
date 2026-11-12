@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import operator_isolation  # noqa: E402,F401
 
-from agent_bridge import drift
+from agent_bridge import drift, qualification, store
 from agent_bridge.orchestration import execution_worker as worker
 from agent_bridge.orchestration.execution_queue import ExecutionAdmissionError
 
@@ -175,13 +175,14 @@ class RunMutationTests(unittest.TestCase):
             AssertionError("once mode dispatched twice")]
         quick, attention, signals = self._context(queue, ("codex", "claude"))
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        with mock.patch.object(drift, "requalify_on_detect") as requalify, contextlib.redirect_stdout(output):
             result = worker.run("invented-config.json", once=True, interval=1,
                                 worker_id="worker-invented")
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "job-invented done\n")
         quick.assert_called_once_with("invented-config.json", force_refresh=False)
         attention.assert_called_once()
+        requalify.assert_called_once()
         queue.hold_dependencies.assert_called_once_with(
             {"codex": "codex", "claude": "claude"}, drift_status={
                 "changed": ["codex", "claude"], "checked_at": 100.0,
@@ -189,6 +190,33 @@ class RunMutationTests(unittest.TestCase):
         queue.run_once.assert_called_once_with("worker-invented",
                                                allowed_providers=set())
         self.assertEqual(signals.call_count, 4)
+
+    def test_foreign_config_cannot_start_requalification_from_worker_loop(self):
+        home = self.root / "home"; home.mkdir()
+        installed = home / "installed.json"; installed.write_text("{}", encoding="utf-8")
+        foreign = self.root / "test-config.json"; foreign.write_text("{}", encoding="utf-8")
+        store.atomic_write_json(home / ".agent-bridge/onboarding/gate-installation.json",
+                                {"config": str(installed)})
+        store.atomic_write_json(home / ".agent-bridge/drift/settings.json", {"auto_requalify": True})
+        status = {"changed": ["claude"], "inventory": {
+            "executables": {"claude": {"path": "/tmp/claude", "version": "new", "sha256": "new"}},
+            "ollama": {}, "gemma": {"delegate": {}, "validator": {}}}}
+        queue = mock.Mock(); queue.run_once.return_value = None
+        self._context(queue, status=status)
+        outcomes: list[dict] = []
+        original = drift.requalify_on_detect
+        def observe(*args, **kwargs):
+            result = original(*args, **kwargs); outcomes.append(result); return result
+        with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(drift, "requalify_on_detect", side_effect=observe), \
+             mock.patch.object(drift.subprocess, "Popen") as spawn, \
+             contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop(drift.NO_AUTO_REQUALIFY_ENV, None)
+            self.assertEqual(worker.run(str(foreign), once=True, interval=1, worker_id="worker-invented"), 0)
+        self.assertEqual(outcomes, [{"started": False, "reason": "foreign_config"}])
+        spawn.assert_not_called()
+        self.assertFalse(os.path.exists(qualification.paths(str(home))["root"]))
 
     def test_refresh_rechecks_and_clears_a_hold_without_dispatching(self):
         queue = mock.Mock()

@@ -143,10 +143,42 @@ class UpgradeTests(unittest.TestCase):
                 result = upgrade.run(home=home, platform="darwin", ask=ask, out=lambda _message: None)
             self.assertEqual(result, 0)
             self.assertIn("Run doctor once to record a baseline? [Y/n] ", prompts)
-            self.assertIn("Install the nightly doctor schedule? [y/N] ", prompts)
+            self.assertTrue(any("small number of Claude or Codex subscription turns" in prompt for prompt in prompts))
+            self.assertIn("Install the nightly doctor schedule? [Y/n] ", prompts)
             baseline.assert_called_once_with(config, home=os.path.abspath(home))
             doctor.assert_not_called()
-            schedule.assert_not_called()
+            schedule.assert_called_once_with(config, home=os.path.abspath(home))
+
+    def test_existing_install_is_asked_and_records_an_explicit_no(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._receipt(home)
+            config = os.path.join(home, "orchestration.json")
+            Path(config).write_text("{}")
+            prompts: list[str] = []
+            def ask(prompt: str) -> str:
+                prompts.append(prompt)
+                if "Automatically recheck" in prompt:
+                    return "n"
+                return "y" if "Apply" in prompt else "n"
+            with mock.patch.object(upgrade.os, "geteuid", return_value=501, create=True), \
+                 mock.patch.object(upgrade.drift, "discover_config", return_value=config), \
+                 mock.patch.object(upgrade.drift, "_read_baseline", return_value={"recorded": True}):
+                result = upgrade.run(home=home, platform="linux", ask=ask, out=lambda _message: None)
+            self.assertEqual(result, 0)
+            self.assertTrue(any("never installs anything or uses paid fallback" in prompt for prompt in prompts))
+            settings = store.read_json(os.path.join(home, ".agent-bridge", "drift", "settings.json"))
+            self.assertIs(settings["auto_requalify"], False)
+
+    def test_undo_restores_the_state_before_an_explicit_no(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = os.path.join(home, ".agent-bridge", "drift", "settings.json")
+            store.atomic_write_json(settings, {"auto_requalify": False})
+            store.atomic_write_json(upgrade._upgrade_path(home), {
+                "created": [], "auto_requalify": {"path": settings, "previous_present": False,
+                                                       "previous_value": None, "applied_value": False},
+            })
+            self.assertEqual(upgrade.undo(home), 0)
+            self.assertNotIn("auto_requalify", store.read_json(settings))
 
     def test_manifest_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as home:
