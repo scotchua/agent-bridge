@@ -645,7 +645,9 @@ class ReconciliationHolds(AutoCase):
     def assertHold(self, decision):
         self.assertEqual((decision.permission, decision.code),
                          ("deny", "stage_reconciliation_required"))
-        for text in (str(self.other), self.item, self.stage,
+        # The gate names the resolved repository; on Windows the temporary
+        # directory's short name differs from it.
+        for text in (str(self.other.resolve()), self.item, self.stage,
                      "agent-bridge-admin stage-reconcile", "operator", "previous owner",
                      "Retrying or signing in will not release it"):
             self.assertIn(text, decision.reason)
@@ -741,9 +743,15 @@ class ReconciliationHolds(AutoCase):
 
         self.hold()
         # Synthetic legacy history: the current archive API refuses live holds.
-        with sqlite3.connect(self.db) as db:
+        # Closed explicitly: a connection's context manager only commits, and
+        # an open handle keeps Windows from removing the temporary directory.
+        db = sqlite3.connect(self.db)
+        try:
             db.execute("UPDATE stages SET archived_at=? WHERE item_id=? AND stage=?",
                        (time.time(), self.item, self.stage))
+            db.commit()
+        finally:
+            db.close()
         before = StageRouter(str(self.db)).get(self.item, self.stage)
         decision = self.judge_paths([self.other / "app.py"])
         self.assertEqual(decision.permission, "allow")
