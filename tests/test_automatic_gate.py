@@ -146,6 +146,312 @@ class AutoCase(unittest.TestCase):
         return gate.read_receipt(str(self.state), str(repo))
 
 
+class CommandTargetsAndTaskOwnership(AutoCase):
+    """Synthetic reproductions of G-1/G-2; no command under test is executed."""
+
+    def setUp(self):
+        from unittest import mock
+        super().setUp()
+        environment = mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                                  "USERPROFILE": str(self.home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.state = self.home / "Claude/team-state/orchestration/runtime"
+        (self.state / "routing").mkdir(parents=True)
+        self.db = self.state / "capacity.sqlite3"
+        self.config.write_text(json.dumps({"state_root": str(self.state),
+                                          "capacity_db": str(self.db)}), encoding="utf-8")
+        self.tasks = self.home / "Claude/team-state/tasks"
+        self.item = "product-task"
+        self.task = self.tasks / self.item
+        self.task.mkdir(parents=True)
+        self.target = self.task / "nightly/receipt.json"
+        self.scratch = self.home / "scratchpad"
+        self.scratch.mkdir()
+        self.write_policy({})
+        self.observe("codex")
+        self.router = StageRouter(str(self.db))
+        registered = self.router.register(self.item, "review", allowed_routes=["codex"])
+        self.owned = self.router.assign(self.item, "review", owner_id="codex-session",
+                                        lease_seconds=600, expected_revision=registered["revision"])
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": "codex-session", "stage": "review",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+
+    def shell(self, command, client="codex"):
+        return self.run_hook(client, {"tool_name": "Bash", "tool_input": {"command": command},
+                                      "cwd": str(self.repo)})
+
+    def test_literal_prose_and_home_siblings_do_not_target_state(self):
+        import shlex
+        self.write_policy({str(self.repo): {"classification": "internal_nonclient",
+                                           "allowed_routes": ["claude", "codex"]}},
+                          prefer=["claude", "codex"])
+        before = self.router.get(self.item, "review")
+        for content in ("rm mv orchestration/runtime", str(self.home), str(self.state),
+                        json.dumps({"review": f"rm {self.state}; mv {self.home} accepted"}),
+                        f"quoted > {self.state}/forged.json"):
+            with self.subTest(content=content):
+                self.assertAllowed(self.shell(f"echo {shlex.quote(content)} > {shlex.quote(str(self.target))}"))
+        self.assertAllowed(self.hook("codex", self.task, str(self.target)))
+        self.assertEqual(self.router.get(self.item, "review"), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.assertEqual([row["item_id"] for row in gate.claim_reconcile._ledger_rows(str(self.db))],
+                         [self.item])
+
+    def test_read_commands_never_open_implementation_stages(self):
+        import shlex
+        before = gate.claim_reconcile._ledger_rows(str(self.db))
+        source = self.state / "execution-queue/job/harness/id/changes.patch"
+        for client in ("codex", "claude"):
+            for command in (f"grep -n 'rm mv' {shlex.quote(str(self.target))}",
+                            f"grep accepted {shlex.quote(str(source))}",
+                            f"shasum -a 256 {shlex.quote(str(source))}",
+                            f"sha256sum {shlex.quote(str(self.scratch / 'receipt'))}",
+                            f"echo 'rm mv {self.state}'",
+                            f"printf '%s' 'rm {self.home}; mv {self.state}'"):
+                with self.subTest(client=client, command=command):
+                    self.assertAllowed(self.shell(command, client))
+        self.assertEqual(gate.claim_reconcile._ledger_rows(str(self.db)), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_copy_from_runtime_to_scratch_is_a_read_of_runtime(self):
+        import shlex
+        source = shlex.quote(str(self.state / "execution-queue/job/harness/id/changes.patch"))
+        destination = shlex.quote(str(self.scratch / "changes.patch"))
+        for command in (f"cp {source} {destination}", f"cp -- {source} {destination}",
+                        f"cp -t {shlex.quote(str(self.scratch))} {source}",
+                        f"cp --target-directory={shlex.quote(str(self.scratch))} {source}"):
+            with self.subTest(command=command):
+                self.assertAllowed(self.shell(command))
+        self.assertAllowed(self.shell(f"git commit -m 'rm mv {self.home} {self.state}'"))
+
+    def test_real_mutations_and_opaque_commands_still_refuse_state(self):
+        import shlex
+        state = shlex.quote(str(self.state))
+        parent = shlex.quote(str(self.state.parent))
+        home = shlex.quote(str(self.home))
+        escaped = shlex.quote(str(self.tasks / "../orchestration/runtime/forged.json"))
+        for command in (f"echo accepted > {state}/forged.json", f"touch {state}/forged.json",
+                        f"rm -rf {state}", f"mv {state} gone", f"rm -rf {parent}",
+                        f"mv {parent} gone", f"rm -rf {home}", f"cp source {state}/forged.json",
+                        f"cp -t {state} source", f"chmod -R 777 {parent}",
+                        f"echo x > {escaped}", f"sh -c 'rm -rf {self.state}'",
+                        f"echo 'safe' > {state}/forged.json; echo 'rm mv {home}'",
+                        f"grep accepted {state}/receipt; rm -rf {parent}",
+                        f"sudo rm -rf {state}", f"xargs rm {state}", f"time rm -rf {state}",
+                        f"'echo'$cmd rm -rf {state}",
+                        f"find {state} -exec sh -c 'rm -rf {self.state}' \\;"):
+            with self.subTest(command=command):
+                self.assertDenied(self.shell(command), "gate_state_protected")
+        self.assertDenied(self.hook("codex", self.state, "forged.json"), "gate_state_protected")
+
+    def test_dynamic_write_targets_fail_closed(self):
+        for command in (f"eval 'rm -rf {self.state}'",
+                        f'p={self.state}; rm -rf "$p"',
+                        'cp source "$destination"'):
+            self.assertDenied(self.shell(command), "shell_targets_unresolved")
+
+    def correction_refusals(self):
+        """Review reproductions; shell text only, never executed."""
+        import shlex
+        state = shlex.quote(str(self.state))
+        parent = shlex.quote(str(self.state.parent))
+        clusters = [f"cp -{flag}t {state} a" for flag in "rfva"]
+        clusters += [f"sh -c {shlex.quote(f'cp -rt {state} a')}",
+                     f"bash -ec {shlex.quote(f'cp -ft {state} a')}"]
+        patterns = [f"{parent}/runti*/f", f"{parent}/runti?e/f",
+                    f"{parent}/runti[m]e/f", "~/Claude/team-state/orch*/runtime/f",
+                    f"{parent}/{{runtime,zz}}/f", f"{parent}/{{a..z}}/f"]
+        expansions = [f"cp {state}/r {pattern}" for pattern in patterns]
+        expansions += [f"cat {state}/r > {parent}/runti*/f",
+                       f"ls {state} | tee {parent}/runti*/f",
+                       f"cd {parent}/runti* && cp {state}/r .",
+                       f"cd {parent}/runti* && cat {state}/r > f",
+                       f"cp -t {parent}/runti* {state}/r",
+                       f"cp -- {state}/r {parent}/runti*/f",
+                       f"xcopy {state}/r {parent}/runti*/f /Y"]
+        return {"clusters": clusters, "expansions": expansions,
+                "value_options": [f"cp a {state}/f -S .bak", f"cp {state}/r {state}/f -S x",
+                                  f"cp a {state}/f -Sx", f"cp a {state}/f -Z context"],
+                "checkout": [f"git checkout -m {state}/f"],
+                # These two cases were also missed by e1de9b8.
+                "new_protection": [f"cp -rt{state} a b", f"echo x >& {state}/f"]}
+
+    def test_base_gate_refusal_differential(self):
+        import shlex
+        # The e1de9b8 protected-shell predicate, using its unchanged operand
+        # and ancestor helpers. Freeze the refusal expectation as well so a
+        # change to a shared helper cannot silently weaken both sides.
+        state = shlex.quote(str(self.state))
+        parent = shlex.quote(str(self.state.parent))
+        home = shlex.quote(str(self.home))
+        escaped = shlex.quote(str(self.tasks / "../orchestration/runtime/forged.json"))
+        round_zero = [f"echo accepted > {state}/forged.json", f"touch {state}/forged.json",
+                      f"rm -rf {state}", f"mv {state} gone", f"rm -rf {parent}",
+                      f"mv {parent} gone", f"rm -rf {home}", f"cp source {state}/forged.json",
+                      f"cp -t {state} source", f"chmod -R 777 {parent}",
+                      f"echo x > {escaped}", f"sh -c 'rm -rf {self.state}'",
+                      f"echo 'safe' > {state}/forged.json; echo 'rm mv {home}'",
+                      f"grep accepted {state}/receipt; rm -rf {parent}",
+                      f"sudo rm -rf {state}", f"xargs rm {state}", f"time rm -rf {state}",
+                      f"'echo'$cmd rm -rf {state}",
+                      f"find {state} -exec sh -c 'rm -rf {self.state}' \\;"]
+        groups = {**self.correction_refusals(), "round_zero": round_zero}
+        for group, commands in groups.items():
+            for command in commands:
+                with self.subTest(group=group, command=command):
+                    base_writes = (any(pattern.search(command) for pattern in gate._WRITE_PATTERNS)
+                                   or gate._launches_bridge(command)
+                                   or gate._git_worktree_writes(command)
+                                   or gate._git_tag_writes(command) or gate._formatter_writes(command))
+                    base_refuses = base_writes and any(
+                        gate._reaches(path, str(self.state),
+                                      through_ancestors=bool(gate._TREE_VERBS.search(command)))
+                        for path in gate._command_paths(command, str(self.repo)))
+                    self.assertEqual(bool(base_refuses), group != "new_protection")
+                    for client in ("codex", "claude"):
+                        decision = gate.judge(
+                            client, "Bash", {"command": command}, str(self.repo),
+                            state_root=str(self.state), protected=(str(self.state),),
+                            capacity_db=str(self.db))
+                        self.assertEqual(decision.permission, "deny", decision)
+                        self.assertEqual(decision.code, "gate_state_protected", decision)
+        # Dollar/backtick refusal ordering is unchanged, including the case
+        # whose state path is hidden behind a variable (GF-3).
+        for command in (f'eval \'rm -rf {self.state}\'',
+                        f'p={self.state}; rm -rf "$p"', 'cp source "$destination"',
+                        'git commit -m "$(cat msg)"', 'git commit -m "`cat msg`"'):
+            for client in ("codex", "claude"):
+                self.assertDenied(self.shell(command, client), "shell_targets_unresolved")
+
+    def test_uncertain_copy_options_and_expansions_use_base_scan(self):
+        groups = self.correction_refusals()
+        for command in groups["expansions"] + groups["value_options"]:
+            with self.subTest(command=command):
+                self.assertIsNone(gate._shell_write_targets(command, str(self.repo)))
+
+    def test_quoted_target_patterns_remain_literal(self):
+        import shlex
+        source = shlex.quote(str(self.state / "r"))
+        for pattern in ("runti*", "runti?e", "runti[m]e", "{runtime,zz}", "{a..z}"):
+            target = str(self.state.parent / pattern / "f")
+            for quote in (shlex.quote(target), f'"{target}"'):
+                for command in (f"cp {source} {quote}", f"cat {source} > {quote}",
+                                f"ls {source} | tee {quote}",
+                                f"cp -rt{quote} {source}",
+                                f"cd {shlex.quote(str(self.state.parent / pattern))} && cp {source} f"):
+                    with self.subTest(command=command):
+                        self.assertIsNotNone(gate._shell_write_targets(command, str(self.repo)))
+                        decision = gate.judge(
+                            "codex", "Bash", {"command": command}, str(self.scratch),
+                            state_root=str(self.state), protected=(str(self.state),),
+                            capacity_db=str(self.db))
+                        self.assertTrue(decision.allowed, decision)
+        # Wildcards in a copy source still only read protected state.
+        self.assertAllowed(self.shell(f"cp {source}* {shlex.quote(str(self.scratch / 'out'))}"))
+        if os.name != "nt":
+            target = str(self.state.parent / "runti\\*" / "f")
+            self.assertAllowed(self.shell(f"cp {source} {target}"))
+
+    def test_descriptor_duplication_is_not_a_file_target(self):
+        for command in ("echo x >& 2", "echo x >&-", "echo x 1>&2",
+                        "cat <& 0", "cat 0<&-", "echo 123>& 2"):
+            with self.subTest(command=command):
+                self.assertEqual(gate._shell_write_targets(command, str(self.repo)), [])
+                self.assertFalse(gate.shell_writes(command))
+                self.assertAllowed(self.shell(command))
+
+    def test_git_message_skip_is_limited_to_message_subcommands(self):
+        import shlex
+        target = shlex.quote(str(self.state / "f"))
+        self.assertDenied(self.shell(f"git checkout -m {target}"), "gate_state_protected")
+        for subcommand in ("commit", "tag v1", "merge topic", "notes add", "stash push"):
+            for flag in ("-m", "--message"):
+                self.assertAllowed(self.shell(f"git {subcommand} {flag} {target}"))
+        self.assertAllowed(self.shell(f"git -C {shlex.quote(str(self.repo))} commit -m {target}"))
+
+    def test_expired_task_lease_denial_names_item_and_stage(self):
+        import sqlite3
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE stages SET lease_until = ? WHERE item_id = ? AND stage = ?",
+                       (time.time() - 1, self.item, "review"))
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "stage_lease_expired")
+        self.assertIn(self.item, decision.reason)
+        self.assertIn("review", decision.reason)
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 700)
+        self.assertEqual(decision.code, "task_lease_expired")
+        self.assertIn(self.item, decision.reason)
+        self.assertIn("review", decision.reason)
+
+    def test_task_writes_require_a_configured_stage_database(self):
+        decision = gate._judge_task_records("codex", [str(self.target)], None, time.time())
+        self.assertEqual(decision.code, "stage_db_unavailable")
+
+    def test_symlink_escape_still_refuses_state(self):
+        import shlex
+        link = self.task / "runtime-link"
+        try:
+            link.symlink_to(self.state, target_is_directory=True)
+        except OSError:
+            self.skipTest("directory symlinks unavailable")
+        self.assertDenied(self.shell(f"echo x > {shlex.quote(str(link / 'forged.json'))}"),
+                          "gate_state_protected")
+        self.assertDenied(self.hook("codex", self.task, "runtime-link/forged.json"),
+                          "gate_state_protected")
+
+    def test_another_provider_cannot_replace_the_live_task_claim(self):
+        import shlex
+        before = self.router.get(self.item, "review")
+        self.assertDenied(self.shell(f"echo x > {shlex.quote(str(self.target))}", "claude"),
+                          "task_owned_elsewhere")
+        self.assertEqual(self.router.get(self.item, "review"), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_conflicts_and_unreadable_state_deny_without_auto_routing(self):
+        from unittest import mock
+        import shlex
+        command = f"echo x > {shlex.quote(str(self.target))}"
+        record = self.task / "task.json"
+        record.write_text('{"workload": {"revision": 7, "claim": {"owner": "other", '
+                          '"stage": "review", "lease_expires_at": 99999999999}}}', encoding="utf-8")
+        self.assertDenied(self.shell(command), "task_claim_conflict")
+        record.write_text('{"workload": []}', encoding="utf-8")
+        self.assertDenied(self.shell(command), "task_claim_unavailable")
+        with mock.patch.object(gate.claim_reconcile, "_ledger_rows", side_effect=OSError("offline")):
+            decision = gate.judge("codex", "Bash", {"command": command}, str(self.repo),
+                                  state_root=str(self.state), capacity_db=str(self.db))
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_portable_task_claim_reader_preserves_ownership_checks(self):
+        from unittest import mock
+        expected = gate._task_claim(str(self.tasks), self.item)
+        with mock.patch.object(gate.os, "supports_dir_fd", set()):
+            self.assertEqual(gate._task_claim(str(self.tasks), self.item), expected)
+            decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+            self.assertTrue(decision.allowed, decision)
+            decision = gate._judge_task_records("claude", [str(self.target)], str(self.db), time.time())
+            self.assertEqual(decision.code, "task_owned_elsewhere")
+
+    def test_mixed_writes_still_check_the_existing_task_owner(self):
+        import shlex
+        self.assertAllowed(self.shell("touch app.py", "claude"))
+        self.assertDenied(self.shell(f"echo x > {shlex.quote(str(self.target))}; touch app.py", "claude"),
+                          "task_owned_elsewhere")
+
+    def test_mixed_repository_writes_still_require_repository_ownership(self):
+        import shlex
+        self.write_policy({str(self.repo): {"classification": "internal_nonclient",
+                                           "allowed_routes": ["claude", "codex"]}},
+                          prefer=["claude", "codex"])
+        self.observe("claude")
+        self.assertDenied(self.shell(f"echo x > {shlex.quote(str(self.target))}; touch app.py"),
+                          "routed_elsewhere")
+        self.assertEqual(self.router.get(self.item, "review"), self.owned)
+
+
 class WorktreeCleanup(AutoCase):
     def setUp(self):
         super().setUp()
