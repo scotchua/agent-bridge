@@ -749,9 +749,22 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
+    needs.extend(_quality_attention(current.get("config_path")))
     return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked,
             "launcher_python": launcher_python, "runtime_revisions": runtime,
             "changed_during_checks": sorted(changed_during_checks)}
+
+
+def _quality_attention(config_path: str | None) -> list[str]:
+    if not config_path:
+        return []
+    from .localq import quality
+    from .orchestration.config import load
+    try:
+        cfg = load(config_path)
+        return quality.attention(cfg.state_root, cfg.local_backend)
+    except (OSError, ValueError):
+        return []
 
 
 def quick_check(config_path: str | None = None, *, home: str | None = None,

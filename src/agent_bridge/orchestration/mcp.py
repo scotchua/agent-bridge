@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
-from ..localq import gemma_child
+from ..localq import gemma_child, quality
 from ..localq.intake import KNOWN_FLAGS, AutomaticIntake
 from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, AdmissionError, JobNotFound,
                             LocalQueue, QueueCaps, UNSUPPORTED_KIND_REASON)
@@ -351,6 +351,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
         if task_type not in queue.allowed_task_types:
             return {"ok": False, "error": f"digest_task_refused:{UNSUPPORTED_KIND_REASON}"}
+        if queue.quality_disabled(task_type):
+            return {"ok": False, "error": "digest_task_refused:quality_disabled", "reason": "quality_disabled"}
         if os.path.islink(path):
             return {"ok": False, "error": "digest_path_refused:symlink"}
         try:
@@ -376,7 +378,15 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             return {"ok": False, "error": "digest_path_refused:repo_not_mechanical_ok"}
         globs = localfirst.effective_globs(repo_policy, policy.local_first)
         if not localfirst.matches_any(real_path, repo_root, globs):
-            return {"ok": False, "error": "digest_path_refused:no_glob_match"}
+            # The read gate falls back from a disabled certified pilot to
+            # summarize. Honor that same operator-selected file boundary.
+            selected = localfirst.file_task_for_path(
+                real_path, repo_root, repo_policy, policy.local_first,
+                allowed_pilot_tasks=queue.allowed_task_types & {"extract", "classify"}
+                if queue.backend_id == "gemma_certified" else frozenset(),
+                disabled_tasks=quality.disabled_types(queue.state_root, queue.backend_id))
+            if task_type != "summarize" or selected is None or selected[0] != "summarize":
+                return {"ok": False, "error": "digest_path_refused:no_glob_match"}
         try:
             instruction = localfirst.render_instruction(
                 task_type, max_chars=policy.local_first.digest_max_output_chars, fields=fields)
@@ -467,6 +477,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         """
         if state_root is None:
             return {"ok": False, "error": "local_first_unavailable"}
+        if queue.quality_disabled(task_type):
+            return {"ok": False, "error": f"{task_type}_path_refused:quality_disabled", "reason": "quality_disabled"}
         path, priority = args.get("path"), args.get("priority", "interactive")
         if not isinstance(path, str) or not path or not os.path.isabs(path) or os.path.islink(path):
             return {"ok": False, "error": f"{task_type}_path_refused:input_invalid"}
@@ -668,6 +680,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "handler": lambda args: {"ok": True, "caller": caller,
                                       "stages": router.report(),
                                       "local_queue": queue.state_report(),
+                                      "disabled_for_quality": sorted(quality.disabled_types(queue.state_root, queue.backend_id)),
                                       "execution_queue": execution.state_report() if execution else {"disabled": 1},
                                       "execution_worker": revision.read_record(
                                           str(execution.root / "execution-worker-status.json"))

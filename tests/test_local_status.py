@@ -37,18 +37,21 @@ class LocalStatusTests(unittest.TestCase):
             "worker_executable": str(self.home / "worker"), "worker_state": str(self.home / "worker-state")}))
         self.now = dt.datetime(2026, 11, 1, 12).timestamp()
         self.start = dt.datetime(2026, 10, 26).timestamp()
-        with sqlite3.connect(self.queue / "localq.sqlite3") as db:
+        report_clock = mock.patch.object(local_status.time, "time", return_value=self.now)
+        report_clock.start()
+        self.addCleanup(report_clock.stop)
+        with contextlib.closing(sqlite3.connect(self.queue / "localq.sqlite3")) as db, db:
             db.execute("""CREATE TABLE jobs (submitted_at REAL, caller TEXT, purpose TEXT,
                 task_type TEXT, status TEXT, feedback_json TEXT, error TEXT,
                 input_blob TEXT, result_blob TEXT, params_json TEXT)""")
-        with sqlite3.connect(self.queue / "routing.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.queue / "routing.sqlite3")) as db, db:
             db.execute("CREATE TABLE checkpoints (created_at REAL, caller TEXT, status TEXT)")
             db.executemany("INSERT INTO checkpoints VALUES (?,?,?)", [
                 (self.now, "claude", "eligible"), (self.now, "claude", "eligible"),
                 (self.now, "codex", "refused"), (self.start - 1, "codex", "eligible")])
 
     def job(self, status="complete", feedback=None, purpose="work", task="summarize", at=None, error=None):
-        with sqlite3.connect(self.queue / "localq.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.queue / "localq.sqlite3")) as db, db:
             db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?)", (
                 self.now if at is None else at, "claude", purpose, task, status,
                 json.dumps({"outcome": feedback}) if feedback else None, error,
@@ -182,7 +185,7 @@ class LocalStatusTests(unittest.TestCase):
 
     def test_bad_schema_and_feedback_do_not_leak_errors(self):
         self.job()
-        with sqlite3.connect(self.queue / "localq.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.queue / "localq.sqlite3")) as db, db:
             db.execute("UPDATE jobs SET feedback_json='SECRET MALFORMED JSON'")
         out = io.StringIO()
         # Keep the CLI's default seven-day window aligned with this fixture's
@@ -191,7 +194,7 @@ class LocalStatusTests(unittest.TestCase):
         with mock.patch.object(local_status.time, "time", return_value=self.now), contextlib.redirect_stdout(out):
             self.assertEqual(local_status.main(["--config", str(self.config), "--json"]), 1)
         self.assertEqual(json.loads(out.getvalue()), {"error": "local_status:report_error"})
-        with sqlite3.connect(self.queue / "localq.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.queue / "localq.sqlite3")) as db, db:
             db.execute("DROP TABLE jobs")
         out = io.StringIO()
         with mock.patch.object(local_status.time, "time", return_value=self.now), contextlib.redirect_stdout(out):

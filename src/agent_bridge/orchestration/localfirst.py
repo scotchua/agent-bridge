@@ -224,7 +224,8 @@ def effective_globs(repo_policy: "autoroute.RepoPolicy",
 
 def file_task_for_path(path: str, repo_root: str, repo_policy: "autoroute.RepoPolicy",
                        local_first: "autoroute.LocalFirstConfig", *,
-                       allowed_pilot_tasks: frozenset[str] = frozenset()) -> tuple[str, str, tuple[str, ...]] | None:
+                       allowed_pilot_tasks: frozenset[str] = frozenset(),
+                       disabled_tasks: frozenset[str] = frozenset()) -> tuple[str, str, tuple[str, ...]] | None:
     """Return the policy-selected whole-file task, with pilot tasks first.
 
     Empty extract/classify globs remain off rather than inheriting the legacy
@@ -233,9 +234,12 @@ def file_task_for_path(path: str, repo_root: str, repo_policy: "autoroute.RepoPo
     """
     for task, call, globs in (("extract", "work_extract_file", repo_policy.extract_globs),
                               ("classify", "work_classify_file", repo_policy.classify_globs)):
-        if task in allowed_pilot_tasks and matches_any(path, repo_root, globs):
+        if task in allowed_pilot_tasks and task not in disabled_tasks and matches_any(path, repo_root, globs):
             return task, call, globs
     globs = effective_globs(repo_policy, local_first)
+    for task, pilot_globs in (("extract", repo_policy.extract_globs), ("classify", repo_policy.classify_globs)):
+        if task in allowed_pilot_tasks and task in disabled_tasks and matches_any(path, repo_root, pilot_globs):
+            return "summarize", "work_digest_file", pilot_globs
     if matches_any(path, repo_root, globs):
         return "summarize", "work_digest_file", globs
     return None

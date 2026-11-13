@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from ..bounded_capture import capture_process
+from . import quality
 
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
@@ -321,8 +322,10 @@ class LocalQueue:
                  backend: Backend | None = None, caps: QueueCaps = QueueCaps(),
                  clock: Callable[[], float] = time.time,
                  allowed_task_types: "frozenset[str] | None" = None,
-                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None):
+                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None,
+                 state_root: str | Path | None = None):
         self.root = Path(root)
+        self.state_root = Path(state_root) if state_root is not None else self.root.parent
         self.blobs = self.root / "blobs"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.blobs.mkdir(mode=0o700, exist_ok=True)
@@ -370,6 +373,15 @@ class LocalQueue:
                 submitted_at REAL NOT NULL, updated_at REAL NOT NULL, expires_at REAL,
                 lease_owner TEXT, lease_until REAL, cancel_requested INTEGER NOT NULL DEFAULT 0,
                 result_blob TEXT, disposition_json TEXT, feedback_json TEXT, error TEXT)""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+            if "backend_id" not in columns:
+                try:
+                    db.execute("ALTER TABLE jobs ADD COLUMN backend_id TEXT")
+                except sqlite3.OperationalError:
+                    # Another starter may have migrated after our PRAGMA.
+                    # Only accept the error if the column now exists.
+                    if "backend_id" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
+                        raise
             db.execute("CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, submitted_at)")
             db.execute("""CREATE TABLE IF NOT EXISTS executor_lock (
                 name TEXT PRIMARY KEY, owner TEXT NOT NULL, lease_until REAL NOT NULL)""")
@@ -520,6 +532,8 @@ class LocalQueue:
             if existing["idem_key"] == idem and existing["content_key"] != content_key:
                 raise AdmissionError("idempotency_key_conflict")
             return self._public(existing, deduplicated=True)
+        if self.quality_disabled(task_type):
+            raise AdmissionError("quality_disabled")
         now = self.clock()
         expires = now + self.caps.bulk_ttl_seconds if priority == "bulk" else None
         job_id = uuid.uuid4().hex
@@ -530,10 +544,10 @@ class LocalQueue:
                 count = db.execute("SELECT COUNT(*) FROM jobs WHERE status NOT IN ('complete','failed','cancelled','expired','unknown')").fetchone()[0]
                 if count >= self.caps.max_jobs:
                     raise AdmissionError("queue_full")
-                db.execute("""INSERT INTO jobs(job_id,idem_key,content_key,task_type,priority,classification,caller,purpose,params_json,input_blob,status,submitted_at,updated_at,expires_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                db.execute("""INSERT INTO jobs(job_id,idem_key,content_key,task_type,priority,classification,caller,purpose,params_json,input_blob,status,submitted_at,updated_at,expires_at,backend_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, idem, content_key, task_type, priority, classification, caller, purpose, self._normalized(params or {}), blob,
-                     "queued", now, now, expires))
+                     "queued", now, now, expires, self.backend_id))
                 db.execute("COMMIT")
         except sqlite3.IntegrityError:
             with self._db() as db:
@@ -544,6 +558,23 @@ class LocalQueue:
                 return self._public(existing, deduplicated=True)
             raise
         return {"job_id": job_id, "status": "queued", "deduplicated": False}
+
+    def quality_disabled(self, task_type: str) -> bool:
+        return task_type in quality.disabled_types(self.state_root, self.backend_id)
+
+    def hold_quality(self) -> None:
+        """Keep queued jobs durable and unclaimed while below the quality bar."""
+        disabled = quality.disabled_types(self.state_root, self.backend_id)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT job_id,task_type,error FROM jobs WHERE status='queued'").fetchall():
+                if row["task_type"] in disabled:
+                    db.execute("UPDATE jobs SET error=?,updated_at=? WHERE job_id=?",
+                               ("quality_disabled:" + row["task_type"], self.clock(), row["job_id"]))
+                elif str(row["error"] or "").startswith("quality_disabled:"):
+                    db.execute("UPDATE jobs SET error=NULL,updated_at=? WHERE job_id=?",
+                               (self.clock(), row["job_id"]))
+            db.execute("COMMIT")
 
     def _client_data_health_refusal(self) -> str | None:
         """Check the backend-specific client-data admission invariant.
@@ -734,6 +765,7 @@ class LocalQueue:
     def _run_once_under_lock(self, owner: str | None = None) -> dict[str, Any] | None:
         if self.backend is None:
             raise RuntimeError("no local executor configured")
+        self.hold_quality()
         owner = owner or uuid.uuid4().hex
         now = self.clock()
         with self._db() as db:
@@ -744,7 +776,7 @@ class LocalQueue:
             self._recover_locked(db, now)
             db.execute("UPDATE jobs SET status='expired',updated_at=?,disposition_json=? WHERE status='queued' AND expires_at IS NOT NULL AND expires_at < ?",
                        (now, self._normalized({"outcome": "expired"}), now))
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND (error IS NULL OR error NOT LIKE 'waiting_on_dependency:%') ORDER BY CASE priority WHEN 'interactive' THEN 0 ELSE 1 END,submitted_at LIMIT 1").fetchone()
+            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND (error IS NULL OR (error NOT LIKE 'waiting_on_dependency:%' AND error NOT LIKE 'quality_disabled:%')) ORDER BY CASE priority WHEN 'interactive' THEN 0 ELSE 1 END,submitted_at LIMIT 1").fetchone()
             if row is None:
                 db.execute("COMMIT")
                 return None
@@ -755,8 +787,8 @@ class LocalQueue:
                            (now, "deferred:" + str(exc), row["job_id"]))
                 db.execute("COMMIT")
                 return self.status(row["job_id"])
-            db.execute("UPDATE jobs SET status='running',lease_owner=?,lease_until=?,updated_at=? WHERE job_id=?",
-                       (owner, now + self.caps.lease_seconds, now, row["job_id"]))
+            db.execute("UPDATE jobs SET status='running',lease_owner=?,lease_until=?,updated_at=?,backend_id=? WHERE job_id=?",
+                       (owner, now + self.caps.lease_seconds, now, self.backend_id, row["job_id"]))
             db.execute("COMMIT")
         if row["classification"] == "client_derived":
             reason = self._client_data_health_refusal()
@@ -812,7 +844,7 @@ class LocalQueue:
         with self._db() as db:
             rows = db.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status").fetchall()
             classes = db.execute("SELECT priority,COUNT(*) AS count FROM jobs WHERE status NOT IN ('complete','failed','cancelled','expired','unknown') GROUP BY priority").fetchall()
-            held = db.execute("SELECT job_id,error FROM jobs WHERE status='queued' AND error LIKE 'waiting_on_dependency:%'").fetchall()
+            held = db.execute("SELECT job_id,error FROM jobs WHERE status='queued' AND (error LIKE 'waiting_on_dependency:%' OR error LIKE 'quality_disabled:%')").fetchall()
         try:
             snapshot = self.sampler.sample()
             age = self.clock() - snapshot.observed_at
@@ -833,4 +865,5 @@ class LocalQueue:
         return {"schema": 1, "state": "local_queue", "counts": {row["status"]: row["count"] for row in rows},
                 "queue_depth_by_class": {row["priority"]: row["count"] for row in classes},
                 "waiting_jobs": {row["job_id"]: row["error"] for row in held},
+                "disabled_for_quality": sorted(quality.disabled_types(self.state_root, self.backend_id)),
                 "resource": sample, "caps": asdict(self.caps), "executor": "single_flock_lease"}
