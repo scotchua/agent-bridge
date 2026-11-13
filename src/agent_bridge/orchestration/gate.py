@@ -1421,7 +1421,8 @@ def _same_path(a: str, b: str) -> bool:
 def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
                      state_root: str, local_queue_root: str,
                      worker_executable: str, protected: tuple[str, ...],
-                     clock: Any, allowed_pilot_tasks: frozenset[str]) -> "Decision | None":
+                     clock: Any, allowed_pilot_tasks: frozenset[str],
+                     disabled_tasks: frozenset[str] | None = None) -> "Decision | None":
     """One file named by a gated-shape read: the design's steps 1 (repository
     membership already checked by the caller; here from step 3 on) through 9.
     None means the fast path allowed it with nothing logged; a ``Decision``
@@ -1443,9 +1444,12 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
     repo_policy = policy.for_repo(repo_root)
     if not repo_policy.mechanical_ok or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS:
         return None
+    if disabled_tasks is None:
+        from ..localq import quality
+        disabled_tasks = quality.disabled_types(state_root, "private_worker")
     selected = localfirst.file_task_for_path(
         real_path, repo_root, repo_policy, policy.local_first,
-        allowed_pilot_tasks=allowed_pilot_tasks)
+        allowed_pilot_tasks=allowed_pilot_tasks, disabled_tasks=disabled_tasks)
     if selected is None:
         return None
     task_type, next_call, globs = selected
@@ -1459,6 +1463,12 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
     # Gated-shape from here on: every branch below is logged.
     size, mtime_ns = info.st_size, info.st_mtime_ns
     now = float(clock())
+    if task_type in disabled_tasks:
+        return Decision(
+            "allow", "local_first_waived",
+            f"Local {task_type} jobs are below the quality bar; read allowed uncompelled",
+            (repo_root,), logged=True,
+            extra={"waiver_reason": f"quality_disabled:{task_type}", "bytes_estimate": size})
     readiness = localfirst.readiness(
         policy=policy, state_root=state_root, local_queue_root=local_queue_root,
         worker_executable=worker_executable, window_bytes=size, clock=clock)
@@ -1538,6 +1548,7 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
         clock=clock)
     task_offer = ""
     if (task_type == "summarize" and "log_triage" in allowed_pilot_tasks
+            and "log_triage" not in disabled_tasks
             and repo_policy.classification in {"synthetic", "public", "internal_nonclient"}):
         task_offer = (", task_type one of summarize|log_triage (log_triage requires unique leading [ID] records: "
                       "1-6 ASCII letters then 1-4 digits, e.g. [L1], with nonblank text and no second ID per line)")
@@ -1556,7 +1567,8 @@ def _judge_read_path(path: str, client: str, *, policy: "autoroute.Policy",
 def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
               local_queue_root: str, worker_executable: str,
               protected: tuple[str, ...] = (), clock: Any = time.time,
-              allowed_pilot_tasks: frozenset[str] = frozenset()) -> Decision:
+              allowed_pilot_tasks: frozenset[str] = frozenset(),
+              disabled_tasks: frozenset[str] | None = None) -> Decision:
     """Allow or deny one whole-file read across every path it names.
 
     Each path is judged independently (design section 2.1); the first that
@@ -1602,7 +1614,8 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
         outcome = _judge_read_path(
             path, client, policy=policy, state_root=state_root,
             local_queue_root=local_queue_root, worker_executable=worker_executable,
-            protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks)
+            protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks,
+            disabled_tasks=disabled_tasks)
         if outcome is not None:
             decisions.append(outcome)
     if not decisions:
@@ -1947,12 +1960,13 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     if kind == "shell_read":
         return Decision("allow", "shell_read_only_heuristic",
                         "command does not look like it writes (heuristic)", logged=False)
+    disabled_tasks = quality_disabled_tasks_from_config(config_path) if config_path else None
     if kind == "read":
         return judge_read(client, paths, cwd, state_root=state_root,
                           local_queue_root=local_queue_root,
                           worker_executable=worker_executable,
                           protected=protected, clock=clock,
-                          allowed_pilot_tasks=allowed_pilot_tasks)
+                          allowed_pilot_tasks=allowed_pilot_tasks, disabled_tasks=disabled_tasks)
     write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
                                   clock=clock, protected=protected, capacity_db=capacity_db,
                                   decide=decide, config_path=config_path)
@@ -1973,7 +1987,8 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
             read_decision = judge_read(
                 client, _shell_read_paths(command, cwd), cwd, state_root=state_root,
                 local_queue_root=local_queue_root, worker_executable=worker_executable,
-                protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks)
+                protected=protected, clock=clock, allowed_pilot_tasks=allowed_pilot_tasks,
+                disabled_tasks=disabled_tasks)
             # A deny always wins over the write-side allow. An allow only
             # replaces it when there is something worth logging (a
             # gated-shape outcome): an unlogged fast-path allow (outside any
@@ -2029,6 +2044,8 @@ def inline_output_update(client: str, payload: dict[str, Any], decision: Decisio
         if (not policy.local_first.inline_output_router or not repo_policy.mechanical_ok
                 or "local" not in repo_policy.allowed_routes
                 or repo_policy.classification not in autoroute.LOCAL_CLASSIFICATIONS):
+            return None
+        if "summarize" in quality_disabled_tasks_from_config(config_path):
             return None
         updated = dict(tool_input)
         # Codex's PreToolUse contract requires a string command field, even
@@ -2299,6 +2316,22 @@ def gate_paths_from_config(config_path: str) -> tuple[str, str, str, str]:
     elif not isinstance(worker_executable, str):
         raise ValueError(f"orchestration config {worker_field} must be a string")
     return loaded["state_root"], loaded["capacity_db"], local_queue_root, worker_executable
+
+
+def quality_disabled_tasks_from_config(config_path: str) -> frozenset[str]:
+    """Hook-side reader: re-read quality state for the configured backend."""
+    from ..localq import quality
+    from ..localq.spool import MECHANICAL_TASKS
+    try:
+        loaded = store.read_json(config_path)
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("state_root"), str):
+            return MECHANICAL_TASKS
+        backend = loaded.get("local_backend", "private_worker")
+        if backend not in {"private_worker", "gemma_certified"}:
+            return MECHANICAL_TASKS
+        return quality.disabled_types(loaded["state_root"], backend)
+    except (OSError, ValueError, TypeError):
+        return MECHANICAL_TASKS
 
 
 def gemma_pilot_tasks_from_config(config_path: str) -> frozenset[str]:

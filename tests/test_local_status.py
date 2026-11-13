@@ -37,6 +37,9 @@ class LocalStatusTests(unittest.TestCase):
             "worker_executable": str(self.home / "worker"), "worker_state": str(self.home / "worker-state")}))
         self.now = dt.datetime(2026, 11, 1, 12).timestamp()
         self.start = dt.datetime(2026, 10, 26).timestamp()
+        report_clock = mock.patch.object(local_status.time, "time", return_value=self.now)
+        report_clock.start()
+        self.addCleanup(report_clock.stop)
         with sqlite3.connect(self.queue / "localq.sqlite3") as db:
             db.execute("""CREATE TABLE jobs (submitted_at REAL, caller TEXT, purpose TEXT,
                 task_type TEXT, status TEXT, feedback_json TEXT, error TEXT,

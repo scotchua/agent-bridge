@@ -13,6 +13,8 @@ import time
 from typing import Any
 
 from . import drift
+from .localq import quality
+from .localq.spool import MECHANICAL_TASKS
 from .orchestration.config import load, OrchestrationConfigError
 
 
@@ -57,6 +59,8 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
     Feedback includes only completed work submitted in this window. Rates
     divide by reviewed work (used + reworked + discarded); no reviews is null.
     Running, expired and unknown jobs retain their own outcome labels.
+    Quality is separate: a fixed 14-day window keyed on review recording,
+    scoped to the configured backend and reset by operator re-enabling.
     """
     if days < 1:
         raise ValueError("days_invalid")
@@ -72,7 +76,9 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
     with closing(_connect(cfg.local_queue_root / "localq.sqlite3")) as db:
         rows = db.execute("""SELECT submitted_at, caller, purpose, task_type,
             CASE WHEN status='queued' AND error LIKE 'waiting_on_dependency:%'
-                 THEN 'held waiting_on_dependency' ELSE status END,
+                 THEN 'held waiting_on_dependency'
+                 WHEN status='queued' AND error LIKE 'quality_disabled:%'
+                 THEN 'held quality_disabled' ELSE status END,
             feedback_json FROM jobs WHERE submitted_at >= ? AND submitted_at <= ?""",
                           (start, now))
         for submitted, caller, purpose, task, outcome, raw_feedback in rows:
@@ -84,6 +90,22 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                 if observation not in {"used", "reworked", "discarded", "unreviewed"}:
                     raise ValueError("feedback_invalid")
                 feedback[task][observation] += 1
+        quality_jobs = quality.job_rows(db)
+    try:
+        quality_state = quality.read_state(cfg.state_root).get(cfg.local_backend, {})
+        disabled = frozenset(task for task, row in quality_state.items() if row["disabled_at"] is not None)
+    except (OSError, ValueError):
+        quality_state = {}
+        disabled = MECHANICAL_TASKS
+    quality_rows = quality.evaluate(quality_jobs, backend_id=cfg.local_backend, now=now,
+                                    previous=quality_state, task_types=MECHANICAL_TASKS)
+    for task, row in quality_rows.items():
+        stored_at = quality_state.get(task, {}).get("disabled_at")
+        if task in disabled:
+            row["verdict"] = "below the quality bar"
+        elif row["disabled_at"] is not None:
+            row["verdict"] = "pending evaluation"
+        row["disabled_at"] = stored_at
     with closing(_connect(cfg.local_queue_root / "routing.sqlite3")) as db:
         checkpoints = [{"caller": caller, "status": status, "count": count}
                        for caller, status, count in db.execute("""SELECT caller, status, COUNT(*)
@@ -103,6 +125,9 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                       "outcome": outcome, "count": count}
                      for (day, caller, purpose, outcome), count in sorted(jobs.items())],
             "feedback": feedback_rows, "checkpoints": checkpoints,
+            "quality_backend_id": cfg.local_backend, "quality_window_days": 14,
+            "quality": [{"task_type": task, **row} for task, row in quality_rows.items()],
+            "disabled_for_quality": sorted(disabled),
             "inline_output_routing": inline_output, "inline_output_undated_records": undated}
 
 
@@ -153,6 +178,11 @@ def main(argv: list[str] | None = None) -> int:
             print(("{task_type}\tused={used}\treworked={reworked}\tdiscarded={discarded}"
                    "\tunreviewed={unreviewed}").format(**row)
                   + f"\trework_rate={rates[0]}\tdiscard_rate={rates[1]}")
+        print(f"Quality ({result['quality_backend_id']}): feedback recorded in the last 14 days, completed work by type")
+        for row in result["quality"]:
+            rate = "n/a" if row["used_rate"] is None else f"{row['used_rate']:.1%}"
+            print(f"{row['task_type']}\tused_rate={rate}\tn={row['n']}\t{row['verdict']}")
+        print("Disabled for quality: " + (", ".join(result["disabled_for_quality"]) or "none"))
         print("Checkpoints by caller and status:")
         for row in result["checkpoints"]:
             print("{caller}\t{status}\t{count}".format(**row))

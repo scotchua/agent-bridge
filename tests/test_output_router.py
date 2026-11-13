@@ -38,6 +38,8 @@ class OutputRouterTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.state = self.base / "state"
+        self.config = self.base / "config.json"
+        self.config.write_text(json.dumps({"state_root": str(self.state)}))
         self.repo = self.base / "repo"
         (self.repo / ".git").mkdir(parents=True)
         (self.state / "routing").mkdir(parents=True)
@@ -111,7 +113,7 @@ class OutputRouterTests(unittest.TestCase):
                     payload = {"tool_name": "Bash", "cwd": str(self.repo),
                                "tool_input": {key: "git status -uall", "timeout": 10}}
                     updated = gate.inline_output_update(client, payload, allowed,
-                                                        state_root=str(self.state), config_path="/tmp/config")
+                                                        state_root=str(self.state), config_path=str(self.config))
                     wire = gate.hook_output(allowed, updated)["hookSpecificOutput"]
                     self.assertEqual(wire["hookEventName"], "PreToolUse")
                     self.assertEqual(wire["permissionDecision"], "allow")
@@ -124,10 +126,10 @@ class OutputRouterTests(unittest.TestCase):
                     self.assertEqual(words[-1], "git status -uall")
                     self.assertIsNone(gate.inline_output_update(client, payload,
                         gate.Decision("deny", "routed_elsewhere", "no"),
-                        state_root=str(self.state), config_path="/tmp/config"))
+                        state_root=str(self.state), config_path=str(self.config)))
                     payload["tool_input"] = updated
                     self.assertIsNone(gate.inline_output_update(client, payload, allowed,
-                        state_root=str(self.state), config_path="/tmp/config"))
+                        state_root=str(self.state), config_path=str(self.config)))
 
     def test_codex_rewrite_retains_policy_and_privacy_requirements(self):
         payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "pytest -q"}}
@@ -141,16 +143,16 @@ class OutputRouterTests(unittest.TestCase):
                     "local_first": {"inline_output_router": True},
                     "repos": {} if repo_policy is None else {str(self.repo): repo_policy}}))
                 self.assertIsNone(gate.inline_output_update("codex", payload, allowed,
-                    state_root=str(self.state), config_path="/tmp/config"))
+                    state_root=str(self.state), config_path=str(self.config)))
         self.policy_path.write_text("unreadable policy")
         self.assertIsNone(gate.inline_output_update("codex", payload, allowed,
-            state_root=str(self.state), config_path="/tmp/config"))
+            state_root=str(self.state), config_path=str(self.config)))
 
     def test_file_rewrite_uses_payload_cwd(self):
         (self.repo / "output.txt").write_text("synthetic output")
         payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "cat output.txt"}}
         self.assertIsNotNone(gate.inline_output_update("codex", payload, gate.Decision("allow", "x", "x"),
-            state_root=str(self.state), config_path="/tmp/config"))
+            state_root=str(self.state), config_path=str(self.config)))
 
     def test_gate_cli_emits_a_rewrite_for_both_callers(self):
         import subprocess
@@ -171,7 +173,7 @@ class OutputRouterTests(unittest.TestCase):
     def test_update_requires_opt_in_admission_and_an_allowed_gate_decision(self):
         payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "pytest -q", "timeout": 10}}
         allowed = gate.Decision("allow", "routing_receipt_valid", "ok")
-        updated = gate.inline_output_update("claude", payload, allowed, state_root=str(self.state), config_path="/tmp/config")
+        updated = gate.inline_output_update("claude", payload, allowed, state_root=str(self.state), config_path=str(self.config))
         self.assertEqual(updated["timeout"], 10)
         self.assertIn("-m agent_bridge.orchestration.output_router run", updated["command"])
         self.assertIn("/bin/sh -c", updated["command"])
@@ -179,11 +181,11 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(wire["hookSpecificOutput"]["updatedInput"], updated)
         self.assertIsNone(gate.inline_output_update("claude", payload,
                                                      gate.Decision("deny", "routed_elsewhere", "no"),
-                                                     state_root=str(self.state), config_path="/tmp/config"))
+                                                     state_root=str(self.state), config_path=str(self.config)))
         self.policy_path.write_text(json.dumps({"version": 1, "repos": {str(self.repo): {
             "classification": "internal_nonclient", "allowed_routes": ["local"], "mechanical_ok": True}}}))
         self.assertIsNone(gate.inline_output_update("claude", payload, allowed,
-                                                     state_root=str(self.state), config_path="/tmp/config"))
+                                                     state_root=str(self.state), config_path=str(self.config)))
 
     def test_inline_router_flag_is_strict_boolean_and_defaults_off(self):
         self.assertFalse(autoroute.parse_policy({"version": 1, "repos": {}}).local_first.inline_output_router)
@@ -203,7 +205,7 @@ class OutputRouterTests(unittest.TestCase):
         (admin / "gitdir").write_text(str(worktree / ".git"))
         payload = {"tool_name": "Bash", "cwd": str(worktree), "tool_input": {"command": original}}
         self.assertIsNotNone(gate.inline_output_update("claude", payload, gate.Decision("allow", "x", "x"),
-                                                        state_root=str(self.state), config_path="/tmp/c"))
+                                                        state_root=str(self.state), config_path=str(self.config)))
 
     def test_small_output_is_exact_and_nonzero_command_status_is_caller_owned(self):
         queue, intake = self.queue()
@@ -352,7 +354,8 @@ class OutputRouterTests(unittest.TestCase):
                    "tool_input": {"command": "pytest -q"}}
         updated = gate.inline_output_update("claude", payload, gate.Decision("allow", "x", "x"),
                                             state_root=str(self.state),
-                                            config_path=str(self.base / "missing.json"))
+                                            config_path=str(self.config))
+        self.config.unlink()
         command = updated["command"].replace("/bin/sh -c 'pytest -q'",
                                              "/bin/sh -c 'printf child-output; exit 5'")
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}

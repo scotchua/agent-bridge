@@ -62,6 +62,7 @@ CHECKPOINT_REASONS = frozenset({
     UNSUPPORTED_KIND_REASON,
     "below_local_delegation_threshold",
     "no_eligible_unit",
+    "quality_disabled",
 })
 
 #: The subset of CHECKPOINT_REASONS that are refusals, used to key the
@@ -81,7 +82,7 @@ def accepted_values(reason: str, allowed_task_types: "frozenset[str]") -> dict[s
         return {"accepted_risk_flags": sorted(KNOWN_FLAGS)}
     if reason == "classification_refused":
         return {"accepted_classifications": sorted(ALLOWED_CLASSIFICATIONS)}
-    if reason == UNSUPPORTED_KIND_REASON:
+    if reason in {UNSUPPORTED_KIND_REASON, "quality_disabled"}:
         return {"accepted_task_types": sorted(allowed_task_types)}
     if reason == "task_requires_cloud_or_human_judgment":
         return {"mechanical_task_types": sorted(MECHANICAL_TASKS)}
@@ -259,6 +260,8 @@ class AutomaticIntake:
         # default; refuse disabled kinds before a job can enter the queue.
         if task_type not in self.queue.allowed_task_types:
             return "refused", UNSUPPORTED_KIND_REASON
+        if self.queue.quality_disabled(task_type):
+            return "refused", "quality_disabled"
         if input_bytes < self.policy.byte_threshold and nonblank_lines < self.policy.min_nonblank_lines:
             return "refused", "below_local_delegation_threshold"
         return "eligible", "eligible_mechanical_work"
@@ -395,6 +398,9 @@ class AutomaticIntake:
                 "WHERE r.checkpoint_id = c.checkpoint_id AND r.job_id IS NOT NULL)").fetchone()[0]
             rows = db.execute(
                 "SELECT reason, COUNT(*) AS n FROM checkpoints WHERE status='refused' GROUP BY reason").fetchall()
+            quality_routes = db.execute(
+                "SELECT COUNT(*) FROM routing_receipts WHERE reason='quality_disabled' "
+                "AND purpose='work'").fetchone()[0]
             health_rows = db.execute(
                 "SELECT reason, COUNT(*) AS n FROM health_refusals GROUP BY reason").fetchall()
         refused_by_reason = {reason: 0 for reason in sorted(CLOSED_REFUSAL_REASONS)}
@@ -407,6 +413,7 @@ class AutomaticIntake:
                 health_refusals_by_reason[row["reason"]] = row["n"]
         return {"total": total, "eligible": eligible, "dispatched": dispatched,
                 "no_eligible_unit": no_eligible_unit, "refused_by_reason": refused_by_reason,
+                "route_refused_quality_disabled": quality_routes,
                 "health_refusals_by_reason": health_refusals_by_reason}
 
     def _record_health_refusal(self, *, checkpoint_id: str | None, classification: str,
@@ -553,6 +560,8 @@ class AutomaticIntake:
             return self._public(existing, deduplicated=True)
 
         job_id = None
+        if decision == "local" and self.queue.quality_disabled(task_type):
+            decision, reason = "refused", "quality_disabled"
         if decision == "local":
             try:
                 submitted = self.queue.submit(
@@ -563,8 +572,12 @@ class AutomaticIntake:
                 if str(exc) in HEALTH_REFUSAL_REASONS:
                     self._record_health_refusal(checkpoint_id=checkpoint_id,
                                                 classification=classification, reason=str(exc))
-                raise
-            job_id = submitted["job_id"]
+                if str(exc) == "quality_disabled":
+                    decision, reason = "refused", "quality_disabled"
+                else:
+                    raise
+            else:
+                job_id = submitted["job_id"]
 
         values = (
             uuid.uuid4().hex, request_key, self.clock(), self.policy.version,

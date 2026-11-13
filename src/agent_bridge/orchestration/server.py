@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import threading
 from typing import Any
@@ -54,6 +55,9 @@ class Server:
                                 pid=os.getpid(), started_at=store.utc_now())
             except OSError:
                 sys.stderr.write("agent-bridge: revision marker unavailable\n")
+        self._state_root = state_root
+        if state_root is not None:
+            service.queue.state_root = Path(state_root)
         self.intake = AutomaticIntake(service.queue)
         self.tools = build_tools(caller, router, service.queue, self.intake, execution,
                                  state_root=state_root, protected=protected,
@@ -72,6 +76,18 @@ class Server:
     def _executor(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._state_root is not None:
+                    from ..localq import quality
+                    queue = self.service.queue
+                    try:
+                        quality.update(self._state_root, queue.db_path, queue.backend_id,
+                                       queue.allowed_task_types)
+                    except Exception:
+                        # Quality evaluation must not stall drift checks or
+                        # the worker heartbeat. Readers still hold jobs when
+                        # persisted quality state is unavailable.
+                        self._record_loop_error()
+                    queue.hold_quality()
                 if self._dependency_check is not None:
                     held = self._dependency_check()
                     self.service.queue.hold_dependency(held)
@@ -219,6 +235,9 @@ def main(argv: list[str] | None = None) -> int:
     def dependency_check() -> str | None:
         from .. import drift
         status = drift.quick_check(args.config)
+        from ..localq import quality
+        lines = quality.attention(cfg.state_root, service.queue.backend_id)
+        status = {**status, "attention": [*status.get("attention", []), *lines]}
         drift.report_attention(None, status)
         try:
             drift.requalify_on_detect(args.config, status)

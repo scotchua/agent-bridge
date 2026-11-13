@@ -38,7 +38,8 @@ class Service:
     def __init__(self, root: str, worker: str, worker_state: str, *, sampler: MacSampler | None = None,
                  backend: Backend | None = None, caps: QueueCaps | None = None,
                  allowed_task_types: "frozenset[str] | None" = None,
-                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None):
+                 backend_id: str = "private_worker", client_data_health_gate: Any | None = None,
+                 state_root: str | Path | None = None):
         """Build the queue for one local backend.
 
         ``worker``/``worker_state`` build the default private-worker
@@ -60,7 +61,8 @@ class Service:
             backend = SubprocessBackend(command)
         self.queue = LocalQueue(self.root, sampler=self.sampler, backend=backend,
                                 caps=caps or QueueCaps(), allowed_task_types=allowed_task_types,
-                                backend_id=backend_id, client_data_health_gate=client_data_health_gate)
+                                backend_id=backend_id, client_data_health_gate=client_data_health_gate,
+                                state_root=state_root)
         self.state_path = self.root / "runtime-state.json"
         self._last_loop_error = self._load_last_loop_error()
 
@@ -106,7 +108,8 @@ class Service:
         return cls(queue_root, str(cfg.worker_executable), str(cfg.worker_state),
                   sampler=sampler, backend=backend, caps=caps, allowed_task_types=allowed,
                   backend_id=str(getattr(cfg, "local_backend", "private_worker")),
-                  client_data_health_gate=health_gate)
+                  client_data_health_gate=health_gate,
+                  state_root=Path(queue_root).parent if root is not None else cfg.state_root)
 
     def once(self) -> dict:
         result = self.queue.run_once("localq-service")
