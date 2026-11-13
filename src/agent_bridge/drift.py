@@ -904,7 +904,7 @@ def requalify_on_detect(config_path: str | None, status: dict[str, Any], *, home
                 kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0)
             else:
                 kwargs["start_new_session"] = True
-            child = subprocess.Popen(program, **kwargs)
+            child = subprocess.Popen(program, shell=False, **kwargs)
         else:
             child = spawner(program, env=env)
         qualification.set_flight_pid(actual_home, int(child.pid))
