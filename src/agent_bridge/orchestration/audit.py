@@ -53,6 +53,9 @@ FAILURE_CODES = frozenset({
     "stage_db_unavailable", "hook_input_invalid", "client_invalid",
 })
 
+#: Expected holds needing an operator, rather than failures of the mechanism.
+OPERATOR_HOLD_CODES = frozenset({"stage_reconciliation_required"})
+
 #: Codes that refuse a write aimed at the gate's own state or hook files.
 #: Counted apart from other denials: one of these is an attempt to disable the
 #: mechanism, not a routing outcome.
@@ -486,6 +489,7 @@ def report(state_root: str, *, home: str | None = None,
 
     denials = [event for event in events if event.get("permission") == "deny"]
     failures = [event for event in denials if event.get("code") in FAILURE_CODES]
+    holds = [event for event in denials if event.get("code") in OPERATOR_HOLD_CODES]
     tamper = [event for event in denials if event.get("code") in TAMPER_CODES]
 
     capacity_db = None
@@ -599,6 +603,11 @@ def report(state_root: str, *, home: str | None = None,
             "local_queue": _local_queue_report(local_root),
         },
 
+        "operator_holds": {
+            "count": len(holds),
+            "by_code": _histogram(event.get("code") for event in holds),
+        },
+
         "gate_events": {
             "count": len(events),
             "by_code": _histogram(event.get("code") for event in events),
@@ -655,6 +664,9 @@ def render(document: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"  gate failures: {document['failures']['gate']['count']} "
                  f"{document['failures']['gate']['by_code'] or ''}")
+    holds = document.get("operator_holds", {})
+    lines.append(f"  operator holds: {holds.get('count', 0)} "
+                 f"{holds.get('by_code') or ''}")
     for name in ("execution_queue", "local_queue"):
         queue = document["failures"][name]
         if queue.get("present"):

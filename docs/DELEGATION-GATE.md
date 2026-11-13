@@ -284,6 +284,18 @@ delegate had silently become a decision to retain, which is the one failure
 this mechanism exists to prevent. A route the decider cannot establish as the
 live owner is now `gate_auto_decision_failed`, a deny.
 
+A live automatic stage in `reconcile_required` denies with
+`stage_reconciliation_required`, naming the repository, item and stage. An
+operator must confirm the previous owner is no longer running, then release
+that stage with `agent-bridge-admin stage-reconcile` (see
+[operator stage reconciliation](orchestration-mcp.md#operator-stage-reconciliation)).
+Retrying or signing in will not release it; an assistant must not release it
+itself. The gate neither changes the held stage nor skips to a new generation.
+The event ledger records this verdict and the audit counts it under
+`operator_holds`, separately from mechanism failures. Other automatic failures
+remain `gate_auto_decision_failed`; their events include a closed sanitized
+`failure_code`, without exception text.
+
 An unreadable stage router is **not** treated as overtaken. That stays a deny
 (`stage_db_unavailable`): fail closed, and never decide without the router.
 

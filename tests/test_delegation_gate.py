@@ -2132,6 +2132,11 @@ class ReadGatePolicyAndMultiPathTests(ReadGateCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "gate_auto_decision_failed")
         self.assertIn("policy_unreadable", decision.reason)
+        self.assertEqual(decision.extra["failure_code"], "PolicyError")
+        gate.record_event(str(self.state), "claude", "Read", decision)
+        event = json.loads((self.state / "routing" / gate.EVENT_LEDGER).read_text().splitlines()[-1])
+        self.assertEqual(event["failure_code"], "PolicyError")
+        self.assertNotIn("{not json", json.dumps(event))
 
     def test_unreadable_policy_still_allows_a_read_outside_any_repository(self):
         path = Path(autoroute.policy_path(str(self.state)))

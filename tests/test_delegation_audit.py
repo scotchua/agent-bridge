@@ -185,6 +185,20 @@ class Bypasses(AuditCase):
 
 
 class Failures(AuditCase):
+    def test_reconciliation_is_an_operator_hold_and_not_a_mechanism_failure(self):
+        self.event(permission="deny", code="stage_reconciliation_required")
+        self.event(permission="deny", code="gate_auto_decision_failed")
+        document = self.run_audit()
+        self.assertEqual(document["operator_holds"], {
+            "count": 1, "by_code": {"stage_reconciliation_required": 1}})
+        self.assertEqual(document["failures"]["gate"]["count"], 1)
+        self.assertEqual(document["failures"]["gate"]["by_code"],
+                         {"gate_auto_decision_failed": 1})
+        self.assertEqual(document["gate_events"]["denials"], 2)
+        self.assertEqual(document["gate_events"]["by_code"]["stage_reconciliation_required"], 1)
+        self.assertIn("operator holds: 1", audit.render(document))
+
+
     def test_gate_failures_are_separated_from_ordinary_denials(self):
         self.event(permission="deny", code="gate_auto_decision_failed")
         self.event(permission="deny", code="routed_elsewhere")
