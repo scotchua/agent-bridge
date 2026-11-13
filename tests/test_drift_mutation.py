@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -129,6 +130,20 @@ class DriftMutationTests(unittest.TestCase):
         self.assertEqual(result["cache_age_seconds"], 0.0)
         self.assertIn("checked_at", result)
 
+    def test_quick_check_cache_invalidates_when_the_baseline_changes(self) -> None:
+        baseline = drift.paths(str(self.home))["baseline"]
+        Path(baseline).parent.mkdir(parents=True)
+        Path(baseline).write_text('{"version": 1}', encoding="utf-8")
+        current = {"paths": {}, "gemma": {"delegate": {}, "validator": {}},
+                   "executables": {"claude": {}, "codex": {}}, "ollama": {}}
+        with mock.patch.object(drift, "discover_config", return_value="invented-config"), \
+             mock.patch.object(drift, "inventory", return_value=current) as inventory, \
+             mock.patch.object(drift, "_read_baseline", return_value=current):
+            drift.quick_check(home=str(self.home))
+            Path(baseline).write_text('{"version": 22}', encoding="utf-8")
+            drift.quick_check(home=str(self.home))
+        self.assertEqual(inventory.call_count, 2)
+
     def test_eligible_release_accepts_cutoff(self) -> None:
         now = datetime.datetime(2034, 3, 5, 12, tzinfo=datetime.timezone.utc).timestamp()
         published = "2034-03-02T12:00:00Z"
@@ -194,8 +209,10 @@ class DriftMutationTests(unittest.TestCase):
         notify.assert_called_once_with(str(self.home), report)
 
     def test_notify_updated_uses_local_notification_command(self) -> None:
-        with mock.patch.object(drift.subprocess, "run") as run:
-            drift._notify_updated("9.8.7")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(drift.NO_DESKTOP_ALERTS_ENV, None)
+            with mock.patch.object(drift.subprocess, "run") as run:
+                drift._notify_updated("9.8.7")
         self.assertIn("9.8.7", " ".join(run.call_args.args[0]))
 
     def test_main_returns_success_for_clean_report(self) -> None:

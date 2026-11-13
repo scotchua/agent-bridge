@@ -45,7 +45,7 @@ GEMMA_CHECK_TEXT = (
     "The temporary folder is removed after the check finishes."
 )
 QUICK_CHECK_TIMEOUT = 2
-_quick_cache: dict[tuple[str | None, str], tuple[float, dict[str, Any]]] = {}
+_quick_cache: dict[tuple[str | None, str], tuple[Any, ...]] = {}
 
 # Keep these beside the compatibility probe.  These are the documented long
 # spellings of flags passed by the bridge's launchers.  The launchers often use
@@ -361,7 +361,46 @@ def _write_baseline(home: str, value: dict[str, Any]) -> None:
     store.atomic_write_json(paths(home)["baseline"], value)
 
 
-def _merge_good_baseline(old: dict[str, Any] | None, current: dict[str, Any], passed: set[str]) -> dict[str, Any]:
+def _same_qualification_identity(component: str, before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Do not bless an executable which changed while its checks were running."""
+    from . import qualification
+    try:
+        return qualification.identity(component, before) == qualification.identity(component, after)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _qualified_passes_still_live(current: dict[str, Any], passed: set[str], *,
+                                 config_path: str | None, home: str, bridge: Any | None,
+                                 runner: Any, has_baseline: bool,
+                                 live_components: set[str] | None = None) -> tuple[set[str], set[str]]:
+    """Re-read only at activation time; this guard is shared by foreground doctor."""
+    # The first record is not a requalification of a known identity.  Retain
+    # the historical first-baseline behaviour; all later activations get the
+    # closing identity read below.
+    watched = ({name for name in passed if name in {"claude", "codex", "gemma"}}
+               if has_baseline else set())
+    if not watched:
+        return passed, set()
+    try:
+        live = inventory(config_path, home=home, bridge=bridge, runner=runner)
+    except Exception:
+        # A failed closing read is not evidence to activate a changed binary.
+        return passed - watched, watched
+    invalid: set[str] = set()
+    for name in watched:
+        components = (({"ollama", "gemma_delegate", "gemma_validator"}
+                       if live_components is None else
+                       {component for component in live_components
+                        if component in {"ollama", "gemma_delegate", "gemma_validator"}})
+                      if name == "gemma" else {name})
+        if not all(_same_qualification_identity(component, current, live) for component in components):
+            invalid.add(name)
+    return passed - invalid, invalid
+
+
+def _merge_good_baseline(old: dict[str, Any] | None, current: dict[str, Any], passed: set[str],
+                         *, live_components: set[str] | None = None) -> dict[str, Any]:
     """Keep a failed changed component at its last good inventory value."""
     if old is None:
         # There is no previous value to preserve.  Omit failed probes so they
@@ -386,11 +425,13 @@ def _merge_good_baseline(old: dict[str, Any] | None, current: dict[str, Any], pa
     for name in ("claude", "codex"):
         if name not in {"claude", "codex"} or name in passed or current["executables"][name] == old.get("executables", {}).get(name):
             merged.setdefault("executables", {})[name] = current["executables"][name]
-    if "gemma" in passed or current["ollama"] == old.get("ollama"):
+    allowed = live_components
+    if ("gemma" in passed and (allowed is None or "ollama" in allowed)) or current["ollama"] == old.get("ollama"):
         merged["ollama"] = current["ollama"]
     for name in ("delegate", "validator"):
         component = "gemma_" + name
-        if "gemma" in passed or current["gemma"][name] == old.get("gemma", {}).get(name):
+        if (("gemma" in passed and (allowed is None or component in allowed))
+                or current["gemma"][name] == old.get("gemma", {}).get(name)):
             merged.setdefault("gemma", {})[name] = current["gemma"][name]
     return merged
 
@@ -596,7 +637,7 @@ def _audit(home: str, **entry: Any) -> None:
 
 def doctor(config_path: str | None = None, *, home: str | None = None, accept_requalified: bool = False,
            force_checks: bool = False, bridge: Any | None = None, runner: Any = _run,
-           prequalified_codex: bool = False) -> dict[str, Any]:
+           prequalified_codex: bool = False, live_components: set[str] | None = None) -> dict[str, Any]:
     home = _home(home)
     # Inspect the previous record before refreshing it.  Doctor is a repair
     # path, but hiding the stale record it repaired would defeat its warning.
@@ -622,7 +663,10 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     if not hooks["claude"]["present"] or not hooks["claude"]["launcher_exists"]: needs.append("Claude gate hook is missing or its launcher is absent; reinstall the gate hook, then run setup_bridge.py doctor.")
     if not hooks["codex"]["present"] or not hooks["codex"]["launcher_exists"]: needs.append("Codex gate hook is missing or its launcher is absent; reinstall the gate hook, then run setup_bridge.py doctor.")
     elif hooks["codex"].get("trust") != "recorded": needs.append("Codex gate hook is not trusted; open Codex /hooks and trust it, then run setup_bridge.py doctor.")
-    to_check = {"claude", "codex"} if baseline is None or force_checks else set(changed) & {"claude", "codex"}
+    selected_live = None if live_components is None else set(live_components)
+    to_check = ({"claude", "codex"} if baseline is None or force_checks else set(changed) & {"claude", "codex"})
+    if selected_live is not None:
+        to_check &= selected_live
     if prequalified_codex:
         to_check.discard("codex")
     bridge = _bridge() if bridge is None else bridge
@@ -668,7 +712,8 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
         else: needs.append("Codex changed but its configured-model synthetic check failed; repair it and run setup_bridge.py doctor.")
     if checked["codex_models"].get("ok") is False:
         pass
-    elif (baseline is None or "codex" in changed or force_checks) and not prequalified_codex:
+    elif (("codex" in selected_live if selected_live is not None else
+           (baseline is None or "codex" in changed or force_checks)) and not prequalified_codex):
         checked["codex_default"] = run_cli_check("codex", current["executables"]["codex"], default_model=True, runner=runner)
         if checked["codex_default"].get("reason") == "default_model_rejected":
             model = current.get("codex_default_model") or "(unset)"
@@ -681,18 +726,32 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
         # checks in private staging.  Its live post-switch check is purposely
         # free, so no job spends quota on an unchecked release.
         passed.add("codex")
-    gemma_changed = baseline is None or bool({"ollama", "gemma_delegate", "gemma_validator"} & set(changed))
+    gemma_changed = (bool({"ollama", "gemma_delegate", "gemma_validator"} & selected_live)
+                     if selected_live is not None else
+                     baseline is None or bool({"ollama", "gemma_delegate", "gemma_validator"} & set(changed)))
     if gemma_changed and current["config_path"]:
         checked["gemma"] = run_gemma_check(current["config_path"])
         if checked["gemma"].get("ok"): passed.add("gemma")
         else: needs.append("Gemma changed but its synthetic check failed; repair it and run setup_bridge.py doctor.")
+    # Qualify then activate.  A foreground doctor needs the same protection as
+    # the automatic child: its successful probe proves the identity it ran,
+    # not a replacement which appeared halfway through the probe.
+    passed, changed_during_checks = _qualified_passes_still_live(
+        current, passed, config_path=config_path, home=home, bridge=bridge, runner=runner,
+        has_baseline=baseline is not None, live_components=selected_live)
+    if changed_during_checks:
+        for name in sorted(changed_during_checks):
+            checked[name] = {"ok": False, "reason": "identity_changed_during_check"}
+            needs.append(f"{name.capitalize()} changed while doctor was checking it; run setup_bridge.py doctor.")
     if baseline is None or passed:
-        _write_baseline(home, _merge_good_baseline(baseline, current, passed))
+        _write_baseline(home, _merge_good_baseline(baseline, current, passed,
+                                                    live_components=selected_live))
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
     return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked,
-            "launcher_python": launcher_python, "runtime_revisions": runtime}
+            "launcher_python": launcher_python, "runtime_revisions": runtime,
+            "changed_during_checks": sorted(changed_during_checks)}
 
 
 def quick_check(config_path: str | None = None, *, home: str | None = None,
@@ -705,9 +764,16 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
     again.
     """
     home = _home(home); resolved = discover_config(config_path, home=home); key = (resolved, home)
+    baseline_path = paths(home)["baseline"]
+    try:
+        stat = os.stat(baseline_path)
+        baseline_stamp: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        baseline_stamp = None
     cached = _quick_cache.get(key)
-    if cached and not force_refresh and time.monotonic() - cached[0] < CACHE_SECONDS:
-        return {**cached[1], "cache_age_seconds": max(0.0, time.monotonic() - cached[0])}
+    if (cached and len(cached) == 3 and not force_refresh and cached[1] == baseline_stamp
+            and time.monotonic() - cached[0] < CACHE_SECONDS):
+        return {**cached[2], "cache_age_seconds": max(0.0, time.monotonic() - cached[0])}
     # This is called from executor loops.  It is intentionally limited to
     # version probes whose per-process timeout is shorter than one interval.
     current, baseline = inventory(resolved, home=home, runner=_quick_run), _read_baseline(home)
@@ -735,11 +801,153 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
         if state.get("path") and not state.get("pin_matches"):
             names.append("gemma_" + key_name)
             attention.append(f"Gemma {key_name} no longer matches its pinned checksum; repair it and run setup_bridge.py doctor.")
+    try:
+        from . import qualification
+        for item in qualification.attention(home, _qualification_components({"changed": names}), current):
+            attention.append(_qualification_attention_line(item, baseline))
+    except Exception:
+        pass
     result = {"ok": not names, "changed": sorted(set(names)), "inventory": current,
               "baseline": "missing" if baseline is None else "recorded",
               "attention": attention, "checked_at": time.time()}
-    _quick_cache[key] = (time.monotonic(), result)
+    _quick_cache[key] = (time.monotonic(), baseline_stamp, result)
     return {**result, "cache_age_seconds": 0.0}
+
+
+AUTO_REQUALIFY_ENV = "AGENT_BRIDGE_AUTO_REQUALIFY"
+NO_AUTO_REQUALIFY_ENV = "AGENT_BRIDGE_NO_AUTO_REQUALIFY"
+
+
+def _qualification_components(status: dict[str, Any]) -> list[str]:
+    return [name for name in ("claude", "codex", "ollama", "gemma_delegate", "gemma_validator")
+            if name in set(status.get("changed", []))]
+
+
+def _qualification_attention_line(item: dict[str, Any], baseline: dict[str, Any] | None) -> str:
+    """Make a durable automatic-requalification failure part of quick status."""
+    component = str(item["component"])
+    old = "previously recorded"
+    new = "new identity"
+    identity = item.get("identity", {})
+    value = identity.get("identity", {}) if isinstance(identity, dict) else {}
+    if component in {"claude", "codex"}:
+        new = str(value.get("version") or "unknown version")
+        old = str((baseline or {}).get("executables", {}).get(component, {}).get("version") or old)
+    elif component == "ollama":
+        new = str(value.get("version") or "unknown version")
+        old = str((baseline or {}).get("ollama", {}).get("version") or old)
+    else:
+        new = str(value.get("sha256") or "unknown checksum")[:16]
+        name = component.removeprefix("gemma_")
+        old = str((baseline or {}).get("gemma", {}).get(name, {}).get("sha256") or old)[:16]
+    if item.get("reason") == "daily_budget_exhausted":
+        return (f"Automatic requalification for {component} changed from {old} to {new}. "
+                f"The bridge tried automatic requalification, but today's automatic limit for {component if component in {'claude', 'codex'} else 'local'} is used up; it will try again tomorrow. "
+                "Next step: setup_bridge.py doctor.")
+    return (f"Automatic requalification for {component} changed from {old} to {new} did not pass after its allowed attempts. "
+            "It tried the existing doctor checks. Next step: setup_bridge.py doctor.")
+
+
+def requalify_on_detect(config_path: str | None, status: dict[str, Any], *, home: str | None = None,
+                        spawner: Any | None = None) -> dict[str, Any]:
+    """Start one detached existing-doctor run when the operator consented.
+
+    This is intentionally a fail-closed scheduling hint.  The queue has
+    already applied its drift hold before this function is called.
+    """
+    # Test and other foreign-config callers must not be able to spend or
+    # rewrite qualification state for this process's installed home.  Keep
+    # this switch before even looking at qualification state so test runners
+    # can turn the scheduling hint off globally and safely.
+    if os.environ.get(NO_AUTO_REQUALIFY_ENV) == "1":
+        return {"started": False, "reason": "disabled_by_environment"}
+    from . import qualification
+    actual_home = _home(home)
+    if config_path is not None:
+        supplied = discover_config(config_path, home=actual_home)
+        installed = discover_config(home=actual_home)
+        if (supplied is None or installed is None or
+                os.path.realpath(supplied) != os.path.realpath(installed)):
+            return {"started": False, "reason": "foreign_config"}
+    components = _qualification_components(status)
+    if not components:
+        return {"started": False, "reason": "no_qualifying_change"}
+    if not qualification.enabled(actual_home, schedule_path(actual_home)):
+        return {"started": False, "reason": "not_enabled"}
+    inventory_value = status.get("inventory")
+    if not isinstance(inventory_value, dict):
+        return {"started": False, "reason": "inventory_unavailable"}
+    try:
+        reservation = qualification.reserve(actual_home, components, inventory_value)
+    except Exception:
+        return {"started": False, "reason": "state_unavailable"}
+    for skipped in reservation.get("skipped", []):
+        if skipped.get("reason") not in {"attempts_exhausted", "daily_budget_exhausted"}:
+            continue
+        try:
+            qualification.report_refusal(actual_home, str(skipped["component"]), inventory_value,
+                                         str(skipped["reason"]))
+        except Exception:
+            pass
+    if not reservation.get("started"):
+        return reservation
+    program = [sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "setup_bridge.py")),
+               "doctor", "--requalify-only", "--quiet"]
+    if config_path:
+        program += ["--config", config_path]
+    env = {**os.environ, AUTO_REQUALIFY_ENV: "1", "HOME": actual_home}
+    try:
+        if spawner is None:
+            kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                                      "stderr": subprocess.DEVNULL, "close_fds": True, "env": env}
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0)
+            else:
+                kwargs["start_new_session"] = True
+            child = subprocess.Popen(program, shell=False, **kwargs)
+        else:
+            child = spawner(program, env=env)
+        qualification.set_flight_pid(actual_home, int(child.pid))
+        return {**reservation, "pid": int(child.pid)}
+    except Exception:
+        # The attempt was recorded before the spawn as promised.  It did not
+        # spend a provider turn, but remains conservatively eligible only
+        # through the normal backoff path.
+        try:
+            qualification.finish(actual_home, set())
+        except Exception:
+            pass
+        return {"started": False, "reason": "spawn_failed"}
+
+
+def automatic_requalify_child(config_path: str | None = None, *, home: str | None = None) -> dict[str, Any]:
+    """Run by the detached child, using exactly the normal doctor checks."""
+    from . import qualification
+    actual_home = _home(home)
+    active = qualification.flight(actual_home)
+    if not active:
+        return {"ok": False, "needs_you": [], "automatic": "no_flight"}
+    selected = set(active.get("components", []))
+    report = doctor(config_path, home=actual_home, live_components=selected)
+    requalified = set(report.get("requalified", []))
+    passed = {name for name in selected if name in requalified or
+              (name in {"ollama", "gemma_delegate", "gemma_validator"} and "gemma" in requalified)}
+    try:
+        qualification.finish(actual_home, passed)
+        if passed:
+            _audit(actual_home, action="automatic_requalification", components=sorted(passed), result="passed")
+            try:
+                from .orchestration.config import load as load_orchestration_config
+                from .orchestration.execution_worker import _request_drift_refresh
+                cfg = load_orchestration_config(config_path or str(report["inventory"].get("config_path")))
+                _request_drift_refresh(cfg.execution_queue_root)
+            except Exception:
+                # The baseline was already atomically recorded. A later
+                # bounded quick check still lifts the hold, so never undo it.
+                pass
+    except Exception:
+        pass
+    return {**report, "automatic": True, "automatic_passed": sorted(passed)}
 
 
 def scheduled_baseline(config_path: str | None = None, *, home: str | None = None,
@@ -1102,12 +1310,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.remove_schedule: remove_schedule(); return 0
         if args.scheduled and _read_baseline(_home()) is None:
             report = scheduled_baseline(args.config)
+        elif args.requalify_only and os.environ.get(AUTO_REQUALIFY_ENV) == "1":
+            report = automatic_requalify_child(args.config)
         else:
             wants_update = args.update or (args.scheduled and not args.requalify_only)
             report = update(args.config, quarantine_hours=args.quarantine_hours) if wants_update else doctor(args.config, accept_requalified=args.accept_requalified)
     except (OSError, ValueError, PermissionError) as exc: print(str(exc), file=sys.stderr); return 1
-    if not report["ok"] and args.quiet: _notify_attention(_home(), report)
-    elif (args.update or args.scheduled) and args.quiet:
+    automatic_child = args.requalify_only and os.environ.get(AUTO_REQUALIFY_ENV) == "1"
+    if not automatic_child and not report["ok"] and args.quiet: _notify_attention(_home(), report)
+    elif not automatic_child and (args.update or args.scheduled) and args.quiet:
         versions = [str(event.get("current")) for event in report.get("updates", []) if event.get("status") == "updated"]
         if versions: _notify_updated(", ".join(versions))
     if args.json: print(json.dumps(report, sort_keys=True))
@@ -1120,5 +1331,16 @@ def main(argv: list[str] | None = None) -> int:
         for name, detail in (runtime.get("launchers", {}) if isinstance(runtime, dict) else {}).items():
             print(f"{name}: {detail.get('interpreter') or 'no supported Python found'} "
                   f"({detail.get('source')})")
+        try:
+            from . import qualification
+            automatic = qualification.status(_home())
+            if automatic["keys"] or automatic["today"]:
+                print("Automatic requalification:")
+                for item in automatic["keys"]:
+                    print(f"{item.get('component')}: {item.get('attempts', 0)} attempt(s), {item.get('last_result') or 'not run'}")
+                print("Today's automatic budget: " + ", ".join(
+                    f"{provider} {count}" for provider, count in sorted(automatic["today"].items())))
+        except Exception:
+            pass
         if report["ok"] and not report["changed"]: print("Dependencies are unchanged.")
     return 0 if report["ok"] else 1

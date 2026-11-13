@@ -370,6 +370,24 @@ def undo(home: str, *, out: Callable[[str], None] = print) -> int:
         os.unlink(path)
         removed += 1
         out(f"Removed: {path}")
+    automatic = record.get("auto_requalify") if isinstance(record, dict) else None
+    if isinstance(automatic, dict) and isinstance(automatic.get("path"), str) and _inside_base(automatic["path"], home):
+        try:
+            settings = _read_json(automatic["path"])
+            applied_value = automatic.get("applied_value", True)
+            if isinstance(settings, dict) and settings.get("auto_requalify") is applied_value:
+                if automatic.get("previous_present"):
+                    settings["auto_requalify"] = automatic.get("previous_value")
+                else:
+                    settings.pop("auto_requalify", None)
+                store.atomic_write_json(automatic["path"], settings)
+                out("Reverted automatic requalification consent.")
+        except FileNotFoundError:
+            # A settings file created solely for this consent was removed with
+            # the other created upgrade files above.
+            pass
+        except (OSError, ValueError, TypeError):
+            out("Left automatic requalification consent alone because its settings cannot be read safely.")
     try:
         os.unlink(record_path)
     except OSError as exc:
@@ -460,14 +478,22 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
     # updater independently.
     config_path = drift.discover_config(home=home)
     baseline_missing = config_path is not None and drift._read_baseline(home) is None
+    settings_path = os.path.join(_base(home), "drift", "settings.json")
+    existing_settings = store.read_json_or_none(settings_path)
+    existing_settings = existing_settings if isinstance(existing_settings, dict) else {}
+    automatic_requalify: bool | None = None
     if baseline_missing:
         out("Doctor baseline: records this installation's free inventory before future changes are compared.")
         record_baseline = _yes_default(ask("Run doctor once to record a baseline? [Y/n] "))
         decisions["doctor_baseline"] = "yes" if record_baseline else "not_now"
         if platform == "darwin":
             out("Nightly doctor: checks for a quarantined Codex update each night. It is optional.")
-            install_nightly = _yes(ask("Install the nightly doctor schedule? [y/N] "))
+            install_nightly = _yes_default(ask("Install the nightly doctor schedule? [Y/n] "))
             decisions["doctor_schedule"] = "yes" if install_nightly else "not_now"
+    if config_path is not None and "auto_requalify" not in existing_settings:
+        automatic_requalify = _yes_default(ask(
+            "Automatically recheck the bridge after a Claude, Codex, or Ollama update? This can use a small number of Claude or Codex subscription turns; it never installs anything or uses paid fallback. [Y/n] "))
+        decisions["auto_requalify"] = "yes" if automatic_requalify else "not_now"
 
     include_hermes = ((shutil.which("hermes") if (existing_hermes or chosen_hermes) else None)
                       or chosen_hermes or existing_hermes)
@@ -494,6 +520,14 @@ def run(*, home: str, ask: Callable[[str], str] = input, out: Callable[[str], No
             created.append(path)
     record_path = _upgrade_path(home)
     record = {"version": 1, "decisions": decisions, "created": [], "updated_at": datetime.now(UTC).isoformat()}
+    if automatic_requalify is not None:
+        record["auto_requalify"] = {"path": settings_path,
+                                      "previous_present": "auto_requalify" in existing_settings,
+                                      "previous_value": existing_settings.get("auto_requalify"),
+                                      "applied_value": automatic_requalify}
+        updates[settings_path] = (json.dumps({**existing_settings, "auto_requalify": automatic_requalify}, indent=2, sort_keys=True) + "\n").encode()
+        if not os.path.exists(settings_path):
+            created.append(settings_path)
     record["created"] = [{"path": path, "sha256": _sha256(updates[path])} for path in created]
     updates[record_path] = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
 

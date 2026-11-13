@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import operator_isolation  # noqa: E402,F401
 
+from agent_bridge import qualification, store
 from agent_bridge.orchestration import server as module
 
 
@@ -211,8 +212,38 @@ class MainMutationTests(unittest.TestCase):
         check = constructor.call_args.kwargs["dependency_check"]
         from agent_bridge import drift
         with mock.patch.object(drift, "quick_check", return_value={"changed": ["gemma_validator"]}), \
-                mock.patch.object(drift, "report_attention"):
+                mock.patch.object(drift, "report_attention"), \
+                mock.patch.object(drift, "requalify_on_detect") as requalify:
             self.assertEqual(check(), "gemma_validator")
+        requalify.assert_called_once()
+
+    def test_foreign_config_cannot_start_requalification_from_dependency_check(self):
+        home = Path(self.temp.name) / "home"; home.mkdir()
+        installed = home / "installed.json"; installed.write_text("{}", encoding="utf-8")
+        foreign = Path(self.temp.name) / "config.json"; foreign.write_text("{}", encoding="utf-8")
+        store.atomic_write_json(str(home / ".agent-bridge/onboarding/gate-installation.json"),
+                                {"config": str(installed)})
+        store.atomic_write_json(str(home / ".agent-bridge/drift/settings.json"), {"auto_requalify": True})
+        _, _, constructor, _ = self.run_main()
+        check = constructor.call_args.kwargs["dependency_check"]
+        status = {"changed": ["gemma_validator"], "inventory": {
+            "executables": {}, "ollama": {}, "gemma": {"delegate": {}, "validator": {"sha256": "new"}}}}
+        from agent_bridge import drift
+        outcomes: list[dict] = []
+        original = drift.requalify_on_detect
+        def observe(*args, **kwargs):
+            result = original(*args, **kwargs); outcomes.append(result); return result
+        with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(drift, "quick_check", return_value=status), \
+             mock.patch.object(drift, "report_attention"), \
+             mock.patch.object(drift, "requalify_on_detect", side_effect=observe), \
+             mock.patch.object(drift.subprocess, "Popen") as spawn:
+            os.environ.pop(drift.NO_AUTO_REQUALIFY_ENV, None)
+            self.assertEqual(check(), "gemma_validator")
+        self.assertEqual(outcomes, [{"started": False, "reason": "foreign_config"}])
+        spawn.assert_not_called()
+        self.assertFalse(os.path.exists(qualification.paths(str(home))["root"]))
 
 
 if __name__ == "__main__":

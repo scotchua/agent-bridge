@@ -36,6 +36,7 @@ import json
 import os
 # Suppress desktop alerts in tests, including subprocesses that inherit this environment.
 os.environ["AGENT_BRIDGE_NO_DESKTOP_ALERTS"] = "1"
+os.environ["AGENT_BRIDGE_NO_AUTO_REQUALIFY"] = "1"
 import shutil
 import subprocess
 import sys

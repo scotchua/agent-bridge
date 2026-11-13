@@ -1,5 +1,31 @@
 # When a consultation stops working
 
+## Dependency updates and automatic requalification
+
+When the bridge sees a changed Claude, Codex, Ollama, or certified Gemma
+dependency, it continues to hold only work that needs that dependency. If you
+accepted automatic requalification in the upgrade guide, or installed the
+nightly doctor schedule, it starts one detached requalification using the
+normal doctor checks. `auto_requalify: false` overrides an installed schedule;
+`true` enables it, and an absent setting uses schedule consent. It does not
+install an update, change an account, or use an API-key or paid fallback.
+
+The result is accepted only if the executable or local dependency still has
+the identity that was tested. The default limit is two attempts for an
+identity, with a 15 minute backoff, and three automatic runs per provider per
+local day. Other providers continue normally. A final failure produces one
+attention item. Run `python3 setup_bridge.py doctor` as the single next step.
+
+Use `python3 setup_bridge.py doctor` to see the keys, attempts, and today's
+automatic budget. The consent and limits are in
+`~/.agent-bridge/drift/settings.json`; `auto_requalify: true` enables it.
+`auto_requalify: false` disables it even when a schedule remains installed;
+when the key is absent, the schedule is consent. Removing the doctor schedule
+only removes schedule-based consent. The upgrade guide's `--undo` reverts the
+consent it recorded. Set `AGENT_BRIDGE_NO_AUTO_REQUALIFY=1` to disable
+automatic requalification for that process without reading or writing its
+qualification state.
+
 Run this in a normal macOS Terminal:
 
 ```sh

@@ -282,6 +282,60 @@ class IsolatedDriftTests(unittest.TestCase):
             drift.doctor(str(self.config), home=str(self.home)); first = drift.doctor(str(self.config), home=str(self.home)); second = drift.doctor(str(self.config), home=str(self.home))
         self.assertIn("codex", first["changed"]); self.assertIn("codex", second["changed"])
 
+    def test_changed_identity_during_check_is_not_written_to_baseline(self) -> None:
+        old, checked, replaced = self.inventory(), self.inventory(), self.inventory()
+        checked["executables"]["codex"]["sha256"] = "checked"
+        replaced["executables"]["codex"]["sha256"] = "replaced"
+        drift._write_baseline(str(self.home), old)
+        with mock.patch.object(drift, "inventory", side_effect=[checked, replaced]), \
+             mock.patch.object(drift, "run_cli_check", return_value={"ok": True}):
+            report = drift.doctor(str(self.config), home=str(self.home), bridge=self.bridge(self.home / "codex"))
+        self.assertIn("codex", report["changed_during_checks"])
+        self.assertEqual(drift._read_baseline(str(self.home))["executables"]["codex"], old["executables"]["codex"])
+
+    def test_doctor_live_components_checks_only_codex_and_preserves_claude_baseline(self) -> None:
+        old = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        current = json.loads(json.dumps(old))
+        current["executables"]["claude"]["sha256"] = "claude-new"
+        current["executables"]["codex"]["sha256"] = "codex-new"
+        drift._write_baseline(str(self.home), old)
+        calls: list[list[str]] = []
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            if "debug" in argv:
+                return completed('{"models": [{"slug": "good", "supported_reasoning_levels": [{"effort": "low"}]}]}')
+            if "--help" in argv:
+                return completed(" ".join(drift.CLAUDE_FLAGS if "claude" in argv[0] else drift.CODEX_FLAGS))
+            if "codex" in argv[0] and "exec" in argv:
+                return completed("DRIFT_DOCTOR_WORD")
+            return completed()
+        with mock.patch.object(drift, "inventory", side_effect=[current, current]):
+            report = drift.doctor(str(self.config), home=str(self.home), bridge=self.bridge(self.home / "codex"),
+                                  runner=runner, live_components={"codex"})
+        self.assertIn("codex", report["requalified"])
+        self.assertFalse(any("claude" in call[0] and "exec" in call for call in calls))
+        baseline = drift._read_baseline(str(self.home))
+        self.assertEqual(baseline["executables"]["claude"], old["executables"]["claude"])
+        self.assertEqual(baseline["executables"]["codex"], current["executables"]["codex"])
+
+    def test_doctor_live_components_skips_gemma_when_only_claude_is_reserved(self) -> None:
+        old = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        current = json.loads(json.dumps(old))
+        current["executables"]["claude"]["sha256"] = "claude-new"
+        current["gemma"]["delegate"] = {"path": "/new-gemma", "sha256": "new", "pin_matches": True}
+        drift._write_baseline(str(self.home), old)
+        def runner(argv, **kwargs):
+            if "debug" in argv:
+                return completed('{"models": [{"slug": "good", "supported_reasoning_levels": [{"effort": "low"}]}]}')
+            if "--help" in argv:
+                return completed(" ".join(drift.CLAUDE_FLAGS if "claude" in argv[0] else drift.CODEX_FLAGS))
+            return completed()
+        with mock.patch.object(drift, "inventory", side_effect=[current, current]), \
+             mock.patch.object(drift, "run_gemma_check") as gemma:
+            drift.doctor(str(self.config), home=str(self.home), bridge=self.bridge(self.home / "codex"),
+                         runner=runner, live_components={"claude"})
+        gemma.assert_not_called()
+
     def test_passing_gemma_check_records_ollama_inventory(self) -> None:
         old, current = self.inventory(), self.inventory()
         current["ollama"] = {"version": "1", "model_present": True}
