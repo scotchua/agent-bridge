@@ -358,8 +358,8 @@ class Decision:
     logged: bool = True        # False for calls the gate does not judge at all
     #: Extra fields merged into this decision's event-ledger record: a read
     #: gate's ``waiver_reason``, ``bytes_estimate`` and ``job_id``, present
-    #: only where the design calls for them. Routing decisions leave this
-    #: empty; their own extra fields come from ``receipt`` instead.
+    #: only where the design calls for them. Automatic failures carry a
+    #: sanitized ``failure_code``; routing bindings come from ``receipt``.
     extra: dict[str, Any] = field(default_factory=dict)
     #: Other decisions ``record_event`` must also log as their own ledger
     #: line. A single call can name more than one gated-shape read (two
@@ -1596,7 +1596,8 @@ def judge_read(client: str, paths: list[str], cwd: str, *, state_root: str,
             "deny", "gate_auto_decision_failed",
             f"delegation-first gate: the routing policy could not be read "
             f"({type(exc).__name__}); a gated-shape read cannot be judged until it can "
-            f"[policy_unreadable]", repos, logged=True)
+            f"[policy_unreadable]", repos, logged=True,
+            extra={"failure_code": type(exc).__name__})
     decisions = []
     for path, _repo in in_repo:
         outcome = _judge_read_path(
@@ -1794,11 +1795,21 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
 
     def decide_now(repo: str, alongside: bool) -> tuple[dict[str, Any] | None, Decision | None]:
         """Make the missing decision and take up exactly what it wrote."""
+        from .autodecide import AutoDecisionError, StageReconciliationRequired
+
         try:
             if alongside:
                 outcome = decide(repo, task_type, retained_alongside=True)
             else:
                 outcome = decide(repo, task_type)
+        except StageReconciliationRequired as exc:
+            return None, Decision(
+                "deny", exc.code,
+                f"delegation-first gate: repository {repo} is held at item {exc.item_id}, "
+                f"stage {exc.stage}; an operator must confirm the previous owner is no "
+                "longer running and release it with agent-bridge-admin stage-reconcile. "
+                "Retrying or signing in will not release it", repos,
+                receipt={"item_id": exc.item_id, "stage": exc.stage})
         except Exception as exc:  # noqa: BLE001  fail closed, name the class
             # AutoDecisionError carries a fixed reason code this codebase
             # wrote, so it is safe to repeat. Any other class's text is
@@ -1809,7 +1820,9 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             return None, Decision(
                 "deny", "gate_auto_decision_failed",
                 f"delegation-first gate: the routing decision for {repo} could not be "
-                f"created ({detail}); nothing is implemented until it can be", repos)
+                f"created ({detail}); nothing is implemented until it can be", repos,
+                extra={"failure_code": exc.code if isinstance(exc, AutoDecisionError)
+                       else type(exc).__name__})
         receipt = written(outcome, repo)
         if receipt is None:
             # A decider that does not report what it wrote (only a test

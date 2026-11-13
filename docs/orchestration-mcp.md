@@ -38,6 +38,13 @@ caller cannot seize a stage merely because time passed.
 
 ## Operator stage reconciliation
 
+The automatic gate denies writes touching a repository whose live automatic
+stage is in `reconcile_required` with `stage_reconciliation_required`. Its
+reason names the repository, item and stage and directs the operator here.
+Retrying or signing in will not release the hold, and an assistant must not
+release it itself. The audit counts this as an expected operator hold rather
+than a mechanism failure.
+
 Run `agent-bridge-admin stage-reconcile` to list live stages requiring
 reconciliation, without task text. Before releasing one, confirm that its
 previous owner is no longer running and state how you checked:

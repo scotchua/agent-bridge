@@ -367,6 +367,10 @@ class PrivacyIsCheckedBeforeEverythingElse(AutoCase):
         reason = self.assertDenied(self.hook("claude", self.repo),
                                    "gate_auto_decision_failed")
         self.assertIn("policy_unreadable", reason)
+        self.assertIn("AutoDecisionError: policy_unreadable:PolicyError", reason)
+        event = json.loads((self.state / "routing" / gate.EVENT_LEDGER).read_text().splitlines()[-1])
+        self.assertEqual(event["failure_code"], "policy_unreadable")
+        self.assertNotIn("{not json at all", json.dumps(event))
 
     def test_a_policy_with_the_wrong_version_is_refused(self):
         path = Path(autoroute.policy_path(str(self.state)))
@@ -605,6 +609,148 @@ class DefectsFoundWhileBuildingThis(AutoCase):
         self.assertEqual(gate.infer_task_type(["tests/test_app.py"]), "implementation")
 
 
+class ReconciliationHolds(AutoCase):
+    def setUp(self):
+        super().setUp()
+        self.write_policy({})
+        self.other = git_repo(self.base / "second-repo")
+        self.item = autodecide.item_id_for(str(self.other))
+        self.stage = "implementation"
+
+    def expired_stage(self, owner="previous-owner"):
+        now = time.time() - 100
+        router = StageRouter(str(self.db), clock=lambda: now)
+        router.observe_capacity(CapacityObservation(
+            route="claude", observed_at=now, fresh_until=now + 3600,
+            available=True, source="test-operator"), trusted=True)
+        registered = router.register(self.item, self.stage, allowed_routes=("claude",))
+        return router.assign(self.item, self.stage, owner_id=owner, lease_seconds=1,
+                             expected_revision=registered["revision"])
+
+    def hold(self):
+        owned = self.expired_stage()
+        router = StageRouter(str(self.db))
+        with self.assertRaisesRegex(RoutingError, "^liveness_reconciliation_required$"):
+            router.assign(self.item, self.stage, owner_id="second-owner", lease_seconds=1,
+                          expected_revision=owned["revision"])
+        return router.get(self.item, self.stage)
+
+    def judge_paths(self, paths, decide=None, protected=()):
+        return gate.judge(
+            "claude", "MultiEdit", {"edits": [{"file_path": str(path)} for path in paths]},
+            str(self.repo), state_root=str(self.state), capacity_db=str(self.db),
+            protected=protected,
+            decide=decide or gate.automatic_decider("claude", str(self.state), str(self.db)))
+
+    def assertHold(self, decision):
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "stage_reconciliation_required"))
+        for text in (str(self.other), self.item, self.stage,
+                     "agent-bridge-admin stage-reconcile", "operator", "previous owner",
+                     "Retrying or signing in will not release it"):
+            self.assertIn(text, decision.reason)
+
+    def test_two_repositories_hold_repeatedly_until_operator_release(self):
+        held = self.hold()
+        paths = [self.repo / "app.py", self.other / "app.py"]
+        router = StageRouter(str(self.db))
+        for _ in range(2):
+            decision = self.judge_paths(paths)
+            self.assertHold(decision)
+            self.assertEqual(router.get(self.item, self.stage), held)
+            with self.assertRaisesRegex(RoutingError, "^stage_not_found$"):
+                router.get(self.item, "implementation#2")
+        gate.record_event(str(self.state), "claude", "MultiEdit", decision)
+        event = json.loads((self.state / "routing" / gate.EVENT_LEDGER).read_text().splitlines()[-1])
+        self.assertEqual(event["code"], "stage_reconciliation_required")
+        self.assertEqual((event["item_id"], event["stage"]), (self.item, self.stage))
+        router.reconcile_release(self.item, self.stage, actor="operator",
+                                 expected_revision=held["revision"], owner_checked_inactive=True,
+                                 liveness_evidence="Synthetic supervisor confirmed exit")
+        self.assertEqual(self.judge_paths(paths).permission, "allow")
+
+    def test_three_repositories_hold_without_mutating_the_stage(self):
+        third = git_repo(self.base / "third-repo")
+        held = self.hold()
+        paths = [repo / "app.py" for repo in (self.repo, self.other, third)]
+        router = StageRouter(str(self.db))
+        for _ in range(2):
+            self.assertHold(self.judge_paths(paths))
+            self.assertEqual(router.get(self.item, self.stage), held)
+            with self.assertRaisesRegex(RoutingError, "^stage_not_found$"):
+                router.get(self.item, "implementation#2")
+        router.reconcile_release(self.item, self.stage, actor="operator",
+                                 expected_revision=held["revision"], owner_checked_inactive=True,
+                                 liveness_evidence="Synthetic supervisor confirmed exit")
+        self.assertEqual(self.judge_paths(paths).permission, "allow")
+
+    def test_single_blocked_and_healthy_targets(self):
+        self.hold()
+        self.assertHold(self.judge_paths([self.other / "app.py"]))
+        self.assertEqual(self.judge_paths([self.repo / "app.py"]).permission, "allow")
+        self.assertEqual(self.judge_paths([self.repo / "app.py", self.base / "ordinary.txt"]).permission,
+                         "allow")
+
+    def test_healthy_multi_repository_write_allows(self):
+        self.assertEqual(self.judge_paths([self.repo / "app.py", self.other / "app.py"]).permission,
+                         "allow")
+
+    def test_assign_race_is_a_named_hold(self):
+        from unittest import mock
+
+        with mock.patch.object(StageRouter, "assign",
+                               side_effect=RoutingError("liveness_reconciliation_required")):
+            self.assertHold(self.judge_paths([self.other / "app.py"]))
+
+    def test_protected_target_wins_before_routing(self):
+        from unittest import mock
+
+        self.hold()
+        decider = mock.Mock(side_effect=AssertionError("routing must not run"))
+        decision = self.judge_paths([self.other / "app.py", self.state / "protected"],
+                                    decide=decider, protected=(str(self.state),))
+        self.assertEqual(decision.code, "gate_state_protected")
+        decider.assert_not_called()
+
+    def test_second_repository_routed_elsewhere_still_denies(self):
+        self.write_policy({str(self.other): {"classification": "internal_nonclient",
+                                            "allowed_routes": ["codex"]}})
+        self.observe("codex")
+        decision = self.judge_paths([self.repo / "app.py", self.other / "app.py"])
+        self.assertEqual(decision.code, "routed_elsewhere")
+
+    def test_expired_own_stage_is_renewed(self):
+        before = self.expired_stage(autodecide.owner_id_for("claude"))
+        decision = self.judge_paths([self.other / "app.py"])
+        self.assertEqual(decision.permission, "allow")
+        after = StageRouter(str(self.db)).get(self.item, self.stage)
+        self.assertEqual(after["state"], "owned")
+        self.assertEqual(after["owner_id"], before["owner_id"])
+        self.assertGreater(after["lease_until"], before["lease_until"])
+        self.assertEqual(decision.receipt["stage"], self.stage)
+
+    def test_expired_foreign_stage_is_skipped_unchanged(self):
+        before = self.expired_stage()
+        decision = self.judge_paths([self.other / "app.py"])
+        self.assertEqual(decision.permission, "allow")
+        self.assertEqual(StageRouter(str(self.db)).get(self.item, self.stage), before)
+        self.assertEqual(decision.receipt["stage"], "implementation#2")
+
+    def test_archived_reconciliation_stage_is_skipped(self):
+        import sqlite3
+
+        self.hold()
+        # Synthetic legacy history: the current archive API refuses live holds.
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE stages SET archived_at=? WHERE item_id=? AND stage=?",
+                       (time.time(), self.item, self.stage))
+        before = StageRouter(str(self.db)).get(self.item, self.stage)
+        decision = self.judge_paths([self.other / "app.py"])
+        self.assertEqual(decision.permission, "allow")
+        self.assertEqual(decision.receipt["stage"], "implementation#2")
+        self.assertEqual(StageRouter(str(self.db)).get(self.item, self.stage), before)
+
+
 class AFailedDecisionSaysLittleAndDeniesAnyway(AutoCase):
     """``errors.py``'s rule reaches the gate too: no unvetted text escapes."""
 
@@ -627,6 +773,10 @@ class AFailedDecisionSaysLittleAndDeniesAnyway(AutoCase):
         self.assertEqual(decision.code, "gate_auto_decision_failed")
         self.assertIn("Surprising", decision.reason)
         self.assertNotIn(secret, decision.reason)
+        gate.record_event(str(self.state), "claude", "Edit", decision)
+        ledger = (self.state / "routing" / gate.EVENT_LEDGER).read_text()
+        self.assertNotIn(secret, ledger)
+        self.assertEqual(json.loads(ledger)["failure_code"], "Surprising")
 
     def test_our_own_reason_code_is_repeated_because_we_wrote_it(self):
         def decider(repo, task_type):
@@ -635,6 +785,26 @@ class AFailedDecisionSaysLittleAndDeniesAnyway(AutoCase):
         decision = self.judge_with(decider)
         self.assertEqual(decision.code, "gate_auto_decision_failed")
         self.assertIn("policy_unreadable", decision.reason)
+        self.assertEqual(
+            decision.reason,
+            f"delegation-first gate: the routing decision for {self.repo.resolve()} could not be "
+            "created (AutoDecisionError: policy_unreadable:ValueError); nothing is "
+            "implemented until it can be")
+        self.assertEqual(decision.extra["failure_code"], "policy_unreadable")
+
+    def test_failure_metadata_uses_only_the_closed_code(self):
+        secret = "SENTINEL_COMMAND_AND_PATH"
+        for reason, expected in ((f"stage_claim_failed:{secret}", "stage_claim_failed"),
+                                 (secret, "AutoDecisionError")):
+            with self.subTest(reason=reason):
+                def decider(repo, task_type):
+                    raise autodecide.AutoDecisionError(reason)
+
+                decision = self.judge_with(decider)
+                gate.record_event(str(self.state), "claude", "Edit", decision)
+                event = json.loads((self.state / "routing" / gate.EVENT_LEDGER).read_text().splitlines()[-1])
+                self.assertEqual(event["failure_code"], expected)
+                self.assertNotIn(secret, json.dumps(event))
 
     def test_the_deny_stands_even_when_the_decider_returns_nothing_useful(self):
         """A decider that writes no receipt must not become an allow."""

@@ -98,6 +98,31 @@ INTENT_VERSION = 1
 class AutoDecisionError(RuntimeError):
     """The decision could not be created. The gate turns this into a deny."""
 
+    @property
+    def code(self) -> str:
+        candidate = str(self).split(":", 1)[0]
+        return candidate if candidate in AUTO_FAILURE_CODES else "AutoDecisionError"
+
+
+#: Only these fixed prefixes may enter event metadata; details stay out.
+AUTO_FAILURE_CODES = frozenset({
+    "client_invalid", "repo_not_a_repository", "clock_invalid", "policy_unreadable",
+    "router_unavailable", "capacity_record_failed", "stage_register_failed",
+    "stage_unreadable", "stage_renew_failed", "stage_terminal", "stage_claim_failed",
+    "stage_generations_exhausted", "stage_not_owned_after_claim",
+    "stage_owned_by_another_owner", "stage_owned_by_another_route",
+    "receipt_write_failed", "intent_write_failed", "stage_reconciliation_required",
+})
+
+
+class StageReconciliationRequired(AutoDecisionError):
+    """An operator must establish liveness before this stage can run again."""
+
+    def __init__(self, item_id: str, stage: str):
+        super().__init__("stage_reconciliation_required")
+        self.item_id = item_id
+        self.stage = stage
+
 
 @dataclass(frozen=True)
 class Outcome:
@@ -247,6 +272,8 @@ def _own_stage(router: StageRouter, *, item_id: str, stage: str, route: str,
                              lease_seconds=lease_seconds,
                              expected_revision=current["revision"])
     except RoutingError as exc:
+        if str(exc) == "liveness_reconciliation_required":
+            raise StageReconciliationRequired(item_id, stage) from None
         raise AutoDecisionError(f"stage_claim_failed:{exc}") from None
 
 
@@ -289,6 +316,8 @@ def stage_name(router: StageRouter, item_id: str, task_type: str, *,
             # Treat its name exactly like a completed generation so a later
             # decision can never recreate an old receipt binding.
             continue
+        if current.get("state") == "reconcile_required":
+            raise StageReconciliationRequired(item_id, candidate)
         if current.get("state") in ("complete", "blocked"):
             continue                  # terminal: history, try the next one
         if (current.get("state") == "owned" and owner_id is not None
