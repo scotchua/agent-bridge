@@ -422,7 +422,10 @@ class QualityTests(unittest.TestCase):
         self.disable()
         router = StageRouter(self.home / "stages.db")
         tools = mcp.build_tools("codex", router, self.queue, self.intake, state_root=str(self.state))
-        for name, args in (("work_digest_file", {"path": "/synthetic.log", "task_type": "summarize"}),):
+        # A drive-qualified temp path: Python 3.13 on Windows no longer treats
+        # a root-relative "/x" as absolute, which would refuse it as invalid input.
+        synthetic = str(self.home / "synthetic.log")
+        for name, args in (("work_digest_file", {"path": synthetic, "task_type": "summarize"}),):
             result = tools[name]["handler"](args)
             self.assertEqual(result["reason"], "quality_disabled")
         self.assertEqual(tools["orchestration_status"]["handler"]({})["disabled_for_quality"], ["summarize"])
