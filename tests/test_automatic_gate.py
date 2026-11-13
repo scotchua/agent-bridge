@@ -372,8 +372,11 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.assertAllowed(self.shell(f"git -C {shlex.quote(str(self.repo))} commit -m {target}"))
 
     def test_expired_task_lease_denial_names_item_and_stage(self):
+        import contextlib
         import sqlite3
-        with sqlite3.connect(self.db) as db:
+        # closing(): the connection's own context manager commits but does not
+        # close, and an open handle blocks temp cleanup on Windows (WinError 32).
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
             db.execute("UPDATE stages SET lease_until = ? WHERE item_id = ? AND stage = ?",
                        (time.time() - 1, self.item, "review"))
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
