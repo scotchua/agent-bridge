@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -93,6 +94,41 @@ class QualityTests(unittest.TestCase):
         self.assertLess(row["lower_bound"], .5)
         self.assertIsNone(row["disabled_at"])
 
+    def test_all_used_reviews_write_valid_state_without_disabling(self):
+        # Include 21 and 37, where floating-point cancellation made the
+        # exact zero bound negative and invalidated the persisted state.
+        for n in range(1, 65):
+            with self.subTest(n=n):
+                with self.queue._db() as db:
+                    db.execute("DELETE FROM jobs")
+                self.seed(self.rows(n=n, not_used=0))
+                root = self.state / str(n)
+                written = quality.update(root, self.queue.db_path, self.queue.backend_id,
+                                         self.queue.allowed_task_types, now=self.now)
+                state = quality.read_state(root)
+                self.assertEqual(state, written)
+                row = state["private_worker"]["summarize"]
+                self.assertEqual((row["n"], row["used"]), (n, n))
+                self.assertGreaterEqual(row["lower_bound"], 0.0)
+                self.assertLessEqual(row["lower_bound"], 1.0)
+                self.assertIsNone(row["disabled_at"])
+                self.assertFalse(quality.disabled_types(root, "private_worker"))
+
+    def test_twenty_review_wilson_boundary_fourteen_and_fifteen_bad(self):
+        for bad in (14, 15):
+            with self.subTest(bad=bad):
+                row = self.measure(self.rows(n=20, not_used=bad))
+                z = 1.959963984540054
+                p = bad / 20
+                expected = (p + z**2 / 40 - z * math.sqrt(p * (1-p) / 20 + z**2 / 1600)) / (1 + z**2 / 20)
+                self.assertAlmostEqual(row["lower_bound"], expected)
+                if bad == 14:
+                    self.assertLess(row["lower_bound"], 0.5)
+                    self.assertIsNone(row["disabled_at"])
+                else:
+                    self.assertGreater(row["lower_bound"], 0.5)
+                    self.assertEqual(row["disabled_at"], self.now)
+
     def test_window_uses_recorded_at_and_only_completed_work(self):
         # Old submissions with fresh reviews count; fresh submissions with
         # stale reviews, test jobs, incomplete jobs and future reviews do not.
@@ -177,6 +213,27 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(quality.disabled_types(self.state, "private_worker"), MECHANICAL_TASKS)
             read.assert_not_called()
 
+    def assert_stat_permission_error_fails_closed(self, path):
+        def deny(real_stat):
+            def stat(candidate, *args, **kwargs):
+                if Path(candidate) == path:
+                    raise PermissionError("quality directory is unreadable")
+                return real_stat(candidate, *args, **kwargs)
+            return stat
+        # Cover both stat variants, independent of pathlib's Python version.
+        with mock.patch.object(os, "stat", deny(os.stat)), \
+             mock.patch.object(os, "lstat", deny(os.lstat)):
+            self.assertEqual(quality.disabled_types(self.state, "private_worker"), MECHANICAL_TASKS)
+            lines = quality.attention(self.state, "private_worker")
+            self.assertEqual(len(lines), 1)
+            self.assertIn("quality state is unavailable", lines[0])
+
+    def test_state_stat_permission_error_fails_closed_and_reports_attention(self):
+        self.assert_stat_permission_error_fails_closed(quality.state_path(self.state))
+
+    def test_marker_stat_permission_error_fails_closed_and_reports_attention(self):
+        self.assert_stat_permission_error_fails_closed(quality.state_path(self.state).with_suffix(".initialized"))
+
     def test_corrupt_initialized_state_needs_operator_repair_then_enable(self):
         self.disable()
         path = quality.state_path(self.state)
@@ -214,6 +271,21 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(repaired["gemma_certified"]["extract"], state["gemma_certified"]["extract"])
         self.assertEqual(quality.disabled_types(self.state, "private_worker"), {"summarize", "classify"})
         self.assertEqual(quality.disabled_types(self.state, "gemma_certified"), {"extract"})
+
+    def test_repair_preserves_malformed_non_null_disabled_at_as_stop(self):
+        self.update()
+        state = quality.read_state(self.state)
+        at = self.now + 10
+        for disabled in ("broken", False, -1, float("nan"), float("inf"), {}, []):
+            with self.subTest(disabled=disabled):
+                state["private_worker"]["summarize"].update(
+                    disabled_at=disabled, reenabled_at=self.now - 1)
+                quality.state_path(self.state).write_text(json.dumps(state))
+                quality.repair(self.state, self.queue.db_path, "private_worker", MECHANICAL_TASKS, now=at)
+                repaired = quality.read_state(self.state)["private_worker"]["summarize"]
+                self.assertEqual(repaired["disabled_at"], at)
+                self.assertIsNone(repaired["reenabled_at"])
+                self.assertEqual(quality.disabled_types(self.state, "private_worker"), {"summarize"})
 
     def test_repair_missing_initialized_state_and_database_failure(self):
         self.disable()
@@ -490,7 +562,9 @@ class QualityTests(unittest.TestCase):
              mock.patch.object(quality.sqlite3, "connect", side_effect=connect), \
              mock.patch.object(drift, "quick_check", return_value={"changed": [], "attention": ["dependency attention"]}) as check, \
              mock.patch.object(drift, "report_attention") as attention, \
-             mock.patch.object(self.queue, "hold_quality", wraps=self.queue.hold_quality) as hold_quality, \
+             mock.patch.object(self.queue, "hold_quality", wraps=self.queue.hold_quality,
+                               side_effect=sqlite3.OperationalError("queue database is locked")
+                               if fault == "hold_quality" else None) as hold_quality, \
              mock.patch.object(self.queue, "hold_dependency", wraps=self.queue.hold_dependency) as hold_dependency:
             self.assertEqual(server_module.main(["--caller", "codex", "--config", str(self.config)]), 0)
         self.assertEqual(check.call_count, 2)
@@ -520,6 +594,9 @@ class QualityTests(unittest.TestCase):
 
     def test_executor_database_open_failure_keeps_dependency_checks_and_once_running(self):
         self.run_executor_fault("database")
+
+    def test_executor_hold_quality_failure_keeps_dependency_checks_and_once_running(self):
+        self.run_executor_fault("hold_quality")
 
     def test_executor_evaluates_before_running_and_reports_attention(self):
         self.seed()

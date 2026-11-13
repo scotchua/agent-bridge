@@ -87,7 +87,10 @@ class Server:
                         # the worker heartbeat. Readers still hold jobs when
                         # persisted quality state is unavailable.
                         self._record_loop_error()
-                    queue.hold_quality()
+                    try:
+                        queue.hold_quality()
+                    except Exception:
+                        self._record_loop_error()
                 if self._dependency_check is not None:
                     held = self._dependency_check()
                     self.service.queue.hold_dependency(held)

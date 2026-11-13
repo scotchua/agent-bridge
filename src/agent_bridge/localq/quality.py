@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import stat
 import time
 from typing import Any, Iterable, Mapping
 
@@ -36,8 +37,9 @@ def state_path(state_root: str | Path) -> Path:
 
 def _read_value(path: Path) -> Any:
     # Avoid the Windows replacement retry's one-second delay on first run.
-    if not path.exists():
-        raise FileNotFoundError(str(path))
+    # lstat distinguishes absence from access errors and refuses dangling links.
+    if stat.S_ISLNK(path.lstat().st_mode):
+        raise ValueError("quality_state_invalid")
     return store.read_json_atomic(str(path)) if store.WINDOWS else store.read_json(str(path))
 
 
@@ -46,9 +48,11 @@ def read_state(state_root: str | Path) -> dict[str, dict[str, dict[str, Any]]]:
     try:
         value = _read_value(path)
     except FileNotFoundError:
-        if path.is_symlink() or path.with_suffix(".initialized").exists():
-            raise ValueError("quality_state_invalid")
-        return {}
+        try:
+            path.with_suffix(".initialized").lstat()
+        except FileNotFoundError:
+            return {}
+        raise ValueError("quality_state_invalid")
     except RecursionError as exc:
         raise ValueError("quality_state_invalid") from exc
     return _validate_state(value)
@@ -124,6 +128,7 @@ def evaluate(rows: Iterable[Mapping[str, Any]], *, backend_id: str, now: float,
             p = (count["reworked"] + count["discarded"]) / n
             z = 1.959963984540054
             lower = (p + z*z/(2*n) - z*math.sqrt(p*(1-p)/n + z*z/(4*n*n))) / (1 + z*z/n)
+            lower = max(0.0, min(1.0, lower))
         old = previous.get(task, {})
         disabled_at = old.get("disabled_at")
         below = n >= 20 and lower is not None and lower > 0.5
@@ -186,7 +191,7 @@ def enable(state_root: str | Path, backend_id: str, task_type: str, *, now: floa
         _write_state(path, state)
 
 
-def _recover_state(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
+def _recover_state(path: Path, *, now: float) -> dict[str, dict[str, dict[str, Any]]]:
     """Salvage independent rows, even when another row invalidates the state."""
     try:
         value = _read_value(path)
@@ -205,12 +210,13 @@ def _recover_state(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
             try:
                 _validate_state({backend: {task: row}})
             except ValueError:
-                # Even damaged counts must not erase a readable sticky stop
-                # or the operator's evidence reset. Discard invalid fields.
+                # Damaged fields must not erase a sticky stop or a valid
+                # evidence reset. An unreadable stop timestamp stays stopped.
                 disabled = row.get("disabled_at")
-                disabled = disabled if _number(disabled) else None
                 reenabled = row.get("reenabled_at")
                 reenabled = reenabled if _number(reenabled) else None
+                if disabled is not None and not _number(disabled):
+                    disabled, reenabled = now, None
                 if disabled is not None and reenabled is not None and disabled <= reenabled:
                     reenabled = None
                 row = {"disabled_at": disabled, "reenabled_at": reenabled,
@@ -224,11 +230,11 @@ def repair(state_root: str | Path, queue_path: str | Path, backend_id: str,
     """Operator-only rebuild from current evidence, retaining readable stops."""
     path = state_path(state_root)
     with store.file_lock(str(path.with_suffix(".lock")), timeout=2.0):
-        state = _recover_state(path)
+        at = time.time() if now is None else now
+        state = _recover_state(path, now=at)
         with closing(sqlite3.connect(Path(queue_path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
             rows = job_rows(db)
         backends = set(state) | {backend_id} | {row["backend_id"] for row in rows if row["backend_id"]}
-        at = time.time() if now is None else now
         for backend in sorted(backends):
             tasks = state.setdefault(backend, {})
             measured = evaluate(rows, backend_id=backend, now=at, previous=tasks,
