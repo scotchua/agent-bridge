@@ -68,7 +68,7 @@ from .. import python_runtime, store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
-from . import autoroute, config as orchestration_config, localfirst
+from . import autoroute, claim_reconcile, config as orchestration_config, localfirst
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -1156,8 +1156,277 @@ def _git_worktree_writes(command: str) -> bool:
     return False
 
 
+# Keep operators separate from literal arguments. Unlike splitting raw text,
+# this does not turn prose in a JSON string or commit message into commands.
+_SHELL_TOKEN = re.compile(
+    r'''(?:'[^']*'|"(?:\\.|[^"\\])*"|\\[^\n]|[^\s;&|<>()'"\\])+|[;&|<>()]+|\n''')
+
+
+def _shell_commands(command: str, *, preserve_quotes: bool = False
+                    ) -> list[tuple[list[str], list[tuple[str, str]]]] | None:
+    """Simple commands and their redirects; None keeps the conservative legacy
+    heuristic for syntax we cannot resolve (substitution, eval, here-docs).
+    Quoted operators are ordinary arguments. No command is executed here.
+    preserve_quotes retains raw arguments for target expansion checks.
+    """
+    commands = []
+    words: list[str] = []
+    redirects: list[tuple[str, str]] = []
+    pending = ""
+    end = 0
+    for match in _SHELL_TOKEN.finditer(command):
+        if command[end:match.start()].strip():
+            return None
+        end = match.end()
+        raw = match.group()
+        if raw in ("(", ")", "<<", "<<-", "<<<"):
+            return None
+        # Expansion can contain executable syntax even inside double quotes.
+        executable = re.sub(r"'[^']*'", "", raw)
+        if "$" in executable or "`" in executable:
+            return None
+        if raw in _COMMAND_SEPARATORS or raw == "\n":
+            if pending:
+                return None
+            commands.append((words, redirects))
+            words, redirects = [], []
+        elif raw in ("<", ">", ">>", "<>", ">|", "&>", "&>>", ">&", "<&"):
+            if pending:
+                return None
+            # A numeric file descriptor immediately before an operator is
+            # shell syntax, not a path or program name.
+            if words and words[-1].isdigit() and match.start() > 0 \
+                    and command[match.start() - 1].isdigit():
+                words.pop()
+            pending = raw
+        elif re.fullmatch(r"[;&|<>()]+", raw):
+            return None
+        else:
+            decoded = _shell_words(raw)
+            if len(decoded) != 1:
+                return None
+            word = decoded[0]
+            if pending:
+                if pending not in (">&", "<&") or not (word.isdigit() or word == "-"):
+                    redirects.append((pending, raw if preserve_quotes else word))
+                pending = ""
+            else:
+                words.append(raw if preserve_quotes else word)
+    if command[end:].strip() or pending:
+        return None
+    commands.append((words, redirects))
+    for command_words, _ in commands:
+        words = ([_shell_words(word)[0] for word in command_words]
+                 if preserve_quotes else command_words)
+        if not words:
+            continue
+        name = _program_name(words[0]).lower()
+        if (_ENV_ASSIGNMENT.match(words[0]) or name in {
+                "eval", "env", "command", "exec", "sudo", "doas", "xargs",
+                "timeout", "nice", "nohup", "source", ".", "call"}
+                or (name == "find" and any(word in {"-exec", "-execdir", "-ok", "-okdir"}
+                                           for word in words[1:]))
+                or (name in _SHELLS and not any(_SHELL_COMMAND_FLAGS.match(word)
+                                               for word in words[1:]))):
+            return None
+        # An unknown program may be a command wrapper (for example `time
+        # rm ...`). Keep the old scan for it; only known literal readers
+        # and directly recognized writers get the precise argument path.
+        literal = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "shasum",
+                   "sha256sum", "sha512sum", "sha1sum", "md5sum", "md5", "cksum",
+                   "git", "ls", "dir", "cat", "less", "more", "bat", "head", "tail",
+                   "wc", "pwd", "type", "get-content", "get-childitem", "where",
+                   "findstr", "test", "true", "false", "cd"}
+        if name not in literal and name not in _SHELLS and not _simple_shell_writes(words):
+            return None
+    return commands
+
+
+def _shell_target_expands(raw: str) -> bool:
+    """Whether a raw target contains unquoted shell glob/brace expansion.
+
+    Inspect before decoding quotes: a quoted or escaped wildcard is literal.
+    We do not expand patterns against today's filesystem, since execution may
+    see different entries. The caller must use the conservative operand scan.
+    """
+    quoted = r'''('[^']*'|"(?:\\.|[^"\\])*")'''
+    if os.name != "nt":
+        quoted += r"|\\."
+    unquoted = re.sub(quoted, "", raw)
+    return (any(char in unquoted for char in "*?[")
+            or re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", unquoted) is not None)
+
+
+def _simple_shell_writes(words: list[str]) -> bool:
+    if not words:
+        return False
+    name = _program_name(words[0])
+    if name.lower() in _SHELLS:
+        for index, word in enumerate(words[1:], 1):
+            if _SHELL_COMMAND_FLAGS.match(word) and index + 1 < len(words):
+                return shell_writes(" ".join(words[index + 1:]))
+    # Only a program at command position can be a write verb. Preserve
+    # argument boundaries for git/tar option parsing, and never scan prose
+    # for another command name.
+    normalized = [name]
+    for word in words[1:]:
+        if name == "git" and word.startswith(("-C", "-c")) and len(word) > 2:
+            normalized.extend((word[:2], word[2:]))
+        else:
+            normalized.append(word)
+    text = " ".join(word.split("=", 1)[0] + "=" + shlex.quote(word.split("=", 1)[1])
+                    if word.startswith("--") and "=" in word else shlex.quote(word)
+                    for word in normalized)
+    return (any(pattern.match(text) for pattern in _WRITE_PATTERNS)
+            or (name == "git" and (_git_worktree_writes(text) or _git_tag_writes(text)))
+            or (bool(_FORMATTERS.match(text)) and _formatter_writes(text))
+            or (name.lower().startswith(("agent-bridge-", "setup_bridge", "python"))
+                and _launches_bridge(text)))
+
+
+def _shell_write_targets(command: str, cwd: str) -> list[tuple[str, bool]] | None:
+    """Resolved mutation targets and whether each can affect a whole tree.
+
+    Copy sources and read-only invocations never contribute targets. Unknown
+    writers keep the old conservative operand scan, scoped to that command.
+    None means the caller must retain the legacy whole-command check.
+    """
+    commands = _shell_commands(command, preserve_quotes=True)
+    if commands is None:
+        return None
+    targets: list[tuple[str, bool]] = []
+    current = cwd
+    unresolved = False
+
+    def add(word: str, raw: str, tree: bool = False) -> None:
+        nonlocal unresolved
+        unresolved |= _shell_target_expands(raw)
+        targets.extend((path, tree) for path in _command_paths(shlex.quote(word), current))
+
+    for raw_words, redirects in commands:
+        words = [_shell_words(raw)[0] for raw in raw_words]
+        for operator, target in redirects:
+            if operator != "<":
+                add(_shell_words(target)[0], target)
+        if not words:
+            continue
+        name = _program_name(words[0]).lower()
+        if name in _SHELLS:
+            for index, word in enumerate(words[1:], 1):
+                if _SHELL_COMMAND_FLAGS.match(word) and index + 1 < len(words):
+                    nested = _shell_write_targets(" ".join(words[index + 1:]), current)
+                    if nested is None:
+                        return None
+                    targets.extend(nested)
+                    break
+            continue
+        if name == "cd":
+            if len(words) != 2 or _shell_target_expands(raw_words[1]):
+                return None
+            resolved = _command_paths(shlex.quote(words[1]), current)
+            if len(resolved) != 1:
+                return None
+            current = resolved[0]
+            continue
+        if not _simple_shell_writes(words):
+            continue
+        args = words[1:]
+        raw_args = raw_words[1:]
+        if name in {"cp", "copy", "xcopy", "robocopy"}:
+            # POSIX -t/--target-directory names the destination, including
+            # the attached spelling. Other unknown long options fall back
+            # rather than guessing which following word is an operand.
+            operands = []
+            destination = None
+            raw_destination = ""
+            index = 0
+            while index < len(args):
+                word = args[index]
+                if word == "--target-directory" and index + 1 < len(args):
+                    index += 1
+                    destination = args[index]
+                    raw_destination = raw_args[index]
+                elif word.startswith("--target-directory="):
+                    destination = word.split("=", 1)[1]
+                    raw_destination = raw_args[index]
+                elif word == "--":
+                    operands.extend(zip(args[index + 1:], raw_args[index + 1:]))
+                    break
+                elif word.startswith("--") and word not in {
+                        "--recursive", "--force", "--archive", "--no-clobber",
+                        "--preserve", "--remove-destination", "--verbose"}:
+                    return None
+                elif word.startswith("-") and not word.startswith("--"):
+                    # Only known flag-only short options may precede -t in a
+                    # cluster. -t consumes the rest of the word or the next
+                    # argument. Unknown/value-taking options (e.g. -S) retain
+                    # the base scan instead of guessing at the destination.
+                    for offset, option in enumerate(word[1:], 2):
+                        if option == "t":
+                            destination = word[offset:]
+                            raw_destination = raw_args[index]
+                            if not destination:
+                                index += 1
+                                if index >= len(args):
+                                    return None
+                                destination = args[index]
+                                raw_destination = raw_args[index]
+                            break
+                        if option not in "aRrfinpvHLPTduxsl":
+                            return None
+                elif not word.startswith("-") and not (
+                        name != "cp" and re.fullmatch(r"/[A-Za-z]+", word)):
+                    operands.append((word, raw_args[index]))
+                index += 1
+            if destination is None:
+                if len(operands) < 2:
+                    return None
+                destination, raw_destination = operands[1] if name == "robocopy" else operands[-1]
+            add(destination, raw_destination, True)
+            continue
+        if name in {"echo", "printf"}:
+            continue                    # only their redirects write
+        if name == "git":
+            # Only these subcommands take -m/--message as literal content.
+            # For example, checkout -m still has a pathspec after the flag.
+            subcommand = None
+            index = 0
+            while index < len(args):
+                word = args[index]
+                if word in {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}:
+                    index += 2
+                    continue
+                if not word.startswith("-"):
+                    subcommand = word
+                    break
+                index += 1
+            messages = subcommand in {"commit", "tag", "merge", "notes", "stash"}
+            cleaned = [words[0]]
+            cleaned_raw = [raw_words[0]]
+            skip = False
+            for word, raw in zip(args, raw_args):
+                if skip:
+                    skip = False
+                elif messages and word in ("-m", "--message"):
+                    skip = True
+                elif not (messages and word.startswith("--message=")):
+                    cleaned.append(word)
+                    cleaned_raw.append(raw)
+            words = cleaned
+            raw_words = cleaned_raw
+        if any(_shell_target_expands(raw) for raw in raw_words[1:]):
+            return None
+        tree = bool(_TREE_VERBS.match(" ".join([name, *words[1:]])))
+        targets.extend((path, tree) for path in _command_paths(shlex.join(words[1:]), current))
+    return None if unresolved else targets
+
+
 def shell_writes(command: str) -> bool:
     """Whether ``command`` looks like it writes. A heuristic; see the module docstring."""
+    commands = _shell_commands(command)
+    if commands is not None:
+        return any(any(operator != "<" for operator, _ in redirects)
+                   or _simple_shell_writes(words) for words, redirects in commands)
     return (any(pattern.search(command) for pattern in _WRITE_PATTERNS)
             or _launches_bridge(command) or _git_worktree_writes(command)
             or _git_tag_writes(command) or _formatter_writes(command))
@@ -1280,9 +1549,13 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
         if shell_writes(command):
             # The command runs in cwd, and may name files elsewhere (git -C
             # /other commit, cd /other && ..., cp x /other/y). Every named
-            # path counts as a place the command may write, so each
-            # repository among them needs its own receipt.
-            return "shell", [cwd, *_command_paths(command, cwd)]
+            # mutation target counts as a place the command may write, so
+            # each repository among them needs its own receipt. Unresolved
+            # command syntax retains the conservative operand scan.
+            targets = _shell_write_targets(command, cwd)
+            named = (_command_paths(command, cwd) if targets is None
+                     else [path for path, _ in targets])
+            return "shell", [cwd, *named]
         # The whole-file-read heuristic is Codex-only: Claude has its own
         # deterministic Read tool (matched above), and design section 2.1
         # states the two clients' read gates as separate mechanisms rather
@@ -1727,6 +2000,86 @@ def _explain_protected(matched: list[tuple[str, str]]) -> str:
     return f". Matched: {shown}"
 
 
+def _task_claim(root: str, item: str) -> dict:
+    """Use no-follow reads where supported; otherwise bound and confine a
+    portable read. The ledger independently verifies the owner on both paths,
+    so task content alone can never authorize another provider's live stage.
+    """
+    if os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW"):
+        return claim_reconcile.read_task_claim(root, item)
+    record = os.path.join(root, item, "task.json")
+    try:
+        if (os.path.islink(os.path.join(root, item)) or os.path.islink(record)
+                or not _under(record, root)):
+            return {"status": "unreadable"}
+        with open(record, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return {"status": "unreadable"}
+            data = handle.read(claim_reconcile.MAX_RECORD_BYTES + 1)
+        if len(data) > claim_reconcile.MAX_RECORD_BYTES or not _under(record, root):
+            return {"status": "unreadable"}
+        return claim_reconcile.parse_task_claim(json.loads(data.decode("utf-8")))
+    except FileNotFoundError:
+        return {"status": "no_record"} if os.path.isdir(root) else {"status": "unreadable"}
+    except (OSError, ValueError, RecursionError):
+        return {"status": "unreadable"}
+
+
+def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
+                        now: float) -> Decision | None:
+    """Task evidence outside repositories follows existing task ownership.
+
+    Never create an implementation stage or repair a conflicting claim here.
+    Repository targets (including repositories inside the task tree) still
+    require their ordinary routing receipts. The protected-path check runs
+    before this function, including for symlinks resolving out of this tree.
+    """
+    root = os.path.realpath(os.path.expanduser("~/Claude/team-state/tasks"))
+    task_paths = [path for path in paths if _under(path, root) and not _same_path(path, root)]
+    if not task_paths:
+        return None
+    items = {os.path.relpath(os.path.realpath(path), root).split(os.sep)[0]
+             for path in task_paths}
+    try:
+        if capacity_db is None:
+            raise OSError("stage database required")
+        rows = claim_reconcile._ledger_rows(capacity_db)
+        for item in sorted(items):
+            task = _task_claim(root, item)
+            if task["status"] in {"unreadable", "malformed"}:
+                return Decision("deny", "task_claim_unavailable",
+                                "delegation-first gate: task ownership could not be read")
+            claim = task.get("claim")
+            owned = [row for row in rows if row["item_id"] == item
+                     and row["state"] == "owned"]
+            if claim and claim["active"]:
+                if claim["lease_expires_at"] <= now:
+                    return Decision("deny", "task_lease_expired",
+                                    f"delegation-first gate: task {item!r} stage {claim['stage']!r} "
+                                    "claim needs renewal")
+                if not any(row["stage"] == claim["stage"]
+                           and row["owner_id"] == claim["owner"] for row in owned):
+                    return Decision("deny", "task_claim_conflict",
+                                    "delegation-first gate: task claim and ledger need reconciliation")
+            for row in owned:
+                lease = row["lease_until"]
+                if not isinstance(lease, (int, float)) or not math.isfinite(lease) or lease <= now:
+                    return Decision("deny", "stage_lease_expired",
+                                    f"delegation-first gate: task {item!r} stage {row['stage']!r} "
+                                    "needs renewal")
+                if row["owner_route"] != client:
+                    return Decision("deny", "task_owned_elsewhere",
+                                    "delegation-first gate: the existing task owner is another route; "
+                                    "automatic repository routing cannot replace it")
+    except (OSError, ValueError, sqlite3.Error):
+        return Decision("deny", "stage_db_unavailable",
+                        "delegation-first gate: task ownership state could not be read")
+    if len(task_paths) != len(paths) or any(enclosing_repos(path) for path in task_paths):
+        return None                     # mixed/code writes also need repo receipts
+    return Decision("allow", "task_record_write",
+                    "task evidence follows its existing ownership outside repositories")
+
+
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
@@ -1737,15 +2090,21 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     whole (``cat a.log > b.log``) can be judged on both counts -- see
     ``judge``'s own overlay of ``judge_read`` for a whole-file read hiding
     behind a write-shaped command."""
+    targets = None
     if kind == "edit":
         matched = [(path, root) for path in paths for root in protected if _under(path, root)]
         hit = [path for path, _ in matched]
     else:
         command = _command_text(tool_input)
-        named = _command_paths(command, cwd)
-        whole_trees = bool(_TREE_VERBS.search(command))
-        matched = [(path, root) for path in named for root in protected
-                   if _reaches(path, root, through_ancestors=whole_trees)]
+        targets = _shell_write_targets(command, cwd)
+        resolved_targets = targets is not None
+        if targets is None:
+            # Unresolved executable syntax retains the previous fail-closed
+            # operand check; precision on simple commands grants no exemption.
+            targets = [(path, bool(_TREE_VERBS.search(command)))
+                       for path in _command_paths(command, cwd)]
+        matched = [(path, root) for path, tree in targets for root in protected
+                   if _reaches(path, root, through_ancestors=tree)]
         hit = [root for _, root in matched]
     if hit:
         return Decision("deny", "gate_state_protected",
@@ -1756,6 +2115,14 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         prune = _worktree_prune_decision(command, cwd, config_path, protected)
         if prune is not None:
             return prune
+    # A shell's cwd is not the owner of a task-record destination elsewhere.
+    # Only fully resolved targets qualify; opaque commands keep normal routing.
+    task_paths = paths if kind == "edit" else (
+        None if not resolved_targets else [path for path, _ in targets])
+    if task_paths:
+        task_decision = _judge_task_records(client, task_paths, capacity_db, float(clock()))
+        if task_decision is not None:
+            return task_decision
     # Every enclosing repository, so a nested .git cannot shadow an outer
     # routed decision. See enclosing_repos for the escape this closes.
     repos = tuple(sorted({repo for path in paths for repo in enclosing_repos(path)}))
@@ -1983,6 +2350,15 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
                                   clock=clock, protected=protected, capacity_db=capacity_db,
                                   decide=decide, config_path=config_path)
+    if kind == "shell" and write_decision.allowed:
+        command = _command_text(tool_input)
+        if _shell_commands(command) is None:
+            executable = re.sub(r"'[^']*'", "", command)
+            if ("$" in executable or "`" in executable
+                    or re.search(r"(^|[;&|\n])\s*eval(?:\s|$)", command)):
+                return Decision("deny", "shell_targets_unresolved",
+                                "delegation-first gate: dynamic shell write targets cannot be resolved; "
+                                "use explicit commands and paths", write_decision.repos)
     # classify's own contract (tested, unchanged) picks a command's write
     # shape over its read shape: shell_writes is checked before
     # _shell_whole_file_read, so a Codex command that both writes and reads

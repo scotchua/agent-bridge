@@ -154,6 +154,11 @@ def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
     except (OSError, ValueError, RecursionError):
         # RecursionError: deeply nested JSON is rejected, not a crash.
         return {"status": "unreadable"}
+    return parse_task_claim(value)
+
+
+def parse_task_claim(value: object) -> dict:
+    """Validate an already decoded record without trusting any owner text."""
     if not isinstance(value, dict):
         return {"status": "malformed"}
     workload = value.get("workload", {"revision": 0, "claim": None})

@@ -40,7 +40,13 @@ Covered, with the hook installed and trusted:
   or at Codex's `hooks.json` or `config.toml` is denied
   (`gate_state_protected`) in any repository or none. A command that acts
   on a whole tree (`rm`, `mv`, `cp`, `rsync`, `tar`, and their kin) is also
-  refused when it names a directory above a protected path. A client
+  refused when its mutation target is a directory above a protected path.
+  Simple shell commands are parsed with argument boundaries: quoted prose
+  is not another command, and copy sources and read-only commands do not
+  count as mutation targets. Moving or deleting a protected ancestor still
+  refuses; resolving symlinks and `..` happens before comparison. Opaque
+  syntax retains the conservative operand check, and unresolved dynamic
+  writes are denied (`shell_targets_unresolved`). A client
   cannot write itself a receipt, replace the database the live check
   trusts, or unhook itself with a covered tool.
 * Live ownership. On every allow the hook re-reads the stage router's
@@ -269,6 +275,19 @@ in five ordinary cases:
   which is what happens after a normal `stage_complete`. Before that was
   handled, the first completed stage in a repository left every later edit
   denied with `stage_not_owned` and an instruction to claim a stage by hand.
+
+Task records and evidence under `~/Claude/team-state/tasks/<item>` are
+checked against that item's existing task claim and live ledger ownership,
+without creating or reassigning a stage. These writes outside repositories
+do not inherit an implementation route from the shell's working directory.
+Claim conflicts, expired leases, and unreadable ownership state deny; the
+operator reconciles them. An expired task claim or stage lease denial names
+the item and stage to renew. Task-record writes also deny with
+`stage_db_unavailable` when no stage database is configured; they do not
+fall back to receipt-free writes outside repositories.
+Mixed repository/task writes must also satisfy
+the repository receipts, and repositories inside the task tree keep their
+ordinary receipt checks. Protected-state checks run first in every case.
 
 Stages therefore carry a generation (`implementation`, `implementation#2`), so
 a completed or superseded decision is history rather than a wall, and a stage
