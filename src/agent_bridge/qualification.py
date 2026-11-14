@@ -43,6 +43,8 @@ def identity(component: str, inventory: dict[str, Any]) -> dict[str, Any]:
         entry["path"] = os.path.realpath(path) if isinstance(path, str) else path
         value: Any = {"path": entry.get("path"), "version": entry.get("version"),
                       "sha256": entry.get("sha256")}
+        if "native_sha256" in entry:
+            value["native_sha256"] = entry["native_sha256"]
     elif component == "ollama":
         value = inventory.get("ollama", {})
     elif component == "gemma_delegate":

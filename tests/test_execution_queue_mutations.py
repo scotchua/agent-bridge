@@ -149,6 +149,41 @@ class QueueMutationTests(unittest.TestCase):
             "checked_at": 101.0, "cache_age_seconds": 0.0})
         self.assertNotIn("drift_checked_at", self.queue.status(job["job_id"]))
 
+    def test_identical_content_move_from_quick_check_releases_provider_hold(self):
+        from agent_bridge import drift
+        first, second = (self.root / prefix / "vendor" / "synthetic-target" / "bin" / "codex"
+                         for prefix in ("first", "second"))
+        for path in (first, second):
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"\x7fELF synthetic native executable")
+            (path.parent.parent / "codex-package.json").write_text("{}")
+        selected = [first]
+        with mock.patch.dict(os.environ, {"HOME": str(self.root), "USERPROFILE": str(self.root)}), \
+             mock.patch.object(drift, "_executable", side_effect=lambda name, _: str(selected[0]) if name == "codex" else None), \
+             mock.patch.object(drift, "_version", return_value="1.0"), \
+             mock.patch.object(drift, "_ollama", return_value={}), \
+             mock.patch.object(drift, "_hook_state", return_value={}):
+            baseline = drift.inventory(home=str(self.root), bridge=object())
+            selected[0] = second
+            current = drift.inventory(home=str(self.root), bridge=object())
+        drift._quick_cache.clear()
+        self.addCleanup(drift._quick_cache.clear)
+        with mock.patch.object(drift, "inventory", return_value=current), \
+             mock.patch.object(drift, "_read_baseline", return_value=baseline), \
+             mock.patch.object(drift, "discover_config", return_value=str(self.root / "config.json")):
+            report = drift.quick_check(home=str(self.root))
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["changed"], [])
+        self.assertEqual(report["moved"], ["codex"])
+        job = self.submit()
+        self.queue.hold_dependencies({"codex": "codex"}, drift_status={**report, "changed": ["codex"]})
+        self.assertEqual(self.queue.status(job["job_id"])["drift_hold_reason"], "provider_changed:codex")
+        self.queue.hold_dependencies({name: name for name in report["changed"]}, drift_status=report)
+        status = self.queue.status(job["job_id"])
+        self.assertEqual(status["state"], "queued")
+        self.assertNotIn("drift_hold_reason", status)
+        self.assertNotIn("waiting_on_dependency", status)
+
     def test_result_refuses_queued_job_by_name(self):
         job = self.submit()
         with self.assertRaisesRegex(eq.ExecutionAdmissionError, "execution_job_not_terminal"):

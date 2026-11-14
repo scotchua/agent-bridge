@@ -191,6 +191,21 @@ class RunMutationTests(unittest.TestCase):
                                                allowed_providers=set())
         self.assertEqual(signals.call_count, 4)
 
+    def test_moved_only_status_does_not_hold_or_block_dispatch(self):
+        queue = mock.Mock()
+        queue.run_once.return_value = {"job_id": "job-invented", "state": "done"}
+        status = {"ok": True, "changed": [], "moved": ["codex"], "attention": []}
+        self._context(queue, status=status)
+        queue.queued_providers.return_value = {"codex"}
+        with mock.patch.object(worker, "readiness_holds", return_value={}), \
+             mock.patch.object(drift, "requalify_on_detect"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = worker.run("invented-config.json", once=True, interval=1,
+                                worker_id="worker-invented")
+        self.assertEqual(result, 0)
+        queue.hold_dependencies.assert_called_once_with({}, drift_status=status)
+        queue.run_once.assert_called_once_with("worker-invented", allowed_providers={"codex"})
+
     def test_foreign_config_cannot_start_requalification_from_worker_loop(self):
         home = self.root / "home"; home.mkdir()
         installed = home / "installed.json"; installed.write_text("{}", encoding="utf-8")

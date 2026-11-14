@@ -13,6 +13,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,165 @@ def _version(path: str | None, runner: Any | None = None) -> str | None:
         return None
     text = completed.stdout.decode("utf-8", "replace").strip()
     return text.splitlines()[0] if text else None
+
+
+# Use the launcher's Node runtime for process.arch (including emulation) and
+# createRequire for Node's optional-dependency lookup, exports and symlinks.
+# This probe never imports or executes the Codex launcher or native binary.
+_CODEX_NATIVE_PROBE = r"""
+const { createRequire } = require('node:module');
+const targets = {
+  linux: { x64: 'x86_64-unknown-linux-musl', arm64: 'aarch64-unknown-linux-musl' },
+  android: { x64: 'x86_64-unknown-linux-musl', arm64: 'aarch64-unknown-linux-musl' },
+  darwin: { x64: 'x86_64-apple-darwin', arm64: 'aarch64-apple-darwin' },
+  win32: { x64: 'x86_64-pc-windows-msvc', arm64: 'aarch64-pc-windows-msvc' }
+};
+const target = targets[process.platform]?.[process.arch];
+if (!target) process.exit(1);
+const packages = JSON.parse(process.argv[2]);
+if (!packages[target]) process.exit(1);
+let package_json = null;
+try {
+  package_json = createRequire(process.argv[1]).resolve(`${packages[target]}/package.json`);
+} catch {}
+console.log(JSON.stringify({ target, package_json }));
+"""
+
+
+def _is_native_executable(path: str | None) -> bool:
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            magic = handle.read(4)
+        return magic == b"\x7fELF" or magic[:2] == b"MZ" or magic in {
+            b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca"}
+    except OSError:
+        return False
+
+
+def _native_tree_signature(root: Path) -> tuple[Any, ...]:
+    """Stat every entry without walking links; refuse the digest's bad types.
+
+    Compare snapshots around each fresh hash to refuse observable concurrent
+    mutations. Timestamps are never used to reuse a digest: on Windows ctime
+    can mean creation time, and mtime can have coarse resolution.
+    """
+    entries: list[tuple[Any, ...]] = []
+
+    def walk(path: Path, relative: str) -> None:
+        info = path.lstat()
+        link = None
+        if stat.S_ISLNK(info.st_mode):
+            link = os.readlink(path)
+            resolved = os.path.realpath(path)
+            if (os.path.isabs(link) or os.path.commonpath([str(root), resolved]) != str(root)
+                    or not os.path.exists(resolved)):
+                raise ValueError("native tree link escapes or is dangling")
+        elif not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise ValueError("native tree holds an unsupported type")
+        entries.append((relative, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                        info.st_dev, info.st_ino, info.st_mode, link))
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(path) as children:
+                names = sorted(entry.name for entry in children)
+            for name in names:
+                walk(path / name, f"{relative}/{name}" if relative else name)
+
+    if not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError("native tree root is not a directory")
+    walk(root, "")
+    return tuple(entries)
+
+
+def _native_tree_sha256(root: Path) -> str | None:
+    from .execution.codex_promotion import AdmissionRefused, tree_digest
+    try:
+        root = root.resolve()
+        signature = _native_tree_signature(root)
+        digest = tree_digest(root)
+        if _native_tree_signature(root) != signature:
+            return None
+        return digest
+    except (OSError, ValueError, RuntimeError, AdmissionRefused):
+        return None
+
+
+def _codex_native_tree(executable: Path) -> Path | None:
+    """Qualify only the grandparent of a direct binary in a known layout."""
+    executable = executable.resolve()
+    root = executable.parent.parent
+    if (executable.parent.name in ("bin", "codex")
+            and executable.name in ("codex", "codex.exe")
+            and ((root / "codex-package.json").is_file() or root.parent.name == "vendor")):
+        return root
+    return None
+
+
+def _codex_native_identity(path: str | None, runner: Any | None = None) -> tuple[str, str | None]:
+    """Fingerprint the npm payload or a direct binary with its proof kind.
+
+    Layouts are read from bin/codex.js, rather than choosing the first vendor
+    file on disk. Unknown launcher layouts are deliberately unprovable.
+    """
+    kind = "vendor_tree_v1"
+    if not path:
+        return kind, None
+    try:
+        executable = Path(path)
+        if _is_native_executable(str(executable)):
+            kind = "file_v1"
+            tree = _codex_native_tree(executable)
+            if tree is None:
+                return kind, _sha256(str(executable))
+            return "vendor_tree_v1", _native_tree_sha256(tree)
+        root = executable.parent.parent
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        if package.get("name") != "@openai/codex" or executable != root / "bin" / "codex.js":
+            return kind, None
+        source = executable.read_text(encoding="utf-8")
+        mapping = re.search(r"const PLATFORM_PACKAGE_BY_TARGET\s*=\s*(\{.*?\});", source, re.S)
+        layout = re.search(
+            r'path\.join\(\s*vendorRoot,\s*targetTriple,\s*"(bin|codex)",\s*'
+            r'process\.platform\s*===\s*"win32"\s*\?\s*"codex.exe"\s*:\s*"codex"', source)
+        if (not mapping or not layout or
+                'require.resolve(`${platformPackage}/package.json`)' not in source or
+                'path.join(path.dirname(packageJsonPath), "vendor")' not in source or
+                'path.join(__dirname, "..", "vendor")' not in source):
+            return kind, None
+        packages = json.loads(re.sub(r",\s*}", "}", mapping.group(1)))
+        node = shutil.which("node")
+        if not node:
+            return kind, None
+        argv = [node, "-e", _CODEX_NATIVE_PROBE, str(executable), json.dumps(packages)]
+        if runner is None:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=QUICK_CHECK_TIMEOUT,
+                                    check=False, shell=False)
+        else:
+            result = runner(argv, cwd=str(executable.parent), text="")
+        if result is None or result.returncode != 0:
+            return kind, None
+        resolved = json.loads(_completed_text(result))
+        target = resolved["target"]
+        if target not in packages:
+            return kind, None
+        package_json = resolved.get("package_json")
+        # A resolved optional package wins even if its binary is missing. The
+        # launcher only falls back when require.resolve itself throws.
+        vendor = Path(package_json).parent / "vendor" if package_json else root / "vendor"
+        filename = "codex.exe" if target.endswith("windows-msvc") else "codex"
+        tree = (vendor / target).resolve()
+        if not (tree / layout.group(1) / filename).is_file():
+            return kind, None
+        return kind, _native_tree_sha256(tree)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+        return kind, None
+
+
+def _codex_native_sha256(path: str | None, runner: Any | None = None) -> str | None:
+    return _codex_native_identity(path, runner)[1]
 
 
 def _bridge() -> Any | None:
@@ -309,8 +469,13 @@ def inventory(config_path: str | None = None, *, home: str | None = None,
             pass
     bridge = _bridge() if bridge is None else bridge
     executables = {name: {"path": _executable(name, bridge)} for name in ("claude", "codex")}
-    for item in executables.values():
+    for name, item in executables.items():
         item.update(version=_version(item["path"], runner), sha256=_sha256(item["path"]))
+        if name == "codex":
+            item["native_kind"], item["native_sha256"] = _codex_native_identity(item["path"], runner)
+        else:
+            item["native_kind"] = "file_v1"
+            item["native_sha256"] = item["sha256"] if _is_native_executable(item["path"]) else None
     gems: dict[str, dict[str, Any]] = {}
     for key, field, pin in (("delegate", "gemma_delegate_executable", "gemma_delegate_sha256"),
                             ("validator", "gemma_receipt_validator_executable", "gemma_receipt_validator_sha256")):
@@ -334,12 +499,45 @@ def _stable(value: Any) -> Any:
     return value
 
 
+def _same_executable(current: Any, baseline: Any) -> bool:
+    if not isinstance(current, dict) or not isinstance(baseline, dict):
+        return current == baseline
+    # Round-0 native hashes covered only one file. Upgrade them like a legacy
+    # baseline: unchanged paths may be recorded by doctor, moves need new proof.
+    upgrading = ("native_kind" not in baseline and
+                 current.get("native_kind") in ("file_v1", "vendor_tree_v1"))
+    ignored = {"path"}
+    if upgrading:
+        ignored.update({"native_kind", "native_sha256"})
+    elif "native_sha256" not in baseline:
+        ignored.add("native_sha256")
+    if ({key: value for key, value in current.items() if key not in ignored} !=
+            {key: value for key, value in baseline.items() if key not in ignored}):
+        return False
+    if current.get("path") != baseline.get("path"):
+        # Uninstalls and unprovable relocations must still hold. In particular,
+        # an older baseline cannot prove the payload at a different path.
+        return bool(not upgrading and current.get("path") and baseline.get("path") and
+                    current.get("version") and current.get("sha256") and
+                    current.get("native_kind") == baseline.get("native_kind") == "vendor_tree_v1" and
+                    current.get("native_sha256") and baseline.get("native_sha256"))
+    return True
+
+
+def _moved(current: dict[str, Any], baseline: dict[str, Any] | None) -> list[str]:
+    if not baseline:
+        return []
+    return [name for name in ("claude", "codex")
+            if _same_executable(current["executables"].get(name), baseline.get("executables", {}).get(name))
+            and current["executables"].get(name, {}).get("path") != baseline.get("executables", {}).get(name, {}).get("path")]
+
+
 def changes(current: dict[str, Any], baseline: dict[str, Any] | None) -> list[str]:
     if not baseline:
         return []
     answer: list[str] = []
     for name in ("claude", "codex"):
-        if current["executables"].get(name) != baseline.get("executables", {}).get(name): answer.append(name)
+        if not _same_executable(current["executables"].get(name), baseline.get("executables", {}).get(name)): answer.append(name)
     if current.get("ollama") != baseline.get("ollama"): answer.append("ollama")
     for name in ("delegate", "validator"):
         if current["gemma"].get(name) != baseline.get("gemma", {}).get(name): answer.append("gemma_" + name)
@@ -423,7 +621,7 @@ def _merge_good_baseline(old: dict[str, Any] | None, current: dict[str, Any], pa
             merged[section] = current[section]
     merged["codex_default_model"] = current["codex_default_model"]
     for name in ("claude", "codex"):
-        if name not in {"claude", "codex"} or name in passed or current["executables"][name] == old.get("executables", {}).get(name):
+        if name in passed or _same_executable(current["executables"][name], old.get("executables", {}).get(name)):
             merged.setdefault("executables", {})[name] = current["executables"][name]
     allowed = live_components
     if ("gemma" in passed and (allowed is None or "ollama" in allowed)) or current["ollama"] == old.get("ollama"):
@@ -449,9 +647,9 @@ def _quick_run(argv: list[str], *, cwd: str, text: str,
                env: dict[str, str] | None = None) -> subprocess.CompletedProcess | None:
     """Run the only CLI probes allowed from an executor loop.
 
-    ``inventory`` only asks these commands for their versions.  Keep that
-    narrow path independently bounded so a wedged CLI cannot consume an
-    executor interval on a cache miss.
+    ``inventory`` asks for versions and Node's native-payload resolution.
+    Keep these probes independently bounded so a wedged runtime cannot
+    consume an executor interval on a cache miss.
     """
     return _run(argv, cwd=cwd, text=text, timeout=min(timeout, QUICK_CHECK_TIMEOUT), env=env)
 
@@ -696,7 +894,7 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
         checked["consumer_pins"] = {"ok": None, "status": "unknown",
                                     "reason": "installed_version_unknown", "consumers": consumers}
     else:
-        mismatches = [consumer for consumer in consumers if consumer.get("version") != installed]
+        mismatches = [consumer for consumer in consumers if _consumer_version(consumer.get("version")) != installed]
         checked["consumer_pins"] = {"ok": not mismatches, "status": "ok" if not mismatches else "needs_you",
                                     "installed": installed, "consumers": consumers}
         for consumer in mismatches:
@@ -743,14 +941,17 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
         for name in sorted(changed_during_checks):
             checked[name] = {"ok": False, "reason": "identity_changed_during_check"}
             needs.append(f"{name.capitalize()} changed while doctor was checking it; run setup_bridge.py doctor.")
-    if baseline is None or passed:
+    metadata_refreshed = baseline is not None and any(
+        name not in changed and current["executables"].get(name) != baseline.get("executables", {}).get(name)
+        for name in ("claude", "codex"))
+    if baseline is None or passed or metadata_refreshed:
         _write_baseline(home, _merge_good_baseline(baseline, current, passed,
                                                     live_components=selected_live))
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
     needs.extend(_quality_attention(current.get("config_path")))
-    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "requalified": sorted(passed), "needs_you": needs, "checks": checked,
+    return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "moved": _moved(current, baseline), "requalified": sorted(passed), "needs_you": needs, "checks": checked,
             "launcher_python": launcher_python, "runtime_revisions": runtime,
             "changed_during_checks": sorted(changed_during_checks)}
 
@@ -820,10 +1021,25 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
             attention.append(_qualification_attention_line(item, baseline))
     except Exception:
         pass
-    result = {"ok": not names, "changed": sorted(set(names)), "inventory": current,
+    result = {"ok": not names, "changed": sorted(set(names)), "moved": _moved(current, baseline), "inventory": current,
               "baseline": "missing" if baseline is None else "recorded",
               "attention": attention, "checked_at": time.time()}
-    _quick_cache[key] = (time.monotonic(), baseline_stamp, result)
+    # A bounded Node probe can fail transiently. Keep the hold for this check,
+    # but let the next loop retry if missing native proof is the only difference
+    # for a same-path executable. Moves still require proof and remain cached.
+    transient_native = False
+    for name in ("claude", "codex"):
+        entry = current.get("executables", {}).get(name, {})
+        previous = (baseline or {}).get("executables", {}).get(name, {})
+        if (name in names and entry.get("path") and entry.get("path") == previous.get("path")
+                and entry.get("version") == previous.get("version")
+                and entry.get("native_sha256") is None and previous.get("native_sha256")
+                and _same_executable({**entry, "native_sha256": previous["native_sha256"]}, previous)):
+            transient_native = True
+    if transient_native:
+        _quick_cache.pop(key, None)
+    else:
+        _quick_cache[key] = (time.monotonic(), baseline_stamp, result)
     return {**result, "cache_age_seconds": 0.0}
 
 
@@ -1097,6 +1313,11 @@ def _consumer_message(pin: str, candidate: str) -> str:
             "(source platform/firm-claude-plugins), then the nightly update will proceed.")
 
 
+def _consumer_version(value: Any) -> Any:
+    # The consumer pins CLI --version output; npm reports the package version.
+    return value.strip().removeprefix("codex-cli ").strip() if isinstance(value, str) else value
+
+
 def _staging_checks(executable: str, *, bridge: Any | None, default_model: str | None,
                     runner: Any) -> dict[str, Any]:
     spec = bridge.peer("codex") if bridge else {}
@@ -1197,7 +1418,7 @@ def update(config_path: str | None = None, *, home: str | None = None,
             events.append({"prefix": str(prefix), "status": "staged_failed", "candidate": candidate, "published": published, "checks": qualification})
             needs.append(f"Codex {candidate} failed private staging checks; the existing install was left untouched.")
             continue
-        pin = next((item for item in _consumer_pins(home) if item.get("version") == previous), None)
+        pin = next((item for item in _consumer_pins(home) if _consumer_version(item.get("version")) == previous), None)
         if pin:
             events.append({"prefix": str(prefix), "status": "blocked_by_consumer", "previous": previous, "candidate": candidate, "published": published})
             needs.append(_consumer_message(previous or "(unknown)", candidate))
