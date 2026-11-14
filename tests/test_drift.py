@@ -195,6 +195,34 @@ class IsolatedDriftTests(unittest.TestCase):
                                   runner=lambda *_args, **_kwargs: completed())
         self.assertIn("launcher_python_record_failed", report["needs_you"])
 
+    def test_consumer_cli_prefix_compares_with_npm_version(self) -> None:
+        source = self.home / ".claude/plugins/cache/market/firm-tools/9.0/skills/codex-job-runner/bridge.py"
+        source.parent.mkdir(parents=True)
+        for pin, matches in (("codex-cli 0.160.1", True), (" codex-cli 0.160.1 ", True),
+                             ("codex-cli 0.160.2", False), ("codex-cli 0.160.1-beta.1", False)):
+            with self.subTest(pin=pin):
+                source.write_text(f'PINNED_CODEX_VERSION = "{pin}"\n')
+                current = self.inventory()
+                current["consumers"] = drift._consumer_pins(str(self.home))
+                with mock.patch.object(drift, "inventory", return_value=current), \
+                     mock.patch.object(drift, "_npm_version_for_executable", return_value="0.160.1"):
+                    report = drift.doctor(str(self.config), home=str(self.home))
+                self.assertEqual(report["checks"]["consumer_pins"]["ok"], matches)
+                self.assertEqual(any("update that pin" in line for line in report["needs_you"]), not matches)
+                self.assertEqual(report["consumers"][0]["version"], pin)
+
+    def test_prefixed_consumer_still_blocks_an_update(self) -> None:
+        prefix, calls = self.prefix("one"), []
+        source = self.home / ".claude/plugins/cache/market/firm-tools/9.0/skills/codex-job-runner/bridge.py"
+        source.parent.mkdir(parents=True)
+        source.write_text('PINNED_CODEX_VERSION = "codex-cli 1.0"\n')
+        report = drift.update(str(self.config), home=str(self.home), path_env=str(prefix / "bin"),
+                              bridge=self.bridge(prefix / "bin" / "codex"), runner=self.runner(calls))
+        self.assertIn("pins 1.0; update that pin to 2.0", " ".join(report["needs_you"]))
+        self.assertFalse(any("install" in argv and any(
+            Path(arg).resolve() == prefix.resolve() for arg in argv if os.path.isabs(arg))
+            for argv in calls))
+
     def test_model_check_and_paid_check_order(self) -> None:
         missing = drift._model_check("/ignored", configured_model="missing", configured_effort="low", default_model=None, runner=lambda *a, **k: completed('{"models": []}'))
         unsupported = drift._model_check("/ignored", configured_model="good", configured_effort="high", default_model=None, runner=lambda *a, **k: completed('{"models":[{"slug":"good","supported_reasoning_levels":[{"effort":"low"}]}]}'))
@@ -427,6 +455,570 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["changed"], ["codex"])
         self.assertEqual(report["attention"], [])
+
+    def test_quick_check_only_vendor_tree_content_move_is_informational(self) -> None:
+        for name in ("claude", "codex"):
+            with self.subTest(name=name):
+                baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+                baseline["executables"][name].update(
+                    native_kind="vendor_tree_v1" if name == "codex" else "file_v1", native_sha256="native")
+                current = json.loads(json.dumps(baseline))
+                current["executables"][name]["path"] = str(self.home / "moved" / name)
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], [] if name == "codex" else [name])
+                self.assertEqual(report["moved"], [name] if name == "codex" else [])
+                self.assertEqual(report["ok"], name == "codex")
+                self.assertEqual(report["attention"], [])
+
+    def test_quick_check_content_changes_and_unprovable_moves_still_hold(self) -> None:
+        for path_changed in (False, True):
+            for field, value in (("native_sha256", "different"), ("native_sha256", None),
+                                 ("sha256", "different"), ("version", "different")):
+                with self.subTest(path_changed=path_changed, field=field, value=value):
+                    baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+                    baseline["executables"]["codex"]["native_sha256"] = "native"
+                    current = json.loads(json.dumps(baseline))
+                    if path_changed:
+                        current["executables"]["codex"]["path"] = str(self.home / "moved" / "codex")
+                    current["executables"]["codex"][field] = value
+                    report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                    self.assertEqual(report["changed"], ["codex"])
+                    self.assertEqual(report["moved"], [])
+                    self.assertFalse(report["ok"])
+
+    def test_quick_check_move_requires_both_native_hashes(self) -> None:
+        for before, after in ((None, "native"), ("native", None), (None, None)):
+            with self.subTest(before=before, after=after):
+                baseline = self.inventory(codex=self.home / "codex")
+                baseline["executables"]["codex"]["native_sha256"] = before
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["codex"].update(path=str(self.home / "moved"), native_sha256=after)
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"])
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["moved"], [])
+
+    def test_quick_check_legacy_baseline_requires_same_path(self) -> None:
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                baseline = self.inventory(codex=self.home / "codex")
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["codex"]["native_sha256"] = "native"
+                if moved:
+                    current["executables"]["codex"]["path"] = str(self.home / "moved")
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"] if moved else [])
+                self.assertEqual(report["ok"], not moved)
+                self.assertEqual(report["moved"], [])
+
+    def test_doctor_records_move_and_legacy_native_hash_without_paid_checks(self) -> None:
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                baseline = self.inventory(codex=self.home / "codex")
+                if moved:
+                    baseline["executables"]["codex"].update(native_kind="vendor_tree_v1", native_sha256="native")
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["codex"]["native_sha256"] = "native"
+                if moved:
+                    current["executables"]["codex"]["path"] = str(self.home / "moved")
+                drift._write_baseline(str(self.home), baseline)
+                with mock.patch.object(drift, "inventory", return_value=current), \
+                     mock.patch.object(drift, "run_cli_check") as paid:
+                    report = drift.doctor(str(self.config), home=str(self.home))
+                paid.assert_not_called()
+                self.assertEqual(report["changed"], [])
+                self.assertEqual(report["moved"], ["codex"] if moved else [])
+                self.assertEqual(drift._read_baseline(str(self.home))["executables"], current["executables"])
+
+    def test_doctor_rejects_native_payload_replaced_during_checks(self) -> None:
+        baseline = self.inventory(codex=self.home / "codex")
+        baseline["executables"]["codex"]["native_sha256"] = "old"
+        current = json.loads(json.dumps(baseline))
+        current["executables"]["codex"]["native_sha256"] = "checked"
+        replaced = json.loads(json.dumps(current))
+        replaced["executables"]["codex"]["native_sha256"] = "replaced"
+        drift._write_baseline(str(self.home), baseline)
+        with mock.patch.object(drift, "inventory", side_effect=[current, replaced]), \
+             mock.patch.object(drift, "run_cli_check", return_value={"ok": True}):
+            report = drift.doctor(str(self.config), home=str(self.home))
+        self.assertIn("codex", report["changed_during_checks"])
+        self.assertEqual(drift._read_baseline(str(self.home))["executables"]["codex"], baseline["executables"]["codex"])
+
+    def npm_launcher(self, prefix: str = "") -> Path:
+        root = self.home / prefix / "node_modules" / "@openai" / "codex"
+        (root / "bin").mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text('{"name":"@openai/codex"}')
+        launcher = root / "bin" / "codex.js"
+        launcher.write_text((ROOT / "tests/fixtures/codex_npm_launcher.js").read_text())
+        return launcher
+
+    def test_native_fingerprint_follows_optional_package_and_vendor_fallback(self) -> None:
+        launcher = self.npm_launcher()
+        for target in ("aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-musl",
+                       "x86_64-unknown-linux-musl", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"):
+            for optional in (False, True):
+                with self.subTest(target=target, optional=optional):
+                    root = self.home / "optional" if optional else launcher.parent.parent
+                    package_json = root / "package.json"
+                    native = root / "vendor" / target / "bin" / ("codex.exe" if "windows" in target else "codex")
+                    native.parent.mkdir(parents=True, exist_ok=True)
+                    native.write_bytes(b"synthetic native payload")
+                    decoy = root / "vendor" / target / "codex" / native.name
+                    decoy.parent.mkdir(parents=True, exist_ok=True)
+                    decoy.write_bytes(b"wrong payload")
+                    response = {"target": target, "package_json": str(package_json) if optional else None}
+                    probe = mock.Mock(return_value=completed(json.dumps(response)))
+                    with mock.patch.object(drift.shutil, "which", return_value=str(self.bin / "node")):
+                        from agent_bridge.execution.codex_promotion import tree_digest
+                        self.assertEqual(drift._codex_native_sha256(str(launcher), probe),
+                                         tree_digest(root / "vendor" / target))
+                        native.unlink()
+                        self.assertIsNone(drift._codex_native_sha256(str(launcher), probe))
+                    self.assertIn("createRequire", probe.call_args.args[0][2])
+                    self.assertEqual(probe.call_args.args[0][3], str(launcher))
+
+    def test_unresolved_native_fingerprint_is_null(self) -> None:
+        launcher = self.npm_launcher()
+        for result in (None, completed("", 1), completed("bad json"), completed('{"target":"unknown"}')):
+            with self.subTest(result=result), \
+                 mock.patch.object(drift.shutil, "which", return_value=str(self.bin / "node")):
+                self.assertIsNone(drift._codex_native_sha256(str(launcher), lambda *a, **k: result))
+        with mock.patch.object(drift.shutil, "which", return_value=None):
+            self.assertIsNone(drift._codex_native_sha256(str(launcher)))
+        launcher.write_text("// unsupported future launcher")
+        probe = mock.Mock()
+        self.assertIsNone(drift._codex_native_sha256(str(launcher), probe))
+        probe.assert_not_called()
+
+    def test_missing_optional_payload_does_not_select_bundled_fallback(self) -> None:
+        launcher = self.npm_launcher()
+        target = "aarch64-apple-darwin"
+        fallback = launcher.parent.parent / "vendor" / target / "bin" / "codex"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_bytes(b"bundled decoy")
+        response = {"target": target, "package_json": str(self.home / "optional" / "package.json")}
+        with mock.patch.object(drift.shutil, "which", return_value=str(self.bin / "node")):
+            self.assertIsNone(drift._codex_native_sha256(
+                str(launcher), lambda *a, **k: completed(json.dumps(response))))
+
+    def test_direct_native_binary_uses_its_own_digest(self) -> None:
+        native = self.home / "codex"
+        for magic in (b"\x7fELF", b"MZ00", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+            with self.subTest(magic=magic):
+                native.write_bytes(magic + b"synthetic payload")
+                self.assertEqual(drift._codex_native_sha256(str(native)), drift._sha256(str(native)))
+        native.write_bytes(b"#!/bin/sh\n# unresolved external wrapper")
+        self.assertIsNone(drift._codex_native_sha256(str(native)))
+
+    def test_inventory_records_native_hash_and_null_when_unresolved(self) -> None:
+        launcher = self.npm_launcher()
+        for native in ("native", None):
+            with self.subTest(native=native), \
+                 mock.patch.object(drift, "_codex_native_identity", return_value=("vendor_tree_v1", native)), \
+                 mock.patch.object(drift, "_ollama", return_value={}):
+                current = drift.inventory(str(self.config), home=str(self.home),
+                                          bridge=self.bridge(launcher), runner=self.runner([]))
+            entry = current["executables"]["codex"]
+            self.assertIn("native_sha256", entry)
+            self.assertEqual(entry["native_sha256"], native)
+            self.assertEqual(entry["native_kind"], "vendor_tree_v1")
+            self.assertEqual(entry["sha256"], drift._sha256(str(launcher)))
+
+    def npm_inventory(self, launcher: Path) -> dict:
+        probe = completed(json.dumps({"target": "aarch64-apple-darwin", "package_json": None}))
+        with mock.patch.object(drift, "_executable", side_effect=lambda name, _: str(launcher.resolve()) if name == "codex" else None), \
+             mock.patch.object(drift.shutil, "which", return_value=str(self.bin / "node")), \
+             mock.patch.object(drift, "_ollama", return_value={}), \
+             mock.patch.object(drift, "_hook_state", return_value={}):
+            return drift.inventory(str(self.config), home=str(self.home), bridge=self.bridge(launcher),
+                                   runner=lambda argv, **kw: probe if "-e" in argv else completed("1.0"))
+
+    def vendor_tree(self, launcher: Path) -> Path:
+        tree = launcher.parent.parent / "vendor" / "aarch64-apple-darwin"
+        for name in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg",
+                     "codex-resources/zsh/bin/zsh", "codex-resources/voice/bin/codex-voice-host",
+                     "codex-resources/voice/lib/one.dylib"):
+            path = tree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic native payload")
+        return tree
+
+    def test_vendor_helpers_changed_at_same_path_or_move_still_hold(self) -> None:
+        first, second = self.npm_launcher("first"), self.npm_launcher("second")
+        tree, moved_tree = self.vendor_tree(first), self.vendor_tree(second)
+        baseline = self.npm_inventory(first)
+        report = self.quick_with_baseline(self.npm_inventory(second), baseline, config=str(self.config))
+        self.assertEqual(report["changed"], [])
+        self.assertEqual(report["moved"], ["codex"])
+        for relative in ("bin/codex-code-mode-host", "codex-path/rg", "codex-resources/zsh/bin/zsh",
+                         "codex-resources/voice/bin/codex-voice-host", "codex-resources/voice/lib/one.dylib"):
+            for launcher, root in ((first, tree), (second, moved_tree)):
+                with self.subTest(relative=relative, moved=launcher == second):
+                    helper = root / relative
+                    original = helper.read_bytes()
+                    helper.write_bytes(b"changed synthetic helper")
+                    current = self.npm_inventory(launcher)
+                    self.assertEqual(current["executables"]["codex"]["sha256"], baseline["executables"]["codex"]["sha256"])
+                    report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                    self.assertEqual(report["changed"], ["codex"])
+                    self.assertEqual(report["moved"], [])
+                    self.assertFalse(report["ok"])
+                    helper.write_bytes(original)
+
+    def test_direct_vendor_binary_helpers_changed_at_same_path_or_move_hold(self) -> None:
+        trees = [self.vendor_tree(self.npm_launcher(prefix)) for prefix in ("first", "second")]
+        for tree in trees:
+            (tree / "bin/codex").write_bytes(b"\xcf\xfa\xed\xfe synthetic codex")
+            (tree / "codex-package.json").write_text('{"name":"synthetic codex"}')
+        baseline = self.npm_inventory(trees[0] / "bin/codex")
+        entry = baseline["executables"]["codex"]
+        unchanged = self.quick_with_baseline(self.npm_inventory(trees[1] / "bin/codex"), baseline,
+                                             config=str(self.config))
+        self.assertEqual(unchanged["changed"], [])
+        self.assertEqual(unchanged["moved"], ["codex"])
+        for tree in trees:
+            for relative in ("bin/codex-code-mode-host", "codex-path/rg", "codex-package.json"):
+                with self.subTest(moved=tree == trees[1], relative=relative):
+                    helper = tree / relative
+                    original = helper.read_bytes()
+                    helper.write_bytes(b"different synthetic helper")
+                    current = self.npm_inventory(tree / "bin/codex")
+                    self.assertEqual(current["executables"]["codex"]["sha256"], entry["sha256"])
+                    report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                    self.assertEqual(report["changed"], ["codex"])
+                    self.assertEqual(report["moved"], [])
+                    self.assertFalse(report["ok"])
+                    helper.write_bytes(original)
+        self.assertEqual(entry["native_kind"], "vendor_tree_v1")
+
+    def test_direct_vendor_binary_and_npm_launcher_share_tree_digest(self) -> None:
+        launcher = self.npm_launcher()
+        tree = self.vendor_tree(launcher)
+        native = tree / "bin/codex"
+        native.write_bytes(b"\xcf\xfa\xed\xfe synthetic codex")
+        for marker in (False, True):
+            with self.subTest(marker=marker):
+                if marker:
+                    (tree / "codex-package.json").write_text("{}")
+                launched = self.npm_inventory(launcher)["executables"]["codex"]
+                direct = self.npm_inventory(native)["executables"]["codex"]
+                self.assertIsNotNone(direct["native_sha256"])
+                self.assertEqual(direct["native_sha256"], launched["native_sha256"])
+                self.assertEqual(direct["native_kind"], "vendor_tree_v1")
+                self.assertEqual(drift._codex_native_sha256(str(native)), launched["native_sha256"])
+
+    def test_direct_native_package_uses_grandparent_root(self) -> None:
+        outer = self.home / "outer"
+        tree = outer / "package"
+        native = tree / "bin/codex"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"MZ00 synthetic codex")
+        for root in (outer, tree):
+            (root / "codex-package.json").write_text("{}")
+        entry = self.npm_inventory(native)["executables"]["codex"]
+        self.assertEqual(entry["native_kind"], "vendor_tree_v1")
+        self.assertEqual(entry["native_sha256"], drift._native_tree_sha256(tree))
+        deep = tree / "one/two/three/four/codex"
+        deep.parent.mkdir(parents=True)
+        deep.write_bytes(native.read_bytes())
+        deep_entry = self.npm_inventory(deep)["executables"]["codex"]
+        self.assertEqual(deep_entry["native_kind"], "file_v1")
+        self.assertEqual(deep_entry["native_sha256"], drift._sha256(str(deep)))
+
+    def test_direct_vendor_binary_bin_marker_does_not_hide_helper_changes(self) -> None:
+        trees = [self.vendor_tree(self.npm_launcher(prefix)) for prefix in ("first", "second")]
+        for tree in trees:
+            (tree / "bin/codex").write_bytes(b"MZ00 synthetic codex")
+            (tree / "bin/codex-package.json").write_text("{}")
+        baseline = self.npm_inventory(trees[0] / "bin/codex")
+        for tree in trees:
+            with self.subTest(moved=tree == trees[1]):
+                helper = tree / "codex-path/rg"
+                original = helper.read_bytes()
+                helper.write_bytes(b"different synthetic helper")
+                current = self.npm_inventory(tree / "bin/codex")
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"])
+                self.assertEqual(report["moved"], [])
+                self.assertFalse(report["ok"])
+                helper.write_bytes(original)
+        for tree in trees:
+            entry = self.npm_inventory(tree / "bin/codex")["executables"]["codex"]
+            self.assertEqual(entry["native_kind"], "vendor_tree_v1")
+            self.assertEqual(entry["native_sha256"], drift._native_tree_sha256(tree))
+        marker = trees[0] / "bin/codex-package.json"
+        marker.write_text('{"extra":"marker changed"}')
+        self.assertEqual(drift.changes(self.npm_inventory(trees[0] / "bin/codex"), baseline), ["codex"])
+
+    def test_direct_native_marker_outside_grandparent_does_not_qualify(self) -> None:
+        for relative, marker_relative in (("bin/codex", "bin/codex-package.json"),
+                                          ("bin/deeper/codex", "codex-package.json"),
+                                          ("other/codex", "codex-package.json"),
+                                          ("bin/other", "codex-package.json")):
+            with self.subTest(relative=relative, marker=marker_relative):
+                binaries = []
+                for prefix in ("first", "second"):
+                    root = self.home / prefix / relative.replace("/", "-")
+                    native = root / relative
+                    native.parent.mkdir(parents=True)
+                    native.write_bytes(b"MZ00 synthetic codex")
+                    (root / marker_relative).write_text("{}")
+                    entry = self.npm_inventory(native)["executables"]["codex"]
+                    self.assertEqual(entry["native_kind"], "file_v1")
+                    self.assertEqual(entry["native_sha256"], drift._sha256(str(native)))
+                    binaries.append(native)
+                baseline = self.npm_inventory(binaries[0])
+                report = self.quick_with_baseline(self.npm_inventory(binaries[1]), baseline,
+                                                 config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"])
+                self.assertEqual(report["moved"], [])
+                self.assertFalse(report["ok"])
+
+    def test_identical_generic_native_shim_moves_hold(self) -> None:
+        for shim in ("scoop/codex.exe", ".bunx/codex", "volta/volta-shim"):
+            with self.subTest(shim=shim):
+                binaries = [self.home / prefix / shim for prefix in ("first", "second")]
+                for index, binary in enumerate(binaries):
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"MZ00 identical generic shim")
+                    binary.with_suffix(".shim").write_text(f"path = synthetic-install-{index}")
+                baseline = self.npm_inventory(binaries[0])
+                current = self.npm_inventory(binaries[1])
+                before, after = (value["executables"]["codex"] for value in (baseline, current))
+                self.assertEqual(after["native_sha256"], before["native_sha256"])
+                self.assertEqual(drift.changes(self.npm_inventory(binaries[0]), baseline), [])
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"])
+                self.assertEqual(report["moved"], [])
+                self.assertFalse(report["ok"])
+                self.assertEqual(after["native_kind"], "file_v1")
+                binaries[0].write_bytes(b"MZ00 changed generic shim")
+                self.assertEqual(drift.changes(self.npm_inventory(binaries[0]), baseline), ["codex"])
+
+    def test_file_and_legacy_native_kinds_never_prove_moves(self) -> None:
+        entry = {"path": "first", "version": "1", "sha256": "file", "native_sha256": "native"}
+        for kind in (None, "binary_v1", "file_v1", "vendor_tree_v1"):
+            with self.subTest(kind=kind):
+                before = {**entry, **({"native_kind": kind} if kind else {})}
+                self.assertTrue(drift._same_executable(before, before))
+                self.assertEqual(drift._same_executable({**before, "path": "second"}, before),
+                                 kind == "vendor_tree_v1")
+
+    def test_round_zero_baseline_upgrades_only_at_same_path(self) -> None:
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                baseline = self.inventory(codex=self.home / "codex")
+                baseline["executables"]["codex"]["native_sha256"] = "old-single-file"
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["codex"].update(native_sha256="new-tree", native_kind="vendor_tree_v1")
+                if moved:
+                    current["executables"]["codex"]["path"] = str(self.home / "moved")
+                report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                self.assertEqual(report["changed"], ["codex"] if moved else [])
+                self.assertEqual(report["moved"], [])
+                self.assertEqual(report["ok"], not moved)
+                if not moved:
+                    drift._write_baseline(str(self.home), baseline)
+                    with mock.patch.object(drift, "inventory", return_value=current), \
+                         mock.patch.object(drift, "run_cli_check") as paid:
+                        drift.doctor(str(self.config), home=str(self.home))
+                    paid.assert_not_called()
+                    self.assertEqual(drift._read_baseline(str(self.home))["executables"], current["executables"])
+                for field in ("sha256", "version"):
+                    changed = json.loads(json.dumps(current))
+                    changed["executables"]["codex"][field] = "real change"
+                    self.assertEqual(drift.changes(changed, baseline), ["codex"])
+
+    def test_unknown_executable_identity_fields_fail_closed(self) -> None:
+        entry = {"path": "same", "version": "1", "sha256": "shim", "native_sha256": "native"}
+        for before, after in ((entry, {**entry, "future": "value"}),
+                              ({**entry, "future": "value"}, entry),
+                              ({**entry, "future": "one"}, {**entry, "future": "two"}),
+                              (entry, {**entry, "future": None})):
+            with self.subTest(before=before, after=after):
+                self.assertFalse(drift._same_executable(after, before))
+        self.assertFalse(drift._same_executable({**entry, "native_kind": ["unknown"]}, entry))
+
+    def test_claude_native_proof_requires_native_magic(self) -> None:
+        path = self.home / "claude"
+        for contents, native in ((b"#!/bin/sh\nexternal-claude", False),
+                                 (b"\xcf\xfa\xed\xfe synthetic binary", True)):
+            with self.subTest(native=native):
+                path.write_bytes(contents)
+                with mock.patch.object(drift, "_ollama", return_value={}):
+                    baseline = drift.inventory(str(self.config), home=str(self.home),
+                                               bridge=self.bridge(path), runner=self.runner([]))
+                entry = baseline["executables"]["claude"]
+                self.assertEqual(entry["native_sha256"], entry["sha256"] if native else None)
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["claude"]["path"] = str(self.home / "moved-claude")
+                self.assertEqual(drift.changes(current, baseline), ["claude"])
+
+    def test_claude_native_move_holds(self) -> None:
+        binaries = [self.home / name / "claude" for name in ("first", "second")]
+        inventories = []
+        for binary in binaries:
+            binary.parent.mkdir()
+            binary.write_bytes(b"\xcf\xfa\xed\xfe identical synthetic claude")
+            with mock.patch.object(drift, "_executable", side_effect=lambda name, _: str(binary) if name == "claude" else None), \
+                 mock.patch.object(drift, "_ollama", return_value={}), \
+                 mock.patch.object(drift, "_hook_state", return_value={}):
+                inventories.append(drift.inventory(str(self.config), home=str(self.home),
+                                                   bridge=self.bridge(binary), runner=self.runner([])))
+        before, after = (value["executables"]["claude"] for value in inventories)
+        self.assertEqual(after["native_sha256"], before["native_sha256"])
+        report = self.quick_with_baseline(inventories[1], inventories[0], config=str(self.config))
+        self.assertEqual(report["changed"], ["claude"])
+        self.assertEqual(report["moved"], [])
+        self.assertFalse(report["ok"])
+        self.assertEqual(after["native_kind"], "file_v1")
+
+    def test_round_zero_claude_baseline_upgrades_only_at_same_path(self) -> None:
+        for native in (False, True):
+            for moved in (False, True):
+                with self.subTest(native=native, moved=moved):
+                    baseline = self.inventory(claude=self.home / "claude")
+                    baseline["executables"]["claude"]["native_sha256"] = "claude"
+                    current = json.loads(json.dumps(baseline))
+                    current["executables"]["claude"].update(native_kind="file_v1",
+                                                          native_sha256="claude" if native else None)
+                    if moved:
+                        current["executables"]["claude"]["path"] = str(self.home / "moved-claude")
+                    report = self.quick_with_baseline(current, baseline, config=str(self.config))
+                    self.assertEqual(report["changed"], ["claude"] if moved else [])
+                    self.assertEqual(report["moved"], [])
+                    self.assertEqual(report["ok"], not moved)
+                    for field in ("sha256", "version"):
+                        changed = json.loads(json.dumps(current))
+                        changed["executables"]["claude"][field] = "real change"
+                        self.assertEqual(drift.changes(changed, baseline), ["claude"])
+                    if not moved:
+                        drift._write_baseline(str(self.home), baseline)
+                        with mock.patch.object(drift, "inventory", return_value=current), \
+                             mock.patch.object(drift, "run_cli_check") as paid:
+                            drift.doctor(str(self.config), home=str(self.home))
+                        paid.assert_not_called()
+                        self.assertEqual(drift._read_baseline(str(self.home))["executables"], current["executables"])
+
+    def test_transient_same_path_native_probe_failure_is_not_cached(self) -> None:
+        for moved in (False, True):
+            for other_change in (False, True):
+                with self.subTest(moved=moved, other_change=other_change):
+                    baseline = self.inventory(codex=self.home / "codex")
+                    baseline["executables"]["codex"].update(native_kind="vendor_tree_v1", native_sha256="tree")
+                    failed = json.loads(json.dumps(baseline))
+                    failed["executables"]["codex"]["native_sha256"] = None
+                    if moved:
+                        failed["executables"]["codex"]["path"] = str(self.home / "moved")
+                    if other_change:
+                        failed["executables"]["codex"]["sha256"] = "changed shim"
+                    drift._quick_cache.clear()
+                    with mock.patch.object(drift, "inventory", side_effect=[failed, baseline]) as inventory, \
+                         mock.patch.object(drift, "_read_baseline", return_value=baseline):
+                        first = drift.quick_check(str(self.config), home=str(self.home))
+                        second = drift.quick_check(str(self.config), home=str(self.home))
+                    self.assertEqual(first["changed"], ["codex"])
+                    self.assertEqual(second["changed"], ["codex"] if moved or other_change else [])
+                    self.assertEqual(inventory.call_count, 1 if moved or other_change else 2)
+
+    def test_native_tree_rehashes_every_inventory_and_tree_change(self) -> None:
+        from agent_bridge.execution import codex_promotion
+        launcher = self.npm_launcher(); tree = self.vendor_tree(launcher)
+        helper = tree / "codex-path/rg"
+        with mock.patch.object(codex_promotion, "tree_digest", wraps=codex_promotion.tree_digest) as digest:
+            before = drift._native_tree_sha256(tree)
+            self.assertIsNotNone(before)
+            self.assertEqual(drift._native_tree_sha256(tree), before)
+            self.assertEqual(digest.call_count, 2)
+            info = helper.stat()
+            helper.write_bytes(b"x" * info.st_size)
+            os.utime(helper, ns=(info.st_atime_ns, info.st_mtime_ns))
+            after = drift._native_tree_sha256(tree)
+            self.assertNotEqual(after, before)
+            self.assertEqual(digest.call_count, 3)
+            for action in (lambda: helper.rename(helper.with_name("renamed")),
+                           lambda: (tree / "extra").write_bytes(b"new"),
+                           lambda: (tree / "extra").unlink(),
+                           lambda: (tree / "empty-directory").mkdir()):
+                previous = after
+                action()
+                after = drift._native_tree_sha256(tree)
+                self.assertIsNotNone(after)
+                self.assertNotEqual(after, previous)
+            self.assertEqual(digest.call_count, 7)
+            if os.name == "posix":
+                (tree / "extra-mode").write_bytes(b"mode")
+                previous = drift._native_tree_sha256(tree)
+                (tree / "extra-mode").chmod(0o500)
+                self.assertNotEqual(drift._native_tree_sha256(tree), previous)
+                self.assertEqual(digest.call_count, 9)
+
+    def test_windows_coarse_stat_semantics_cannot_reuse_stale_tree_digest(self) -> None:
+        from types import SimpleNamespace
+        launcher = self.npm_launcher()
+        tree = self.vendor_tree(launcher)
+        helper = tree / "codex-path/rg"
+        real_lstat = Path.lstat
+        creation_times = {}
+        def windows_lstat(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            creation = creation_times.setdefault(str(path), info.st_ctime_ns)
+            return SimpleNamespace(st_size=info.st_size, st_mtime_ns=info.st_mtime_ns // 2_000_000_000 * 2_000_000_000,
+                                   st_ctime_ns=creation, st_dev=info.st_dev, st_ino=info.st_ino, st_mode=info.st_mode)
+        with mock.patch.object(Path, "lstat", windows_lstat):
+            baseline = self.npm_inventory(launcher)
+            signature = drift._native_tree_signature(tree.resolve())
+            info = helper.stat()
+            helper.write_bytes(b"x" * info.st_size)
+            os.utime(helper, ns=(info.st_atime_ns, info.st_mtime_ns))
+            self.assertEqual(drift._native_tree_signature(tree.resolve()), signature)
+            current = self.npm_inventory(launcher)
+        self.assertNotEqual(current["executables"]["codex"]["native_sha256"],
+                            baseline["executables"]["codex"]["native_sha256"])
+        report = self.quick_with_baseline(current, baseline, config=str(self.config))
+        self.assertEqual(report["changed"], ["codex"])
+        self.assertEqual(report["moved"], [])
+        self.assertFalse(report["ok"])
+
+    def test_native_tree_read_failure_and_mutation_during_hash_are_unprovable(self) -> None:
+        from agent_bridge.execution import codex_promotion
+        tree = self.vendor_tree(self.npm_launcher())
+        self.assertIsNotNone(drift._native_tree_sha256(tree))
+        with mock.patch.object(drift.os, "scandir", side_effect=PermissionError("unreadable")):
+            self.assertIsNone(drift._native_tree_sha256(tree))
+        with mock.patch.object(codex_promotion, "tree_digest", side_effect=PermissionError("unreadable")):
+            self.assertIsNone(drift._native_tree_sha256(tree))
+        original = codex_promotion.tree_digest
+        def mutating(root):
+            value = original(root)
+            (root / "new-helper").write_bytes(b"changed during hash")
+            return value
+        with mock.patch.object(codex_promotion, "tree_digest", side_effect=mutating):
+            self.assertIsNone(drift._native_tree_sha256(tree))
+        self.assertIsNotNone(drift._native_tree_sha256(tree))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlinks and FIFO")
+    def test_native_tree_links_modes_and_refused_types(self) -> None:
+        from agent_bridge.execution.codex_promotion import tree_digest
+        tree = self.vendor_tree(self.npm_launcher())
+        before = drift._native_tree_sha256(tree)
+        helper = tree / "codex-path/rg"
+        helper.chmod(0o500)
+        after = drift._native_tree_sha256(tree)
+        self.assertNotEqual(before, after)
+        self.assertEqual(after, tree_digest(tree))
+        link = tree / "link"
+        link.symlink_to("bin/codex")
+        before = drift._native_tree_sha256(tree)
+        self.assertEqual(before, tree_digest(tree))
+        link.unlink(); link.symlink_to("codex-path/rg")
+        self.assertNotEqual(drift._native_tree_sha256(tree), before)
+        for target in ("missing", "../outside", str(helper)):
+            link.unlink(); link.symlink_to(target)
+            self.assertIsNone(drift._native_tree_sha256(tree))
+        link.unlink()
+        os.mkfifo(tree / "fifo")
+        self.assertIsNone(drift._native_tree_sha256(tree))
 
     def test_quick_check_conditions_that_cannot_repair_themselves_need_attention(self) -> None:
         baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
