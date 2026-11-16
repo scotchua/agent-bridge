@@ -374,7 +374,16 @@ and client-data health checks remain authoritative. There is no API fallback.
 Eligible classes include the existing test, lint, build, git history/diff,
 and recursive search commands, plus `git status` (including untracked files),
 read-only `find`, `ls -R`, and `cat`/`head`/`tail` of one existing regular
-file. Shell composition, pipes, redirection, heredocs, `tee`, watch/follow
+file. Recursive `grep` (including `-rn`/`-nr`) and `rg` accept line
+numbering (`-n`/`--line-number`); `-m`/`--max-count` searches remain
+excluded, including short-option clusters with an attached count.
+`sed -n 'Ap' FILE` and `sed -n 'A,Bp' FILE` accept exactly one decimal
+numeric print script, directly or with one `-e`, and one existing regular
+file. Other scripts and options, including in-place edits, are excluded.
+`nl` accepts one existing regular file with options limited to `-b a`,
+`-ba`, `-n ln|rn|rz`, `-w N`, `-v N`, `-i N` (decimal numbers), and
+`-s SEP` (a literal separator without shell metacharacters or expansion).
+Shell composition, pipes, redirection, heredocs, `tee`, watch/follow
 modes, and destructive or file-writing `find` actions are excluded. Single
 file readers also exclude globs and stdin. Output below 4 KiB remains raw;
 larger output can return a local digest or a visible waiver with original

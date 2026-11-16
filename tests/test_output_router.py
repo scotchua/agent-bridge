@@ -67,10 +67,85 @@ class OutputRouterTests(unittest.TestCase):
                         "cargo test", "git log --oneline", "git diff", "git show HEAD",
                         "grep -r token .", "rg token .", "npm run build", "ruff check ."):
             self.assertTrue(output_router.is_routable_command(command), command)
-        for command in ("sed -n '1,20p' a", "head missing", "tail missing", "cat missing", "grep -n x a",
+        # The file-reader examples name missing files, including sed's "a".
+        for command in ("sed -n '1,20p' a", "head missing", "tail missing", "cat missing",
                         "git diff -- a", "git show -- a", "pytest -q | tee out", "pytest > out",
                         "cat <<'EOF'", "tail -f log"):
             self.assertFalse(output_router.is_routable_command(command), command)
+
+    def test_numbered_searches_route_but_grep_still_requires_recursion(self):
+        accepted = ("rg -n pattern", "rg -n pattern src", "rg --line-number pattern",
+                    "rg -nH pattern src", "grep -rn pattern .", "grep -nr pattern .",
+                    "grep -r -n pattern .", "grep -r --line-number pattern .",
+                    "grep -RnH pattern .", "grep --recursive -nH pattern .")
+        for command in accepted:
+            with self.subTest(command=command):
+                self.assertTrue(output_router.is_routable_command(command))
+        # Numbered grep still needs recursion.
+        for command in ("grep -n x a", "grep -n x file", "grep -nH x file",
+                        "grep --line-number x file"):
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command))
+
+    def test_search_max_count_still_bounds_output(self):
+        for program in ("rg", "grep -r"):
+            for options in ("-n -m 5", "-nm5", "-m5", "--max-count 5",
+                            "--max-count=5", "-nHm5", "-m 5 -n", "-m"):
+                command = f"{program} {options} x"
+                with self.subTest(command=command):
+                    self.assertFalse(output_router.is_routable_command(command))
+
+    def test_sed_only_routes_one_numeric_print_from_one_regular_file(self):
+        regular = self.repo / "output file.txt"
+        regular.write_text("synthetic output\n", encoding="utf-8")
+        file = shlex.quote(regular.name)
+        for script in ("-n '10,40p'", "-n 5p", "-n -e '1,9p'"):
+            for path in (file, shlex.quote(str(regular))):
+                command = f"sed {script} {path}"
+                with self.subTest(command=command):
+                    self.assertTrue(output_router.is_routable_command(command, cwd=str(self.repo)))
+        rejected = (f"sed -n '1,5w out' {file}", f"sed -i '1d' {file}",
+                    f"sed -i.bak -n 1p {file}", f"sed -n '1p' {file} {file}",
+                    f"sed -n '/a/,/b/p' {file}", f"sed '1,5p' {file}",
+                    "sed -n '1,5p'", "sed -n 1,5p missing-file",
+                    f"sed -n 's/a/b/p' {file}", f"sed -n -e 1p -e 2p {file}",
+                    f"sed -n 1p 2p {file}", "sed -n -e", "sed -n -e 1p",
+                    "sed -n 1p .", "sed -n 1p -", "sed -n 1p '*.txt'",
+                    "sed -n 1p ~/file", "sed -n 1p output?.txt")
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command, cwd=str(self.repo)))
+
+    def test_nl_only_routes_listed_options_and_one_regular_file(self):
+        regular = self.repo / "output file.txt"
+        regular.write_text("synthetic output\n", encoding="utf-8")
+        file = shlex.quote(regular.name)
+        for options in ("", "-ba", "-b a", "-n ln", "-n rn", "-n rz",
+                        "-w 4", "-v 10", "-i 2", "-s ':'", "-s '  '", "-s ''",
+                        "-ba -n rz -w 6 -v 1 -i 1 -s ':'"):
+            command = f"nl {options} {file}"
+            with self.subTest(command=command):
+                self.assertTrue(output_router.is_routable_command(command, cwd=str(self.repo)))
+        self.assertTrue(output_router.is_routable_command(f"nl {shlex.quote(str(regular))}"))
+        rejected = (f"nl {file} {file}", f"nl -b pREGEX {file}", "nl missing", "nl",
+                    "nl .", "nl -", "nl '*.txt'", "nl ~/file", f"nl -b t {file}",
+                    f"nl -ba --help {file}", f"nl --body-numbering=a {file}",
+                    f"nl -w4 {file}", f"nl -w bad {file}", f"nl -v bad {file}",
+                    f"nl -i bad {file}", f"nl -n bad {file}", f"nl -s '*' {file}")
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command, cwd=str(self.repo)))
+
+    def test_new_readers_keep_global_shell_and_follow_exclusions(self):
+        (self.repo / "f").write_text("synthetic output\n", encoding="utf-8")
+        accepted = ("rg -n pattern", "grep -rn pattern .", "sed -n 1p f", "nl -ba f")
+        for command in accepted:
+            for suffix in (" | cat f", "; nl f", " > out", " $TOKEN", " `nl f`",
+                           " &", " < f", "\rnl f", "\nnl f", " -f", " watch", " sleep",
+                           " --watch", " --watchAll", " tee"):
+                composed = command + suffix
+                with self.subTest(command=composed):
+                    self.assertFalse(output_router.is_routable_command(composed, cwd=str(self.repo)))
 
     def test_new_read_only_classes_and_dangerous_variants(self):
         regular = self.repo / "output file.txt"
