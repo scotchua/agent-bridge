@@ -2365,7 +2365,20 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
         command = _command_text(tool_input)
         if _shell_commands(command) is None and literal_records.targets(command) is None:
             executable = re.sub(r"'[^']*'", "", command)
-            if ("$" in executable or "`" in executable
+            # Prove outer quoting only, after the existing write checks.
+            # Never infer permission for a Python body or unknown targets.
+            argv = literal_records.canonical_argv(command)
+            shells = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "yash",
+                      "fish", "csh", "tcsh", "busybox", "eval", "source", "."}
+            literal_dynamic = bool(argv) and any("$" in word or "`" in word for word in argv)
+            # Case-insensitive filesystems may run /bin/BASH as /bin/bash.
+            # This deliberately over-denies e.g. a literal '.' argument.
+            # Renamed shells, env -S bodies and arbitrary interpreter bodies
+            # remain outside this heuristic, as they were before this change.
+            nested_shell = bool(argv) and any(os.path.basename(word).lower() in shells for word in argv)
+            equals_expansion = bool(argv) and any(word.startswith("=") for word in argv)
+            if (equals_expansion or (nested_shell and literal_dynamic)
+                    or (argv is None and ("$" in executable or "`" in executable))
                     or re.search(r"(^|[;&|\n])\s*eval(?:\s|$)", command)):
                 return Decision("deny", "shell_targets_unresolved",
                                 "delegation-first gate: dynamic shell write targets cannot be resolved; "

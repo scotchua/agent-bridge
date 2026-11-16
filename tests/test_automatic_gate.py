@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +199,81 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.assertIsNone(self.receipt_for(self.repo))
         self.assertEqual([row["item_id"] for row in gate.claim_reconcile._ledger_rows(str(self.db))],
                          [self.item])
+
+    def test_canonical_quote_words_preserve_literals_and_reject_shell_syntax(self):
+        import shlex
+        from agent_bridge.orchestration import literal_records as lr
+        words = ["exec", "python3", "-c", "pattern = '--request-limit 12$'\n# café `literal`", "", "a\tb"]
+        self.assertEqual(lr.canonical_argv(shlex.join(words)), words)
+        for command in ('echo $X', 'echo "$X"', 'echo $(id)', 'echo `id`',
+                        'echo x; id', 'echo x && id', 'echo x | cat',
+                        'echo x > y', 'echo\nx', 'echo "safe"', 'echo \\x',
+                        '', 'echo \ud800', 'x' * (lr.MAX_COMMAND + 1)):
+            with self.subTest(command=repr(command)):
+                self.assertIsNone(lr.canonical_argv(command))
+        self.assertIsNone(lr.canonical_argv(None))
+        with mock.patch.object(lr.os, 'name', 'nt'):
+            self.assertIsNone(lr.canonical_argv('echo x'))
+
+    def quote_layer(self, command, write=None, read=None):
+        # Isolate only the final dynamic-shell check. Separate end-to-end
+        # tests below exercise actual target ownership and routing decisions.
+        with mock.patch.object(gate, 'classify', return_value=('shell', [])), \
+             mock.patch.object(gate, '_judge_write', return_value=write or gate.Decision('allow', 'test', 'test')), \
+             mock.patch.object(gate, '_shell_commands', return_value=None), \
+             mock.patch.object(gate, 'judge_read', return_value=read or gate.Decision('allow', 'read-test', 'test')):
+            return gate.judge('codex', 'Bash', {'command': command}, str(self.repo), state_root=str(self.state))
+
+    def test_apostrophe_joined_python_regex_is_not_outer_shell_expansion(self):
+        import shlex
+        import re
+        body = "pattern = '--request-limit 12$'\nPath('/tmp/result.json').write_text('done')"
+        command = shlex.join(['exec', '/usr/bin/env', '-i', 'HOME=/tmp',
+                              sys.executable, '-B', '-c', body])
+        self.assertIn('$', re.sub(r"'[^']*'", '', command))
+        self.assertTrue(self.quote_layer(command).allowed)
+        self.assertTrue(self.quote_layer(shlex.join(['printf', '%s', '$X'])).allowed)
+        # All earlier denials remain authoritative even for this syntax.
+        for code in ('gate_state_protected', 'task_owned_elsewhere', 'routed_elsewhere'):
+            result = self.quote_layer(command, gate.Decision('deny', code, 'test'))
+            self.assertEqual(result.code, code)
+            self.assertFalse(result.allowed)
+
+    def test_dynamic_outer_and_nested_shells_remain_refused(self):
+        import shlex
+        commands = ['echo $X', 'echo "$X"', 'echo $(id)', 'echo `id`',
+                    'eval x', '=python3 x']
+        for shell in ('sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'yash',
+                      'fish', 'csh', 'tcsh', 'busybox', 'eval', 'source', '.',
+                      '/bin/sh', '/bin/BASH', '/bin/Sh', '/bin/Zsh'):
+            for wrapper in ([], ['env'], ['xargs'], ['find', '.', '-exec']):
+                commands.append(shlex.join(wrapper + [shell, '-c', "echo 'x' $T"]))
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.quote_layer(command)
+                self.assertEqual(result.code, 'shell_targets_unresolved')
+                self.assertFalse(result.allowed)
+
+    def test_list_form_and_read_denial_survive_quote_proof(self):
+        import shlex
+        command = shlex.join([sys.executable, '-c', "pattern = '12$'\nPath('/tmp/x').write_text('x')"])
+        normalized = gate._command_text({'command': ['bash', '-lc', command]})
+        self.assertEqual(shlex.split(normalized), ['bash', '-lc', command])
+        self.assertEqual(self.quote_layer(normalized).code, 'shell_targets_unresolved')
+        direct = gate._command_text({'command': shlex.split(command)})
+        self.assertTrue(self.quote_layer(direct).allowed)
+        with mock.patch.object(gate, '_shell_whole_file_read', return_value=True):
+            result = self.quote_layer(command, read=gate.Decision('deny', 'read-denied', 'test'))
+        self.assertEqual(result.code, 'read-denied')
+        self.assertFalse(result.allowed)
+
+    def test_literal_dollars_do_not_override_actual_task_or_protected_targets(self):
+        # The recognized receipt workflow still applies target and ownership
+        # checks to data containing the exact failing apostrophe/dollar shape.
+        text = "pattern = '--request-limit 12$'"
+        self.assertAllowed(self.shell(self.literal_receipt_command(content=text)))
+        self.assertDenied(self.shell(self.literal_receipt_command(content=text), 'claude'), 'task_owned_elsewhere')
+        self.assertDenied(self.shell(self.literal_receipt_command(self.state / 'forged', text)), 'gate_state_protected')
 
     def literal_receipt_command(self, destination=None, content=None, body=None):
         import shlex

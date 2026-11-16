@@ -65,19 +65,11 @@ def is_attempt(command: str) -> bool:
     return "-I" in flags or "-S" in flags
 
 
-def targets(command: str) -> list[str] | None:
-    """Return every destination only when the entire command is understood.
+def canonical_argv(command: str) -> list[str] | None:
+    """Decode canonical words; never authorize their body or write targets.
 
-    Accepted body, repeated at most MAX_FILES times::
-
-        with open('/absolute/new-receipt.json', 'x', encoding='utf-8') as receipt:
-            receipt.write('literal text, including quoted peer prose')
-
-    The interpreter must use the exact canonical path pinned by this gate, with
-    isolated startup and no site processing. This is not a binary hash
-    attestation. As with existing shell recognition, files can change between
-    judgment and execution. Protected paths and task ownership are checked
-    by the caller after this function returns.
+    This proves quoting only. A caller handling zsh must also account for
+    leading-equals expansion, and nested interpreters remain separate layers.
     """
     if os.name != "posix" or not isinstance(command, str) or len(command) > MAX_COMMAND:
         return None
@@ -110,6 +102,26 @@ def targets(command: str) -> list[str] | None:
     # contain only safe bare characters or single-quoted literal segments
     # joined by the exact double-quoted apostrophe sequence. No expansions.
     if any(part != shlex.quote(word) for part, word in zip(raw, argv)):
+        return None
+    return argv
+
+
+def targets(command: str) -> list[str] | None:
+    """Return every destination only when the entire command is understood.
+
+    Accepted body, repeated at most MAX_FILES times::
+
+        with open('/absolute/new-receipt.json', 'x', encoding='utf-8') as receipt:
+            receipt.write('literal text, including quoted peer prose')
+
+    The interpreter must use the exact canonical path pinned by this gate, with
+    isolated startup and no site processing. This is not a binary hash
+    attestation. As with existing shell recognition, files can change between
+    judgment and execution. Protected paths and task ownership are checked
+    by the caller after this function returns.
+    """
+    argv = canonical_argv(command)
+    if argv is None:
         return None
     if argv[:1] == ["exec"]:
         argv = argv[1:]
