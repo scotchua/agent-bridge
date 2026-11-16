@@ -121,6 +121,58 @@ def is_routable_command(command: str, *, cwd: str | None = None) -> bool:
     program = os.path.basename(words[0]).lower()
     if program in {"cat", "head", "tail"}:
         return _single_file_reader(program, words[1:], cwd)
+    if program == "sed":
+        quiet = False
+        script = None
+        paths = []
+        arguments = iter(words[1:])
+        for value in arguments:
+            if value == "-n" and not quiet:
+                quiet = True
+            elif value == "-e" and script is None:
+                script = next(arguments, None)
+                if script is None:
+                    return False
+            elif value.startswith("-"):
+                return False
+            elif script is None:
+                script = value
+            else:
+                paths.append(value)
+        return (quiet and script is not None
+                and re.fullmatch(r"[0-9]+(?:,[0-9]+)?p", script) is not None
+                and _single_file_reader("cat", ["--", *paths], cwd))
+    if program == "nl":
+        paths = []
+        arguments = iter(words[1:])
+        for value in arguments:
+            if value == "-ba":
+                continue
+            if value in {"-b", "-n", "-w", "-v", "-i", "-s"}:
+                operand = next(arguments, None)
+                if operand is None:
+                    return False
+                if value == "-b" and operand != "a":
+                    return False
+                if value == "-n" and operand not in {"ln", "rn", "rz"}:
+                    return False
+                if value in {"-w", "-v", "-i"} and not re.fullmatch(r"[0-9]+", operand):
+                    return False
+                if value == "-s" and any(char in operand for char in "*?[]{}~"):
+                    return False
+            elif value.startswith("-"):
+                return False
+            else:
+                paths.append(value)
+        return _single_file_reader("cat", ["--", *paths], cwd)
+    if program in {"grep", "rg"}:
+        recursive = program == "rg" or any(word == "--recursive" or re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", word)
+                                         for word in words[1:])
+        # Line numbering does not bound output. A short-option cluster may
+        # contain -m with an attached count (for example, -nm5).
+        bounded = any(re.match(r"-[a-zA-Z]*m", word) or word == "--max-count"
+                      or word.startswith("--max-count=") for word in words[1:])
+        return recursive and not bounded
     if program == "find":
         return not any(word in {"-exec", "-execdir", "-delete", "-ok", "-okdir",
                                 "-fprint", "-fprint0", "-fprintf", "-fls"}
@@ -140,11 +192,6 @@ def is_routable_command(command: str, *, cwd: str | None = None) -> bool:
         return True
     if re.search(r"(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|lint)(?:\s|$)|(?:^|\s)(?:make|cargo|go)\s+(?:build|lint|clippy|vet)(?:\s|$)|(?:^|\s)(?:ruff|mypy|eslint|tsc|gradle|mvn)(?:\s|$)", joined):
         return True
-    if program in {"grep", "rg"}:
-        recursive = program == "rg" or any(word in {"-r", "-R", "--recursive"} for word in words[1:])
-        bounded = any(word == "-n" or word.startswith("-n") or word in {"-m", "--max-count"}
-                      or word.startswith("--max-count=") for word in words[1:])
-        return recursive and not bounded
     return False
 
 

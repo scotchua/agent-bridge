@@ -44,9 +44,71 @@ class OutputRouterMutationTests(unittest.TestCase):
     def test_git_routable_rejects_diff_stat_without_path_separator(self):
         self.assertFalse(output_router._git_routable(["git", "diff", "--stat"]))
 
-    def test_is_routable_command_rejects_non_string_and_unbounded_grep(self):
+    def test_is_routable_command_rejects_non_string_and_nonrecursive_grep(self):
         self.assertFalse(output_router.is_routable_command(None))
         self.assertFalse(output_router.is_routable_command("grep marker invented.txt"))
+
+    def test_numbering_and_long_search_options_are_not_max_count(self):
+        for command in ("rg -n x", "rg --no-heading x", "rg --no-line-number x",
+                        "rg --mmap x", "grep -nr x .", "grep -nR x .",
+                        "grep -r --line-number x ."):
+            with self.subTest(command=command):
+                self.assertTrue(output_router.is_routable_command(command))
+        for command in ("rg -nm5 x", "rg -nHm5 x", "grep -rnm5 x .",
+                        "grep -mr5 x .", "grep -r --max-count=5 x .",
+                        "rg -nm5 pytest", "rg --max-count=5 'git status'",
+                        "grep -n pytest f", "grep -n 'git status' f"):
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command))
+
+    def test_sed_rejects_other_scripts_even_with_existing_files(self):
+        root = Path(self.state)
+        for name in ("f", "g", "1p"):
+            (root / name).write_text("synthetic output\n", encoding="utf-8")
+        for command in ("sed -n '1,5w out' f", "sed -n '1W out' f",
+                        "sed -n '1r g' f", "sed -n '1R g' f", "sed -n '1e echo x' f",
+                        "sed -n 'y/a/b/' f", "sed -n 's/a/b/p' f",
+                        "sed -n '1p;2p' f", "sed -n '/a/,/b/p' f",
+                        "sed -n '1 p' f", "sed -n '1, 5p' f", "sed -n 1P f",
+                        "sed -n 1,2,3p f", "sed -n ١p f", "sed -n +1p f",
+                        "sed -n -e 1p 1p f", "sed -n -e 1p -e 1p f",
+                        "sed -n 1p f g", "sed -n 1p", "sed 1p f",
+                        "sed -i '1d' f", "sed -i.bak -n 1p f",
+                        "sed -in 1p f", "sed -n -f g f", "sed -n -s 1p f",
+                        "sed -n -z 1p f", "sed -n --quiet 1p f",
+                        "sed -n --in-place 1p f", "sed -n --in-place=.bak 1p f",
+                        "sed -n -e -e 1p f", "sed -n -n 1p f"):
+            with self.subTest(command=command):
+                self.assertFalse(output_router.is_routable_command(command, cwd=self.state))
+        self.assertFalse((root / "out").exists())
+
+    def test_nl_rejects_missing_operands_and_unlisted_options(self):
+        (Path(self.state) / "f").write_text("synthetic output\n", encoding="utf-8")
+        for option in ("-b", "-n", "-w", "-v", "-i", "-s"):
+            with self.subTest(option=option):
+                self.assertFalse(output_router.is_routable_command(f"nl f {option}", cwd=self.state))
+        for option in ("-bt", "-bn", "-d aa", "-l 2", "-p", "-h a", "-f a",
+                       "-w ١", "-v 1.0", "-i 1x", "-s '~'", "-s '$X'",
+                       "-s 'a;b'", "-s 'a|b'", "-s 'a>b'"):
+            with self.subTest(option=option):
+                self.assertFalse(output_router.is_routable_command(f"nl {option} f", cwd=self.state))
+        (Path(self.state) / "g").write_text("synthetic output\n", encoding="utf-8")
+        self.assertFalse(output_router.is_routable_command("nl f g", cwd=self.state))
+
+    def test_numeric_readers_reuse_regular_file_checks(self):
+        root = Path(self.state)
+        (root / "f").write_text("synthetic output\n", encoding="utf-8")
+        for reader in ("sed -n 1p", "nl"):
+            for path in ("missing", ".", "-", "'f*'", "'f?'", "'[f]'", "'{f,g}'", "'~/f'"):
+                with self.subTest(reader=reader, path=path):
+                    self.assertFalse(output_router.is_routable_command(f"{reader} {path}", cwd=self.state))
+            with self.subTest(reader=reader, stat_error=True):
+                with mock.patch.object(Path, "is_file", side_effect=OSError("synthetic stat failure")):
+                    self.assertFalse(output_router.is_routable_command(f"{reader} f", cwd=self.state))
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(root / "fifo")
+            for reader in ("sed -n 1p", "nl"):
+                self.assertFalse(output_router.is_routable_command(f"{reader} fifo", cwd=self.state))
 
     def test_prune_output_files_removes_old_capture(self):
         directory = output_router.output_directory(self.state)
