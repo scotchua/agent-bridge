@@ -456,6 +456,116 @@ class IsolatedDriftTests(unittest.TestCase):
         self.assertEqual(report["changed"], ["codex"])
         self.assertEqual(report["attention"], [])
 
+    def test_failed_and_successful_version_probes_do_not_flap_or_write_baseline(self) -> None:
+        from agent_bridge import qualification, store
+        baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        drift._write_baseline(str(self.home), baseline)
+        baseline_path = Path(drift.paths(str(self.home))["baseline"])
+        original = baseline_path.read_bytes()
+        stamp = baseline_path.stat().st_mtime_ns
+        failures = (subprocess.TimeoutExpired(["codex", "--version"], 10),
+                    OSError("unavailable"), None, completed("error", 1), completed(" \n"))
+        drift._quick_cache.clear()
+        with mock.patch.dict(os.environ), \
+             mock.patch.object(drift, "_write_baseline") as write, \
+             mock.patch.object(qualification, "reserve") as reserve, \
+             mock.patch.object(drift, "_desktop_notify") as notify:
+            os.environ.pop(drift.NO_AUTO_REQUALIFY_ENV, None)
+            first_state = None
+            for result in (item for failure in failures for item in (failure, completed("1"))):
+                fake = mock.Mock(**({"side_effect": result} if isinstance(result, Exception)
+                                    else {"return_value": result}))
+                current = json.loads(json.dumps(baseline))
+                current["executables"]["codex"]["version"] = drift._version(
+                    str(self.home / "codex"), runner=fake)
+                with mock.patch.object(drift, "inventory", return_value=current):
+                    report = drift.quick_check(str(self.config), home=str(self.home), force_refresh=True)
+                self.assertTrue(report["ok"])
+                self.assertEqual(report["changed"], [])
+                self.assertEqual(report["attention"], [])
+                self.assertEqual(drift.requalify_on_detect(None, report, home=str(self.home))["started"], False)
+                drift.report_attention(str(self.home), report)
+                state = store.read_json(drift.paths(str(self.home))["attention"])
+                if first_state is None:
+                    first_state = state
+                self.assertEqual(state, first_state)
+            write.assert_not_called()
+            reserve.assert_not_called()
+            notify.assert_not_called()
+        self.assertEqual(qualification.status(str(self.home))["keys"], [])
+        self.assertEqual(baseline_path.read_bytes(), original)
+        self.assertEqual(baseline_path.stat().st_mtime_ns, stamp)
+
+    def test_doctor_does_not_record_an_unavailable_version(self) -> None:
+        baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        failed = json.loads(json.dumps(baseline))
+        failed["executables"]["codex"]["version"] = None
+        for old in (baseline, None):
+            with self.subTest(has_baseline=old is not None), \
+                 mock.patch.object(drift, "inventory", return_value=failed), \
+                 mock.patch.object(drift, "_read_baseline", return_value=old), \
+                 mock.patch.object(drift, "_write_baseline") as write, \
+                 mock.patch.object(drift, "_claude_help_has_flags", return_value={"ok": True}), \
+                 mock.patch.object(drift, "run_cli_check", return_value={"ok": True}), \
+                 mock.patch.object(drift, "run_gemma_check", return_value={"ok": True}):
+                report = drift.doctor(str(self.config), home=str(self.home), runner=self.runner([]))
+                self.assertEqual(report["changed"], [])
+                write.assert_not_called()
+                if old is None:
+                    scheduled = drift.scheduled_baseline(str(self.config), home=str(self.home), runner=self.runner([]))
+                    self.assertTrue(scheduled["ok"])
+                    self.assertFalse(scheduled["recorded"])
+                    write.assert_not_called()
+
+    def test_unknown_version_keeps_hash_and_move_checks(self) -> None:
+        for name in ("claude", "codex"):
+            baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+            baseline["executables"][name].update(native_kind="vendor_tree_v1", native_sha256="tree")
+            failed = json.loads(json.dumps(baseline))
+            failed["executables"][name]["version"] = None
+            self.assertEqual(drift.changes(failed, baseline), [])
+            for field in ("sha256", "native_sha256", "path"):
+                with self.subTest(name=name, field=field):
+                    current = json.loads(json.dumps(failed))
+                    current["executables"][name][field] = "changed"
+                    self.assertEqual(drift.changes(current, baseline), [name])
+                    self.assertEqual(drift._moved(current, baseline), [])
+
+    def test_successful_unchanged_probe_clears_only_failed_probe_records(self) -> None:
+        from agent_bridge import qualification, store
+        baseline = self.inventory(codex=self.home / "codex", claude=self.home / "claude")
+        drift._write_baseline(str(self.home), baseline)
+        failed = json.loads(json.dumps(baseline))
+        failed["executables"]["codex"]["version"] = None
+        real_change = json.loads(json.dumps(failed))
+        real_change["executables"]["codex"]["sha256"] = "changed"
+        for reason in ("attempts_exhausted", "daily_budget_exhausted"):
+            with self.subTest(reason=reason):
+                qualification.report_refusal(str(self.home), "codex", failed, reason)
+                qualification.report_refusal(str(self.home), "codex", real_change, reason)
+                with mock.patch.object(drift, "_desktop_notify"):
+                    drift.report_attention(str(self.home), {"ok": False, "changed": ["codex"],
+                                                           "attention": [reason]})
+                old_path = Path(qualification._state_path(str(self.home), qualification.key("codex", failed)))
+                original = old_path.read_bytes()
+                self.quick_with_baseline(failed, baseline, config=str(self.config))
+                self.assertEqual(old_path.read_bytes(), original)
+                # Neither a different successful version nor an unknown hash
+                # can prove the old exhausted identity was just a failed probe.
+                for field, value in (("version", "2"), ("sha256", None)):
+                    current = json.loads(json.dumps(baseline))
+                    current["executables"]["codex"][field] = value
+                    self.quick_with_baseline(current, baseline, config=str(self.config))
+                    self.assertTrue(old_path.exists())
+                report = self.quick_with_baseline(baseline, baseline, config=str(self.config))
+                drift.report_attention(str(self.home), report)
+                self.assertTrue(report["ok"])
+                self.assertEqual(report["attention"], [])
+                self.assertTrue(store.read_json(drift.paths(str(self.home))["attention"])["ok"])
+                self.assertFalse(old_path.exists())
+                self.assertEqual(len(qualification.status(str(self.home))["keys"]), 1)
+                self.assertEqual(qualification.attention(str(self.home), ["codex"], real_change)[0]["reason"], reason)
+
     def test_quick_check_only_vendor_tree_content_move_is_informational(self) -> None:
         for name in ("claude", "codex"):
             with self.subTest(name=name):
