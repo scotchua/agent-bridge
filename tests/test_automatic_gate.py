@@ -257,6 +257,7 @@ class CommandTargetsAndTaskOwnership(AutoCase):
                 self.assertEqual(result.code, 'shell_targets_unresolved')
                 self.assertFalse(result.allowed)
 
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
     def test_list_form_and_read_denial_survive_quote_proof(self):
         import shlex
         command = shlex.join([sys.executable, '-c', "pattern = '12$'\nPath('/tmp/x').write_text('x')"])
