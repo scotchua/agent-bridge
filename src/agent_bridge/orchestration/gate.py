@@ -68,7 +68,7 @@ from .. import python_runtime, store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
-from . import autoroute, claim_reconcile, config as orchestration_config, localfirst
+from . import autoroute, claim_reconcile, config as orchestration_config, literal_records, localfirst
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -1291,6 +1291,9 @@ def _shell_write_targets(command: str, cwd: str) -> list[tuple[str, bool]] | Non
     writers keep the old conservative operand scan, scoped to that command.
     None means the caller must retain the legacy whole-command check.
     """
+    records = literal_records.targets(command)
+    if records is not None:
+        return [(path, False) for path in records]
     commands = _shell_commands(command, preserve_quotes=True)
     if commands is None:
         return None
@@ -1423,6 +1426,8 @@ def _shell_write_targets(command: str, cwd: str) -> list[tuple[str, bool]] | Non
 
 def shell_writes(command: str) -> bool:
     """Whether ``command`` looks like it writes. A heuristic; see the module docstring."""
+    if literal_records.targets(command) is not None or literal_records.is_attempt(command):
+        return True
     commands = _shell_commands(command)
     if commands is not None:
         return any(any(operator != "<" for operator, _ in redirects)
@@ -2340,6 +2345,12 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     if kind == "shell_read":
         return Decision("allow", "shell_read_only_heuristic",
                         "command does not look like it writes (heuristic)", logged=False)
+    if kind == "shell":
+        command = _command_text(tool_input)
+        if literal_records.is_attempt(command) and literal_records.targets(command) is None:
+            return Decision("deny", "literal_receipt_unresolved",
+                            "delegation-first gate: isolated receipt command is not fully literal "
+                            "and canonically quoted; no write is authorized")
     disabled_tasks = quality_disabled_tasks_from_config(config_path) if config_path else None
     if kind == "read":
         return judge_read(client, paths, cwd, state_root=state_root,
@@ -2352,9 +2363,22 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                                   decide=decide, config_path=config_path)
     if kind == "shell" and write_decision.allowed:
         command = _command_text(tool_input)
-        if _shell_commands(command) is None:
+        if _shell_commands(command) is None and literal_records.targets(command) is None:
             executable = re.sub(r"'[^']*'", "", command)
-            if ("$" in executable or "`" in executable
+            # Prove outer quoting only, after the existing write checks.
+            # Never infer permission for a Python body or unknown targets.
+            argv = literal_records.canonical_argv(command)
+            shells = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "yash",
+                      "fish", "csh", "tcsh", "busybox", "eval", "source", "."}
+            literal_dynamic = bool(argv) and any("$" in word or "`" in word for word in argv)
+            # Case-insensitive filesystems may run /bin/BASH as /bin/bash.
+            # This deliberately over-denies e.g. a literal '.' argument.
+            # Renamed shells, env -S bodies and arbitrary interpreter bodies
+            # remain outside this heuristic, as they were before this change.
+            nested_shell = bool(argv) and any(os.path.basename(word).lower() in shells for word in argv)
+            equals_expansion = bool(argv) and any(word.startswith("=") for word in argv)
+            if (equals_expansion or (nested_shell and literal_dynamic)
+                    or (argv is None and ("$" in executable or "`" in executable))
                     or re.search(r"(^|[;&|\n])\s*eval(?:\s|$)", command)):
                 return Decision("deny", "shell_targets_unresolved",
                                 "delegation-first gate: dynamic shell write targets cannot be resolved; "
@@ -2372,7 +2396,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     # going nowhere should not trigger.
     if kind == "shell" and client == "codex" and write_decision.allowed:
         command = _command_text(tool_input)
-        if _shell_whole_file_read(command):
+        if literal_records.targets(command) is None and _shell_whole_file_read(command):
             read_decision = judge_read(
                 client, _shell_read_paths(command, cwd), cwd, state_root=state_root,
                 local_queue_root=local_queue_root, worker_executable=worker_executable,

@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +199,285 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.assertIsNone(self.receipt_for(self.repo))
         self.assertEqual([row["item_id"] for row in gate.claim_reconcile._ledger_rows(str(self.db))],
                          [self.item])
+
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
+    def test_canonical_quote_words_preserve_literals_and_reject_shell_syntax(self):
+        import shlex
+        from agent_bridge.orchestration import literal_records as lr
+        words = ["exec", "python3", "-c", "pattern = '--request-limit 12$'\n# café `literal`", "", "a\tb"]
+        self.assertEqual(lr.canonical_argv(shlex.join(words)), words)
+        for command in ('echo $X', 'echo "$X"', 'echo $(id)', 'echo `id`',
+                        'echo x; id', 'echo x && id', 'echo x | cat',
+                        'echo x > y', 'echo\nx', 'echo "safe"', 'echo \\x',
+                        '', 'echo \ud800', 'x' * (lr.MAX_COMMAND + 1)):
+            with self.subTest(command=repr(command)):
+                self.assertIsNone(lr.canonical_argv(command))
+        self.assertIsNone(lr.canonical_argv(None))
+        with mock.patch.object(lr.os, 'name', 'nt'):
+            self.assertIsNone(lr.canonical_argv('echo x'))
+
+    def quote_layer(self, command, write=None, read=None):
+        # Isolate only the final dynamic-shell check. Separate end-to-end
+        # tests below exercise actual target ownership and routing decisions.
+        with mock.patch.object(gate, 'classify', return_value=('shell', [])), \
+             mock.patch.object(gate, '_judge_write', return_value=write or gate.Decision('allow', 'test', 'test')), \
+             mock.patch.object(gate, '_shell_commands', return_value=None), \
+             mock.patch.object(gate, 'judge_read', return_value=read or gate.Decision('allow', 'read-test', 'test')):
+            return gate.judge('codex', 'Bash', {'command': command}, str(self.repo), state_root=str(self.state))
+
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
+    def test_apostrophe_joined_python_regex_is_not_outer_shell_expansion(self):
+        import shlex
+        import re
+        body = "pattern = '--request-limit 12$'\nPath('/tmp/result.json').write_text('done')"
+        command = shlex.join(['exec', '/usr/bin/env', '-i', 'HOME=/tmp',
+                              sys.executable, '-B', '-c', body])
+        self.assertIn('$', re.sub(r"'[^']*'", '', command))
+        self.assertTrue(self.quote_layer(command).allowed)
+        self.assertTrue(self.quote_layer(shlex.join(['printf', '%s', '$X'])).allowed)
+        # All earlier denials remain authoritative even for this syntax.
+        for code in ('gate_state_protected', 'task_owned_elsewhere', 'routed_elsewhere'):
+            result = self.quote_layer(command, gate.Decision('deny', code, 'test'))
+            self.assertEqual(result.code, code)
+            self.assertFalse(result.allowed)
+
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
+    def test_dynamic_outer_and_nested_shells_remain_refused(self):
+        import shlex
+        commands = ['echo $X', 'echo "$X"', 'echo $(id)', 'echo `id`',
+                    'eval x', '=python3 x']
+        for shell in ('sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'yash',
+                      'fish', 'csh', 'tcsh', 'busybox', 'eval', 'source', '.',
+                      '/bin/sh', '/bin/BASH', '/bin/Sh', '/bin/Zsh'):
+            for wrapper in ([], ['env'], ['xargs'], ['find', '.', '-exec']):
+                commands.append(shlex.join(wrapper + [shell, '-c', "echo 'x' $T"]))
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.quote_layer(command)
+                self.assertEqual(result.code, 'shell_targets_unresolved')
+                self.assertFalse(result.allowed)
+
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
+    def test_list_form_and_read_denial_survive_quote_proof(self):
+        import shlex
+        command = shlex.join([sys.executable, '-c', "pattern = '12$'\nPath('/tmp/x').write_text('x')"])
+        normalized = gate._command_text({'command': ['bash', '-lc', command]})
+        self.assertEqual(shlex.split(normalized), ['bash', '-lc', command])
+        self.assertEqual(self.quote_layer(normalized).code, 'shell_targets_unresolved')
+        direct = gate._command_text({'command': shlex.split(command)})
+        self.assertTrue(self.quote_layer(direct).allowed)
+        with mock.patch.object(gate, '_shell_whole_file_read', return_value=True):
+            result = self.quote_layer(command, read=gate.Decision('deny', 'read-denied', 'test'))
+        self.assertEqual(result.code, 'read-denied')
+        self.assertFalse(result.allowed)
+
+    def test_literal_dollars_do_not_override_actual_task_or_protected_targets(self):
+        # The recognized receipt workflow still applies target and ownership
+        # checks to data containing the exact failing apostrophe/dollar shape.
+        text = "pattern = '--request-limit 12$'"
+        self.assertAllowed(self.shell(self.literal_receipt_command(content=text)))
+        self.assertDenied(self.shell(self.literal_receipt_command(content=text), 'claude'), 'task_owned_elsewhere')
+        self.assertDenied(self.shell(self.literal_receipt_command(self.state / 'forged', text)), 'gate_state_protected')
+
+    def literal_receipt_command(self, destination=None, content=None, body=None):
+        import shlex
+        if os.name != "posix":
+            self.skipTest("the new receipt envelope is POSIX-only; Windows retains its existing gate")
+        destination = self.target if destination is None else destination
+        content = f"copy rm mv {self.home}; cat {self.state}/ledger > x" if content is None else content
+        body = (f"with open({str(destination)!r}, 'x', encoding='utf-8') as receipt:\n"
+                f"    receipt.write({content!r})\n") if body is None else body
+        return shlex.join(["exec", "/usr/bin/env", "-i", f"HOME={self.home}",
+                           "PATH=/usr/bin:/bin", "LANG=en_US.UTF-8", f"PYTHONPATH={self.repo}/src",
+                           os.path.realpath(sys.executable), "-I", "-S", "-B", "-c", body])
+
+    def test_literal_receipt_envelope_routes_only_actual_destinations(self):
+        before = gate.claim_reconcile._ledger_rows(str(self.db))
+        for client in ("codex", "claude"):
+            if client == "claude":
+                # Owner must still govern the new syntax.
+                self.assertDenied(self.shell(self.literal_receipt_command(), client), "task_owned_elsewhere")
+                continue
+            for content in ("copy", f"rm -rf {self.home}", f"$(rm -rf {self.state})",
+                            f"quoted ' ; `cat {self.state}`", 'line1\nline2', ""):
+                command = self.literal_receipt_command(content=content)
+                with self.subTest(content=content):
+                    self.assertEqual(gate._shell_write_targets(command, str(self.repo)),
+                                     [(str(self.target), False)])
+                    self.assertAllowed(self.shell(command))
+        self.assertEqual(gate.claim_reconcile._ledger_rows(str(self.db)), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.assertFalse(self.target.exists())  # command text was never run
+
+    def test_literal_receipts_keep_protected_and_symlink_refusals(self):
+        link = self.task / "linked-state"
+        link.symlink_to(self.state, target_is_directory=True)
+        for destination in (self.state / "forged.json", link / "forged.json",
+                            self.tasks / "../orchestration/runtime/forged.json",
+                            self.home / ".codex/hooks.json"):
+            with self.subTest(destination=destination):
+                self.assertDenied(self.shell(self.literal_receipt_command(destination)), "gate_state_protected")
+
+    def test_literal_receipts_check_all_targets_and_ownership(self):
+        self.router.renew(self.item, "review", owner_id="codex-session", lease_seconds=1,
+                          expected_revision=self.owned["revision"])
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 10)
+        self.assertEqual(decision.code, "stage_lease_expired")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 700)
+        self.assertEqual(decision.code, "task_lease_expired")
+        decision = gate._judge_task_records("codex", [str(self.target)], None, time.time())
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        safe = f"with open({str(self.target)!r}, 'x', encoding='utf-8') as receipt:\n    receipt.write('ok')\n"
+        unsafe = f"with open({str(self.state / 'forged')!r}, 'x', encoding='utf-8') as receipt:\n    receipt.write('ok')\n"
+        self.assertDenied(self.shell(self.literal_receipt_command(body=safe + unsafe)), "gate_state_protected")
+
+    def test_unrecognized_python_does_not_gain_precision(self):
+        from agent_bridge.orchestration import literal_records
+        good = f"with open({str(self.target)!r}, 'x', encoding='utf-8') as receipt:\n    receipt.write('ok')\n"
+        bodies = [good.replace("'x'", "'w'"), good.replace("'ok'", "str(1)"),
+                  good + "import os\n", good + "open = print\n", good + "exec('pass')\n",
+                  good.replace("receipt.write('ok')", "receipt.write(open('/secret').read())"),
+                  good.replace(repr(str(self.target)), "destination"),
+                  good.replace("'utf-8'", "'utf-7'"),
+                  good.replace("encoding='utf-8'", "opener=custom"),
+                  good.replace("as receipt", "as open"), good + "raise Exception()\n"]
+        for body in bodies:
+            with self.subTest(body=body):
+                command = self.literal_receipt_command(body=body)
+                self.assertIsNone(literal_records.targets(command))
+                self.assertDenied(self.shell(command), "literal_receipt_unresolved")
+        command = self.literal_receipt_command()
+        for changed in (command + '; touch ' + str(self.state / 'f'),
+                        command + ' > ' + str(self.state / 'f'),
+                        command.replace('exec ', 'sudo '), command.replace(' -i ', ' '),
+                        command.replace(' -B ', ' -S -B '), command.replace(' -c ', ' -m '),
+                        command.replace('LANG=', 'PYTHONSTARTUP='),
+                        command.replace(' -B ', ' -B\n'), command + ' ignored',
+                        command.replace('exec ', 'exec -a disguised ')):
+            with self.subTest(command=changed):
+                self.assertIsNone(literal_records.targets(changed))
+
+    def test_literal_receipt_repo_writes_still_route(self):
+        destination = self.repo / "new.py"
+        self.write_policy({str(self.repo): {"classification": "internal_nonclient",
+                                           "allowed_routes": ["claude"]}})
+        self.observe("claude")
+        self.assertDenied(self.shell(self.literal_receipt_command(destination)), "routed_elsewhere")
+
+    def test_literal_receipt_target_repo_independent_of_cwd_and_pythonpath(self):
+        import shlex
+        self.write_policy({str(self.repo): {"classification": "internal_nonclient",
+                                           "allowed_routes": ["claude"]}})
+        self.observe("claude")
+        command = self.literal_receipt_command(self.repo / "new.py")
+        args = shlex.split(command)
+        args[6] = f"PYTHONPATH={self.scratch}"
+        command = shlex.join(args)
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.scratch)}
+        self.assertDenied(self.run_hook("codex", payload), "routed_elsewhere")
+        # Opposite direction: Python search path is not a mutation target.
+        payload["tool_input"]["command"] = self.literal_receipt_command(self.scratch / "new.json")
+        self.assertAllowed(self.run_hook("codex", payload))
+
+    def test_literal_receipt_rejects_reviewed_quote_gap_and_startup_attacks(self):
+        import shlex
+        from agent_bridge.orchestration import literal_records
+        args = shlex.split(self.literal_receipt_command())
+        for symbol in ("$", "`"):
+            link = self.scratch / symbol
+            link.symlink_to(self.state, target_is_directory=True)
+            # Gate sees a literal backslash; shell removes it in double quotes.
+            body = f"with open('{self.scratch}/\\{symbol}/forged', 'x', encoding='utf-8') as receipt: receipt.write('copy')"
+            attack = shlex.join(args[:-1]) + ' "' + body + '"'
+            self.assertIsNone(literal_records.targets(attack))
+            self.assertNotEqual(self.shell(attack), {})
+        command = shlex.join(args)
+        for gap in ('\x0b', '\x0c', '\x1c', '\x85', '\xa0', '\u2028', '\n', '\r'):
+            self.assertIsNone(literal_records.targets(command.replace(' -I ', gap + '-I ', 1)))
+        for flag in ('-I', '-S', '-B'):
+            changed = args.copy()
+            changed.remove(flag)
+            self.assertIsNone(literal_records.targets(shlex.join(changed)))
+        changed = args.copy()
+        changed[changed.index('-I') - 1] = '/untrusted/python3'
+        self.assertIsNone(literal_records.targets(shlex.join(changed)))
+        self.assertIsNone(literal_records.targets(command.replace('en_US.UTF-8', 'ja_JP.SJIS')))
+
+    def test_literal_receipt_isolated_startup_ignores_synthetic_customization(self):
+        import shlex
+        marker = self.scratch / 'startup-was-run'
+        site = self.scratch / 'sitecustomize.py'
+        site.write_text(f"open({str(marker)!r}, 'w').write('bad')\n")
+        self.target.parent.mkdir()
+        args = shlex.split(self.literal_receipt_command(content='ok'))[1:]
+        args[5] = f'PYTHONPATH={self.scratch}'
+        self.assertIsNotNone(gate.literal_records.targets(shlex.join(args)))
+        completed = subprocess.run(args, capture_output=True, timeout=15, cwd=self.scratch)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.target.read_text(), 'ok')
+
+    def test_literal_receipt_rejects_symlink_venv_and_startup_configs(self):
+        import shlex
+        from unittest import mock
+        from agent_bridge.orchestration import literal_records
+        binary = self.scratch / 'venv/bin/python3'
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(os.path.realpath(sys.executable))
+        cfg = binary.parent.parent / 'pyvenv.cfg'
+        cfg.write_text(f'home = {Path(sys.executable).parent}\ninclude-system-site-packages = false\n')
+        args = shlex.split(self.literal_receipt_command())
+        args[args.index('-I') - 1] = str(binary)
+        command = shlex.join(args)
+        self.assertIsNone(literal_records.targets(command))
+        self.assertDenied(self.shell(command), 'literal_receipt_unresolved')
+        # Read-only synthetic child demonstrates venv detection despite -I -S.
+        # It runs no substituted library and writes no marker or receipt.
+        observed = subprocess.run([str(binary), '-I', '-S', '-B', '-c',
+                                   'import sys; print(sys.prefix)'], capture_output=True,
+                                  timeout=15, env={'HOME':str(self.home), 'LANG':'en_US.UTF-8'})
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        if sys.version_info >= (3, 14):
+            self.assertEqual(os.path.realpath(observed.stdout.decode().strip()),
+                             os.path.realpath(binary.parent.parent))
+        # Fixture-only simulated gate pin; no real interpreter directory edit.
+        fake = (self.scratch / 'install/bin/python3').resolve()
+        fake.parent.mkdir(parents=True)
+        fake.write_text('not executed')
+        with mock.patch.object(literal_records, '_GATE_INTERPRETER', str(fake)):
+            self.assertTrue(literal_records._interpreter_path_is_clean(str(fake)))
+            for root in (fake.parent, fake.parent.parent):
+                for name in ('pyvenv.cfg', 'python3._pth'):
+                    config = root / name
+                    config.write_text('synthetic')
+                    self.assertFalse(literal_records._interpreter_path_is_clean(str(fake)))
+                    config.unlink()
+
+    def test_literal_receipt_rejects_lossy_unicode(self):
+        from agent_bridge.orchestration import literal_records
+        for command in (self.literal_receipt_command(content='\ud800'),
+                        self.literal_receipt_command(destination=str(self.target)+'\ud800'),
+                        self.literal_receipt_command()+'\ud800'):
+            self.assertIsNone(literal_records.targets(command))
+        body = f"with open({str(self.target)!r}, 'x', encoding='utf-8') as receipt:\n    receipt.write('''first\n   \nlast''')"
+        self.assertIsNone(literal_records.targets(self.literal_receipt_command(body=body)))
+
+    def test_literal_receipt_native_semantics_create_exactly_once(self):
+        import shlex
+        # Execute only this synthetic fixture in its isolated temporary home.
+        # No protected target, real receipt, runtime or provider is touched.
+        self.target.parent.mkdir()
+        content = "copy 'quoted' $(literal) `literal`\n   \nzero=0.00; blank=null\n"
+        command = self.literal_receipt_command(content=content)
+        argv = shlex.split(command)[1:]
+        command = shlex.join(argv)
+        self.assertEqual(gate._shell_write_targets(command, str(self.repo)), [(str(self.target), False)])
+        completed = subprocess.run(argv, capture_output=True, timeout=15, cwd=self.scratch)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.target.read_bytes(), content.encode('utf-8'))
+        again = subprocess.run(argv, capture_output=True, timeout=15, cwd=self.scratch)
+        self.assertNotEqual(again.returncode, 0)
+        self.assertEqual(self.target.read_bytes(), content.encode('utf-8'))
 
     def test_read_commands_never_open_implementation_stages(self):
         import shlex
