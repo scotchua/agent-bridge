@@ -55,6 +55,22 @@ class DriftMutationTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(drift._version(str(self.home / "invented-cli"), runner=lambda *a, **k: completed), "9.8.7")
 
+    def test_failed_version_probes_are_unknown(self) -> None:
+        failures = (subprocess.TimeoutExpired(["invented-cli", "--version"], 10),
+                    OSError("unavailable"), None,
+                    subprocess.CompletedProcess([], 1, b"error output"),
+                    subprocess.CompletedProcess([], 0, b" \n"))
+        for injected in (False, True):
+            for failure in failures:
+                with self.subTest(injected=injected, failure=failure):
+                    fake = mock.Mock(**({"side_effect": failure} if isinstance(failure, Exception)
+                                        else {"return_value": failure}))
+                    with mock.patch.object(drift.subprocess, "run", fake):
+                        self.assertIsNone(drift._version(str(self.home / "invented-cli"),
+                                                       runner=fake if injected else None))
+                    if not injected:
+                        self.assertEqual(fake.call_args.kwargs["timeout"], 10)
+
     def test_bridge_returns_loaded_configuration(self) -> None:
         configured = object()
         with mock.patch.object(drift.bridge_config, "load", return_value=configured):

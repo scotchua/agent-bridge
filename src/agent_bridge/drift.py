@@ -127,17 +127,18 @@ def _sha256(path: str | None) -> str | None:
 def _version(path: str | None, runner: Any | None = None) -> str | None:
     if not path:
         return None
-    if runner is not None:
-        completed = runner([path, "--version"], cwd=str(Path(path).parent), text="")
-        text = _completed_text(completed).strip()
-        return text.splitlines()[0] if completed and completed.returncode == 0 and text else None
     try:
-        completed = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   timeout=10, check=False, shell=False)
+        if runner is not None:
+            completed = runner([path, "--version"], cwd=str(Path(path).parent), text="")
+        else:
+            completed = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       timeout=10, check=False, shell=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    text = completed.stdout.decode("utf-8", "replace").strip()
+    if completed is None or completed.returncode != 0:
+        return None
+    text = _completed_text(completed).strip()
     return text.splitlines()[0] if text else None
 
 
@@ -507,6 +508,10 @@ def _same_executable(current: Any, baseline: Any) -> bool:
     upgrading = ("native_kind" not in baseline and
                  current.get("native_kind") in ("file_v1", "vendor_tree_v1"))
     ignored = {"path"}
+    # An unavailable probe is no evidence of a version change. Keep comparing
+    # every other field, including the hashes and relocation proof below.
+    if current.get("version") is None:
+        ignored.add("version")
     if upgrading:
         ignored.update({"native_kind", "native_sha256"})
     elif "native_sha256" not in baseline:
@@ -552,6 +557,26 @@ def _read_baseline(home: str) -> dict[str, Any] | None:
         return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _unavailable_versions(current: dict[str, Any]) -> list[str]:
+    return [name for name in ("claude", "codex")
+            if current["executables"].get(name, {}).get("path")
+            and current["executables"][name].get("version") is None]
+
+
+def _clear_version_probe_failures(home: str, current: dict[str, Any],
+                                  baseline: dict[str, Any] | None) -> None:
+    """Retire only old unknown-version identities now proven unchanged."""
+    if baseline is None:
+        return
+    from . import qualification
+    for name in ("claude", "codex"):
+        entry = current["executables"].get(name, {})
+        previous = baseline.get("executables", {}).get(name, {})
+        if (entry.get("version") is not None and entry.get("version") == previous.get("version")
+                and _same_executable(entry, previous)):
+            qualification.clear_version_probe_failure(home, name, current)
 
 
 def _write_baseline(home: str, value: dict[str, Any]) -> None:
@@ -944,12 +969,13 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
     metadata_refreshed = baseline is not None and any(
         name not in changed and current["executables"].get(name) != baseline.get("executables", {}).get(name)
         for name in ("claude", "codex"))
-    if baseline is None or passed or metadata_refreshed:
+    if (baseline is None or passed or metadata_refreshed) and not _unavailable_versions(current):
         _write_baseline(home, _merge_good_baseline(baseline, current, passed,
                                                     live_components=selected_live))
     # A foreground doctor is the explicit resolution action.  Do not leave a
     # worker holding otherwise qualified jobs on a ten-minute cached diff.
     _quick_cache.clear()
+    _clear_version_probe_failures(home, current, baseline)
     needs.extend(_quality_attention(current.get("config_path")))
     return {"ok": not needs, "inventory": current, "consumers": current.get("consumers", []), "changed": changed, "moved": _moved(current, baseline), "requalified": sorted(passed), "needs_you": needs, "checks": checked,
             "launcher_python": launcher_python, "runtime_revisions": runtime,
@@ -1017,6 +1043,7 @@ def quick_check(config_path: str | None = None, *, home: str | None = None,
             attention.append(f"Gemma {key_name} no longer matches its pinned checksum; repair it and run setup_bridge.py doctor.")
     try:
         from . import qualification
+        _clear_version_probe_failures(home, current, baseline)
         for item in qualification.attention(home, _qualification_components({"changed": names}), current):
             attention.append(_qualification_attention_line(item, baseline))
     except Exception:
@@ -1223,6 +1250,9 @@ def scheduled_baseline(config_path: str | None = None, *, home: str | None = Non
     if needs:
         return {"ok": False, "baseline": "missing", "recorded": False,
                 "inventory": current, "needs_you": needs, "checks": checks}
+    if _unavailable_versions(current):
+        return {"ok": True, "baseline": "missing", "recorded": False,
+                "inventory": current, "needs_you": [], "checks": checks}
     _write_baseline(home, current)
     _quick_cache.clear()
     return {"ok": True, "baseline": "recorded", "recorded": True,

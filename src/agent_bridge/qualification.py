@@ -244,6 +244,24 @@ def report_refusal(home: str, component: str, inventory: dict[str, Any], reason:
         return {"component": component, "key": identity_key, "identity": state["identity"]}
 
 
+def clear_version_probe_failure(home: str, component: str, inventory: dict[str, Any]) -> None:
+    """Forget the old failed-probe key after a successful unchanged reading.
+
+    The caller proves equivalence to the baseline. This exact key preserves
+    records for real hash, path or successful-version changes.
+    """
+    failed = {**inventory, "executables": {**inventory["executables"],
+              component: {**inventory["executables"][component], "version": None}}}
+    path = _state_path(home, key(component, failed))
+    if not os.path.isfile(path):
+        return
+    try:
+        with store.file_lock(paths(home)["lock"], timeout=2.0):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def status(home: str, *, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
     locations = paths(home); rows: list[dict[str, Any]] = []
