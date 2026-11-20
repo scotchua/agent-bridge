@@ -200,6 +200,7 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.assertEqual([row["item_id"] for row in gate.claim_reconcile._ledger_rows(str(self.db))],
                          [self.item])
 
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
     def test_canonical_quote_words_preserve_literals_and_reject_shell_syntax(self):
         import shlex
         from agent_bridge.orchestration import literal_records as lr
@@ -224,6 +225,7 @@ class CommandTargetsAndTaskOwnership(AutoCase):
              mock.patch.object(gate, 'judge_read', return_value=read or gate.Decision('allow', 'read-test', 'test')):
             return gate.judge('codex', 'Bash', {'command': command}, str(self.repo), state_root=str(self.state))
 
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
     def test_apostrophe_joined_python_regex_is_not_outer_shell_expansion(self):
         import shlex
         import re
@@ -239,6 +241,7 @@ class CommandTargetsAndTaskOwnership(AutoCase):
             self.assertEqual(result.code, code)
             self.assertFalse(result.allowed)
 
+    @unittest.skipUnless(os.name == "posix", "canonical quote recognition is POSIX-only; Windows keeps the base heuristic")
     def test_dynamic_outer_and_nested_shells_remain_refused(self):
         import shlex
         commands = ['echo $X', 'echo "$X"', 'echo $(id)', 'echo `id`',
