@@ -3842,12 +3842,15 @@ def test_timeout_canary_effective_config_and_verdict() -> None:
 
 def test_candidate_verification_path() -> None:
     print("\n[candidate verification path]")
+    import contextlib
     import importlib.util
+    import io
     from unittest import mock
     from agent_bridge import python_runtime, setup_cmd
 
     peer_fixture = Sandbox()
-    root = tempfile.mkdtemp(prefix=".candidate-test-", dir=REPO)
+    root = tempfile.mkdtemp(prefix=".candidate-test-")
+    fixture_patches = contextlib.ExitStack()
     real_launcher_record = python_runtime.record_path()
     real_launcher_before = (open(real_launcher_record, "rb").read()
                             if os.path.isfile(real_launcher_record) else None)
@@ -3869,6 +3872,18 @@ def test_candidate_verification_path() -> None:
 
         candidate_claude = candidate_executable("claude")
         candidate_codex = candidate_executable("codex")
+        incomplete_path = os.path.join(root, "incomplete-results.json")
+        results_path = os.path.join(root, "canary-results.json")
+        # Model installed peers and durable evidence without requiring the
+        # checkout (or Windows launcher shims) to live outside the OS temp
+        # directory. Every other path still uses the real durability check.
+        real_is_durable = setup_cmd.is_durable
+        durable_fixture_paths = {
+            candidate_claude, candidate_codex, incomplete_path, results_path,
+        }
+        fixture_patches.enter_context(mock.patch.object(
+            setup_cmd, "is_durable", side_effect=lambda path: (
+                path in durable_fixture_paths or real_is_durable(path))))
         check("VP1: candidate setup paths are durable",
               setup_cmd.is_durable(candidate_claude)
               and setup_cmd.is_durable(candidate_codex),
@@ -3913,6 +3928,8 @@ def test_candidate_verification_path() -> None:
                 "--claude", candidate_claude,
                 "--codex", candidate_codex,
             ])
+        check("VP2: candidate setup succeeds and creates its output",
+              result == 0 and os.path.isfile(candidate_path), str(result))
         candidate = config_module.load_effective(candidate_path)
         check("VP2: --candidate writes one complete validated effective config",
               result == 0 and candidate.raw == runtime.raw
@@ -3942,16 +3959,20 @@ def test_candidate_verification_path() -> None:
         run_canaries = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(run_canaries)
 
-        incomplete_path = os.path.join(root, "incomplete-results.json")
         env = dict(os.environ)
         env["PYTHONPATH"] = os.path.join(REPO, "src")
-        proc = subprocess.run([
-            sys.executable, os.path.join(REPO, "canaries", "run_canaries.py"),
+        # Run the real CLI entry point in-process so the narrowly scoped
+        # durability fixture also applies to its result path. Broker workers
+        # still execute the fake peers in subprocesses.
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", [
+            os.path.join(REPO, "canaries", "run_canaries.py"),
             "--config", candidate_path,
             "--direction", "claude-to-codex",
             "--one-turn", "1", "--three-turn", "0",
             "--skip-timeout-canary", "--out", incomplete_path,
-        ], capture_output=True, cwd=REPO, env=env, timeout=90)
+        ]), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            exit_code = run_canaries.main()
         incomplete = store.read_json(incomplete_path)
         required_fields = {
             "effective_config_sha256", "configured_versions",
@@ -3959,8 +3980,8 @@ def test_candidate_verification_path() -> None:
             "verdict",
         }
         check("VP3: the runner always writes every required result field",
-              proc.returncode == 0 and required_fields <= set(incomplete),
-              proc.stderr.decode("utf-8", "replace")[-500:])
+              exit_code == 0 and required_fields <= set(incomplete),
+              errors.getvalue()[-500:])
         check("VP3: --skip-timeout-canary has a durable INCOMPLETE verdict",
               incomplete["verdict"] == "INCOMPLETE"
               and incomplete["controls_requested"]["timeout_canaries"] == 1
@@ -3984,6 +4005,8 @@ def test_candidate_verification_path() -> None:
         temporary_out = os.path.join(
             tempfile.gettempdir(),
             f"agent-bridge-disallowed-{os.path.basename(root)}.json")
+        check("VP3: the durability fixture still rejects unrelated temporary paths",
+              not setup_cmd.is_durable(temporary_out))
         temp_result = subprocess.run([
             sys.executable, os.path.join(REPO, "canaries", "run_canaries.py"),
             "--config", candidate_path, "--skip-timeout-canary",
@@ -4025,7 +4048,6 @@ def test_candidate_verification_path() -> None:
               and passing["controls_requested"] == passing["controls_executed"],
               json.dumps(passing))
 
-        results_path = os.path.join(root, "canary-results.json")
         destination = os.path.join(root, "promoted-local.json")
         store.atomic_write_json(destination, {"sentinel": "unchanged"})
         refused_before = open(destination, "rb").read()
@@ -4068,6 +4090,7 @@ def test_candidate_verification_path() -> None:
               store.read_json(destination) == promoted
               and config_module.merge(base_config, promoted) == candidate.raw)
     finally:
+        fixture_patches.close()
         shutil.rmtree(root, ignore_errors=True)
         peer_fixture.cleanup()
 
