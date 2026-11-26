@@ -2051,11 +2051,14 @@ def _task_ledger_rows(capacity_db: str) -> list[dict]:
 
     The gate never changes the ledger.  A short retry only avoids turning a
     writer's momentary SQLite lock into a self-inflicted task-folder lockout;
-    all other failures retain the normal fail-closed behavior.
+    all other failures retain the normal fail-closed behavior.  At most three
+    one-second SQLite waits and 0.15 seconds of backoff are spent here, so
+    lock contention costs at most 3.15 seconds inside the hook's ten-second
+    judgment budget.
     """
     for attempt in range(3):
         try:
-            return claim_reconcile._ledger_rows(capacity_db, timeout=0.1)
+            return claim_reconcile._ledger_rows(capacity_db, timeout=1.0)
         except sqlite3.OperationalError as exc:
             if not _locked_or_busy(exc) or attempt == 2:
                 raise
@@ -2121,8 +2124,23 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
                                   f"expected_revision={task.get('revision', 0)}; if this claim is stale, "
                                   f"run claims.py release for task {item!r}")
                     else:
-                        action = (f"reconcile task {item!r} with its live ledger owner, or run "
-                                  f"claims.py release for task {item!r} if this claim is stale")
+                        row = stage_rows[0]
+                        lease = row.get("lease_until")
+                        own_expired = (row.get("state") == "owned"
+                                       and row.get("owner_id") == claim["owner"]
+                                       and isinstance(lease, (int, float))
+                                       and not isinstance(lease, bool)
+                                       and math.isfinite(float(lease))
+                                       and float(lease) <= now)
+                        if own_expired:
+                            action = (f"call stage_renew with item_id={item!r}, "
+                                      f"stage={claim['stage']!r}; or call stage_claim with "
+                                      f"item_id={item!r}, stage={claim['stage']!r}, "
+                                      f"expected_revision={row['revision']}")
+                        else:
+                            action = (f"reconcile task {item!r} with ledger owner "
+                                      f"{row['owner_id']!r} on route {row['owner_route']!r}, or run "
+                                      f"claims.py release for task {item!r} if this claim is stale")
                     return Decision("deny", "task_claim_conflict",
                                     f"delegation-first gate: task {item!r} stage {claim['stage']!r} "
                                     f"has an unconfirmed live claim; {action}")
@@ -2213,13 +2231,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         """The receipt that governs this client here, and whether it lives in
         this client's own retain slot."""
         shared = read_receipt(state_root, repo, grace=False)
-        if (shared is not None and capacity_db is not None
-                and stage_binding(capacity_db, shared, now) == _STAGE_OWNER_EXPIRED):
-            # Unlike a terminal or reassigned stage, an expired owned row is
-            # no ownership at all. It must not route a later caller to the
-            # old owner even when automatic routing is disabled.
-            shared = None
-        if shared is not None and decide is not None and is_another_clients_retain(shared, client):
+        if shared is not None and is_another_clients_retain(shared, client):
             # Another client kept its own work. That is not a claim on the
             # repository, so this client is governed by its own retain, made
             # and re-made exactly like a shared one but never overwriting
@@ -2231,6 +2243,14 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             if own is not None and overtaken(own):
                 own = None
             return own, True
+        if (shared is not None and decide is None and capacity_db is not None
+                and stage_binding(capacity_db, shared, now) == _STAGE_OWNER_EXPIRED):
+            # Unlike a terminal or reassigned stage, an expired owned row is
+            # no ownership at all. It must not route a later caller to the
+            # old owner even when automatic routing is disabled. When a
+            # decider is present, ``overtaken`` performs this one binding
+            # read and retires the receipt below.
+            shared = None
         if shared is not None and decide is not None and overtaken(shared):
             shared = None
         return shared, False

@@ -57,6 +57,12 @@ Covered, with the hook installed and trusted:
   `stage_db_unavailable`, a deny). A receipt is a pointer to ownership the
   router holds, not a token: a fabricated one must name a stage the router
   really assigned to this route, which is the delegation-first flow itself.
+  An expired owned row is no ownership: it no longer routes a later caller to
+  the old owner. For task records, the self-heal denial names `stage_renew`
+  for that item's expired same-owner stage (or `stage_claim` with that
+  ledger row's `expected_revision`); an absent stage names
+  `stage_register`/`stage_claim`, while a different owner is named for
+  reconciliation or `claims.py release`.
 
 Not covered, stated plainly:
 

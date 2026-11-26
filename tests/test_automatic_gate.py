@@ -665,6 +665,33 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.assertEqual(decision.code, "task_claim_conflict")
         self.assertIn(self.item, decision.reason)
         self.assertIn("review", decision.reason)
+        self.assertIn("stage_renew", decision.reason)
+        self.assertIn(f"expected_revision={self.owned['revision']}", decision.reason)
+
+        # A claim whose stage is absent still names the register/claim repair.
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": "codex-session", "stage": "missing-stage",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_conflict")
+        self.assertIn("stage_register", decision.reason)
+        self.assertIn("stage_claim", decision.reason)
+        self.assertIn("claims.py release", decision.reason)
+
+        # A different ledger owner names the owner and route to reconcile.
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": "codex-session", "stage": "review",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET owner_id=?, owner_route=?, lease_until=? "
+                       "WHERE item_id = ? AND stage = ?",
+                       ("other-session", "claude", time.time() + 600, self.item, "review"))
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_conflict")
+        self.assertIn("other-session", decision.reason)
+        self.assertIn("claude", decision.reason)
+        self.assertIn("claims.py release", decision.reason)
+
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 700)
         self.assertTrue(decision.allowed, decision)
         (self.task / "task.json").write_text(json.dumps({"workload": {}}), encoding="utf-8")
@@ -2819,6 +2846,35 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         self.assertAllowed(self.hook("claude", self.repo))
         self.assertNotEqual(self.receipt_for(self.repo)["policy_fingerprint"],
                             shared["policy_fingerprint"])
+
+    def test_an_expired_other_retain_still_uses_the_callers_slot(self):
+        """An expired retain is its caller's concern, never the arrival's."""
+        for with_decider in (False, True):
+            with self.subTest(with_decider=with_decider):
+                self.setUp()
+                self.arrange({})
+                self.assertAllowed(self.hook("claude", self.repo))
+                self.assertAllowed(self.hook("codex", self.repo))
+                shared = self.receipt_for(self.repo)
+                own = self.own_receipt("codex")
+                # The direct update is deliberate: make only Claude's retain
+                # expired while preserving Codex's retain slot.
+                import contextlib
+                import sqlite3
+                with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+                    db.execute("UPDATE stages SET lease_until=? WHERE item_id=? AND stage=?",
+                               (time.time() - 1, shared["item_id"], shared["stage"]))
+                before = self.receipt_for(self.repo)
+                patch = ("*** Begin Patch\n*** Update File: app.py\n@@\n-x = 1\n+x = 2\n"
+                         "*** End Patch\n")
+                decision = gate.judge(
+                    "codex", "apply_patch", {"input": patch}, str(self.repo),
+                    state_root=str(self.state), capacity_db=str(self.db),
+                    decide=(gate.automatic_decider("codex", str(self.state), str(self.db))
+                            if with_decider else None))
+                self.assertTrue(decision.allowed, decision)
+                self.assertEqual(decision.receipt["stage"], own["stage"])
+                self.assertEqual(self.receipt_for(self.repo), before)
 
     def judge_in_process(self, client: str, decide=None):
         patch = ("*** Begin Patch\n*** Update File: app.py\n@@\n-x = 1\n+x = 2\n"
