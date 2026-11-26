@@ -63,6 +63,7 @@ from agent_bridge.orchestration.execution_queue import (  # noqa: E402
     ExecutionQueue, Harnesses, SubprocessHarnessExecutor,
     reserve_nothing,
 )
+import verification_capabilities
 
 def _verify_python() -> str | None:
     """The interpreter name to verify with, or None if this host has neither.
@@ -162,6 +163,11 @@ class Workflow(unittest.TestCase):
                 f"execution lanes refuse by design: {exc.code}") from None
 
     def setUp(self):
+        # Repo-default verification now discovers this workflow inside an
+        # already-confined job. Probe and record unsupported nested/loopback
+        # capabilities using the same helpers as the other harness suites.
+        verification_capabilities.requires_nested_confinement(self)
+        verification_capabilities.requires_loopback(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()

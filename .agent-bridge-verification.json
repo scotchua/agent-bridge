@@ -1,0 +1,7 @@
+{
+  "verify_argv": [
+    ["python3", "-m", "unittest", "bridge_verify"],
+    ["python3", "-m", "unittest", "discover", "-s", "tests"]
+  ],
+  "verify_timeout_seconds": 1800
+}

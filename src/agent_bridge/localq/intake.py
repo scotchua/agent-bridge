@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, UNSUPPORTED_KIND_REASON,
+from .spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, COORDINATOR_CHORES, UNSUPPORTED_KIND_REASON,
                     AdmissionError, LocalQueue, QueueCaps)
 
 
@@ -72,6 +72,13 @@ CLOSED_REFUSAL_REASONS = frozenset(CHECKPOINT_REASONS - {"eligible_mechanical_wo
 
 #: Every risk flag the intake recognizes. Anything else is risk_flags_invalid.
 KNOWN_FLAGS = frozenset(PROHIBITED_FLAGS | PERMITTED_FLAGS)
+
+# Recording cloud work is accounting only: it neither authorizes a cloud
+# route nor changes any classification, safety or backend admission decision.
+CHORE_WAIVER_REASONS = frozenset({
+    "local_unavailable", "local_refused", "local_failed", "local_timeout",
+    "quality_rejected", "operator_requested_cloud", "requires_judgment",
+})
 
 
 def accepted_values(reason: str, allowed_task_types: "frozenset[str]") -> dict[str, list[str]]:
@@ -115,7 +122,7 @@ class IntakePolicy:
     than inherited from the legacy field name.
     """
 
-    version: str = "localq-intake/v2"
+    version: str = "localq-intake/v3"
     min_input_chars: int = 800
     min_nonblank_lines: int = 12
     min_input_bytes: int | None = None
@@ -206,6 +213,13 @@ class AutomaticIntake:
             db.execute("""CREATE TRIGGER IF NOT EXISTS checkpoints_no_delete
                 BEFORE DELETE ON checkpoints BEGIN
                 SELECT RAISE(ABORT, 'checkpoints are append-only'); END""")
+            db.execute("""CREATE TABLE IF NOT EXISTS chore_waivers (
+                checkpoint_id TEXT PRIMARY KEY, created_at REAL NOT NULL,
+                caller TEXT NOT NULL, task_type TEXT NOT NULL, reason TEXT NOT NULL)""")
+            for operation in ("UPDATE", "DELETE"):
+                db.execute(f"""CREATE TRIGGER IF NOT EXISTS chore_waivers_no_{operation.lower()}
+                    BEFORE {operation} ON chore_waivers BEGIN
+                    SELECT RAISE(ABORT, 'chore waivers are append-only'); END""")
             db.execute("""CREATE TABLE IF NOT EXISTS health_refusals (
                 refusal_id TEXT PRIMARY KEY, created_at REAL NOT NULL,
                 checkpoint_id TEXT, classification TEXT NOT NULL, reason TEXT NOT NULL)""")
@@ -262,7 +276,11 @@ class AutomaticIntake:
             return "refused", UNSUPPORTED_KIND_REASON
         if self.queue.quality_disabled(task_type):
             return "refused", "quality_disabled"
-        if input_bytes < self.policy.byte_threshold and nonblank_lines < self.policy.min_nonblank_lines:
+        # Short coordinator chores are useful work too. All privacy, safety,
+        # capability and quality checks above still apply. Empty input never
+        # becomes invented work, and other kinds retain the original floor.
+        short_chore = task_type in COORDINATOR_CHORES and input_bytes > 0 and nonblank_lines > 0
+        if not short_chore and input_bytes < self.policy.byte_threshold and nonblank_lines < self.policy.min_nonblank_lines:
             return "refused", "below_local_delegation_threshold"
         return "eligible", "eligible_mechanical_work"
 
@@ -380,6 +398,33 @@ class AutomaticIntake:
         if row is None:
             raise AdmissionError("checkpoint_not_found")
         return self._public_checkpoint(row)
+
+    def waive_chore(self, *, checkpoint_id: str, caller: str, reason: str) -> dict[str, Any]:
+        """Append a caller-bound, content-free record of a cloud-done chore.
+
+        This is an explicit coordinator action, never automatic fallback.
+        Replays deduplicate; a different reason cannot overwrite the record.
+        """
+        if not isinstance(reason, str) or reason not in CHORE_WAIVER_REASONS:
+            raise AdmissionError("chore_waiver_reason_invalid")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM checkpoints WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
+            if row is None:
+                raise AdmissionError("checkpoint_not_found")
+            if caller not in {"claude", "codex"} or row["caller"] != caller:
+                raise AdmissionError("checkpoint_binding_mismatch")
+            if row["task_type"] not in COORDINATOR_CHORES or row["status"] == "no_eligible_unit":
+                raise AdmissionError("checkpoint_not_a_chore")
+            existing = db.execute("SELECT reason FROM chore_waivers WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
+            if existing is not None and existing["reason"] != reason:
+                raise AdmissionError("chore_waiver_conflict")
+            db.execute("INSERT OR IGNORE INTO chore_waivers VALUES (?,?,?,?,?)",
+                       (checkpoint_id, self.clock(), caller, row["task_type"], reason))
+            db.commit()
+        return {"checkpoint_id": checkpoint_id, "caller": caller,
+                "task_type": row["task_type"], "reason": reason,
+                "cloud_fallback": False, "deduplicated": existing is not None}
 
     def audit(self) -> dict[str, Any]:
         """Content-free aggregate counts. No task id or content hash ever appears here."""

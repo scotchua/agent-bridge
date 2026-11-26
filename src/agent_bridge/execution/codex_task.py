@@ -111,7 +111,8 @@ CACHE_PREVENTION_ENV={"PYTHONDONTWRITEBYTECODE":"1","PYTEST_ADDOPTS":"-p no:cach
 VERIFICATION_ENV_EXCLUDED=frozenset({"PYTEST_ADDOPTS"})
 
 def _verification_env(env:dict[str,str])->dict[str,str]:
-    return {k:v for k,v in env.items() if k not in VERIFICATION_ENV_EXCLUDED}
+    return {**{k:v for k,v in env.items() if k not in VERIFICATION_ENV_EXCLUDED},
+            "PYTHONPATH":os.pathsep.join(("src", "tests"))}
 MAX_IGNORED_ARTIFACT_PATHS=20
 MAX_IGNORED_ARTIFACT_PATH_BYTES=512
 DEFAULT_TASK_ROOT=Path.home()/".agent-bridge"/"execution"
@@ -592,7 +593,7 @@ def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],t
     verification result, because a command that did not run under the
     confinement it claims has told us nothing."""
     scratch.mkdir(mode=0o700)
-    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
+    sandbox_env={**env,"HOME":str(scratch),"USERPROFILE":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
                  verification_diagnostics.JOB_VERIFICATION_MARKER:"1",
                  verification_diagnostics.SKIP_RECORD_PATH:str(scratch / verification_diagnostics.SKIP_RECORD_NAME)}
     sandbox_env.pop("CODEX_HOME",None)
@@ -672,7 +673,7 @@ def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str
                        f'(allow file-write* (literal "/dev/null") (subpath "{quoted(tree)}") (subpath "{quoted(tree.resolve())}") '
                        f'(subpath "{quoted(scratch)}") (subpath "{quoted(scratch.resolve())}"))\n')
     os.chmod(profile,0o600)
-    sandbox_env={**env,"HOME":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
+    sandbox_env={**env,"HOME":str(scratch),"USERPROFILE":str(scratch),"TMPDIR":str(scratch),"TMP":str(scratch),"TEMP":str(scratch),
                  verification_diagnostics.JOB_VERIFICATION_MARKER:"1",
                  verification_diagnostics.SKIP_RECORD_PATH:str(scratch / verification_diagnostics.SKIP_RECORD_NAME)}
     # The base environment never carried CODEX_HOME (it is added per Codex
@@ -724,12 +725,15 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
                   classification:str,model:str|None=None,reasoning_effort:str|None=None,
                   client_derived_routes: tuple[str, ...] = (),exception_id:str|None=None,
                   verify_argv:list[list[str]]|None=None,base:str="HEAD",timeout:int=900,
-                  verify_timeout:int=300,cleanup_timeout:int=60,job_source:Path|None=None):
+                  verify_timeout:int|None=None,cleanup_timeout:int=60,job_source:Path|None=None,
+                  verification_default:str|None=None):
     # The operator settings file decides; the argument is the legacy fallback.
     client_derived_routes=operator_settings.client_derived_routes(legacy=[client_derived_routes])
     if classification not in ALLOWED_CLASSIFICATIONS and not (
             classification == "client_derived" and "execution" in client_derived_routes):
         raise TaskError("execution lane refuses client-derived material")
+    requested_verify_timeout=verify_timeout
+    if verify_timeout is None: verify_timeout=300
     if (any(isinstance(value,bool) or not isinstance(value,int) or value < 1
             for value in (timeout,verify_timeout,cleanup_timeout))):
         raise TaskError("execution deadline invalid")
@@ -741,7 +745,19 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
     if not raw or len(raw)>MAX_BRIEF_BYTES: raise TaskError("brief empty or too large")
     try: brief_text=raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc: raise TaskError("brief must be UTF-8") from exc
-    checks=_verify_argv(verify_argv or []); env=_env()
+    try:
+        if verification_default is None and job_source is None:
+            checks,verification_default,verify_timeout=verify_policy.resolve_verification(
+                repo,verify_argv,timeout=requested_verify_timeout)
+        else:
+            checks=_verify_argv(verify_argv or [])
+            verification_default=verification_default or ("explicit" if checks else "none")
+        if (verification_default not in verify_policy.DEFAULT_SOURCES
+                or (verification_default == "none") != (not checks)):
+            raise TaskError("verification_default_invalid")
+    except verify_policy.VerifyPolicyError as exc:
+        raise TaskError(str(exc)) from None
+    env=_env()
     manifest,manifest_sha256,pinned_git_dir=_pinned_source(job_source,base)
     source_before=None if manifest is not None else _source_state(repo,env)
     source_checks=[]
@@ -771,6 +787,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
              "executable_sha256":_sha(codex_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
              "codex_home":str(codex_home),"host_platform":platform.system(),"cli_admission":admission.receipt(),
              "git_executable":str(_git_bin()),"verification_confinement":backend.name,
+             "verification_default":verification_default,"verification":[],
              "confinement_denies_network":backend.denies_network,
              "confinement_confines_reads":backend.confines_reads,
              "confinement_confines_writes":backend.confines_writes,
@@ -837,6 +854,7 @@ def _run_admitted(*,brief:Path,repo:Path,task_root:Path,codex_bin:Path,admission
         except NoPatchError: raise TaskError("fresh patch differs from generated patch") from None
         if hashlib.sha256(applied).digest()!=hashlib.sha256(patch).digest(): raise TaskError("fresh patch differs from generated patch")
         evidence=[]; capability_skips={}
+        receipt.update(verification=evidence, verification_capability_skips=capability_skips)
         for i,c in enumerate(checks,1):
             scratch=job/f"verify-{i}-scratch"
             if manifest is not None:
@@ -953,10 +971,11 @@ def main(argv=None):
     p.add_argument("--exception-id",default=None,dest="exception_id",type=_exception_id)
     p.add_argument("--model",default=None); p.add_argument("--reasoning-effort",default=None,dest="reasoning_effort")
     p.add_argument("--base",default="HEAD"); p.add_argument("--timeout",type=int,default=900)
-    p.add_argument("--verify-timeout",type=int,default=300)
+    p.add_argument("--verify-timeout",type=int,default=None)
     p.add_argument("--cleanup-timeout",type=int,default=60)
     p.add_argument("--tasks-dir",type=Path,default=DEFAULT_TASK_ROOT,dest="task_root")
     p.add_argument("--verify-json",action="append",default=[])
+    p.add_argument("--verification-default",choices=verify_policy.DEFAULT_SOURCES,default=None)
     a=p.parse_args(argv)
     try:
         checks=[json.loads(x) for x in a.verify_json]; del a.verify_json; result=run_task(**vars(a),verify_argv=checks)

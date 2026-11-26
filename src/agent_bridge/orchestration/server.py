@@ -30,7 +30,12 @@ INSTRUCTIONS = (
     "work_checkpoint and work_route_local with its true classification; the on-device "
     "lane accepts client_derived. Peer and execution routes refuse client-derived input "
     "unless the operator enables their matching client_derived_routes setting. "
-    "Local drafts require review; silent cloud fallback is refused."
+    "Coordinator chores default to local even when short: log_triage for test/CI logs; "
+    "summarize for execution receipts, Codex last messages, and short PR/commit/checkpoint "
+    "drafts from diff stats and bullet facts. Use work_checkpoint/work_route_local; "
+    "backend contracts and opt-ins still apply. If doing a chore in cloud, record "
+    "work_chore_waiver with its checkpoint and a fixed reason. Missing dispositions "
+    "appear in local-status --work-split. Local drafts require review; silent cloud fallback is refused."
 )
 
 

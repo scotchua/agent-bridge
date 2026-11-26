@@ -291,6 +291,40 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(captured.getvalue(), "small\n")
         self.assertEqual(self.rows()[-1]["waiver_reason"], "below_threshold")
 
+    def test_short_test_log_routes_locally_and_keeps_failing_test_names(self):
+        queue, intake = self.queue()
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            output_router.route_output(b"FAILED test_login\n1 failed, 9 passed\n", task_type="log_triage",
+                state_root=str(self.state), repo=str(self.repo), classification="internal_nonclient",
+                intake=intake, executor=lambda: queue.run_once("synthetic"), exit_code=1)
+        self.assertIn("FAILED test_login", captured.getvalue())
+        self.assertIn("exit 1", captured.getvalue())
+        self.assertTrue(self.rows()[-1]["routed"])
+        self.assertEqual(queue.status(self.rows()[-1]["job_id"])["task_type"], "log_triage")
+
+    def test_chore_recognition_does_not_reclassify_other_small_output(self):
+        for command in (["python3", "-m", "unittest", "discover"], ["pytest", "-q"],
+                        ["python3", "tests/test_suite.py"], ["cargo", "test"], ["tail", "ci.log"]):
+            self.assertEqual(output_router.coordinator_chore(command), "log_triage")
+        self.assertEqual(output_router.coordinator_chore(["cat", "receipt.json"]), "summarize")
+        self.assertEqual(output_router.coordinator_chore(["cat", "/tmp/job/codex-last-message.txt"]), "summarize")
+        self.assertEqual(output_router.coordinator_chore(["/bin/sh", "-c", "python3 -m unittest discover"]), "log_triage")
+        self.assertIsNone(output_router.coordinator_chore(["/bin/sh", "-c", "pytest; echo done"]))
+        for command in (["git", "diff", "--stat"], ["rg", "test", "src"], []):
+            self.assertIsNone(output_router.coordinator_chore(command))
+
+    def test_short_log_cannot_enable_the_certified_triage_pilot(self):
+        queue, intake = self.queue()
+        queue.backend_id = "gemma_certified"
+        queue.allowed_task_types = frozenset({"summarize"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            output_router.route_output(b"FAILED test_login\n", task_type="log_triage", state_root=str(self.state),
+                repo=str(self.repo), classification="internal_nonclient", intake=intake)
+        self.assertIn("intake_refused:unsupported_kind", out.getvalue())
+        self.assertEqual(queue.state_report()["counts"], {})
+
     def test_wrapper_preserves_a_nonzero_original_exit_code(self):
         # A deliberately unusable config exercises the wrapper's own waiver
         # path after the child has run; its status must remain the child's.

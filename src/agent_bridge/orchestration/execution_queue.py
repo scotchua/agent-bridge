@@ -303,6 +303,11 @@ class SubprocessHarnessExecutor:
             argv += ["--exception-id", request["exception_id"]]
         if pinned_job_source:
             argv += ["--job-source", str(job_dir)]
+        if provider == "codex" and not is_review:
+            # Legacy queued jobs already selected their checks too. Never
+            # reload a newer repo default behind their recorded deadline.
+            source = request.get("verification_default", "explicit" if request["verify_argv"] else "none")
+            argv += ["--verification-default", source]
         for command in request["verify_argv"]:
             argv += ["--verify-json", json.dumps(command, separators=(",", ":"))]
         # Reject a stale or tampered durable request immediately before it can
@@ -360,6 +365,10 @@ class SubprocessHarnessExecutor:
             raise ExecutionAdmissionError("execution_harness_capture_failed")
         summary = _harness_summary_file(job_dir / "harness.stdout",
                                         limit=self.capture_limit_bytes)
+        if request.get("verification_default") == "repo" and summary.get("harness_ok"):
+            observed = [row["argv"] for row in summary.get("verification", [])]
+            if observed != request["verify_argv"]:
+                raise ExecutionAdmissionError("verification_default_evidence_missing")
         if is_review and "review_receipt_path" in summary:
             # The worker records a review receipt only when the harness put it
             # inside this queue job's private harness directory.  A printed
@@ -479,9 +488,22 @@ def _harness_summary(stdout: bytes) -> dict[str, Any]:
         receipt_path = parsed.get("receipt_path")
         review_receipt = ({"review_receipt_path": receipt_path}
                           if isinstance(receipt_path, str) and receipt_path else {})
+        verification = {}
+        if "verification" in parsed:
+            rows = parsed["verification"]
+            if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)):
+                return _unreadable("receipt_verification_invalid")
+            try:
+                commands = verify_policy.check_verify_argv([row.get("argv") for row in rows])
+            except verify_policy.VerifyPolicyError:
+                return _unreadable("receipt_verification_invalid")
+            if any(isinstance(row.get("returncode"), bool) or not isinstance(row.get("returncode"), int) for row in rows):
+                return _unreadable("receipt_verification_invalid")
+            verification["verification"] = [{"argv": command, "returncode": row["returncode"]}
+                                              for command, row in zip(commands, rows)]
         return {"harness_ok": parsed.get("ok") is True and status == HARNESS_COMPLETE,
                 "harness_status": status, "harness_verdict": "read", **diagnostics,
-                **review_receipt}
+                **review_receipt, **verification}
     return _unreadable("receipt_absent")
 
 
@@ -562,13 +584,21 @@ def outcome_is_success(outcome: Mapping[str, Any]) -> bool:
     Either alone is insufficient. A zero exit with a "verification_failed"
     receipt is the case this exists for; a nonzero exit with a "complete"
     receipt would mean the harness contradicted itself, which is equally not
-    a success.
+    a success. When per-command verification evidence is present, each check
+    must also have exited successfully. This remains the one success rule.
     """
 
     if outcome.get("returncode") != 0:
         return False
     if not outcome.get("harness_ok"):
         return False
+    checks = outcome.get("verification", [])
+    if not isinstance(checks, list):
+        return False
+    for row in checks:
+        if (not isinstance(row, Mapping) or isinstance(row.get("returncode"), bool)
+                or not isinstance(row.get("returncode"), int) or row["returncode"] != 0):
+            return False
     return outcome.get("harness_status") == HARNESS_COMPLETE
 
 
@@ -786,7 +816,11 @@ class ExecutionQueue:
             if request_path.is_file():
                 previous = _read_json(request_path)
                 if previous.get("caller") == caller and previous.get("idempotency_key") == key:
-                    if any(previous.get(name) != value for name, value in identity.items()):
+                    # Legacy requests have no provenance field. Preserve
+                    # idempotent retries when their selected checks match.
+                    comparison = dict(previous)
+                    comparison.setdefault("verification_default", "explicit" if previous.get("verify_argv") else "none")
+                    if any(comparison.get(name) != value for name, value in identity.items()):
                         raise ExecutionAdmissionError("idempotency_conflict")
                     return directory.name
         return None
@@ -831,7 +865,7 @@ class ExecutionQueue:
                stage_assignment: int | None = None,
                verify_argv: list[list[str]] | None = None,
                timeout_seconds: int = 900, paid_fallback: bool = False,
-               verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
+               verify_timeout_seconds: int | None = None,
                cleanup_timeout_seconds: int = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
                total_timeout_seconds: int | None = None,
                idempotency_key: str | None = None, kind: str = "execution",
@@ -915,6 +949,9 @@ class ExecutionQueue:
         if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int)
                 or not 1 <= timeout_seconds <= MAX_GENERATION_TIMEOUT_SECONDS):
             raise ExecutionAdmissionError("timeout_invalid")
+        requested_verify_timeout = verify_timeout_seconds
+        if verify_timeout_seconds is None:
+            verify_timeout_seconds = DEFAULT_VERIFY_TIMEOUT_SECONDS
         if (isinstance(verify_timeout_seconds, bool)
                 or not isinstance(verify_timeout_seconds, int)
                 or not 1 <= verify_timeout_seconds <= MAX_VERIFY_TIMEOUT_SECONDS):
@@ -924,6 +961,7 @@ class ExecutionQueue:
                 or not 1 <= cleanup_timeout_seconds <= MAX_CLEANUP_TIMEOUT_SECONDS):
             raise ExecutionAdmissionError("cleanup_timeout_invalid")
         checks = verify_argv or []
+        verification_default = "explicit" if checks else "none"
         if kind == "review" and checks:
             raise ExecutionAdmissionError("review_verify_argv_forbidden")
         if provider == "claude" and not checks:
@@ -933,7 +971,11 @@ class ExecutionQueue:
             # harness would refuse is refused here, now, with the harness's
             # words, instead of after a claim, a worker slot and a receipt
             # that said only "TaskError".
-            checks = verify_policy.check_verify_argv(checks)
+            if provider == "codex" and kind == "execution":
+                checks, verification_default, verify_timeout_seconds = verify_policy.resolve_verification(
+                    repo_path, verify_argv, timeout=requested_verify_timeout)
+            else:
+                checks = verify_policy.check_verify_argv(checks)
         except verify_policy.VerifyPolicyError as exc:
             if str(exc) == verify_policy.MESSAGE_SHAPE:
                 raise ExecutionAdmissionError("verify_argv_invalid") from None
@@ -967,6 +1009,8 @@ class ExecutionQueue:
                     "stage_assignment": stage_assignment, "kind": kind, "head": head,
                     "author_provider": author_provider,
                     "client_derived_admitted": client_derived_admitted}
+        if provider == "codex" and kind == "execution":
+            identity["verification_default"] = verification_default
         # Only when given, so jobs submitted before U3 keep the same identity.
         if exception_id is not None:
             identity["exception_id"] = exception_id
@@ -1012,6 +1056,7 @@ class ExecutionQueue:
                     _atomic_json(directory / "receipt.json", {
                         "schema": 1, "job_id": job_id, "state": "queued", "caller": caller,
                         "provider": provider, "classification": classification,
+                        "verification_default": verification_default,
                         "permission_to_apply": False, "permission_to_commit": False,
                         "permission_to_push": False, "permission_to_merge": False,
                         "submitted_at": request["submitted_at"]})
@@ -1054,6 +1099,7 @@ class ExecutionQueue:
             _atomic_json(directory / "receipt.json", {
                 "schema": 1, "job_id": job_id, "state": "queued", "caller": caller,
                 "provider": provider, "classification": classification,
+                "verification_default": verification_default,
                 "permission_to_apply": False, "permission_to_commit": False,
                 "permission_to_push": False, "permission_to_merge": False,
                 "submitted_at": request["submitted_at"]})

@@ -96,7 +96,7 @@ class SystemAcceptanceTests(unittest.TestCase):
             {"risk_flags": ["confidential"]},
             {"risk_flags": ["professional_judgment"]},
             {"task_type": "tax_position"},
-            {"input": "small"},
+            {"input": "small", "task_type": "extract"},
         )
         for index, changes in enumerate(cases):
             with self.subTest(changes=changes):

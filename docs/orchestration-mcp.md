@@ -158,6 +158,47 @@ set. It exposes no document text, task id or content hash. This is auditable
 instruction/tool enforcement for desktop chats; only supported CLI hook
 surfaces can be hard-gated before a read or edit.
 
+Coordinator chores default to the local lane even below the general size floor:
+use `log_triage` for test/CI output (preserve pass/fail and failing test names),
+and `summarize` for execution receipts, Codex last messages, or a short PR body,
+commit message or checkpoint draft from a diff stat and bullet facts. The latter
+is a factual summary, within the existing summary contract, not test generation.
+Empty inputs and other task kinds retain the size floor. Intake policy v3 applies
+this change after classification, risk, backend capability and quality checks.
+Every work call still creates or consumes an exact checkpoint. Local results
+remain drafts to review and rate with `work_feedback`.
+
+If the coordinator handles one of these chores in cloud, it must call
+`work_chore_waiver` with the same checkpoint and one fixed reason:
+`local_unavailable`, `local_refused`, `local_failed`, `local_timeout`,
+`quality_rejected`, `operator_requested_cloud`, or `requires_judgment`.
+Waivers are append-only, caller-bound and idempotent. They record cloud work;
+they grant no cloud permission and trigger no inference or fallback. Do not use
+`work_checkpoint_no_eligible_unit` when chore input exists. Without changing hook
+block rules, arbitrary cloud prose cannot be detected: this is a coordinator
+instruction with accounting of declared work, not enforcement against undeclared
+prose. Checkpoints with no queued job or waiver are reported as **unaccounted
+(pending or skipped)**, not assumed to be completed cloud work.
+
+The existing inline wrapper also routes short recognized test commands, `.log`
+readers, `receipt.json`, and last-message readers. Other small command output
+keeps the existing behavior. Certified Gemma still requires the `log_triage`
+pilot opt-in; only the inline wrapper prefixes its captured lines with record
+IDs, while direct `work_route_local` calls retain the existing ID contract.
+Certified summary drafts remain one sentence; the adapter's instructions and
+validation are unchanged. Unsupported work is visibly refused, never sent to a
+different model.
+
+`python3 setup_bridge.py local-status --days 7 --work-split` prints deterministic,
+read-only, offline counts for the selected local-calendar window: local work jobs
+by type, current outcome and feedback; Codex implementation jobs by submission
+time and current state (reviews excluded); cloud-done chores by waiver recording
+time, caller, type and reason; and unaccounted checkpoints. Inline output waivers
+are separate because returning original output does not prove cloud completion.
+`--json` includes the same data under `work_split`. Old databases without the
+waiver table report accounting unavailable until the updated server migrates
+them; reporting never creates databases or migrates them. No routine is scheduled.
+
 ### Certified Gemma local backend
 
 The default remains `private_worker` for compatibility. An operator may select
@@ -276,7 +317,39 @@ passed through as the harness receives them). A command outside that policy is r
 `execution_dispatch` as `verify_argv_rejected: <reason>` before a job exists;
 the same command reaching a harness is refused with the same words. The
 Claude lane requires at least one command (`claude_verification_required`);
-the Codex lane permits none.
+Codex implementation dispatches with omitted or empty `verify_argv` resolve
+`.agent-bridge-verification.json` at admission. Its required key is `verify_argv`,
+a nonempty array of argv arrays subject to that same policy. The optional
+`verify_timeout_seconds` is an integer from 1 through 3600; an explicit dispatch
+timeout wins, and without either setting the existing 300-second limit applies.
+This repository selects 1800 seconds per command for the full offline suites.
+The total job deadline still reserves generation, each verifier, cleanup and
+overhead within the existing cap. Invalid or
+unreadable defaults refuse the dispatch. Explicit nonempty commands win.
+Requests snapshot the commands, reserve time for every check, and pass their
+source to the harness; generated code cannot silently replace the selection.
+Queue and harness receipts record `verification_default` as `repo`, `explicit`,
+or `none`. A missing default is visibly `none`, never an implied test pass.
+Review jobs do not acquire implementation defaults. The Claude lane's existing
+explicit verification requirement remains unchanged.
+
+This repo selects `python3 -m unittest bridge_verify` (a small unittest adapter
+that executes `python3 tests/test_suite.py`) followed by `python3 -m unittest
+discover -s tests`. Using the adapter preserves the existing Python module-only
+policy instead of adding a script-execution exception. Verification uses
+`PYTHONPATH=src:tests` with the host's path separator and a separate scratch HOME
+and USERPROFILE for each check. Existing confinement remains mandatory. The
+harness receipt keeps per-command return codes, output hashes and log files;
+the execution receipt's outcome includes argv and return codes. A successful
+defaulted dispatch without matching verification evidence is refused.
+
+Full discovery runs under the same network/read/write confinement as any other
+verification. Workflow and local-model HTTP fixtures use the existing measured
+capability helpers when nested confinement or loopback is denied inside a job;
+these remain named, counted skips in the harness receipt, not claimed coverage.
+Outside a job those tests retain their normal behavior. The Codex test account
+fixture also follows the verifier's temporary HOME; production account-home
+admission is unchanged.
 
 Receipts carry the reason for a failure, not only its class. A harness that
 refuses a job prints `{"ok": false, "error": "<class>", "error_detail":

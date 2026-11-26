@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import verification_capabilities
 from pathlib import Path
 from unittest import mock
 
@@ -975,6 +976,7 @@ class CalibrateTests(unittest.TestCase):
         _FlakyModel._failed = False
 
     def _start_model(self):
+        verification_capabilities.requires_loopback(self)
         server = ThreadingHTTPServer(("127.0.0.1", 0), _FlakyModel)
         import threading
         thread = threading.Thread(target=server.serve_forever, daemon=True)

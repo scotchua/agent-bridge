@@ -138,6 +138,60 @@ class CheckpointLedgerTests(unittest.TestCase):
                                       input_bytes=len(text.encode("utf-8")),
                                       nonblank_lines=nonblank_lines(text))
 
+    def test_all_three_short_coordinator_chores_route_with_default_policy(self):
+        self.intake = AutomaticIntake(self.queue, clock=lambda: 5000.0)
+        for index, (task, text) in enumerate((
+                ("log_triage", "FAILED test_login; 8 passed, 1 failed"),
+                ("summarize", "Codex receipt: patch generated, 9 tests passed"),
+                ("summarize", "1 file changed; fix retry timeout; tested offline"))):
+            checkpoint = self.mint(text, task_id=f"chore-{index}", task_type=task)
+            self.assertEqual(checkpoint["status"], "eligible")
+            routed = self.route_with_checkpoint(text, checkpoint_id=checkpoint["checkpoint_id"], task_type=task)
+            self.assertIsNotNone(routed["job_id"])
+            self.assertEqual(routed["fallback"], "none")
+
+    def test_short_chores_keep_safety_capability_quality_and_empty_input_checks(self):
+        intake = AutomaticIntake(self.queue)
+        for index, changes in enumerate((
+                {"classification": "client"}, {"risk_flags": ["professional_judgment"]},
+                {"risk_flags": ["unknown_flag"]}, {"input_bytes": 0, "nonblank_lines": 0})):
+            args = dict(task_id=f"refused-{index}", task_type="summarize", classification="internal_nonclient",
+                        caller="codex", input_bytes=4, nonblank_lines=1, risk_flags=[])
+            checkpoint = intake.checkpoint(**{**args, **changes})
+            self.assertEqual(checkpoint["status"], "refused")
+        self.queue.allowed_task_types = frozenset({"summarize"})
+        self.assertEqual(intake.checkpoint(task_id="unsupported-short", task_type="log_triage",
+            classification="internal_nonclient", caller="codex", input_bytes=4, nonblank_lines=1)["reason"], "unsupported_kind")
+        with mock.patch.object(self.queue, "quality_disabled", return_value=True):
+            self.assertEqual(intake.checkpoint(task_id="quality-short", task_type="summarize",
+                classification="internal_nonclient", caller="codex", input_bytes=4, nonblank_lines=1)["reason"], "quality_disabled")
+
+    def test_chore_waivers_are_closed_caller_bound_append_only_and_idempotent(self):
+        checkpoint = self.mint("result facts", task_id="cloud-done")
+        args = dict(checkpoint_id=checkpoint["checkpoint_id"], caller="codex", reason="local_unavailable")
+        with self.assertRaisesRegex(AdmissionError, "checkpoint_binding_mismatch"):
+            self.intake.waive_chore(**{**args, "caller": "claude"})
+        with self.assertRaisesRegex(AdmissionError, "chore_waiver_reason_invalid"):
+            self.intake.waive_chore(**{**args, "reason": "free text SECRET"})
+        self.assertFalse(self.intake.waive_chore(**args)["deduplicated"])
+        self.assertTrue(self.intake.waive_chore(**args)["deduplicated"])
+        with self.assertRaisesRegex(AdmissionError, "chore_waiver_conflict"):
+            self.intake.waive_chore(**{**args, "reason": "local_failed"})
+        with self.intake._db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM chore_waivers").fetchone()[0], 1)
+            for sql in ("DELETE FROM chore_waivers", "UPDATE chore_waivers SET reason='local_failed'"):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute(sql)
+        self.assertEqual(self.queue.state_report()["counts"], {})
+
+    def test_no_unit_and_nonchore_checkpoints_cannot_be_cloud_chore_waivers(self):
+        empty = self.intake.checkpoint(task_id="nothing", task_type="summarize", classification="internal_nonclient",
+                                      caller="codex", input_bytes=0, nonblank_lines=0, no_eligible_unit=True)
+        extract = self.mint("extract facts", task_id="extract", task_type="extract")
+        for checkpoint in (empty, extract):
+            with self.assertRaisesRegex(AdmissionError, "checkpoint_not_a_chore"):
+                self.intake.waive_chore(checkpoint_id=checkpoint["checkpoint_id"], caller="codex", reason="local_refused")
+
     # -- requirement 2: purpose="work" requires a checkpoint -------------
 
     def test_direct_work_without_a_checkpoint_refuses(self):
@@ -337,12 +391,13 @@ class CheckpointLedgerTests(unittest.TestCase):
         # explained by counting UTF-8 bytes.
         self.assertEqual(len(text), 9)
         self.assertEqual(len(text.encode("utf-8")), 18)
-        routed = intake.route(task_type="summarize", input=text, params=None, priority="interactive",
+        # Coordinator chores no longer have a size floor; extract still does.
+        routed = intake.route(task_type="extract", input=text, params=None, priority="interactive",
                               classification="internal_nonclient", caller="codex", purpose="test")
         self.assertEqual(routed["decision"], "local")
         self.assertEqual(routed["reason"], "eligible_mechanical_work")
         self.assertEqual(routed["input_bytes"], 18)
-        checkpoint = intake.checkpoint(task_id="multibyte-checkpoint", task_type="summarize",
+        checkpoint = intake.checkpoint(task_id="multibyte-checkpoint", task_type="extract",
                                        classification="internal_nonclient", caller="codex",
                                        input_bytes=18, nonblank_lines=1)
         self.assertEqual(checkpoint["status"], "eligible")

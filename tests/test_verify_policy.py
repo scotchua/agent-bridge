@@ -1,8 +1,12 @@
 """The verification-command policy shared by both harnesses and the queue."""
 
 import os
+import json
 import sys
+import tempfile
+from pathlib import Path
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -92,6 +96,78 @@ class VerifyPolicyTests(unittest.TestCase):
                 self.assertEqual(str(caught.exception), verify_policy.MESSAGE_PYTHON)
                 unittest_run = [["python3", "-m", "unittest", "-q"]]
                 self.assertEqual(harness._verify_argv(unittest_run), unittest_run)
+
+
+class VerificationDefaultsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.path = self.repo / verify_policy.DEFAULT_FILE
+        self.checks = [["python3", "-m", "unittest", "discover", "-s", "tests"]]
+
+    def write(self, commands):
+        self.path.write_text(json.dumps({"verify_argv": commands}), encoding="utf-8")
+
+    def test_omitted_and_empty_commands_resolve_the_repo_default(self):
+        self.write(self.checks)
+        for value in (None, []):
+            self.assertEqual(verify_policy.resolve_verification(self.repo, value), (self.checks, "repo", 300))
+
+    def test_no_default_is_visible(self):
+        self.assertEqual(verify_policy.resolve_verification(self.repo, None), ([], "none", 300))
+
+    def test_explicit_commands_win_even_over_an_invalid_default_file(self):
+        self.path.write_text("invalid", encoding="utf-8")
+        self.assertEqual(verify_policy.resolve_verification(self.repo, self.checks), (self.checks, "explicit", 300))
+
+    def test_repo_timeout_is_bounded_and_explicit_timeout_wins(self):
+        for timeout in (0, 3601, True, "600"):
+            self.path.write_text(json.dumps({"verify_argv": self.checks, "verify_timeout_seconds": timeout}))
+            with self.assertRaisesRegex(VerifyPolicyError, "verification_default_invalid"):
+                verify_policy.resolve_verification(self.repo, None)
+        self.path.write_text(json.dumps({"verify_argv": self.checks, "verify_timeout_seconds": 1800}))
+        self.assertEqual(verify_policy.resolve_verification(self.repo, None), (self.checks, "repo", 1800))
+        self.assertEqual(verify_policy.resolve_verification(self.repo, None, timeout=60), (self.checks, "repo", 60))
+        self.assertEqual(verify_policy.resolve_verification(self.repo, self.checks), (self.checks, "explicit", 300))
+
+    def test_defaults_cannot_relax_the_command_policy_or_silently_disable_tests(self):
+        for value in ([], [["sh", "-c", "exit 0"]], [["python3", "tests/test_suite.py"]],
+                      [["python3", "-c", "print(1)"]], [["git", "push"]], [["pytest", "bad\narg"]]):
+            with self.subTest(value=value):
+                self.write(value)
+                with self.assertRaisesRegex(VerifyPolicyError, "verification_default_invalid"):
+                    verify_policy.resolve_verification(self.repo, None)
+        for value in ("bad json", "[]", '{"verify_argv": [], "env": {}}', " " * (64 * 1024 + 1)):
+            self.path.write_text(value, encoding="utf-8")
+            with self.assertRaisesRegex(VerifyPolicyError, "verification_default_invalid"):
+                verify_policy.resolve_verification(self.repo, None)
+
+    def test_unreadable_default_is_refused(self):
+        with mock.patch.object(Path, "open", side_effect=PermissionError):
+            with self.assertRaisesRegex(VerifyPolicyError, "verification_default_unreadable"):
+                verify_policy.resolve_verification(self.repo, None)
+
+    def test_repository_defaults_are_policy_valid_and_do_not_duplicate_discovery(self):
+        repo = Path(__file__).resolve().parents[1]
+        checks, source, timeout = verify_policy.resolve_verification(repo, None)
+        self.assertEqual(source, "repo")
+        self.assertEqual(timeout, 1800)
+        self.assertEqual(checks, [["python3", "-m", "unittest", "bridge_verify"],
+                                  ["python3", "-m", "unittest", "discover", "-s", "tests"]])
+        import bridge_verify
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(bridge_verify.subprocess, "run", return_value=completed) as run:
+            bridge_verify.BrokerSuite("test_broker_suite").test_broker_suite()
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(repo / "tests" / "test_suite.py")])
+        completed.returncode = 1
+        with mock.patch.object(bridge_verify.subprocess, "run", return_value=completed), self.assertRaises(AssertionError):
+            bridge_verify.BrokerSuite("test_broker_suite").test_broker_suite()
+
+    def test_verification_environment_uses_portable_repo_paths_and_removes_pytest_injection(self):
+        env = codex_task._verification_env({"PATH": "synthetic", "PYTEST_ADDOPTS": "--override", "PYTHONPATH": "outside"})
+        self.assertEqual(env["PYTHONPATH"], os.pathsep.join(("src", "tests")))
+        self.assertNotIn("PYTEST_ADDOPTS", env)
 
 
 if __name__ == "__main__":

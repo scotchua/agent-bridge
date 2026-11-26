@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from ..capacity_router import RoutingError, StageRouter
 from ..localq import gemma_child, quality
-from ..localq.intake import KNOWN_FLAGS, AutomaticIntake
+from ..localq.intake import CHORE_WAIVER_REASONS, KNOWN_FLAGS, AutomaticIntake
 from ..localq.spool import (ALLOWED_CLASSIFICATIONS, MECHANICAL_TASKS, AdmissionError, JobNotFound,
                             LocalQueue, QueueCaps, UNSUPPORTED_KIND_REASON)
 from . import autodecide, autoroute, gate, localfirst
@@ -609,7 +609,9 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         "work_checkpoint_no_eligible_unit": {
             "description": ("Record, append-only, that a search for local mechanical work found "
                             "no eligible unit. Distinct from a refusal: no content was declared "
-                            "and none is invented. Counted separately by work_checkpoint_audit."),
+                            "and none is invented. Do not use this when logs, execution results or "
+                            "facts for a change draft exist: checkpoint and route those chores. "
+                            "Counted separately by work_checkpoint_audit."),
             "inputSchema": no_eligible_unit_schema,
             "handler": lambda args: call(intake.checkpoint, {
                 "idempotency_key": None, **args, "caller": caller,
@@ -623,10 +625,28 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "handler": lambda args: call(intake.audit, {}),
         },
         "work_route_local": {
-            "description": ("Route substantial declared non-client mechanical work to the local worker or refuse it. "
+            "description": ("Default for coordinator chores even when short: log_triage for test/CI logs "
+                            "(retain pass/fail and failing test names); summarize for execution receipts, "
+                            "Codex last messages, and short PR/commit/checkpoint drafts from diff stats "
+                            "and bullet facts. Other mechanical work retains its size floor. "
                             "Pass a prior work_checkpoint checkpoint_id for the same unit, or omit it and this call "
-                            "creates the checkpoint automatically. Never falls back to cloud."),
+                            "creates the checkpoint automatically. Keep true classification and risk flags. "
+                            "Certified backend contracts and opt-ins still apply. Review local output; "
+                            "if doing the chore in cloud, record work_chore_waiver against the checkpoint. "
+                            "Never falls back to cloud."),
             "inputSchema": route, "handler": route_local,
+        },
+        "work_chore_waiver": {
+            "description": ("Record an explicit cloud-done coordinator chore against its checkpoint. "
+                            "Required when handling a log summary, execution result summary or "
+                            "fact-based change draft in cloud. Records accounting only; grants no "
+                            "cloud permission and never invokes a fallback. Unrouted checkpoints "
+                            "without a waiver appear as unaccounted in local-status --work-split."),
+            "inputSchema": _schema({
+                "checkpoint_id": {"type": "string", "minLength": 1},
+                "reason": {"type": "string", "enum": sorted(CHORE_WAIVER_REASONS)},
+            }, ["checkpoint_id", "reason"]),
+            "handler": lambda args: call(intake.waive_chore, {**args, "caller": caller}),
         },
         "work_digest_file": {
             "description": ("Digest a mechanical artifact (a log or captured test output) the "
@@ -743,7 +763,8 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             "repo": {"type": "string"}, "brief": {"type": "string"},
             "base": {"type": "string"},
             "model": {"type": "string"}, "effort": {"type": "string"},
-            "verify_argv": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            "verify_argv": {"type": "array", "items": {"type": "array", "items": {"type": "string"}},
+                            "description": "Explicit commands win. Omitted/empty Codex build checks use .agent-bridge-verification.json; missing defaults are visible as verification_default: none in the receipt."},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200},
             "verify_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
             "cleanup_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
@@ -840,7 +861,7 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
                 router.require_execution_presence(provider)
                 result = call(execution.submit, {
                     "verify_argv": None, "timeout_seconds": 900,
-                    "verify_timeout_seconds": 300, "cleanup_timeout_seconds": 60,
+                    "verify_timeout_seconds": None, "cleanup_timeout_seconds": 60,
                     "total_timeout_seconds": None,
                     "paid_fallback": False, "idempotency_key": None,
                     "stage_assignment": current.get("assignment"),
