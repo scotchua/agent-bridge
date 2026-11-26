@@ -158,11 +158,29 @@ class ClaimReconcileTests(unittest.TestCase):
         self.task("badtoken", {"revision": 1, "claim": claim(owner="has space")})
         findings = self.run_reconcile()
         self.assertIn("task_record_missing", self.kinds(findings, "absent"))
-        for item_id in ("badshape", "badclaim", "badtoken"):
+        for item_id in ("badclaim", "badtoken"):
             self.assertIn("task_record_malformed", self.kinds(findings, item_id))
+        # A workload without a claim asserts no ownership, even when an
+        # old writer left a non-integer revision beside its notes.
+        self.assertEqual(self.kinds(findings, "badshape"),
+                         ["ledger_owner_without_task_claim"])
         self.assertIn("task_record_unreadable", self.kinds(findings, "garbled"))
         # No owner text from a rejected record reaches the report.
         self.assertNotIn("has space", json.dumps(findings))
+
+    def test_no_claim_workloads_normalize_missing_or_invalid_revisions(self):
+        for workload in ({}, {"notes": "waiting for triage"},
+                         {"revision": 0, "claim": None},
+                         {"revision": "old", "claim": None}):
+            with self.subTest(workload=workload):
+                self.assertEqual(claim_reconcile.parse_task_claim({"workload": workload}),
+                                 {"status": "no_claim", "revision": 0})
+
+    def test_invalid_present_claim_remains_malformed(self):
+        parsed = claim_reconcile.parse_task_claim({"workload": {
+            "revision": 3, "claim": {"stage": "build", "lease_expires_at": NOW + 60}}})
+        self.assertEqual(parsed["status"], "malformed")
+        self.assertEqual(parsed["problem"], "invalid claim")
 
     def test_release_reason_must_match_released_at(self):
         self.owned("reason")

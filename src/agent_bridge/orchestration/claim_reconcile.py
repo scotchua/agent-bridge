@@ -151,6 +151,10 @@ def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
         value = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         return {"status": "no_record"}
+    except UnicodeDecodeError:
+        return {"status": "unreadable"}
+    except json.JSONDecodeError:
+        return {"status": "unreadable"}
     except (OSError, ValueError, RecursionError):
         # RecursionError: deeply nested JSON is rejected, not a crash.
         return {"status": "unreadable"}
@@ -160,18 +164,25 @@ def read_task_claim(tasks_root: str | Path, item_id: object) -> dict:
 def parse_task_claim(value: object) -> dict:
     """Validate an already decoded record without trusting any owner text."""
     if not isinstance(value, dict):
-        return {"status": "malformed"}
+        return {"status": "malformed", "problem": "record is not an object"}
     workload = value.get("workload", {"revision": 0, "claim": None})
     if not isinstance(workload, dict):
-        return {"status": "malformed"}
-    revision = workload.get("revision")
-    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-        return {"status": "malformed"}
+        return {"status": "malformed", "problem": "malformed workload"}
     claim = workload.get("claim")
     if claim is None:
+        # A workload can carry notes before it has ever carried a claim.  It
+        # is not an ownership assertion, so a missing or bad revision cannot
+        # turn it into one.  The claim writer will fence its first mutation at
+        # revision zero.
+        revision = workload.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            revision = 0
         return {"status": "no_claim", "revision": revision}
+    revision = workload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        return {"status": "malformed", "problem": "invalid workload revision"}
     if not isinstance(claim, dict):
-        return {"status": "malformed", "revision": revision}
+        return {"status": "malformed", "revision": revision, "problem": "invalid claim"}
     owner, stage = _token(claim.get("owner")), _token(claim.get("stage"))
     lease = _number(claim.get("lease_expires_at"))
     released_at = claim.get("released_at")
@@ -181,17 +192,17 @@ def parse_task_claim(value: object) -> dict:
             or (released_at is None and reason is not None)
             or (released_at is not None
                 and (not isinstance(reason, str) or reason not in _RELEASE_REASONS))):
-        return {"status": "malformed", "revision": revision}
+        return {"status": "malformed", "revision": revision, "problem": "invalid claim"}
     return {"status": "claim", "revision": revision,
             "claim": {"owner": owner, "stage": stage, "lease_expires_at": lease,
                       "active": released_at is None,
                       "released_at": _number(released_at), "release_reason": reason}}
 
 
-def _ledger_rows(ledger: str | Path) -> list[dict]:
+def _ledger_rows(ledger: str | Path, *, timeout: float = 5.0) -> list[dict]:
     """Every live stage row, through a read-only connection."""
     uri = Path(ledger).resolve(strict=True).as_uri() + "?mode=ro"
-    db = sqlite3.connect(uri, uri=True, timeout=5.0)
+    db = sqlite3.connect(uri, uri=True, timeout=timeout)
     db.row_factory = sqlite3.Row
     try:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(stages)")}

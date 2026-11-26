@@ -420,7 +420,8 @@ class StageBindingTests(GateCase):
                          "stage_reassigned")
         self.assertEqual(gate.stage_binding(self.db, {**self.written, "owner_route": "codex"}, 1000.0),
                          "stage_reassigned")
-        self.assertEqual(gate.stage_binding(self.db, self.written, 1000.0 + 601), "stage_lease_expired")
+        self.assertEqual(gate.stage_binding(self.db, self.written, 1000.0 + 601),
+                         gate._STAGE_OWNER_EXPIRED)
         self.assertIsNone(gate.stage_binding(self.db, self.written, 1000.0))
 
     def test_an_unreadable_router_database_denies(self):
