@@ -225,19 +225,44 @@ class DriftFixtureTests(unittest.TestCase):
     def test_drift_invokes_existing_certified_path_with_new_fixture(self):
         from types import SimpleNamespace
         from agent_bridge.localq import gemma_child
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
         cfg = SimpleNamespace(local_backend="gemma_certified", gemma_delegate_executable="delegate",
             gemma_python_executable="python", gemma_receipt_validator_executable="validator",
             gemma_model_digest="digest", gemma_timeout_seconds=600)
         with mock.patch("agent_bridge.orchestration.config.load", return_value=cfg), \
              mock.patch.object(drift, "_sha256", side_effect=["delegate-hash", "validator-hash"] * 2), \
              mock.patch.object(gemma_child, "invoke", return_value={"invocation_id": "receipt"}) as invoke:
-            self.assertEqual(drift.run_gemma_check("synthetic-config"), {"ok": True, "receipt_id": "receipt"})
+            success = drift.run_gemma_check("synthetic-config", home=root.name)
+            self.assertTrue(success["ok"])
+            self.assertEqual(success["receipt_id"], "receipt")
+            directory = Path(success["receipt_directory"])
+            self.assertEqual(directory.parent, Path(drift.paths(root.name)["root"], "gemma-probes"))
+            if os.name == "posix":  # Windows has no POSIX mode bits
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
             self.assertEqual(invoke.call_args.args[0]["input"], drift.GEMMA_CHECK_TEXT)
             self.assertEqual(invoke.call_args.kwargs["delegate_sha256"], "delegate-hash")
             self.assertEqual(invoke.call_args.kwargs["validator_sha256"], "validator-hash")
             self.assertEqual(invoke.call_args.kwargs["model_digest"], "digest")
-            invoke.side_effect = gemma_child.GemmaRefusal("gemma_delegate_unavailable")
-            self.assertFalse(drift.run_gemma_check("synthetic-config")["ok"])
+            def failed_probe(job, *, receipt_root, **kwargs):
+                Path(receipt_root, "operation.json").write_text("synthetic failure")
+                raise gemma_child.GemmaRefusal("gemma_delegate_unavailable")
+
+            invoke.side_effect = failed_probe
+            failure = drift.run_gemma_check("synthetic-config", home=root.name)
+            self.assertFalse(failure["ok"])
+            self.assertEqual(failure["reason"], "gemma_delegate_unavailable")
+            failed_directory = Path(failure["receipt_directory"])
+            self.assertNotEqual(failed_directory, directory)
+            self.assertEqual((failed_directory / "operation.json").read_text(), "synthetic failure")
+
+        with mock.patch("agent_bridge.orchestration.config.load", return_value=cfg), \
+             mock.patch.object(drift, "_sha256", return_value="digest"), \
+             mock.patch.object(drift.store, "secure_mkdir", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(gemma_child, "invoke") as invoke:
+            failure = drift.run_gemma_check("synthetic-config", home=root.name)
+            self.assertEqual(failure["reason"], "diagnostic_receipt_store_unavailable")
+            invoke.assert_not_called()
 
 
 if __name__ == "__main__":

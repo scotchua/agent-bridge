@@ -372,7 +372,7 @@ class IsolatedDriftTests(unittest.TestCase):
              mock.patch.object(drift, "run_gemma_check", return_value={"ok": True}) as gemma:
             report = drift.doctor(str(self.config), home=str(self.home),
                                   bridge=self.bridge(self.home / "codex"))
-        gemma.assert_called_once_with(str(self.config))
+        gemma.assert_called_once_with(str(self.config), home=str(self.home))
         self.assertIn("gemma", report["requalified"])
         baseline = drift._read_baseline(str(self.home))
         self.assertEqual(baseline["ollama"], current["ollama"])
@@ -389,7 +389,7 @@ class IsolatedDriftTests(unittest.TestCase):
              mock.patch.object(drift, "run_gemma_check", return_value={"ok": False}) as gemma:
             report = drift.doctor(str(self.config), home=str(self.home),
                                   bridge=self.bridge(self.home / "codex"))
-        gemma.assert_called_once_with(str(self.config))
+        gemma.assert_called_once_with(str(self.config), home=str(self.home))
         self.assertNotIn("gemma", report["requalified"])
         baseline = drift._read_baseline(str(self.home))
         self.assertEqual(baseline["executables"]["claude"], current["executables"]["claude"])
@@ -508,11 +508,12 @@ class IsolatedDriftTests(unittest.TestCase):
                  mock.patch.object(drift, "_claude_help_has_flags", return_value={"ok": True}), \
                  mock.patch.object(drift, "run_cli_check", return_value={"ok": True}), \
                  mock.patch.object(drift, "run_gemma_check", return_value={"ok": True}):
-                report = drift.doctor(str(self.config), home=str(self.home), runner=self.runner([]))
+                bridge = self.bridge(self.home / "codex")
+                report = drift.doctor(str(self.config), home=str(self.home), bridge=bridge, runner=self.runner([]))
                 self.assertEqual(report["changed"], [])
                 write.assert_not_called()
                 if old is None:
-                    scheduled = drift.scheduled_baseline(str(self.config), home=str(self.home), runner=self.runner([]))
+                    scheduled = drift.scheduled_baseline(str(self.config), home=str(self.home), bridge=bridge, runner=self.runner([]))
                     self.assertTrue(scheduled["ok"])
                     self.assertFalse(scheduled["recorded"])
                     write.assert_not_called()
