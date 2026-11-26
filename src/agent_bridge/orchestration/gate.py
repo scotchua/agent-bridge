@@ -775,13 +775,19 @@ def capacity_digest(capacity_db: str, now: float) -> str | None:
     return capacity_fingerprint(rows, now)
 
 
+_STAGE_OWNER_EXPIRED = "stage_owner_expired"
+
+
 def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str | None:
     """None when the stage router still shows the receipt's stage owned by
     the receipt's owner on its route with an unexpired lease; otherwise the
     code naming what changed. The revision is not compared: a renewal bumps
     it without changing who owns the stage. The database is opened
     read-only: the hook never writes the router's state. An unreadable
-    database is ``stage_db_unavailable`` (a deny, fail closed)."""
+    database is ``stage_db_unavailable`` (a deny, fail closed). An expired
+    or non-finite owned row returns the internal ``stage_owner_expired``
+    marker: it is not an ownership assertion and therefore cannot keep
+    routing work to its old owner."""
     uri = "file:" + _sqlite_uri_path(capacity_db) + "?mode=ro"
     try:
         db = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -803,7 +809,7 @@ def stage_binding(capacity_db: str, receipt: dict[str, Any], now: float) -> str 
         return "stage_reassigned"
     lease = row["lease_until"]
     if not isinstance(lease, (int, float)) or not math.isfinite(float(lease)) or float(lease) <= now:
-        return "stage_lease_expired"
+        return _STAGE_OWNER_EXPIRED
     return None
 
 
@@ -1577,7 +1583,7 @@ def classify(client: str, tool_name: str, tool_input: Any, cwd: str) -> tuple[st
 #: absent, because a router we cannot read is an infrastructure failure and
 #: must stay a deny rather than triggering a decision made without it.
 _OVERTAKEN = frozenset({"stage_not_found", "stage_not_owned", "stage_reassigned",
-                        "stage_lease_expired"})
+                        _STAGE_OWNER_EXPIRED})
 
 
 def automatic_receipt_overtaken(receipt: dict[str, Any], now: float,
@@ -2026,8 +2032,50 @@ def _task_claim(root: str, item: str) -> dict:
         return claim_reconcile.parse_task_claim(json.loads(data.decode("utf-8")))
     except FileNotFoundError:
         return {"status": "no_record"} if os.path.isdir(root) else {"status": "unreadable"}
+    except UnicodeDecodeError:
+        return {"status": "unreadable"}
+    except json.JSONDecodeError:
+        return {"status": "unreadable"}
     except (OSError, ValueError, RecursionError):
         return {"status": "unreadable"}
+
+
+def _locked_or_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether SQLite says a short retry can help a read-only lookup."""
+    detail = str(exc).lower()
+    return "locked" in detail or "busy" in detail
+
+
+def _task_ledger_rows(capacity_db: str) -> list[dict]:
+    """Read ownership with a bounded retry for a briefly contended ledger.
+
+    The gate never changes the ledger.  A short retry only avoids turning a
+    writer's momentary SQLite lock into a self-inflicted task-folder lockout;
+    all other failures retain the normal fail-closed behavior.  At most three
+    one-second SQLite waits and 0.15 seconds of backoff are spent here, so
+    lock contention costs at most 3.15 seconds inside the hook's ten-second
+    judgment budget.
+    """
+    for attempt in range(3):
+        try:
+            return claim_reconcile._ledger_rows(capacity_db, timeout=1.0)
+        except sqlite3.OperationalError as exc:
+            if not _locked_or_busy(exc) or attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def _live_owned_task_row(row: dict, now: float) -> bool:
+    """Whether a ledger row is a current ownership assertion for this read."""
+    lease = row.get("lease_until")
+    if row.get("state") != "owned" or isinstance(lease, bool) \
+            or not isinstance(lease, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(lease)) and float(lease) > now
+    except (OverflowError, ValueError):
+        return False
 
 
 def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
@@ -2047,38 +2095,67 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
              for path in task_paths}
     try:
         if capacity_db is None:
-            raise OSError("stage database required")
-        rows = claim_reconcile._ledger_rows(capacity_db)
+            raise OSError("stage database is not configured")
+        rows = _task_ledger_rows(capacity_db)
         for item in sorted(items):
             task = _task_claim(root, item)
             if task["status"] in {"unreadable", "malformed"}:
+                problem = task.get("problem", "an unreadable record (link, non-regular file, "
+                                               "oversize record, or undecodable JSON)")
                 return Decision("deny", "task_claim_unavailable",
-                                "delegation-first gate: task ownership could not be read")
+                                f"delegation-first gate: task {item!r} record has {problem}; "
+                                "replace it with a regular task.json containing a valid workload claim")
             claim = task.get("claim")
-            owned = [row for row in rows if row["item_id"] == item
-                     and row["state"] == "owned"]
+            live_owned = [row for row in rows if row["item_id"] == item
+                          and _live_owned_task_row(row, now)]
             if claim and claim["active"]:
-                if claim["lease_expires_at"] <= now:
-                    return Decision("deny", "task_lease_expired",
-                                    f"delegation-first gate: task {item!r} stage {claim['stage']!r} "
-                                    "claim needs renewal")
-                if not any(row["stage"] == claim["stage"]
-                           and row["owner_id"] == claim["owner"] for row in owned):
+                # An expired task-record claim no longer asserts ownership.
+                # It is still visible to the reconciler, but the read-only
+                # gate must not make it a permanent denial.
+                if claim["lease_expires_at"] > now and not any(
+                        row["stage"] == claim["stage"]
+                        and row["owner_id"] == claim["owner"] for row in live_owned):
+                    stage_rows = [row for row in rows if row["item_id"] == item
+                                  and row["stage"] == claim["stage"]]
+                    if not stage_rows:
+                        action = (f"call stage_register with item_id={item!r}, "
+                                  f"stage={claim['stage']!r}, then stage_claim with "
+                                  f"item_id={item!r}, stage={claim['stage']!r}, "
+                                  f"expected_revision={task.get('revision', 0)}; if this claim is stale, "
+                                  f"run claims.py release for task {item!r}")
+                    else:
+                        row = stage_rows[0]
+                        lease = row.get("lease_until")
+                        own_expired = (row.get("state") == "owned"
+                                       and row.get("owner_id") == claim["owner"]
+                                       and isinstance(lease, (int, float))
+                                       and not isinstance(lease, bool)
+                                       and math.isfinite(float(lease))
+                                       and float(lease) <= now)
+                        if own_expired:
+                            action = (f"call stage_renew with item_id={item!r}, "
+                                      f"stage={claim['stage']!r}; or call stage_claim with "
+                                      f"item_id={item!r}, stage={claim['stage']!r}, "
+                                      f"expected_revision={row['revision']}")
+                        else:
+                            action = (f"reconcile task {item!r} with ledger owner "
+                                      f"{row['owner_id']!r} on route {row['owner_route']!r}, or run "
+                                      f"claims.py release for task {item!r} if this claim is stale")
                     return Decision("deny", "task_claim_conflict",
-                                    "delegation-first gate: task claim and ledger need reconciliation")
-            for row in owned:
-                lease = row["lease_until"]
-                if not isinstance(lease, (int, float)) or not math.isfinite(lease) or lease <= now:
-                    return Decision("deny", "stage_lease_expired",
-                                    f"delegation-first gate: task {item!r} stage {row['stage']!r} "
-                                    "needs renewal")
+                                    f"delegation-first gate: task {item!r} stage {claim['stage']!r} "
+                                    f"has an unconfirmed live claim; {action}")
+            for row in live_owned:
                 if row["owner_route"] != client:
                     return Decision("deny", "task_owned_elsewhere",
-                                    "delegation-first gate: the existing task owner is another route; "
-                                    "automatic repository routing cannot replace it")
-    except (OSError, ValueError, sqlite3.Error):
+                                    f"delegation-first gate: task {item!r} stage {row['stage']!r} is "
+                                    f"owned by route {row['owner_route']!r}; dispatch to that route or "
+                                    f"run claims.py release for task {item!r} after confirming it is stale")
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        item_text = ", ".join(repr(item) for item in sorted(items))
+        detail = "not configured" if capacity_db is None else f"unreadable ({type(exc).__name__})"
         return Decision("deny", "stage_db_unavailable",
-                        "delegation-first gate: task ownership state could not be read")
+                        f"delegation-first gate: ownership ledger for task {item_text} is {detail}; "
+                        "retry when the ledger is available")
     if len(task_paths) != len(paths) or any(enclosing_repos(path) for path in task_paths):
         return None                     # mixed/code writes also need repo receipts
     return Decision("allow", "task_record_write",
@@ -2154,7 +2231,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         """The receipt that governs this client here, and whether it lives in
         this client's own retain slot."""
         shared = read_receipt(state_root, repo, grace=False)
-        if shared is not None and decide is not None and is_another_clients_retain(shared, client):
+        if shared is not None and is_another_clients_retain(shared, client):
             # Another client kept its own work. That is not a claim on the
             # repository, so this client is governed by its own retain, made
             # and re-made exactly like a shared one but never overwriting
@@ -2166,6 +2243,14 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             if own is not None and overtaken(own):
                 own = None
             return own, True
+        if (shared is not None and decide is None and capacity_db is not None
+                and stage_binding(capacity_db, shared, now) == _STAGE_OWNER_EXPIRED):
+            # Unlike a terminal or reassigned stage, an expired owned row is
+            # no ownership at all. It must not route a later caller to the
+            # old owner even when automatic routing is disabled. When a
+            # decider is present, ``overtaken`` performs this one binding
+            # read and retires the receipt below.
+            shared = None
         if shared is not None and decide is not None and overtaken(shared):
             shared = None
         return shared, False

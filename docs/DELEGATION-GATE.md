@@ -57,6 +57,12 @@ Covered, with the hook installed and trusted:
   `stage_db_unavailable`, a deny). A receipt is a pointer to ownership the
   router holds, not a token: a fabricated one must name a stage the router
   really assigned to this route, which is the delegation-first flow itself.
+  An expired owned row is no ownership: it no longer routes a later caller to
+  the old owner. For task records, the self-heal denial names `stage_renew`
+  for that item's expired same-owner stage (or `stage_claim` with that
+  ledger row's `expected_revision`); an absent stage names
+  `stage_register`/`stage_claim`, while a different owner is named for
+  reconciliation or `claims.py release`.
 
 Not covered, stated plainly:
 
@@ -280,11 +286,17 @@ Task records and evidence under `~/Claude/team-state/tasks/<item>` are
 checked against that item's existing task claim and live ledger ownership,
 without creating or reassigning a stage. These writes outside repositories
 do not inherit an implementation route from the shell's working directory.
-Claim conflicts, expired leases, and unreadable ownership state deny; the
-operator reconciles them. An expired task claim or stage lease denial names
-the item and stage to renew. Task-record writes also deny with
-`stage_db_unavailable` when no stage database is configured; they do not
-fall back to receipt-free writes outside repositories.
+Only live ownership blocks these writes: an active task claim is checked only
+against an `owned` ledger row with a finite, unexpired lease, and such a live
+ledger row still routes task-record writes even where no task claim exists.
+An expired claim or ledger row grants nothing and does not block a fresh
+fenced claim; the gate never rewrites it. A malformed
+or unreadable record and an unreadable ledger still deny with the item and an
+actionable repair, and a live task claim whose stage is absent from the ledger
+names the `stage_register`/`stage_claim` calls (or `claims.py release` when
+the claim is stale). Task-record writes also deny with `stage_db_unavailable`
+when no stage database is configured; they do not fall back to receipt-free
+writes outside repositories.
 Mixed repository/task writes must also satisfy
 the repository receipts, and repositories inside the task tree keep their
 ordinary receipt checks. Protected-state checks run first in every case.

@@ -322,9 +322,9 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         self.router.renew(self.item, "review", owner_id="codex-session", lease_seconds=1,
                           expected_revision=self.owned["revision"])
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 10)
-        self.assertEqual(decision.code, "stage_lease_expired")
+        self.assertEqual(decision.code, "task_claim_conflict")
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 700)
-        self.assertEqual(decision.code, "task_lease_expired")
+        self.assertTrue(decision.allowed, decision)
         decision = gate._judge_task_records("codex", [str(self.target)], None, time.time())
         self.assertEqual(decision.code, "stage_db_unavailable")
         safe = f"with open({str(self.target)!r}, 'x', encoding='utf-8') as receipt:\n    receipt.write('ok')\n"
@@ -651,7 +651,7 @@ class CommandTargetsAndTaskOwnership(AutoCase):
                 self.assertAllowed(self.shell(f"git {subcommand} {flag} {target}"))
         self.assertAllowed(self.shell(f"git -C {shlex.quote(str(self.repo))} commit -m {target}"))
 
-    def test_expired_task_lease_denial_names_item_and_stage(self):
+    def test_expired_ledger_row_does_not_assert_ownership(self):
         import contextlib
         import sqlite3
         # closing(): the connection's own context manager commits but does not
@@ -660,13 +660,118 @@ class CommandTargetsAndTaskOwnership(AutoCase):
             db.execute("UPDATE stages SET lease_until = ? WHERE item_id = ? AND stage = ?",
                        (time.time() - 1, self.item, "review"))
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
-        self.assertEqual(decision.code, "stage_lease_expired")
+        # The still-live task claim is not permission without a matching live
+        # ledger owner, but expiry itself no longer emits a lease denial.
+        self.assertEqual(decision.code, "task_claim_conflict")
         self.assertIn(self.item, decision.reason)
         self.assertIn("review", decision.reason)
+        self.assertIn("stage_renew", decision.reason)
+        self.assertIn(f"expected_revision={self.owned['revision']}", decision.reason)
+
+        # A claim whose stage is absent still names the register/claim repair.
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": "codex-session", "stage": "missing-stage",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_conflict")
+        self.assertIn("stage_register", decision.reason)
+        self.assertIn("stage_claim", decision.reason)
+        self.assertIn("claims.py release", decision.reason)
+
+        # A different ledger owner names the owner and route to reconcile.
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": "codex-session", "stage": "review",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET owner_id=?, owner_route=?, lease_until=? "
+                       "WHERE item_id = ? AND stage = ?",
+                       ("other-session", "claude", time.time() + 600, self.item, "review"))
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_conflict")
+        self.assertIn("other-session", decision.reason)
+        self.assertIn("claude", decision.reason)
+        self.assertIn("claims.py release", decision.reason)
+
         decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time() + 700)
-        self.assertEqual(decision.code, "task_lease_expired")
+        self.assertTrue(decision.allowed, decision)
+        (self.task / "task.json").write_text(json.dumps({"workload": {}}), encoding="utf-8")
+        decision = gate._judge_task_records("claude", [str(self.target)], str(self.db), time.time())
+        self.assertTrue(decision.allowed, decision)
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET lease_until = ? WHERE item_id = ? AND stage = ?",
+                       (float("inf"), self.item, "review"))
+        decision = gate._judge_task_records("claude", [str(self.target)], str(self.db), time.time())
+        self.assertTrue(decision.allowed, decision)
+
+    def test_no_claim_workloads_allow_task_record_writes_without_live_conflict(self):
+        record = self.task / "task.json"
+        for workload in ({}, {"notes": "awaiting worker"},
+                         {"revision": 0, "claim": None}):
+            with self.subTest(workload=workload):
+                record.write_text(json.dumps({"workload": workload}), encoding="utf-8")
+                decision = gate._judge_task_records(
+                    "codex", [str(self.target)], str(self.db), time.time())
+                self.assertTrue(decision.allowed, decision)
+
+    def test_invalid_claim_denies_with_item_and_repair(self):
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"stage": "review", "lease_expires_at": "soon"}}}),
+            encoding="utf-8")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_unavailable")
         self.assertIn(self.item, decision.reason)
-        self.assertIn("review", decision.reason)
+        self.assertIn("invalid claim", decision.reason)
+        self.assertIn("replace", decision.reason)
+
+    def test_expired_claim_stops_asserting_but_live_foreign_owner_still_denies(self):
+        import contextlib
+        import sqlite3
+        record = self.task / "task.json"
+        record.write_text(json.dumps({"workload": {"revision": 7, "claim": {
+            "owner": "other-session", "stage": "review",
+            "lease_expires_at": time.time() - 1}}}), encoding="utf-8")
+        # With no live foreign ledger owner, the expired record claim does
+        # not itself govern the task folder.
+        self.assertTrue(gate._judge_task_records(
+            "codex", [str(self.target)], str(self.db), time.time()).allowed)
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET owner_id=?, owner_route=? WHERE item_id=? AND stage=?",
+                       ("other-session", "claude", self.item, "review"))
+        record.write_text(json.dumps({"workload": {"revision": 7, "claim": {
+            "owner": "other-session", "stage": "review",
+            "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_owned_elsewhere")
+
+    def test_missing_claim_stage_names_register_claim_or_release(self):
+        (self.task / "task.json").write_text(json.dumps({"workload": {"revision": 7, "claim": {
+            "owner": "codex-session", "stage": "missing-stage",
+            "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "task_claim_conflict")
+        self.assertIn(self.item, decision.reason)
+        self.assertIn("missing-stage", decision.reason)
+        self.assertIn("stage_register", decision.reason)
+        self.assertIn("stage_claim", decision.reason)
+        self.assertIn("expected_revision=7", decision.reason)
+        self.assertIn("claims.py release", decision.reason)
+
+    def test_locked_or_missing_ledger_denies_after_bounded_retry(self):
+        import sqlite3
+        locked = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(gate.claim_reconcile, "_ledger_rows", side_effect=locked) as read:
+            with mock.patch.object(gate.time, "sleep") as sleep:
+                decision = gate._judge_task_records(
+                    "codex", [str(self.target)], str(self.db), time.time())
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn(self.item, decision.reason)
+        self.assertIn("unreadable", decision.reason)
+        decision = gate._judge_task_records(
+            "codex", [str(self.target)], str(self.base / "missing.sqlite3"), time.time())
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        self.assertIn(self.item, decision.reason)
 
     def test_task_writes_require_a_configured_stage_database(self):
         decision = gate._judge_task_records("codex", [str(self.target)], None, time.time())
@@ -2741,6 +2846,35 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         self.assertAllowed(self.hook("claude", self.repo))
         self.assertNotEqual(self.receipt_for(self.repo)["policy_fingerprint"],
                             shared["policy_fingerprint"])
+
+    def test_an_expired_other_retain_still_uses_the_callers_slot(self):
+        """An expired retain is its caller's concern, never the arrival's."""
+        for with_decider in (False, True):
+            with self.subTest(with_decider=with_decider):
+                self.setUp()
+                self.arrange({})
+                self.assertAllowed(self.hook("claude", self.repo))
+                self.assertAllowed(self.hook("codex", self.repo))
+                shared = self.receipt_for(self.repo)
+                own = self.own_receipt("codex")
+                # The direct update is deliberate: make only Claude's retain
+                # expired while preserving Codex's retain slot.
+                import contextlib
+                import sqlite3
+                with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+                    db.execute("UPDATE stages SET lease_until=? WHERE item_id=? AND stage=?",
+                               (time.time() - 1, shared["item_id"], shared["stage"]))
+                before = self.receipt_for(self.repo)
+                patch = ("*** Begin Patch\n*** Update File: app.py\n@@\n-x = 1\n+x = 2\n"
+                         "*** End Patch\n")
+                decision = gate.judge(
+                    "codex", "apply_patch", {"input": patch}, str(self.repo),
+                    state_root=str(self.state), capacity_db=str(self.db),
+                    decide=(gate.automatic_decider("codex", str(self.state), str(self.db))
+                            if with_decider else None))
+                self.assertTrue(decision.allowed, decision)
+                self.assertEqual(decision.receipt["stage"], own["stage"])
+                self.assertEqual(self.receipt_for(self.repo), before)
 
     def judge_in_process(self, client: str, decide=None):
         patch = ("*** Begin Patch\n*** Update File: app.py\n@@\n-x = 1\n+x = 2\n"
