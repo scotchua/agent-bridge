@@ -836,19 +836,26 @@ def run_cli_check(name: str, entry: dict[str, Any], *, model: str | None = None,
                 "output": output[:2000], "receipt_id": "codex-default" if default_model else "codex-synthetic"}
 
 
-def run_gemma_check(config_path: str) -> dict[str, Any]:
+def run_gemma_check(config_path: str, *, home: str | None = None) -> dict[str, Any]:
     from .orchestration.config import load
     from .localq import gemma_child
+    evidence = {}
     try:
         cfg = load(config_path)
         if cfg.local_backend != "gemma_certified": return {"ok": True, "receipt_id": "not-applicable"}
         delegate_hash, validator_hash = _sha256(str(cfg.gemma_delegate_executable)), _sha256(str(cfg.gemma_receipt_validator_executable))
         if not delegate_hash or not validator_hash: return {"ok": False, "reason": "configured_file_missing"}
-        with tempfile.TemporaryDirectory(prefix="agent-bridge-drift-") as receipts:
-            result = gemma_child.invoke({"job_id": "drift-synthetic", "task_type": "summarize", "input": GEMMA_CHECK_TEXT, "params": {"instruction": ""}}, delegate=str(cfg.gemma_delegate_executable), python=str(cfg.gemma_python_executable), receipt_root=receipts, receipt_validator=str(cfg.gemma_receipt_validator_executable), model_digest=str(cfg.gemma_model_digest), delegate_sha256=delegate_hash, validator_sha256=validator_hash, timeout=cfg.gemma_timeout_seconds)
-        return {"ok": True, "receipt_id": result.get("invocation_id")}
+        # A failed probe can own a quarantined endpoint. Keep its operation receipts.
+        try:
+            root = store.secure_mkdir(os.path.join(paths(home)["root"], "gemma-probes"))
+            receipts = tempfile.mkdtemp(prefix="agent-bridge-drift-", dir=root)
+        except OSError as exc:
+            return {"ok": False, "reason": "diagnostic_receipt_store_unavailable", "errno": exc.errno}
+        evidence["receipt_directory"] = receipts
+        result = gemma_child.invoke({"job_id": "drift-synthetic", "task_type": "summarize", "input": GEMMA_CHECK_TEXT, "params": {"instruction": ""}}, delegate=str(cfg.gemma_delegate_executable), python=str(cfg.gemma_python_executable), receipt_root=receipts, receipt_validator=str(cfg.gemma_receipt_validator_executable), model_digest=str(cfg.gemma_model_digest), delegate_sha256=delegate_hash, validator_sha256=validator_hash, timeout=cfg.gemma_timeout_seconds)
+        return {"ok": True, "receipt_id": result.get("invocation_id"), **evidence}
     except Exception as exc:
-        return {"ok": False, "reason": str(exc) or type(exc).__name__}
+        return {"ok": False, "reason": str(exc) or type(exc).__name__, **evidence}
 
 
 def _audit(home: str, **entry: Any) -> None:
@@ -953,7 +960,7 @@ def doctor(config_path: str | None = None, *, home: str | None = None, accept_re
                      if selected_live is not None else
                      baseline is None or bool({"ollama", "gemma_delegate", "gemma_validator"} & set(changed)))
     if gemma_changed and current["config_path"]:
-        checked["gemma"] = run_gemma_check(current["config_path"])
+        checked["gemma"] = run_gemma_check(current["config_path"], home=home)
         if checked["gemma"].get("ok"): passed.add("gemma")
         else: needs.append("Gemma changed but its synthetic check failed; repair it and run setup_bridge.py doctor.")
     # Qualify then activate.  A foreground doctor needs the same protection as
