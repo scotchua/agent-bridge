@@ -109,7 +109,7 @@ class AutomaticIntakeTests(unittest.TestCase):
         self.assertEqual(queue.status(routed["job_id"])["classification"], "client_derived")
 
     def test_small_work_is_refused_without_queue_or_fallback(self):
-        routed = self.route(input="tiny note")
+        routed = self.route(task_type="extract", input="tiny note")
         self.assertEqual(routed["decision"], "refused")
         self.assertEqual(routed["reason"], "below_local_delegation_threshold")
         self.assertIsNone(routed["job_id"])

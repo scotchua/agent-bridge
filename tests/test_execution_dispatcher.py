@@ -117,6 +117,63 @@ class ExecutionDispatcherTests(unittest.TestCase):
                         timeout_seconds=10, verify_timeout_seconds=20,
                         cleanup_timeout_seconds=30)
 
+    def test_codex_defaults_are_snapshotted_and_counted_in_the_deadline_and_receipt(self):
+        path = self.repo / ".agent-bridge-verification.json"
+        checks = [["python3", "-m", "unittest", "discover", "-s", "tests"], ["git", "diff", "--check"]]
+        path.write_text(json.dumps({"verify_argv": checks}), encoding="utf-8")
+        job = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra", verify_argv=None)
+        directory = self.queue.root / job["job_id"]
+        request = json.loads((directory / "request.json").read_text())
+        self.assertEqual(request["verify_argv"], checks)
+        self.assertEqual(request["verification_default"], "repo")
+        self.assertEqual(request["total_timeout_seconds"], 90 + 2 * 300 + 3 * 60 + 300)
+        self.assertEqual(json.loads((directory / "receipt.json").read_text())["verification_default"], "repo")
+        path.write_text("invalid later edit", encoding="utf-8")
+        self.queue.run_once("synthetic-worker")
+        self.assertEqual(self.fake.requests[0]["verify_argv"], checks)
+
+    def test_codex_without_a_default_records_none_and_explicit_checks_win(self):
+        for commands, source in ((None, "none"), ([], "none"), ([["git", "status"]], "explicit")):
+            job = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra", verify_argv=commands)
+            directory = self.queue.root / job["job_id"]
+            self.assertEqual(json.loads((directory / "receipt.json").read_text())["verification_default"], source)
+            self.assertEqual(json.loads((directory / "request.json").read_text())["verify_argv"], commands or [])
+
+    def test_repository_timeout_is_in_the_deadline_and_explicit_timeout_wins(self):
+        path = self.repo / ".agent-bridge-verification.json"
+        path.write_text(json.dumps({"verify_argv": [["git", "status"]], "verify_timeout_seconds": 1800}))
+        for overrides, seconds in (({}, 1800), ({"verify_timeout_seconds": 60}, 60)):
+            job = self.submit(caller="claude", provider="codex", model="gpt-5.6-terra", verify_argv=None, **overrides)
+            request = json.loads((self.queue.root / job["job_id"] / "request.json").read_text())
+            self.assertEqual(request["verify_timeout_seconds"], seconds)
+            self.assertEqual(request["total_timeout_seconds"], 90 + seconds + 180 + 300)
+
+    def test_codex_invalid_default_refuses_before_admission(self):
+        (self.repo / ".agent-bridge-verification.json").write_text('{"verify_argv": [["sh", "-c", "exit 0"]]}')
+        with self.assertRaisesRegex(ExecutionAdmissionError, "verification_default_invalid"):
+            self.submit(caller="claude", provider="codex", model="gpt-5.6-terra", verify_argv=None)
+        self.assertEqual(self.queue.state_report(), {})
+
+    def test_legacy_explicit_request_still_deduplicates_after_upgrade(self):
+        args = dict(caller="claude", provider="codex", model="gpt-5.6-terra", idempotency_key="legacy-explicit")
+        job = self.submit(**args)
+        path = self.queue.root / job["job_id"] / "request.json"
+        request = json.loads(path.read_text())
+        del request["verification_default"]
+        path.write_text(json.dumps(request))
+        self.assertEqual(self.submit(**args)["job_id"], job["job_id"])
+
+    def test_verification_summary_retains_return_codes_without_model_text(self):
+        summary = _harness_summary(json.dumps({"ok": False, "status": "verification_failed", "verification": [
+            {"argv": ["git", "diff", "--check"], "returncode": 1, "output": "SECRET MODEL TEXT"}]}).encode())
+        self.assertEqual(summary["verification"], [{"argv": ["git", "diff", "--check"], "returncode": 1}])
+        self.assertNotIn("SECRET", json.dumps(summary))
+        self.assertFalse(outcome_is_success({"returncode": 0, "harness_ok": True,
+            "harness_status": "complete", "verification": summary["verification"]}))
+        for evidence in ({}, [{"argv": ["sh"], "returncode": 0}], [{"argv": ["git", "status"], "returncode": True}]):
+            result = _harness_summary(json.dumps({"ok": True, "status": "complete", "verification": evidence}).encode())
+            self.assertFalse(result["harness_ok"])
+
     def test_atomic_receipt_closes_descriptor_and_preserves_acl_failure(self):
         target = self.root / "queue" / "acl-test.json"
         target.parent.mkdir(exist_ok=True)
@@ -655,7 +712,7 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
             caller="claude", provider="codex", repo=str(self.repo), brief=str(self.brief),
             base="HEAD", classification="synthetic", model="gpt-5.6-terra", effort="low",
             item_id="item-1", stage="implement", owner_id="owner-1", stage_revision=1,
-            verify_argv=[["git", "status"], ["git", "diff"]], timeout_seconds=1,
+            verify_argv=extra.pop("verify_argv", [["git", "status"], ["git", "diff"]]), timeout_seconds=1,
             verify_timeout_seconds=1, cleanup_timeout_seconds=1, **extra)
 
     def _observed_exception(self, queued):
@@ -672,6 +729,23 @@ class CoherentDeadlineHarnessTests(unittest.TestCase):
         queued = self._submit()
         self.queue.run_once("worker-1")
         self.assertIsNone(self._observed_exception(queued))
+
+    def test_defaulted_build_requires_matching_evidence_from_the_harness(self):
+        checks = [["git", "diff", "--check"]]
+        (self.repo / ".agent-bridge-verification.json").write_text(json.dumps({"verify_argv": checks}))
+        queued = self._submit(verify_argv=None)
+        self.queue.run_once("offline-worker")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_detail"], "verification_default_evidence_missing")
+
+        text = self.harness.read_text()
+        self.harness.write_text(text.replace("'status': 'complete'", "'status': 'complete', 'verification': [{'argv': json.loads(c), 'returncode': 0} for c in a.verify_json]"))
+        queued = self._submit(verify_argv=None)
+        self.queue.run_once("offline-worker")
+        result = self.queue.result(queued["job_id"])
+        self.assertEqual(result["state"], "complete", result)
+        self.assertEqual(result["harness"]["verification"], [{"argv": checks[0], "returncode": 0}])
 
     def test_malformed_or_review_exception_id_is_refused_at_submit(self):
         for extra in ({"exception_id": "../x"}, {"exception_id": ""},

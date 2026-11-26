@@ -30,6 +30,9 @@ from . import quality
 
 TERMINAL = frozenset({"complete", "failed", "cancelled", "expired", "unknown"})
 MECHANICAL_TASKS = frozenset({"summarize", "extract", "classify", "checklist", "log_triage", "test_draft"})
+# Summarize also covers short PR/commit/checkpoint drafts from supplied facts.
+# Reusing the certified summary contract avoids inventing a new backend kind.
+COORDINATOR_CHORES = frozenset({"log_triage", "summarize"})
 #: Includes client_derived: this queue's only worker is the on-device model.
 ALLOWED_CLASSIFICATIONS = frozenset({"synthetic", "public", "internal_nonclient", "client_derived"})
 #: Fixed refusal reason for a mechanical task type that is real (it is in

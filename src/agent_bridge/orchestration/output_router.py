@@ -36,6 +36,41 @@ DIGEST_PROMPT = (
     "Summarize this command output for the calling engineer. Preserve the "
     "command result, failures, and actionable diagnostics; do not invent facts."
 )
+TRIAGE_PROMPT = (
+    "Summarize test or CI output: state pass/fail (or unknown when incomplete), "
+    "preserve failing test names and actionable diagnostics. Do not invent facts."
+)
+
+
+def coordinator_chore(command: list[str]) -> str | None:
+    """Recognize chores among commands the existing hook already wraps.
+
+    This changes neither the hook's command allowlist nor repo classification.
+    Unrecognized small output retains its existing bounded-read behavior.
+    """
+    # The installed hook passes /bin/sh -c <one already-allowlisted command>.
+    # Decode only that exact shape and repeat the existing routability check;
+    # never interpret composed shell input as a declared chore.
+    if len(command) == 3 and Path(command[0]).name in {"sh", "bash", "zsh"} and command[1] == "-c":
+        if not is_routable_command(command[2], cwd=os.getcwd()):
+            return None
+        import shlex
+        command = shlex.split(command[2])
+    words = [Path(word).name.lower() for word in command]
+    if not words:
+        return None
+    if (words[0] in {"pytest"}
+            or (words[0] in {"python", "python3"} and len(words) > 1
+                and ((len(words) > 2 and words[1] == "-m" and words[2] in {"pytest", "unittest"})
+                     or words[1] == "test_suite.py"))
+            or (words[0] in {"npm", "pnpm", "yarn", "cargo", "go"} and "test" in words[1:])):
+        return "log_triage"
+    if words[0] in {"cat", "head", "tail", "sed", "nl"}:
+        if any(word.endswith(".log") for word in words[1:]):
+            return "log_triage"
+        if any(word in {"receipt.json", "last-message.txt", "last_message.txt", "codex-last-message.txt"} for word in words[1:]):
+            return "summarize"
+    return None
 
 
 def is_wrapped_command(command: str) -> bool:
@@ -294,6 +329,7 @@ def _record(state_root: str, *, bytes_count: int, repo: str, classification: str
 def route_output(output: bytes, *, state_root: str, repo: str, classification: str,
                  intake: AutomaticIntake, executor: Callable[[], Any] | None = None,
                  caller: str = "claude",
+                 task_type: str | None = None,
                  exit_code: int = 0, wait_seconds: float = WAIT_SECONDS,
                  clock: Callable[[], float] = time.monotonic) -> int:
     """Print the context-safe response for a captured command and return 0.
@@ -308,7 +344,7 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
     routed = False
     try:
         full_path = capture_output(state_root, output)
-        if len(output) < SMALL_OUTPUT_BYTES:
+        if len(output) < SMALL_OUTPUT_BYTES and task_type is None:
             _raw(output)
             _record(state_root, bytes_count=len(output), repo=repo, classification=classification, caller=caller,
                     routed=False, waiver_reason="below_threshold", job_id=None,
@@ -319,20 +355,28 @@ def route_output(output: bytes, *, state_root: str, repo: str, classification: s
         intake.queue.admit("interactive")
         local_bytes, clipped = _fit_for_queue(output, intake.queue.caps.max_input_bytes)
         text = local_bytes.decode("utf-8", "replace")
+        kind = task_type or "summarize"
+        if kind == "log_triage" and intake.queue.backend_id == "gemma_certified":
+            # Keep the certified triage's record-identity and completeness
+            # contract. No custom prompt or implicit pilot opt-in is added.
+            text = "\n".join(f"[T{i}] {line}" for i, line in enumerate(
+                (line for line in text.splitlines() if line.strip()), 1))
         # Identity is the whole output, scoped by caller so matching output
         # from the two hosts cannot conflict on checkpoint provenance. Keep
         # Claude's historical key so existing jobs still deduplicate.
         prefix = "inline-output:" if caller == "claude" else "inline-output:" + caller + ":"
+        if task_type is not None:
+            prefix += task_type + ":"
         task_id = prefix + hashlib.sha256(output).hexdigest()
         checkpoint = intake.checkpoint(
-            task_id=task_id, task_type="summarize", classification=classification,
-            caller=caller, input_bytes=len(local_bytes),
+            task_id=task_id, task_type=kind, classification=classification,
+            caller=caller, input_bytes=len(text.encode("utf-8")),
             nonblank_lines=sum(1 for line in text.splitlines() if line.strip()),
             risk_flags=[], idempotency_key=task_id)
         params = ({} if intake.queue.backend_id == "gemma_certified"
-                  else {"instruction": DIGEST_PROMPT})
+                  else {"instruction": TRIAGE_PROMPT if kind == "log_triage" else DIGEST_PROMPT})
         receipt = intake.route(
-            task_type="summarize", input=text, params=params,
+            task_type=kind, input=text, params=params,
             priority="interactive", classification=classification, caller=caller,
             purpose="work", checkpoint_id=checkpoint["checkpoint_id"])
         job_id = receipt.get("job_id") if isinstance(receipt.get("job_id"), str) else None
@@ -415,6 +459,7 @@ def run_command(command: list[str], *, config_path: str, caller: str = "claude")
                      # here could let one 60-second queue job overrun this
                      # wrapper's 45-second wait bound.
                      intake=AutomaticIntake(service.queue), executor=None,
+                     task_type=coordinator_chore(command),
                      exit_code=int(completed.returncode))
         return int(completed.returncode)
     except Exception as exc:  # noqa: BLE001 - wrapper itself never masks child execution

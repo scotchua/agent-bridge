@@ -60,13 +60,17 @@ def setUpModule():
     global _PROMOTION_TMP, _PROMOTION_PATCH
     from agent_bridge.execution import codex_promotion
     _PROMOTION_TMP = tempfile.TemporaryDirectory()
-    _PROMOTION_PATCH = mock.patch.object(codex_promotion, "default_promotion_dir",
-                                         return_value=Path(_PROMOTION_TMP.name) / "promotion")
-    _PROMOTION_PATCH.start()
+    _PROMOTION_PATCH = contextlib.ExitStack()
+    _PROMOTION_PATCH.enter_context(mock.patch.object(codex_promotion, "default_promotion_dir",
+                                         return_value=Path(_PROMOTION_TMP.name) / "promotion"))
+    # The repository default now discovers this module inside the verifier's
+    # isolated HOME. Model the test account there, just as the existing
+    # isolated-home subprocess launcher does; production admission stays strict.
+    _PROMOTION_PATCH.enter_context(mock.patch.object(codex_promotion, "account_home", side_effect=Path.home))
 
 
 def tearDownModule():
-    _PROMOTION_PATCH.stop()
+    _PROMOTION_PATCH.close()
     _PROMOTION_TMP.cleanup()
 
 
@@ -287,6 +291,31 @@ class CodexTaskTests(unittest.TestCase):
         result = self.run_default(verify_argv=[])
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["verification"], [])
+        self.assertEqual(result["verification_default"], "none")
+
+    def test_omitted_verification_runs_repo_defaults_and_records_each_result(self):
+        requires_confinement(self)
+        # A deliberate assertion failure has a portable exit status inside
+        # confinement; git diff can instead fail on access to git metadata.
+        checks = [["python3", "-m", "unittest", "repo_checks.Passing"],
+                  ["python3", "-m", "unittest", "repo_checks.Failing"]]
+        (self.repo / "repo_checks.py").write_text(
+            "import unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_pass(self): self.assertTrue(True)\n"
+            "class Failing(unittest.TestCase):\n"
+            "    def test_fail(self): self.fail('deliberate repo verification failure')\n",
+            encoding="utf-8")
+        (self.repo / ".agent-bridge-verification.json").write_text(json.dumps({"verify_argv": checks}))
+        subprocess.run(["git", "add", ".agent-bridge-verification.json", "repo_checks.py"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "verification defaults"], cwd=self.repo, check=True)
+        result = self.run_default(verify_argv=None)
+        self.assertEqual(result["verification_default"], "repo")
+        self.assertEqual([row["argv"] for row in result["verification"]], checks)
+        self.assertEqual([row["returncode"] for row in result["verification"]], [0, 1])
+        self.assertIn("deliberate repo verification failure",
+                      (Path(result["job_dir"]) / "verify-2.stderr").read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "verification_failed")
 
     def test_refuses_shell_verification(self):
         for commands in ([["sh", "-c", "touch escaped"]], [["python3", "-c", "print(1)"]]):

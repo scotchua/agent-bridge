@@ -71,7 +71,7 @@ _SAFE_EXECUTION_CODES = frozenset({
     "review_receipt_outside_job", "review_request_invalid",
     "review_verify_argv_forbidden", "stage_revision_invalid", "timeout_invalid",
     "total_timeout_invalid", "verify_argv_invalid", "verify_argv_rejected",
-    "verify_not_runnable", "verify_timeout_invalid",
+    "verify_not_runnable", "verify_timeout_invalid", "verification_default_evidence_missing",
     "windows_wsl_configuration_missing",
     # Worker status and restart requests in PR #69 (I2).
     "execution_worker_restart_request_unavailable",

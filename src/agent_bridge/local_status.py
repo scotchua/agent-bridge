@@ -14,7 +14,8 @@ from typing import Any
 
 from . import drift
 from .localq import quality
-from .localq.spool import MECHANICAL_TASKS
+from .localq.spool import COORDINATOR_CHORES, MECHANICAL_TASKS
+from .localq.intake import CHORE_WAIVER_REASONS
 from .orchestration.config import load, OrchestrationConfigError
 
 
@@ -53,6 +54,62 @@ def _inline_output_counts(state_root: Path, start: float, now: float) -> tuple[l
             for (caller, routed, reason), count in sorted(counts.items())], undated
 
 
+def _chore_counts(db: sqlite3.Connection, start: float, now: float) -> dict[str, Any]:
+    # Older installations have no waiver table. Report that accounting is
+    # unavailable instead of manufacturing a zero count of silent skips.
+    available = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chore_waivers'").fetchone()
+    if not available:
+        return {"chore_accounting_available": False, "chore_waivers": [], "unaccounted_chores": []}
+    waivers = []
+    for caller, task, reason, count in db.execute("""SELECT caller, task_type, reason, COUNT(*)
+            FROM chore_waivers WHERE created_at >= ? AND created_at <= ?
+            GROUP BY caller, task_type, reason ORDER BY caller, task_type, reason""", (start, now)):
+        if reason not in CHORE_WAIVER_REASONS or task not in COORDINATOR_CHORES or caller not in {"claude", "codex"}:
+            raise ValueError("chore_waiver_invalid")
+        waivers.append({"caller": caller, "task_type": task, "reason": reason, "count": count})
+    unaccounted = [{"caller": caller, "task_type": task, "status": status, "count": count}
+        for caller, task, status, count in db.execute("""SELECT c.caller, c.task_type, c.status, COUNT(*)
+            FROM checkpoints c WHERE c.created_at >= ? AND c.created_at <= ?
+            AND c.status != 'no_eligible_unit' AND c.task_type IN ('log_triage', 'summarize')
+            AND NOT EXISTS (SELECT 1 FROM routing_receipts r
+                            WHERE r.checkpoint_id=c.checkpoint_id AND r.job_id IS NOT NULL)
+            AND NOT EXISTS (SELECT 1 FROM chore_waivers w WHERE w.checkpoint_id=c.checkpoint_id)
+            GROUP BY c.caller, c.task_type, c.status ORDER BY c.caller, c.task_type, c.status""", (start, now))]
+    return {"chore_accounting_available": True, "chore_waivers": waivers, "unaccounted_chores": unaccounted}
+
+
+def _execution_counts(root: Path | None, start: float, now: float) -> dict[str, Any]:
+    counts: Counter = Counter()
+    undated = 0
+    if root is not None and root.exists():
+        for directory in sorted(root.iterdir()):
+            if len(directory.name) != 32 or any(char not in "0123456789abcdef" for char in directory.name):
+                continue
+            if not directory.is_dir():
+                continue
+            request_path = directory / "request.json"
+            # Source preparation creates a directory before admission. Only
+            # publication of request.json makes it an execution job.
+            if not request_path.is_file():
+                continue
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            if request.get("provider") != "codex" or request.get("kind", "execution") != "execution":
+                continue
+            at = request.get("submitted_at")
+            if not isinstance(at, (int, float)) or isinstance(at, bool):
+                undated += 1
+                continue
+            if start <= at <= now:
+                receipt = json.loads((directory / "receipt.json").read_text(encoding="utf-8"))
+                state = receipt.get("state")
+                if state not in {"queued", "running", "complete", "failed", "blocked", "cancelled", "unknown"}:
+                    raise ValueError("execution_state_invalid")
+                counts[state] += 1
+    return {"execution_configured": root is not None,
+            "codex_execution_jobs": [{"state": state, "count": count} for state, count in sorted(counts.items())],
+            "codex_execution_undated_records": undated}
+
+
 def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict[str, Any]:
     """Group current outcomes by submission day, within N local calendar days.
 
@@ -70,6 +127,7 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
     first = today - dt.timedelta(days=days - 1)
     start = dt.datetime.combine(first, dt.time()).timestamp()
     jobs: Counter = Counter()
+    split_jobs: Counter = Counter()
     feedback: dict[str, Counter] = defaultdict(Counter)
     # Do not select content, blob paths, disposition, or error text. Only
     # the fixed dependency class is derived inside SQLite.
@@ -84,12 +142,15 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
         for submitted, caller, purpose, task, outcome, raw_feedback in rows:
             day = dt.datetime.fromtimestamp(submitted).date().isoformat()
             jobs[(day, caller, purpose, outcome)] += 1
+            observation = "-"
             if purpose == "work" and outcome == "complete":
                 value = json.loads(raw_feedback) if raw_feedback is not None else {}
                 observation = value.get("outcome", "unreviewed")
                 if observation not in {"used", "reworked", "discarded", "unreviewed"}:
                     raise ValueError("feedback_invalid")
                 feedback[task][observation] += 1
+            if purpose == "work":
+                split_jobs[(task, outcome, observation)] += 1
         quality_jobs = quality.job_rows(db)
     try:
         quality_state = quality.read_state(cfg.state_root).get(cfg.local_backend, {})
@@ -111,6 +172,7 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                        for caller, status, count in db.execute("""SELECT caller, status, COUNT(*)
                            FROM checkpoints WHERE created_at >= ? AND created_at <= ?
                            GROUP BY caller, status ORDER BY caller, status""", (start, now))]
+        chores = _chore_counts(db, start, now)
     feedback_rows = []
     for task, counts in sorted(feedback.items()):
         reviewed = sum(counts[key] for key in ("used", "reworked", "discarded"))
@@ -128,6 +190,11 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
             "quality_backend_id": cfg.local_backend, "quality_window_days": 14,
             "quality": [{"task_type": task, **row} for task, row in quality_rows.items()],
             "disabled_for_quality": sorted(disabled),
+            "work_split": {"local_jobs": [{"task_type": task, "outcome": outcome,
+                                            "feedback": observation, "count": count}
+                                           for (task, outcome, observation), count in sorted(split_jobs.items())],
+                           **chores, **_execution_counts(cfg.execution_queue_root, start, now),
+                           "inline_output_waivers": [row for row in inline_output if not row["routed"]]},
             "inline_output_routing": inline_output, "inline_output_undated_records": undated}
 
 
@@ -147,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="installed orchestration configuration")
     parser.add_argument("--days", type=_days, default=7)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--work-split", action="store_true", help="show local, Codex and cloud-done chore counts")
     args = parser.parse_args(argv)
     try:
         config_path = drift.discover_config(args.config)
@@ -166,6 +234,29 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.json:
         print(json.dumps(result, sort_keys=True))
+    elif args.work_split:
+        print(f"Local days {result['first_local_day']} through {result['last_local_day']}")
+        split = result["work_split"]
+        print("Local work jobs by type, current outcome and feedback:")
+        for row in split["local_jobs"]:
+            print("{task_type}\t{outcome}\t{feedback}\t{count}".format(**row))
+        print("Codex execution jobs by submission time and current state:")
+        for row in split["codex_execution_jobs"]:
+            print("codex\t{state}\t{count}".format(**row))
+        if not split["execution_configured"]:
+            print("Execution queue: not configured")
+        print(f"Undated Codex execution records excluded: {split['codex_execution_undated_records']}")
+        print("Cloud-done chores (explicit waivers, by recording time):")
+        for row in split["chore_waivers"]:
+            print("{caller}\t{task_type}\t{reason}\t{count}".format(**row))
+        print("Inline output waivers (output returned; cloud completion not observed):")
+        for row in split["inline_output_waivers"]:
+            print("{caller}\t{waiver_reason}\t{count}".format(**row))
+        print("Unaccounted chores (pending or skipped; no local job or waiver):")
+        for row in split["unaccounted_chores"]:
+            print("{caller}\t{task_type}\t{status}\t{count}".format(**row))
+        if not split["chore_accounting_available"]:
+            print("Chore accounting unavailable: start the updated orchestration server to migrate")
     else:
         print(f"Local days {result['first_local_day']} through {result['last_local_day']}")
         print("Jobs by submission day (current outcome):")
@@ -193,4 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row['caller']}\t{outcome}\t{reason}\t{row['count']}")
         if result["inline_output_undated_records"]:
             print(f"Undated inline output records excluded from window: {result['inline_output_undated_records']}")
+        split = result["work_split"]
+        print("Unaccounted chores (pending or skipped): " +
+              (str(sum(row["count"] for row in split["unaccounted_chores"]))
+               if split["chore_accounting_available"] else "accounting unavailable"))
     return 0

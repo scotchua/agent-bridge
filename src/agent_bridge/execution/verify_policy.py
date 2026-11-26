@@ -13,9 +13,10 @@ read-only subcommands, and no control characters anywhere in an argument.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
 
@@ -35,6 +36,50 @@ MESSAGE_PYTHON = "Python verification is limited to python -m pytest or python -
 MESSAGE_GIT = "git verification is read-only"
 MESSAGE_CONTROL = "control character in verification argv"
 MESSAGE_NOT_ON_PATH = "verification program is not on the worker's PATH: {}"
+DEFAULT_FILE = ".agent-bridge-verification.json"
+DEFAULT_SOURCES = ("repo", "explicit", "none")
+
+
+def resolve_verification(repo: Path, commands: object, *, timeout: int | None = None
+                         ) -> tuple[list[list[str]], str, int]:
+    """Resolve omitted/empty checks once, before generation, and validate them.
+
+    Repository defaults have exactly the explicit-command policy; they cannot
+    introduce shell execution, Python scripts, arbitrary environment variables,
+    or a less confined verifier. A malformed/unreadable file is a refusal.
+    """
+    selected_timeout = 300 if timeout is None else timeout
+    if commands is not None:
+        checked = check_verify_argv(commands)
+        if checked:
+            return checked, "explicit", selected_timeout
+    path = repo / DEFAULT_FILE
+    try:
+        if path.is_symlink():
+            raise VerifyPolicyError("verification_default_invalid")
+        with path.open("rb") as stream:
+            raw = stream.read(64 * 1024 + 1)
+    except FileNotFoundError:
+        return [], "none", selected_timeout
+    except OSError:
+        raise VerifyPolicyError("verification_default_unreadable") from None
+    try:
+        value = json.loads(raw)
+        if (len(raw) > 64 * 1024 or not isinstance(value, dict)
+                or "verify_argv" not in value
+                or set(value) - {"verify_argv", "verify_timeout_seconds"}):
+            raise ValueError
+        checked = check_verify_argv(value["verify_argv"])
+        if not checked:
+            raise ValueError
+        repo_timeout = value.get("verify_timeout_seconds", 300)
+        if isinstance(repo_timeout, bool) or not isinstance(repo_timeout, int) or not 1 <= repo_timeout <= 3600:
+            raise ValueError
+        if timeout is None:
+            selected_timeout = repo_timeout
+    except (ValueError, UnicodeError):
+        raise VerifyPolicyError("verification_default_invalid") from None
+    return checked, "repo", selected_timeout
 
 
 def _bare_name(program: str) -> bool:
