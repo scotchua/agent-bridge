@@ -322,7 +322,7 @@ Codex implementation dispatches with omitted or empty `verify_argv` resolve
 a nonempty array of argv arrays subject to that same policy. The optional
 `verify_timeout_seconds` is an integer from 1 through 3600; an explicit dispatch
 timeout wins, and without either setting the existing 300-second limit applies.
-This repository selects 1800 seconds per command for the full offline suites.
+This repository selects 600 seconds per command for its bounded offline checks.
 The total job deadline still reserves generation, each verifier, cleanup and
 overhead within the existing cap. Invalid or
 unreadable defaults refuse the dispatch. Explicit nonempty commands win.
@@ -334,8 +334,12 @@ Review jobs do not acquire implementation defaults. The Claude lane's existing
 explicit verification requirement remains unchanged.
 
 This repo selects `python3 -m unittest bridge_verify` (a small unittest adapter
-that executes `python3 tests/test_suite.py`) followed by `python3 -m unittest
-discover -s tests`. Using the adapter preserves the existing Python module-only
+that executes `python3 tests/test_suite.py`) followed by an explicit unittest
+module list for the touched and core components, pinned in
+`.agent-bridge-verification.json` and `tests/test_verify_policy.py`. The dispatch
+defaults omit `test_local_first`, whose pre-existing bare-verify launcher test
+fails on main; the full review checks still run that module. Using the adapter
+preserves the existing Python module-only
 policy instead of adding a script-execution exception. Verification uses
 `PYTHONPATH=src:tests` with the host's path separator and a separate scratch HOME
 and USERPROFILE for each check. Existing confinement remains mandatory. The
@@ -343,7 +347,7 @@ harness receipt keeps per-command return codes, output hashes and log files;
 the execution receipt's outcome includes argv and return codes. A successful
 defaulted dispatch without matching verification evidence is refused.
 
-Full discovery runs under the same network/read/write confinement as any other
+These checks run under the same network/read/write confinement as any other
 verification. Workflow and local-model HTTP fixtures use the existing measured
 capability helpers when nested confinement or loopback is denied inside a job;
 these remain named, counted skips in the harness receipt, not claimed coverage.

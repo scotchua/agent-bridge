@@ -102,6 +102,47 @@ class WorkSplitTests(unittest.TestCase):
         self.assertEqual(invalid["error"], "chore_waiver_reason_invalid")
         self.assertEqual(self.report()["unaccounted_chores"], [{"caller": "claude", "task_type": "summarize", "status": "eligible", "count": 1}])
 
+    def test_file_digest_keeps_its_floor_while_the_same_short_chore_routes(self):
+        repo = (self.root / "repo").resolve()
+        (repo / ".git").mkdir(parents=True)
+        state = self.root / "state"
+        (state / "routing").mkdir(parents=True)
+        (state / "routing" / "routing-policy.json").write_text(json.dumps({
+            "version": 1, "local_first": {"enabled": True},
+            "repos": {str(repo): {"classification": "internal_nonclient",
+                "allowed_routes": ["local"], "mechanical_ok": True,
+                "mechanical_globs": ["**/*.log"]}},
+        }), encoding="utf-8")
+        tools = build_tools("claude", self.router, self.queue, self.intake, state_root=str(state))
+        text = "short\n"
+        target = repo / "tiny.log"
+        target.write_text(text, encoding="utf-8")
+        for task_type in ("summarize", "log_triage"):
+            with self.subTest(task_type=task_type):
+                args = {"path": str(target), "task_type": task_type}
+                refused = tools["work_digest_file"]["handler"](args)
+                self.assertTrue(refused["ok"], refused)
+                self.assertEqual(refused["decision"], "refused")
+                self.assertEqual(refused["reason"], "below_local_delegation_threshold")
+                self.assertIsNone(refused["job_id"])
+                repeated = tools["work_digest_file"]["handler"](args)
+                self.assertEqual(repeated["receipt_id"], refused["receipt_id"])
+                self.assertTrue(repeated["deduplicated"])
+                routed = tools["work_route_local"]["handler"]({
+                    "task_type": task_type, "input": text,
+                    "classification": "internal_nonclient", "priority": "interactive"})
+                self.assertTrue(routed["ok"], routed)
+                self.assertEqual(routed["decision"], "local")
+                self.assertIsNotNone(routed["job_id"])
+                for label, content in (("bytes", "x" * self.intake.policy.byte_threshold),
+                                       ("lines", "x\n" * self.intake.policy.min_nonblank_lines)):
+                    eligible = repo / f"{task_type}-{label}.log"
+                    eligible.write_text(content, encoding="utf-8")
+                    digested = tools["work_digest_file"]["handler"]({
+                        "path": str(eligible), "task_type": task_type})
+                    self.assertTrue(digested["ok"], digested)
+                    self.assertIsNotNone(digested["job_id"])
+
     def test_deterministic_text_readonly_and_window(self):
         self.execution(1, at=self.now)
         (self.executions / ("f" * 32)).mkdir()  # source preparation, not an admitted job

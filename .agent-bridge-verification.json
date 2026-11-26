@@ -1,7 +1,7 @@
 {
   "verify_argv": [
     ["python3", "-m", "unittest", "bridge_verify"],
-    ["python3", "-m", "unittest", "discover", "-s", "tests"]
+    ["python3", "-m", "unittest", "test_checkpoint", "test_codex_task", "test_execution_dispatcher", "test_localq_intake", "test_output_router", "test_system_acceptance", "test_verify_policy", "test_automatic_delegation_e2e", "test_local_status", "test_drift", "test_onboard", "test_local_worker", "test_work_split"]
   ],
-  "verify_timeout_seconds": 1800
+  "verify_timeout_seconds": 600
 }

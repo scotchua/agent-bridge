@@ -126,6 +126,8 @@ class IntakePolicy:
     min_input_chars: int = 800
     min_nonblank_lines: int = 12
     min_input_bytes: int | None = None
+    # File-digest callers disable this exemption to retain their size floor.
+    allow_short_chores: bool = True
 
     @property
     def byte_threshold(self) -> int:
@@ -279,7 +281,8 @@ class AutomaticIntake:
         # Short coordinator chores are useful work too. All privacy, safety,
         # capability and quality checks above still apply. Empty input never
         # becomes invented work, and other kinds retain the original floor.
-        short_chore = task_type in COORDINATOR_CHORES and input_bytes > 0 and nonblank_lines > 0
+        short_chore = (self.policy.allow_short_chores and task_type in COORDINATOR_CHORES
+                       and input_bytes > 0 and nonblank_lines > 0)
         if not short_chore and input_bytes < self.policy.byte_threshold and nonblank_lines < self.policy.min_nonblank_lines:
             return "refused", "below_local_delegation_threshold"
         return "eligible", "eligible_mechanical_work"

@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -429,12 +430,17 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
         # channel: the checkpoint itself carries only the byte/line metrics,
         # never ``text``.
         nonblank_lines = sum(1 for line in text.splitlines() if line.strip())
+        # File digests retain their original byte/line floor. The short
+        # coordinator-chore exemption applies to work_route_local and inline
+        # output, not to arbitrary small files selected for digesting.
+        digest_intake = AutomaticIntake(
+            queue, policy=replace(intake.policy, allow_short_chores=False), clock=intake.clock)
         try:
-            checkpoint = intake.checkpoint(
+            checkpoint = digest_intake.checkpoint(
                 task_id=idem, task_type=task_type, classification=repo_policy.classification,
                 caller=caller, input_bytes=len(text.encode("utf-8")), nonblank_lines=nonblank_lines,
                 risk_flags=[], idempotency_key=idem)
-            intake_result = intake.route(
+            intake_result = digest_intake.route(
                 task_type=task_type, input=text, params=params,
                 priority=priority, classification=repo_policy.classification, caller=caller,
                 purpose="work", checkpoint_id=checkpoint["checkpoint_id"])

@@ -828,6 +828,11 @@ class DigestLane(Workflow):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["decision"], "refused")
         self.assertEqual(result["reason"], "below_local_delegation_threshold")
+        self.assertIsNone(result["job_id"])
+        self.assertEqual(result["fallback"], "none")
+        repeated = self.digest("codex", target)
+        self.assertEqual(repeated["receipt_id"], result["receipt_id"])
+        self.assertTrue(repeated["deduplicated"])
 
     def test_local_first_disabled_refuses_even_a_matching_file(self):
         self.write_digest_policy(enabled=False)
