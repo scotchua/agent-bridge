@@ -169,6 +169,9 @@ def _fixed_child_detail(error: str, detail: str) -> bool:
     match = re.fullmatch(r"classify_line_(\d+)_invalid", detail)
     if match and error == "GemmaRefusal" and len(match[1]) <= 5 and 1 <= int(match[1]) <= 24_000:
         return True
+    if error == "GemmaRefusal" and re.fullmatch(
+            r"gemma_certification_refused_[a-z][a-z0-9_]{0,63}", detail):
+        return True
     if error == "GemmaRefusal" and detail.startswith("classify_failed:"):
         reason = detail[len("classify_failed:"):]
         return any(_fixed_child_detail(kind, reason)

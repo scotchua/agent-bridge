@@ -232,11 +232,40 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
                         receipt_root_path, model_digest, timeout, validator)
 
 
+_CERTIFICATION_REFUSAL = re.compile(
+    rb"route certification refused: ([a-z][a-z0-9_]{0,63})\s*$", re.MULTILINE)
+
+
+DELEGATE_STDERR_TAIL_BYTES = 4096
+
+
+def _delegate_refusal(tail: bytes) -> str | None:
+    """Return a content-free certification refusal code from a stderr tail.
+
+    The tail (at most DELEGATE_STDERR_TAIL_BYTES, held in memory only) is
+    scanned for one fixed delegate pattern with a short identifier. Only that
+    identifier is returned; all other stderr text is dropped, so source content
+    never reaches the queue. When several refusals appear, the last one wins.
+    """
+    matches = _CERTIFICATION_REFUSAL.findall(tail)
+    if not matches:
+        return None
+    return "gemma_certification_refused_" + matches[-1].decode("ascii")
+
+
 def _invoke_validated(text: str, job_id: str, delegate_path: Path,
                       python_path: Path, receipt_root_path: Path,
                       model_digest: str, timeout: float, validator: Any,
-                      task: str = "summarize") -> dict[str, Any]:
-    """Run one delegate call after validator preflight succeeds."""
+                      task: str = "summarize",
+                      capture_timeout: float | None = None) -> dict[str, Any]:
+    """Run one delegate call after validator preflight succeeds.
+
+    ``timeout`` is the job timeout passed to the delegate. It is part of the
+    route certificate binding, so it must be the fixed configured value, never
+    a computed remainder. ``capture_timeout`` (default ``timeout``) is how long
+    this adapter waits; a multi-call batch passes its remaining deadline here.
+    """
+    wait = timeout if capture_timeout is None else capture_timeout
     invocation_id = uuid.uuid4().hex
     input_bytes = text.encode("utf-8")
     input_sha256 = hashlib.sha256(input_bytes).hexdigest()
@@ -258,14 +287,16 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
     # Create an anonymous capture before starting it: POSIX unlinks this file
     # immediately, and Windows deletes it on close.  Thus SIGTERM/SIGKILL of
     # this adapter cannot leave a draft path behind.
+    # Stderr is drained continuously into a bounded in-memory tail, so a noisy
+    # delegate can neither fill a pipe nor consume temporary storage.
     with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-") as output_file:
         process = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=env, shell=False)
+            stderr=subprocess.PIPE, env=env, shell=False)
         capture = capture_process(
             process, stdout_file=output_file,
-            limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=timeout,
-            stdin_data=input_bytes)
+            limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=wait,
+            stdin_data=input_bytes, stderr_tail_bytes=DELEGATE_STDERR_TAIL_BYTES)
         if capture.failure == "timeout":
             raise GemmaRefusal("gemma_delegate_timeout")
         if capture.failure == "output_overflow":
@@ -278,7 +309,8 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
         except OSError as exc:
             raise GemmaRefusal("gemma_delegate_unavailable") from exc
     if capture.returncode != 0:
-        raise GemmaRefusal("gemma_delegate_unavailable")
+        raise GemmaRefusal(_delegate_refusal(capture.stderr_tail)
+                           or "gemma_delegate_unavailable")
 
     receipt_path = receipt_root_path / f"local-delegate-{invocation_id}.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():
@@ -381,8 +413,11 @@ def _extract(text: str, documents: Any, job_id: str, delegate: Path, python: Pat
         if remaining <= 0:
             raise GemmaRefusal(f"extract_document_{position}_deadline_exceeded")
         try:
+            # The delegate gets the fixed certified job timeout; only this
+            # adapter's wait shrinks to the batch's remaining deadline.
             call = _invoke_validated(document["text"], f"{job_id}:{position}", delegate,
-                                     python, receipt_root, model_digest, remaining, validator, "extract")
+                                     python, receipt_root, model_digest, timeout, validator,
+                                     "extract", capture_timeout=remaining)
             parsed = json.loads(call["output"]["text"])
         except (GemmaRefusal, GemmaReceiptError, ValueError, json.JSONDecodeError) as exc:
             raise GemmaRefusal(
