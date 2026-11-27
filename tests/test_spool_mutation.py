@@ -41,6 +41,15 @@ class Sampler:
 
 
 class ChildDiagnosticMutationTests(unittest.TestCase):
+    def test_fixed_child_detail_accepts_only_identifier_certification_refusals(self):
+        code = "gemma_certification_refused_matching_certificate_missing"
+        self.assertTrue(_fixed_child_detail("GemmaRefusal", code))
+        self.assertTrue(_fixed_child_detail("GemmaRefusal", f"extract_document_0_failed:{code}"))
+        self.assertTrue(_fixed_child_detail("GemmaRefusal", f"classify_failed:{code}"))
+        self.assertFalse(_fixed_child_detail("ValueError", code))
+        self.assertFalse(_fixed_child_detail("GemmaRefusal", "gemma_certification_refused_Alpha invoice"))
+        self.assertFalse(_fixed_child_detail("GemmaRefusal", "gemma_certification_refused_" + "a" * 65))
+
     def test_fixed_child_detail_rejects_document_index_sixteen(self):
         self.assertFalse(_fixed_child_detail("GemmaRefusal", "extract_document_16_invalid"))
 

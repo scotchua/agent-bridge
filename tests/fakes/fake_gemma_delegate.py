@@ -39,6 +39,13 @@ def main(argv: list[str] | None = None) -> int:
         time.sleep(float(_read(here, "sleep_seconds.txt", "5")))
     if mode == "unavailable":
         return 3
+    if mode == "cert-refused":
+        sys.stderr.write("delegate: task=extract source line Alpha invoice\n"
+                         "delegate: route certification refused: matching_certificate_missing\n")
+        return 1
+    if mode == "cert-refused-prose":
+        sys.stderr.write("delegate: route certification refused: invalid certification configuration\n")
+        return 1
 
     if mode == "chatty":
         sys.stdout.buffer.write(b"x" * 8192)

@@ -523,6 +523,31 @@ class GemmaInvokeTests(unittest.TestCase):
         self.assertEqual(output["documents"][0]["record_status"], "ok")
         self.assertEqual(output["documents"][0]["records"][0]["fields"]["party"]["spans"], [[0, 5]])
 
+    def test_extract_passes_fixed_certified_job_timeout(self):
+        # The job timeout is part of the route certificate binding. A computed
+        # remainder (e.g. 4.9987) would miss the certificate on every call.
+        documents = [{"id": "one", "text": "Alpha invoice"}, {"id": "two", "text": "Beta invoice"}]
+        source = json.dumps(documents, separators=(",", ":"))
+        self.invoke(source, task_type="extract", params={"documents": documents})
+        argv = json.loads((self.fx["install"] / "observed-argv.json").read_text())
+        self.assertEqual(argv[argv.index("--job-timeout") + 1], "5.0")
+
+    def test_certification_refusal_code_is_surfaced_without_stderr_content(self):
+        self.mode("cert-refused")
+        documents = [{"id": "one", "text": "Alpha invoice"}]
+        source = json.dumps(documents, separators=(",", ":"))
+        with self.assertRaises(gemma_child.GemmaRefusal) as caught:
+            self.invoke(source, task_type="extract", params={"documents": documents})
+        self.assertEqual(
+            str(caught.exception),
+            "extract_document_0_failed:gemma_certification_refused_matching_certificate_missing")
+        self.assertNotIn("Alpha", str(caught.exception))
+
+    def test_unpatterned_certification_refusal_stays_generic(self):
+        self.mode("cert-refused-prose")
+        with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^gemma_delegate_unavailable$"):
+            self.invoke()
+
     def test_classify_preserves_unsure_and_blank_lines(self):
         result = self.invoke("a\n\nb", task_type="classify", params={})
         self.assertEqual([row["label"] for row in result["output"]["lines"]],
