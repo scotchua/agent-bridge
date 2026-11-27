@@ -2078,8 +2078,24 @@ def _live_owned_task_row(row: dict, now: float) -> bool:
         return False
 
 
+def _task_record_owner_id(client: str, session_id: Any) -> str | None:
+    """Recognize the coordinator convention using host-supplied identity only.
+
+    Claude Code and Codex CLI supply top-level hook session_id separately
+    from tool_input (https://learn.chatgpt.com/docs/hooks#common-input-fields).
+    Do not infer identity from tool arguments, environment, or a client-only
+    prefix. No session binding exists for gate-auto:<client>.
+    Unknown shapes fail closed; match the full session id, never a prefix.
+    Keep the entire owner within the task claim's 100-character token limit.
+    """
+    if client not in {"claude", "codex"} or not isinstance(session_id, str) \
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,80}", session_id) is None:
+        return None
+    return f"{client}-coordinator:{session_id}"
+
+
 def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
-                        now: float) -> Decision | None:
+                        now: float, *, session_id: Any = None) -> Decision | None:
     """Task evidence outside repositories follows existing task ownership.
 
     Never create an implementation stage or repair a conflicting claim here.
@@ -2093,6 +2109,8 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
         return None
     items = {os.path.relpath(os.path.realpath(path), root).split(os.sep)[0]
              for path in task_paths}
+    writer_owner = _task_record_owner_id(client, session_id)
+    stage_owner_write = False
     try:
         if capacity_db is None:
             raise OSError("stage database is not configured")
@@ -2146,9 +2164,14 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
                                     f"has an unconfirmed live claim; {action}")
             for row in live_owned:
                 if row["owner_route"] != client:
+                    if writer_owner is not None and row["owner_id"] == writer_owner:
+                        stage_owner_write = True
+                        continue
                     return Decision("deny", "task_owned_elsewhere",
                                     f"delegation-first gate: task {item!r} stage {row['stage']!r} is "
-                                    f"owned by route {row['owner_route']!r}; dispatch to that route or "
+                                    f"owned by route {row['owner_route']!r} "
+                                    f"(owner {row['owner_id']!r}); use the matching owner session, "
+                                    "dispatch to that route or "
                                     f"run claims.py release for task {item!r} after confirming it is stale")
     except (OSError, ValueError, sqlite3.Error) as exc:
         item_text = ", ".join(repr(item) for item in sorted(items))
@@ -2158,6 +2181,10 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
                         "retry when the ledger is available")
     if len(task_paths) != len(paths) or any(enclosing_repos(path) for path in task_paths):
         return None                     # mixed/code writes also need repo receipts
+    if stage_owner_write:
+        return Decision("allow", "task_record_write_stage_owner",
+                        "task evidence writer is the session-bound owner of every live "
+                        "stage routed elsewhere outside repositories")
     return Decision("allow", "task_record_write",
                     "task evidence follows its existing ownership outside repositories")
 
@@ -2165,7 +2192,8 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
 def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd: str, *,
                  state_root: str, clock: Any, protected: tuple[str, ...],
                  capacity_db: str | None, decide: Any,
-                 config_path: str | None = None, monotonic: Any = time.monotonic) -> Decision:
+                 config_path: str | None = None, monotonic: Any = time.monotonic,
+                 session_id: Any = None) -> Decision:
     """The write/edit-side judgment for an ``"edit"`` or ``"shell"``
     classification: protected paths, then routing receipts. Split out of
     ``judge`` so a Codex shell command that both writes and reads a file
@@ -2202,7 +2230,8 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     task_paths = paths if kind == "edit" else (
         None if not resolved_targets else [path for path, _ in targets])
     if task_paths:
-        task_decision = _judge_task_records(client, task_paths, capacity_db, float(clock()))
+        task_decision = _judge_task_records(client, task_paths, capacity_db, float(clock()),
+                                           session_id=session_id)
         if task_decision is not None:
             return task_decision
     # Every enclosing repository, so a nested .git cannot shadow an outer
@@ -2400,11 +2429,14 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
           capacity_db: str | None = None,
           local_queue_root: str = "", worker_executable: str = "",
           decide: Any = None, allowed_pilot_tasks: frozenset[str] = frozenset(),
-          config_path: str | None = None) -> Decision:
+          config_path: str | None = None, session_id: Any = None) -> Decision:
     """Allow or deny one tool call. Fails closed when the gate's own state
     cannot be read. ``protected`` paths refuse the editing tools outright;
     with ``capacity_db`` every allow also requires the receipt's stage to be
     owned right now (:func:`stage_binding`).
+
+    ``session_id`` is host hook metadata, never a field from ``tool_input``.
+    Only the task-record owner exception uses it; repository routing does not.
 
     ``decide`` makes the gate automatic. When a repository has no receipt and
     ``decide`` is supplied, it is called with ``(repo, task_type)`` and must
@@ -2445,7 +2477,7 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
                           allowed_pilot_tasks=allowed_pilot_tasks, disabled_tasks=disabled_tasks)
     write_decision = _judge_write(client, kind, paths, tool_input, cwd, state_root=state_root,
                                   clock=clock, protected=protected, capacity_db=capacity_db,
-                                  decide=decide, config_path=config_path)
+                                  decide=decide, config_path=config_path, session_id=session_id)
     if kind == "shell" and write_decision.allowed:
         command = _command_text(tool_input)
         if _shell_commands(command) is None and literal_records.targets(command) is None:
@@ -2907,7 +2939,7 @@ def run_hook(client: str, state_root: str, payload: dict[str, Any], *,
                          capacity_db=capacity_db, local_queue_root=local_queue_root,
                          worker_executable=worker_executable, decide=decide,
                          allowed_pilot_tasks=allowed_pilot_tasks,
-                         config_path=config_path)
+                         config_path=config_path, session_id=payload.get("session_id"))
     if decision.logged:
         try:
             record_event(state_root, client, tool_name, decision, clock)
