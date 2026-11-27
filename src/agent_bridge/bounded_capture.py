@@ -44,6 +44,45 @@ class CaptureResult:
     stdout: CapturedStream
     stderr: CapturedStream
     failure: str | None
+    # Last bytes of stderr when the caller asked for a bounded tail instead of
+    # a file. Empty otherwise.
+    stderr_tail: bytes = b""
+
+
+class _TailPump:
+    """Drain one pipe continuously, keeping only its last ``keep`` bytes.
+
+    Unlike :class:`_FilePump` this never overflows: a noisy stream is read to
+    EOF so the child cannot block on a full pipe, and memory stays bounded.
+    """
+
+    def __init__(self, stream: BinaryIO, *, keep: int) -> None:
+        self.stream = stream
+        self.keep = keep
+        self.tail = b""
+        self.bytes = 0
+        self.overflowed = False
+        self.unavailable = False
+        self.eof_reached = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def result(self) -> CapturedStream:
+        return CapturedStream(None, 0, hashlib.sha256().hexdigest(), False)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                chunk = self.stream.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    self.eof_reached = True
+                    return
+                self.bytes += len(chunk)
+                self.tail = (self.tail + chunk)[-self.keep:]
+        except BaseException:
+            self.unavailable = True
 
 
 class _FilePump:
@@ -157,22 +196,38 @@ def capture_process(process: subprocess.Popen[bytes], *,
                     stdout_file: BinaryIO | None = None,
                     stderr_file: BinaryIO | None = None,
                     limit: int, timeout: float,
-                    stdin_data: bytes | None = None) -> CaptureResult:
+                    stdin_data: bytes | None = None,
+                    stderr_tail_bytes: int | None = None) -> CaptureResult:
     """Capture an already-isolated process with one cap per stream.
 
     ``failure`` is deliberately a fixed vocabulary: ``timeout``,
     ``output_overflow``, ``capture_unavailable``, or ``stream_unclosed``.
     In particular, an overflow is never a truncated successful result.
+
+    ``stderr_tail_bytes`` replaces a stderr file with an in-memory tail of at
+    most that many bytes. The stream is still drained to EOF and its lifecycle
+    is checked like any other, but its size never causes ``output_overflow``.
     """
     if limit <= 0:
         raise ValueError("capture limit must be positive")
     if process.stdout is None:
         raise ValueError("process must provide a stdout pipe")
-    if process.stderr is None and (stderr_path is not None or stderr_file is not None):
+    if process.stderr is None and (stderr_path is not None or stderr_file is not None
+                                   or stderr_tail_bytes is not None):
         raise ValueError("stderr destination requires a stderr pipe")
+    if stderr_tail_bytes is not None:
+        if stderr_tail_bytes <= 0:
+            raise ValueError("stderr tail must be positive")
+        if stderr_path is not None or stderr_file is not None:
+            raise ValueError("provide exactly one stderr destination")
     stdout = _FilePump(process.stdout, path=stdout_path, output_file=stdout_file, limit=limit)
-    stderr = (_FilePump(process.stderr, path=stderr_path, output_file=stderr_file, limit=limit)
-              if process.stderr is not None else None)
+    stderr: _FilePump | _TailPump | None
+    if process.stderr is None:
+        stderr = None
+    elif stderr_tail_bytes is not None:
+        stderr = _TailPump(process.stderr, keep=stderr_tail_bytes)
+    else:
+        stderr = _FilePump(process.stderr, path=stderr_path, output_file=stderr_file, limit=limit)
     stdout.start()
     if stderr is not None:
         stderr.start()
@@ -243,5 +298,7 @@ def capture_process(process: subprocess.Popen[bytes], *,
             except (OSError, ValueError):
                 pass
     empty_stderr = CapturedStream(None, 0, hashlib.sha256().hexdigest(), False)
+    tail = stderr.tail if isinstance(stderr, _TailPump) else b""
     return CaptureResult(process.poll(), stdout.result(),
-                         stderr.result() if stderr is not None else empty_stderr, failure)
+                         stderr.result() if stderr is not None else empty_stderr, failure,
+                         tail)

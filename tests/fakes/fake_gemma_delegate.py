@@ -43,6 +43,21 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("delegate: task=extract source line Alpha invoice\n"
                          "delegate: route certification refused: matching_certificate_missing\n")
         return 1
+    if mode == "cert-refused-noisy":
+        sys.stderr.buffer.write(b"source noise Alpha\n" * 300_000)
+        sys.stderr.write("delegate: route certification refused: matching_certificate_missing\n")
+        return 1
+    if mode == "cert-refused-early":
+        sys.stderr.write("delegate: route certification refused: matching_certificate_missing\n")
+        sys.stderr.buffer.write(b"x" * 8192 + b"\n")
+        return 1
+    if mode == "cert-refused-trailing-prose":
+        sys.stderr.write("delegate: route certification refused: matching_certificate_missing extra words\n")
+        return 1
+    if mode == "cert-refused-twice":
+        sys.stderr.write("delegate: route certification refused: first_code\n"
+                         "delegate: route certification refused: second_code\n")
+        return 1
     if mode == "cert-refused-prose":
         sys.stderr.write("delegate: route certification refused: invalid certification configuration\n")
         return 1

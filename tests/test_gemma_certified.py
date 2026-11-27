@@ -528,9 +528,54 @@ class GemmaInvokeTests(unittest.TestCase):
         # remainder (e.g. 4.9987) would miss the certificate on every call.
         documents = [{"id": "one", "text": "Alpha invoice"}, {"id": "two", "text": "Beta invoice"}]
         source = json.dumps(documents, separators=(",", ":"))
-        self.invoke(source, task_type="extract", params={"documents": documents})
-        argv = json.loads((self.fx["install"] / "observed-argv.json").read_text())
-        self.assertEqual(argv[argv.index("--job-timeout") + 1], "5.0")
+        real = gemma_child._invoke_validated
+        seen = []
+
+        def record(*args, **kwargs):
+            result = real(*args, **kwargs)
+            argv = json.loads((self.fx["install"] / "observed-argv.json").read_text())
+            seen.append((args[6], kwargs.get("capture_timeout"),
+                         argv[argv.index("--job-timeout") + 1]))
+            return result
+
+        with mock.patch.object(gemma_child, "_invoke_validated", side_effect=record):
+            self.invoke(source, task_type="extract", params={"documents": documents})
+        self.assertEqual(len(seen), 2)
+        for timeout, capture_timeout, argv_timeout in seen:
+            self.assertEqual(timeout, 5)
+            self.assertEqual(argv_timeout, "5.0")
+            self.assertIsNotNone(capture_timeout)
+            self.assertGreater(capture_timeout, 0)
+            self.assertLessEqual(capture_timeout, 5)
+        # The second call waits only on what is left of the batch deadline.
+        self.assertLess(seen[1][1], seen[0][1])
+
+    def test_noisy_stderr_is_bounded_and_refusal_still_found(self):
+        self.mode("cert-refused-noisy")
+        documents = [{"id": "one", "text": "Alpha invoice"}]
+        source = json.dumps(documents, separators=(",", ":"))
+        with mock.patch.object(gemma_child.tempfile, "TemporaryFile",
+                               wraps=gemma_child.tempfile.TemporaryFile) as temp:
+            with self.assertRaises(gemma_child.GemmaRefusal) as caught:
+                self.invoke(source, task_type="extract", params={"documents": documents})
+        self.assertEqual(
+            str(caught.exception),
+            "extract_document_0_failed:gemma_certification_refused_matching_certificate_missing")
+        # Only the stdout draft file is disk-backed; stderr never is.
+        self.assertEqual(temp.call_count, 1)
+
+    def test_refusal_marker_outside_tail_or_followed_by_prose_is_generic(self):
+        for mode in ("cert-refused-early", "cert-refused-trailing-prose"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^gemma_delegate_unavailable$"):
+                    self.invoke()
+
+    def test_last_certification_refusal_wins(self):
+        self.mode("cert-refused-twice")
+        with self.assertRaisesRegex(gemma_child.GemmaRefusal,
+                                    "^gemma_certification_refused_second_code$"):
+            self.invoke()
 
     def test_certification_refusal_code_is_surfaced_without_stderr_content(self):
         self.mode("cert-refused")

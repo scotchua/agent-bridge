@@ -236,18 +236,17 @@ _CERTIFICATION_REFUSAL = re.compile(
     rb"route certification refused: ([a-z][a-z0-9_]{0,63})\s*$", re.MULTILINE)
 
 
-def _delegate_refusal(error_file: Any) -> str | None:
-    """Return a content-free certification refusal code from delegate stderr.
+DELEGATE_STDERR_TAIL_BYTES = 4096
 
-    Only a fixed delegate pattern with a short identifier is kept; any other
-    stderr text is discarded unread so source content never reaches the queue.
+
+def _delegate_refusal(tail: bytes) -> str | None:
+    """Return a content-free certification refusal code from a stderr tail.
+
+    The tail (at most DELEGATE_STDERR_TAIL_BYTES, held in memory only) is
+    scanned for one fixed delegate pattern with a short identifier. Only that
+    identifier is returned; all other stderr text is dropped, so source content
+    never reaches the queue. When several refusals appear, the last one wins.
     """
-    try:
-        size = error_file.seek(0, os.SEEK_END)
-        error_file.seek(max(0, size - 4096))
-        tail = error_file.read()
-    except OSError:
-        return None
     matches = _CERTIFICATION_REFUSAL.findall(tail)
     if not matches:
         return None
@@ -288,16 +287,16 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
     # Create an anonymous capture before starting it: POSIX unlinks this file
     # immediately, and Windows deletes it on close.  Thus SIGTERM/SIGKILL of
     # this adapter cannot leave a draft path behind.
-    with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-") as output_file, \
-            tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-err-") as error_file:
+    # Stderr is drained continuously into a bounded in-memory tail, so a noisy
+    # delegate can neither fill a pipe nor consume temporary storage.
+    with tempfile.TemporaryFile(mode="w+b", prefix="agent-bridge-gemma-delegate-") as output_file:
         process = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=error_file, env=env, shell=False)
+            stderr=subprocess.PIPE, env=env, shell=False)
         capture = capture_process(
             process, stdout_file=output_file,
             limit=GEMMA_DELEGATE_CAPTURE_MAX_BYTES, timeout=wait,
-            stdin_data=input_bytes)
-        refusal = _delegate_refusal(error_file)
+            stdin_data=input_bytes, stderr_tail_bytes=DELEGATE_STDERR_TAIL_BYTES)
         if capture.failure == "timeout":
             raise GemmaRefusal("gemma_delegate_timeout")
         if capture.failure == "output_overflow":
@@ -310,7 +309,8 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
         except OSError as exc:
             raise GemmaRefusal("gemma_delegate_unavailable") from exc
     if capture.returncode != 0:
-        raise GemmaRefusal(refusal or "gemma_delegate_unavailable")
+        raise GemmaRefusal(_delegate_refusal(capture.stderr_tail)
+                           or "gemma_delegate_unavailable")
 
     receipt_path = receipt_root_path / f"local-delegate-{invocation_id}.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():
