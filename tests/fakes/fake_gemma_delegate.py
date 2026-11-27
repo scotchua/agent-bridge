@@ -108,8 +108,9 @@ def main(argv: list[str] | None = None) -> int:
         "canonical_input_sha256": hashlib.sha256(input_bytes).hexdigest(),
         "effective_options": {
             "chunk_chars": 24000, "job_timeout": float(args.job_timeout),
-            "think": False, "schema": False, "second_pass": False,
-            "repair_retries": 0, "map_scope": "run", "roster_sha256": None,
+            # Mirror the installed delegate's derivation (delegate.py).
+            "think": False, "schema": args.task == "extract", "second_pass": False,
+            "repair_retries": 2 if args.task == "triage" else 0, "map_scope": "run", "roster_sha256": None,
         },
         # Mirror the installed delegate's documented CLI contract: callers
         # pass a raw identity and the delegate stores only its SHA-256 binding.

@@ -142,15 +142,20 @@ def _load_validator(path: Path):
         sys.path[:] = original_path
 
 
-def _effective_options(timeout: float) -> dict[str, Any]:
-    """Exact defaults implied by the fixed delegate CLI invocation."""
+def _effective_options(timeout: float, task: str) -> dict[str, Any]:
+    """Exact options the installed delegate records for this fixed invocation.
+
+    Mirrors the delegate's own derivation for the flags this adapter never
+    passes: extract always runs with its JSON schema, and triage keeps its
+    default two repair retries. Redact is not a supported task here.
+    """
     return {
         "chunk_chars": 24000,
         "job_timeout": float(timeout),
         "think": False,
-        "schema": False,
+        "schema": task == "extract",
         "second_pass": False,
-        "repair_retries": 0,
+        "repair_retries": 2 if task == "triage" else 0,
         "map_scope": "run",
         "roster_sha256": None,
     }
@@ -327,7 +332,7 @@ def _invoke_validated(text: str, job_id: str, delegate_path: Path,
             invocation_id=invocation_id,
             input_sha256=input_sha256,
             canonical_input_sha256=input_sha256,
-            effective_options=_effective_options(timeout),
+            effective_options=_effective_options(timeout, task),
             parent_task_id=parent_task_id,
             attempt_id=None)
     except Exception as exc:
