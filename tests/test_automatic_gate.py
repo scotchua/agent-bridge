@@ -183,6 +183,147 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         return self.run_hook(client, {"tool_name": "Bash", "tool_input": {"command": command},
                                       "cwd": str(self.repo)})
 
+    def coordinator_task(self, owner="claude-coordinator:owner-session"):
+        """Keep the record and live codex-routed row consistent for owner tests."""
+        import contextlib
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET owner_id=? WHERE item_id=? AND stage=?",
+                       (owner, self.item, "review"))
+        (self.task / "task.json").write_text(json.dumps({"workload": {
+            "revision": 7, "claim": {"owner": owner, "stage": "review",
+                                      "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
+        return {"tool_name": "Write", "tool_input": {"file_path": str(self.task / "task.json")},
+                "cwd": str(self.repo), "session_id": "owner-session"}
+
+    def test_coordinator_session_can_write_its_codex_routed_task_record(self):
+        import shlex
+        payload = self.coordinator_task()
+        before = self.router.get(self.item, "review")
+        self.assertAllowed(self.run_hook("claude", payload))
+        (self.task / "task.json").write_text('{"workload": {}}', encoding="utf-8")
+        self.assertAllowed(self.run_hook("claude", {
+            **payload, "tool_name": "Bash", "tool_input": {
+                "command": f"echo x > {shlex.quote(str(self.target))}"}}))
+        events = [json.loads(line) for line in
+                  (self.state / "routing" / gate.EVENT_LEDGER).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["code"] for row in events], ["task_record_write_stage_owner"] * 2)
+        self.assertEqual(self.router.get(self.item, "review"), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_other_session_of_same_client_cannot_use_coordinator_exception(self):
+        payload = self.coordinator_task()
+        reason = self.assertDenied(self.run_hook("claude", {**payload, "session_id": "other-session"}),
+                                   "task_owned_elsewhere")
+        self.assertIn("claude-coordinator:owner-session", reason)
+        self.assertIn("matching owner session", reason)
+        self.assertIn("dispatch", reason)
+
+    def test_different_client_cannot_use_coordinator_exception(self):
+        payload = self.coordinator_task()
+        # A Claude owner routed to local is foreign to both clients. Even
+        # presenting the same session text must not grant the Codex client it.
+        import contextlib
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE stages SET owner_route='local' WHERE item_id=? AND stage=?",
+                       (self.item, "review"))
+        payload.update(tool_name="apply_patch", tool_input={
+            "input": f"*** Begin Patch\n*** Add File: {self.target}\n+x\n*** End Patch\n"})
+        self.assertDenied(self.run_hook("codex", payload), "task_owned_elsewhere")
+
+    def test_missing_or_malformed_session_identity_cannot_use_coordinator_exception(self):
+        payload = self.coordinator_task()
+        del payload["session_id"]
+        self.assertDenied(self.run_hook("claude", payload), "task_owned_elsewhere")
+        for session in (None, "", 42, True, ["owner-session"], {"id": "owner-session"},
+                        " owner-session", "owner-session\n", "owner:session", "x" * 82, "\ud800"):
+            with self.subTest(session=repr(session)):
+                self.assertDenied(self.run_hook("claude", {**payload, "session_id": session}),
+                                  "task_owned_elsewhere")
+
+    def test_tool_input_cannot_supply_or_override_the_host_session(self):
+        payload = self.coordinator_task()
+        payload["tool_input"].update(session_id="owner-session",
+                                     owner_id="claude-coordinator:owner-session", client="claude")
+        for session in (None, "other-session"):
+            with self.subTest(session=session):
+                self.assertDenied(self.run_hook("claude", {**payload, "session_id": session}),
+                                  "task_owned_elsewhere")
+
+    def test_client_prefix_and_gate_auto_owners_remain_denied_across_routes(self):
+        for owner in ("claude-coordinator:other-session", "claude-session", "claude-owner-session",
+                      "claude-coordinator:owner-session-extra", "gate-auto:claude"):
+            with self.subTest(owner=owner):
+                self.assertDenied(self.run_hook("claude", self.coordinator_task(owner)),
+                                  "task_owned_elsewhere")
+
+    def test_coordinator_must_own_every_live_foreign_stage(self):
+        payload = self.coordinator_task()
+        registered = self.router.register(self.item, "evidence", allowed_routes=["codex"])
+        self.router.assign(self.item, "evidence", owner_id="claude-coordinator:owner-session",
+                           lease_seconds=600, expected_revision=registered["revision"])
+        registered = self.router.register(self.item, "implementation", allowed_routes=["codex"])
+        owned = self.router.assign(self.item, "implementation",
+                                   owner_id="claude-coordinator:other-session", lease_seconds=600,
+                                   expected_revision=registered["revision"])
+        self.assertDenied(self.run_hook("claude", payload), "task_owned_elsewhere")
+        self.router.complete(self.item, "implementation", owner_id=owned["owner_id"],
+                             expected_revision=owned["revision"])
+        self.assertAllowed(self.run_hook("claude", payload))
+
+    def test_coordinator_must_own_foreign_stages_of_every_target_item(self):
+        import shlex
+        payload = self.coordinator_task()
+        other_item = "another-task"
+        (self.tasks / other_item).mkdir()
+        registered = self.router.register(other_item, "review", allowed_routes=["codex"])
+        self.router.assign(other_item, "review", owner_id="claude-coordinator:other-session",
+                           lease_seconds=600, expected_revision=registered["revision"])
+        payload.update(tool_name="Bash", tool_input={"command":
+            f"touch {shlex.quote(str(self.target))} "
+            f"{shlex.quote(str(self.tasks / other_item / 'task.json'))}"})
+        self.assertDenied(self.run_hook("claude", payload), "task_owned_elsewhere")
+
+    def test_coordinator_exception_preserves_claim_and_database_denials(self):
+        payload = self.coordinator_task()
+        record = self.task / "task.json"
+        task = json.loads(record.read_text(encoding="utf-8"))
+        task["workload"]["claim"]["owner"] = "conflicting-owner"
+        record.write_text(json.dumps(task), encoding="utf-8")
+        self.assertDenied(self.run_hook("claude", payload), "task_claim_conflict")
+        record.write_text('{"workload": []}', encoding="utf-8")
+        self.assertDenied(self.run_hook("claude", payload), "task_claim_unavailable")
+        payload = self.coordinator_task()
+        with mock.patch.object(gate, "_task_ledger_rows", side_effect=OSError("offline")):
+            decision = gate.run_hook("claude", str(self.state), payload, capacity_db=str(self.db))
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        decision = gate.run_hook("claude", str(self.state), payload)
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        decision = gate._judge_task_records("claude", [str(self.target)], str(self.db),
+                                           time.time() + 700, session_id="owner-session")
+        self.assertEqual(decision.code, "task_record_write")  # expired rows grant no exception
+        decision = gate._judge_task_records("claude", [str(self.target)], str(self.db),
+                                           self.owned["lease_until"], session_id="owner-session")
+        self.assertEqual(decision.code, "task_claim_conflict")  # a live claim needs a live row
+
+    def test_coordinator_mixed_task_and_repo_write_still_requires_receipt(self):
+        import shlex
+        payload = self.coordinator_task()
+        payload.update(tool_name="Bash", tool_input={"command":
+            f"echo x > {shlex.quote(str(self.target))}; touch app.py"})
+        self.assertDenied(self.run_hook("claude", payload, "--no-automatic-routing"),
+                          "no_routing_receipt")
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_coordinator_cannot_bypass_receipts_in_task_repositories_or_protected_paths(self):
+        payload = self.coordinator_task()
+        git_repo(self.task)
+        self.assertDenied(self.run_hook("claude", payload, "--no-automatic-routing"),
+                          "no_routing_receipt")
+        payload["tool_input"]["file_path"] = str(self.state / "routing" / "forged.json")
+        self.assertDenied(self.run_hook("claude", payload), "gate_state_protected")
+
     def test_literal_prose_and_home_siblings_do_not_target_state(self):
         import shlex
         self.write_policy({str(self.repo): {"classification": "internal_nonclient",

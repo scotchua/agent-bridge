@@ -289,6 +289,19 @@ do not inherit an implementation route from the shell's working directory.
 Only live ownership blocks these writes: an active task claim is checked only
 against an `owned` ledger row with a finite, unexpired lease, and such a live
 ledger row still routes task-record writes even where no task claim exists.
+For a stage routed elsewhere, the writing session may update its own task
+record only when every such live stage has the exact owner
+`claude-coordinator:<session_id>`, using the configured Claude client and
+Claude Code's [top-level hook session_id](https://code.claude.com/docs/en/hooks#common-input-fields).
+The host supplies that field separately from the agent's tool arguments;
+another session's tool arguments cannot select the owner's session identity.
+Missing or malformed identity grants no exception. Other owner conventions,
+including `gate-auto:<client>` (shared across sessions), have no established
+session binding and remain denied across routes. These allows are logged as
+`task_record_write_stage_owner`; claim consistency, protected paths and
+repository receipt checks still apply. This trusts the installed host hook,
+as the rest of the gate does, rather than authenticating manual hook calls
+or preventing an operator from resuming the same session.
 An expired claim or ledger row grants nothing and does not block a fresh
 fenced claim; the gate never rewrites it. A malformed
 or unreadable record and an unreadable ledger still deny with the item and an
