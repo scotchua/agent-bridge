@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from .. import claude_token
 from ..bounded_capture import capture_process
 from . import quality
 
@@ -229,10 +230,12 @@ class SubprocessBackend:
 
     The child reads one JSON payload from stdin and writes one JSON object to
     stdout.  It is intentionally not given environment overrides or any route
-    selection option.
+    selection option, except that bundled bridge adapters may receive the
+    test-only Keychain-reader disable switch.
     """
 
-    def __init__(self, command: list[str], *, capture_limit_bytes: int = LOCAL_CHILD_CAPTURE_MAX_BYTES):
+    def __init__(self, command: list[str], *, capture_limit_bytes: int = LOCAL_CHILD_CAPTURE_MAX_BYTES,
+                 bridge_child: bool = False):
         if not command or not all(isinstance(part, str) and part for part in command):
             raise ValueError("command must be a non-empty argv list")
         if isinstance(capture_limit_bytes, bool) or not isinstance(capture_limit_bytes, int) \
@@ -240,6 +243,7 @@ class SubprocessBackend:
             raise ValueError("capture_limit_bytes must be positive")
         self.command = tuple(command)
         self.capture_limit_bytes = capture_limit_bytes
+        self.bridge_child = bridge_child
         self._lock = threading.Lock()
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
 
@@ -248,6 +252,8 @@ class SubprocessBackend:
         if not isinstance(job_id, str):
             raise RuntimeError("child payload lacks job id")
         env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        if self.bridge_child:
+            env.update(claude_token.disable_child_env())
         # Child stdout can be client-derived.  Allocate its anonymous capture
         # before the child starts so an allocation failure cannot orphan it;
         # a forced termination closes the descriptor without leaving a path.

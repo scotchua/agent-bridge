@@ -698,6 +698,9 @@ def _help_has_flags(path: str | None, runner: Any = _run) -> dict[str, Any]:
 def _claude_help_has_flags(path: str | None, runner: Any = _run) -> dict[str, Any]:
     if not path:
         return {"ok": False, "missing": ["executable"]}
+    # This free help probe does not inspect login state. Paid requalification
+    # below uses claude_task._env(config_dir), which adds the Keychain-only
+    # setup token when it launches Claude.
     result = runner([path, "--help"], cwd=str(Path(path).parent), text="")
     text = _completed_text(result)
     missing = [flag for flag in CLAUDE_FLAGS if not re.search(re.escape(flag) + r"\b(?!-)", text)]

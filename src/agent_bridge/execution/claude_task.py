@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
-    from .. import operator_settings, runner, send_binding, token_usage
+    from .. import claude_token, operator_settings, runner, send_binding, token_usage
     from ..platform import platform as agent_platform
     from ..orchestration import windows_privacy as wpv
     from . import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
 except ImportError:  # The orchestration worker invokes this file directly.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from agent_bridge import operator_settings, runner, send_binding, token_usage
+    from agent_bridge import claude_token, operator_settings, runner, send_binding, token_usage
     from agent_bridge.platform import platform as agent_platform
     from agent_bridge.orchestration import windows_privacy as wpv
     from agent_bridge.execution import claude_config, hostenv, job_source, verification_diagnostics, verify_policy
@@ -163,7 +163,12 @@ def _env(claude_config_dir:Path|None=None):
     # concurrent invalid-grant cleanup there blanks the tokens and this lane
     # reports a lost login. Which directory is allowed is claude_config's
     # decision, not this function's.
-    if claude_config_dir is not None: e["CLAUDE_CONFIG_DIR"]=str(claude_config_dir)
+    if claude_config_dir is not None:
+        e["CLAUDE_CONFIG_DIR"]=str(claude_config_dir)
+        # A config-dir-bearing execution lane is a Claude child environment.
+        # Keep bare _env() useful for git-only helpers without consulting the
+        # Keychain (and without adding credentials to those helpers).
+        e.update(claude_token.child_auth_env())
     return e
 
 def _checked_config_dir(value:Path|None):
@@ -519,6 +524,7 @@ def _netns_confined(command:list[str],tree:Path,scratch:Path,env:dict[str,str],t
                  verification_diagnostics.JOB_VERIFICATION_MARKER:"1",
                  verification_diagnostics.SKIP_RECORD_PATH:str(scratch / verification_diagnostics.SKIP_RECORD_NAME)}
     sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
+    sandbox_env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
     result=_run(hostenv.confined_argv(command,tree=tree,scratch=scratch,
@@ -602,6 +608,7 @@ def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str
     # for the lane's credential store, and pointing it at one would hand every
     # verify command a path to a live subscription session.
     sandbox_env.pop("CLAUDE_CONFIG_DIR",None)
+    sandbox_env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
     if command[0]=="git": command=_git_argv(*command[1:])
     started=time.monotonic()
     result=_run([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],cwd=tree,env=sandbox_env,timeout=timeout)
@@ -737,7 +744,8 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
              "confinement_confines_reads":backend.confines_reads,
              "confinement_confines_writes":backend.confines_writes,
              "executable_sha256":_sha(claude_bin.resolve()),"executable_version":version.stdout.decode("utf-8","replace").strip(),
-             "source_mode":"pinned_job_source" if manifest is not None else "operator_checkout"}
+             "source_mode":"pinned_job_source" if manifest is not None else "operator_checkout",
+             "credential_source":"setup_token" if env.get("CLAUDE_CODE_OAUTH_TOKEN") else "login"}
     if manifest is not None:
         receipt.update(job_source_manifest_sha256=manifest_sha256,job_source_checks=source_checks)
     else:
@@ -781,7 +789,8 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
             _worktree_checkpoint(gen,pinned_git_dir,base_sha,"generation_worktree_before_patch",source_checks,env,
                                   marker_bytes=marker)
         elif (gen/".git").read_bytes()!=marker: raise TaskError("Claude altered git metadata")
-        patch=_patch(gen,base_sha,env); pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600)
+        patch=runner.redact_child_output(_patch(gen,base_sha,env),env)
+        pp=job/"changes.patch"; pp.write_bytes(patch); os.chmod(pp,0o600)
         _remove(repo,gen,env,cleanup_timeout,git_dir=pinned_git_dir if manifest is not None else None)
         if manifest is not None:
             _source_checkpoint(job_source,manifest,"before_verification_worktree",source_checks)
