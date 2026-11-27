@@ -312,11 +312,17 @@ def test_tool_exposure() -> None:
         # nothing about the tool and everything about shebangs.
         launcher = [os.path.join(REPO, "bin", "agent-bridge-mcp.cmd")] \
             if os.name == "nt" else [os.path.join(REPO, "bin", "agent-bridge-mcp")]
-        proc = subprocess.run(launcher, capture_output=True, timeout=60)
+        # Test argument validation with the interpreter running this suite.
+        # A scratch HOME has no installer record, and sandboxed PATH lookup
+        # may select Python installations whose version probes cannot run.
+        # Both platform launchers support this explicit interpreter override.
+        launcher_env = dict(os.environ, AGENT_BRIDGE_PYTHON=sys.executable)
+        proc = subprocess.run(launcher, capture_output=True, timeout=60,
+                              env=launcher_env)
         check("--caller is required",
               proc.returncode != 0 and b"--caller" in proc.stderr, proc.stderr.decode())
         proc = subprocess.run(launcher + ["--caller", "gpt"],
-                              capture_output=True, timeout=60)
+                              capture_output=True, timeout=60, env=launcher_env)
         check("--caller rejects an unknown value",
               proc.returncode != 0 and b"invalid choice" in proc.stderr
               and b"gpt" in proc.stderr, proc.stderr.decode())
