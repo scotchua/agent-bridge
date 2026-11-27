@@ -2081,16 +2081,17 @@ def _live_owned_task_row(row: dict, now: float) -> bool:
 def _task_record_owner_id(client: str, session_id: Any) -> str | None:
     """Recognize the coordinator convention using host-supplied identity only.
 
-    Claude Code's top-level hook session_id is separate from tool_input.
+    Claude Code and Codex CLI supply top-level hook session_id separately
+    from tool_input (https://learn.chatgpt.com/docs/hooks#common-input-fields).
     Do not infer identity from tool arguments, environment, or a client-only
-    prefix. No session binding exists for gate-auto:<client>, and no Codex
-    hook identity convention is established here. Unknown shapes fail closed.
+    prefix. No session binding exists for gate-auto:<client>.
+    Unknown shapes fail closed; match the full session id, never a prefix.
     Keep the entire owner within the task claim's 100-character token limit.
     """
-    if client != "claude" or not isinstance(session_id, str) \
+    if client not in {"claude", "codex"} or not isinstance(session_id, str) \
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,80}", session_id) is None:
         return None
-    return f"claude-coordinator:{session_id}"
+    return f"{client}-coordinator:{session_id}"
 
 
 def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,

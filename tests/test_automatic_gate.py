@@ -183,18 +183,23 @@ class CommandTargetsAndTaskOwnership(AutoCase):
         return self.run_hook(client, {"tool_name": "Bash", "tool_input": {"command": command},
                                       "cwd": str(self.repo)})
 
-    def coordinator_task(self, owner="claude-coordinator:owner-session"):
-        """Keep the record and live codex-routed row consistent for owner tests."""
+    def coordinator_task(self, owner=None, *, client="claude", session_id="owner-session"):
+        """Keep the record and foreign-routed row consistent for owner tests."""
         import contextlib
         import sqlite3
+        owner = owner if owner is not None else f"{client}-coordinator:{session_id}"
+        peer = "codex" if client == "claude" else "claude"
         with contextlib.closing(sqlite3.connect(self.db)) as db, db:
-            db.execute("UPDATE stages SET owner_id=? WHERE item_id=? AND stage=?",
-                       (owner, self.item, "review"))
+            db.execute("UPDATE stages SET owner_id=?, owner_route=? WHERE item_id=? AND stage=?",
+                       (owner, peer, self.item, "review"))
         (self.task / "task.json").write_text(json.dumps({"workload": {
             "revision": 7, "claim": {"owner": owner, "stage": "review",
                                       "lease_expires_at": time.time() + 600}}}), encoding="utf-8")
-        return {"tool_name": "Write", "tool_input": {"file_path": str(self.task / "task.json")},
-                "cwd": str(self.repo), "session_id": "owner-session"}
+        tool_input = ({"file_path": str(self.task / "task.json")} if client == "claude" else
+                      {"command": f"*** Begin Patch\n*** Update File: {self.task / 'task.json'}\n"
+                                  "@@\n-x\n+y\n*** End Patch\n"})
+        return {"hook_event_name": "PreToolUse", "tool_name": "Write" if client == "claude" else "apply_patch",
+                "tool_input": tool_input, "cwd": str(self.repo), "session_id": session_id}
 
     def test_coordinator_session_can_write_its_codex_routed_task_record(self):
         import shlex
@@ -323,6 +328,124 @@ class CommandTargetsAndTaskOwnership(AutoCase):
                           "no_routing_receipt")
         payload["tool_input"]["file_path"] = str(self.state / "routing" / "forged.json")
         self.assertDenied(self.run_hook("claude", payload), "gate_state_protected")
+
+    def test_codex_coordinator_can_write_its_claude_routed_task_record(self):
+        import shlex
+        # Documented Codex PreToolUse wire: session_id is top-level, patch
+        # text is tool_input.command. No live inference is needed.
+        session = "019a7ca0-445b-77b2-aeca-85a57c3d1839"
+        payload = self.coordinator_task(client="codex", session_id=session)
+        before = self.router.get(self.item, "review")
+        self.assertAllowed(self.run_hook("codex", payload))
+        (self.task / "task.json").write_text('{"workload": {}}', encoding="utf-8")
+        self.assertAllowed(self.run_hook("codex", {
+            **payload, "tool_name": "Bash", "tool_input": {
+                "command": f"echo x > {shlex.quote(str(self.target))}"}}))
+        events = [json.loads(line) for line in
+                  (self.state / "routing" / gate.EVENT_LEDGER).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([(row["client"], row["code"]) for row in events],
+                         [("codex", "task_record_write_stage_owner")] * 2)
+        self.assertEqual(self.router.get(self.item, "review"), before)
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_codex_missing_malformed_or_other_session_cannot_use_owner_exception(self):
+        payload = self.coordinator_task(client="codex")
+        del payload["session_id"]
+        # Exec JSONL's thread_id and the hook's turn_id are not session_id.
+        payload.update(thread_id="owner-session", turn_id="owner-session")
+        self.assertDenied(self.run_hook("codex", payload), "task_owned_elsewhere")
+        for session in (None, "", 42, True, ["owner-session"], {"id": "owner-session"},
+                        " owner-session", "owner-session\n", "owner:session", "x" * 82,
+                        "\ud800", "other-session"):
+            with self.subTest(session=repr(session)):
+                self.assertDenied(self.run_hook("codex", {**payload, "session_id": session}),
+                                  "task_owned_elsewhere")
+
+    def test_codex_tool_arguments_and_environment_cannot_select_owner_identity(self):
+        payload = self.coordinator_task(client="codex")
+        payload["tool_input"].update(session_id="owner-session", thread_id="owner-session",
+                                     owner_id="codex-coordinator:owner-session", client="codex")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "owner-session",
+                                           "CODEX_SESSION_ID": "owner-session"}):
+            for session in (None, "other-session"):
+                with self.subTest(session=session):
+                    self.assertDenied(self.run_hook("codex", {**payload, "session_id": session}),
+                                      "task_owned_elsewhere")
+
+    def test_codex_owner_requires_exact_client_and_full_session(self):
+        for owner in ("claude-coordinator:owner-session", "codex-session", "codex-owner-session",
+                      "codex-coordinator:owner", "codex-coordinator:owner-session-extra",
+                      "gate-auto:codex", "gate-auto:claude"):
+            with self.subTest(owner=owner):
+                payload = self.coordinator_task(owner, client="codex")
+                self.assertDenied(self.run_hook("codex", payload), "task_owned_elsewhere")
+        # The reverse client mismatch must also deny for a foreign route.
+        payload = self.coordinator_task("codex-coordinator:owner-session")
+        self.assertDenied(self.run_hook("claude", payload), "task_owned_elsewhere")
+        payload = self.coordinator_task("claude-coordinator:owner")
+        self.assertDenied(self.run_hook("claude", payload), "task_owned_elsewhere")
+
+    def test_codex_coordinator_must_own_every_foreign_stage_and_target_item(self):
+        import shlex
+        payload = self.coordinator_task(client="codex")
+        self.observe("claude")
+        registered = self.router.register(self.item, "evidence", allowed_routes=["claude"])
+        self.router.assign(self.item, "evidence", owner_id="codex-coordinator:owner-session",
+                           lease_seconds=600, expected_revision=registered["revision"])
+        registered = self.router.register(self.item, "implementation", allowed_routes=["claude"])
+        owned = self.router.assign(self.item, "implementation",
+                                   owner_id="codex-coordinator:other-session", lease_seconds=600,
+                                   expected_revision=registered["revision"])
+        self.assertDenied(self.run_hook("codex", payload), "task_owned_elsewhere")
+        self.router.complete(self.item, "implementation", owner_id=owned["owner_id"],
+                             expected_revision=owned["revision"])
+        self.assertAllowed(self.run_hook("codex", payload))
+        other_item = "another-task"
+        (self.tasks / other_item).mkdir()
+        registered = self.router.register(other_item, "review", allowed_routes=["claude"])
+        self.router.assign(other_item, "review", owner_id="codex-coordinator:other-session",
+                           lease_seconds=600, expected_revision=registered["revision"])
+        payload.update(tool_name="Bash", tool_input={"command":
+            f"touch {shlex.quote(str(self.target))} "
+            f"{shlex.quote(str(self.tasks / other_item / 'task.json'))}"})
+        self.assertDenied(self.run_hook("codex", payload), "task_owned_elsewhere")
+
+    def test_codex_coordinator_exception_preserves_claim_and_database_denials(self):
+        payload = self.coordinator_task(client="codex")
+        record = self.task / "task.json"
+        task = json.loads(record.read_text(encoding="utf-8"))
+        task["workload"]["claim"]["owner"] = "conflicting-owner"
+        record.write_text(json.dumps(task), encoding="utf-8")
+        self.assertDenied(self.run_hook("codex", payload), "task_claim_conflict")
+        record.write_text('{"workload": []}', encoding="utf-8")
+        self.assertDenied(self.run_hook("codex", payload), "task_claim_unavailable")
+        payload = self.coordinator_task(client="codex")
+        with mock.patch.object(gate, "_task_ledger_rows", side_effect=OSError("offline")):
+            decision = gate.run_hook("codex", str(self.state), payload, capacity_db=str(self.db))
+        self.assertEqual(decision.code, "stage_db_unavailable")
+        self.assertEqual(gate.run_hook("codex", str(self.state), payload).code, "stage_db_unavailable")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db),
+                                           time.time() + 700, session_id="owner-session")
+        self.assertEqual(decision.code, "task_record_write")
+        decision = gate._judge_task_records("codex", [str(self.target)], str(self.db),
+                                           self.owned["lease_until"], session_id="owner-session")
+        self.assertEqual(decision.code, "task_claim_conflict")
+
+    def test_codex_coordinator_cannot_bypass_repo_receipts_or_protected_paths(self):
+        import shlex
+        payload = self.coordinator_task(client="codex")
+        mixed = {**payload, "tool_name": "Bash", "tool_input": {"command":
+            f"echo x > {shlex.quote(str(self.target))}; touch app.py"}}
+        self.assertDenied(self.run_hook("codex", mixed, "--no-automatic-routing"),
+                          "no_routing_receipt")
+        self.assertIsNone(self.receipt_for(self.repo))
+        git_repo(self.task)
+        self.assertDenied(self.run_hook("codex", payload, "--no-automatic-routing"),
+                          "no_routing_receipt")
+        payload["tool_input"]["command"] = (
+            f"*** Begin Patch\n*** Add File: {self.state / 'routing' / 'forged.json'}\n"
+            "+x\n*** End Patch\n")
+        self.assertDenied(self.run_hook("codex", payload), "gate_state_protected")
 
     def test_literal_prose_and_home_siblings_do_not_target_state(self):
         import shlex

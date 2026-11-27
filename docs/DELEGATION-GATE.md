@@ -291,10 +291,20 @@ against an `owned` ledger row with a finite, unexpired lease, and such a live
 ledger row still routes task-record writes even where no task claim exists.
 For a stage routed elsewhere, the writing session may update its own task
 record only when every such live stage has the exact owner
-`claude-coordinator:<session_id>`, using the configured Claude client and
-Claude Code's [top-level hook session_id](https://code.claude.com/docs/en/hooks#common-input-fields).
+`<client>-coordinator:<session_id>`: `claude-coordinator:<session_id>` for the
+configured Claude client or `codex-coordinator:<session_id>` for Codex.
+Both [Claude Code](https://code.claude.com/docs/en/hooks#common-input-fields)
+and [Codex CLI](https://learn.chatgpt.com/docs/hooks#common-input-fields)
+provide a top-level hook `session_id`.
 The host supplies that field separately from the agent's tool arguments;
 another session's tool arguments cannot select the owner's session identity.
+The owner must contain the **full host session id**; short prefixes such as
+`claude-coordinator:cb333057` do not match a longer session id. No prefix
+matching is permitted. Codex's `thread_id` in `codex exec --json` output
+(see [verified CLI behaviour](verified-cli-behaviour.md)) is a different wire
+format; the gate uses only the hook's top-level `session_id`, never a
+`thread_id` or `turn_id` fallback. Codex subagent hooks carry the parent
+session id, so the binding is to that host session, not an individual subagent.
 Missing or malformed identity grants no exception. Other owner conventions,
 including `gate-auto:<client>` (shared across sessions), have no established
 session binding and remain denied across routes. These allows are logged as
@@ -606,7 +616,8 @@ record of what the gate saw; it does not observe the surfaces it cannot hook.
 ## Hook wire
 
 The hook reads the host's PreToolUse JSON on stdin (`tool_name`,
-`tool_input`, `cwd`) and prints one JSON object: `{}` for allow, or
+`tool_input`, `cwd`, and host-supplied `session_id`) and prints one JSON
+object: `{}` for allow, or
 
 ```json
 {"hookSpecificOutput": {"hookEventName": "PreToolUse",
