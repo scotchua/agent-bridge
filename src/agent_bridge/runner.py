@@ -248,6 +248,10 @@ def run(
         })
         pause_after_marker_transition(env, "peer_exited_uncommitted")
 
+    # A Claude child (and its tool subprocesses) can echo its setup token.
+    # Redact at the common capture boundary before any caller can persist it.
+    stdout = redact_child_output(stdout, env)
+    stderr = redact_child_output(stderr, env)
     return RunResult(
         argv=argv,
         returncode=returncode,
@@ -267,6 +271,13 @@ def run(
                 time.monotonic() - termination_started, 3)},
         ],
     )
+
+
+def redact_child_output(payload: bytes, env: dict[str, str]) -> bytes:
+    """Remove the Keychain setup token from captured output and patches."""
+    token = env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    needle = token.encode("ascii", "ignore") if token else b""
+    return payload.replace(needle, b"[redacted]") if needle else payload
 
 
 def _write_marker(path: str, payload: dict[str, Any]) -> bool:
@@ -311,11 +322,16 @@ def scrubbed_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     env["AGENT_BRIDGE_PEER"] = "1"
     # Explicitly drop credentials that would otherwise leak into a peer run.
-    for banned in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID",
-                   "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "TMPDIR"):
+    for banned in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+                   "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "TMPDIR"):
         env.pop(banned, None)
     if extra:
         env.update(extra)
+    # ``extra`` is configuration in normal callers and Config rejects this
+    # name. Keep the low-level helper equally safe for future/direct callers:
+    # only claude_token.child_auth_env(), merged after scrubbing by a Claude
+    # launcher, may introduce this variable.
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     return env
 
 

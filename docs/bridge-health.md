@@ -57,4 +57,28 @@ Keep the failing job ID, timestamps and health output. Health JSON provides the 
 
 Ask the maintainer to compare the job's `peer_auth_failure_reason`, attempt notes, credential context, CLI version and config hash. `oauth_refresh_failed` identifies the failure stage; it does not establish revocation, Keychain failure, or concurrent refresh as the cause. Older jobs lack the new fields and require careful local inspection of quarantine. Do not paste raw quarantine, credentials, tokens, email addresses or client prompts into a ticket.
 
-Repeated browser logins and app restarts are not the long-term repair procedure. On September 6 we reproduced a context-dependent Keychain visibility problem and confirmed earlier OAuth refresh failures, but could not establish the original refresh failure's underlying cause. See the [investigation and test record](audits/connectivity-investigation-2026-09-06.md).
+Repeated browser logins and app restarts are not the long-term repair procedure: use the one-year subscription setup token below when the bridge's refreshable login races. On September 6 we reproduced a context-dependent Keychain visibility problem and confirmed earlier OAuth refresh failures, but could not establish the original refresh failure's underlying cause. See the [investigation and test record](audits/connectivity-investigation-2026-09-06.md).
+
+## Claude one-year bridge token
+
+The Claude bridge normally has a dedicated `claude-home` login. Its refreshable
+OAuth grant can be rotated by two bridge processes at once, which can lead to
+repeated browser logins. On macOS, use Claude Code's one-year subscription
+setup token instead. This is subscription authentication, never an API key;
+do not put an API key or `CLAUDE_CODE_OAUTH_TOKEN` in bridge configuration.
+
+1. In a normal Terminal, run `claude setup-token` and finish browser sign-in.
+2. Store the printed value without shell history: `security add-generic-password -U -s agent-bridge-claude-oauth-token -a "$USER" -w` (leave the value off `-w`, so Keychain prompts).
+3. Immediately record its mint date: `agent-bridge-admin claude-token mark-set`.
+
+The bridge reads the Keychain item only when launching a Claude child and
+passes it only to that child. It never falls back to an API key. To rotate,
+repeat those three steps (the `-U` replaces the old Keychain value). To remove
+the token and return to the isolated refreshable login, run
+`security delete-generic-password -s agent-bridge-claude-oauth-token` and,
+optionally, `agent-bridge-admin claude-token clear-date`. `agent-bridge-admin
+claude-token status` shows only the source, date, and days remaining.
+
+Test runners set `AGENT_BRIDGE_DISABLE_CLAUDE_TOKEN=1` so bridge child
+processes skip this token lookup. The switch only disables the setup token; it
+cannot supply, select, or enable a credential.

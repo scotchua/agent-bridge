@@ -58,7 +58,7 @@ class Service:
         if backend is None:
             command = [sys.executable, str(Path(worker_child.__file__).resolve()), "--worker", worker, "--state", worker_state,
                        "--queue-root", str(self.root)]
-            backend = SubprocessBackend(command)
+            backend = SubprocessBackend(command, bridge_child=True)
         self.queue = LocalQueue(self.root, sampler=self.sampler, backend=backend,
                                 caps=caps or QueueCaps(), allowed_task_types=allowed_task_types,
                                 backend_id=backend_id, client_data_health_gate=client_data_health_gate,

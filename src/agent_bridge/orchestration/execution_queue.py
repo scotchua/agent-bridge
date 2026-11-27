@@ -25,7 +25,7 @@ from agent_bridge.bounded_capture import capture_process
 
 from ..execution import claude_config, verify_policy
 from ..execution import job_source
-from .. import send_binding
+from .. import claude_token, send_binding
 from ..capacity_router import RoutingError, StageRouter
 from . import windows_privacy as wpv
 
@@ -334,6 +334,7 @@ class SubprocessHarnessExecutor:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                "HOME": str(Path.home()), "LANG": "C.UTF-8",
                "USER": account, "LOGNAME": account}
+        env.update(claude_token.disable_child_env())
         _append_step(job_dir, STEP_PROVIDER_SPAWNED, "begin", time.time(), _attempt_of(job_dir))
         process = subprocess.Popen(argv, cwd=job_dir if pinned_job_source else request["repo"], env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

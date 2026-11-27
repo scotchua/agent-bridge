@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping
 
-from .. import runner
+from .. import claude_token, runner
 from ..execution import claude_config
 
 PROBE_TIMEOUT_SECONDS = 4.0
@@ -70,6 +70,7 @@ class HarnessReadinessProbe:
             if not claude_config.is_ready(directory, home=self.home):
                 return False
             env["CLAUDE_CONFIG_DIR"] = str(directory)
+            env.update(claude_token.child_auth_env())
             auth = ["--safe-mode", "--setting-sources", "", "auth", "status", "--json"]
         else:
             return False
