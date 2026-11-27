@@ -78,7 +78,7 @@ def build_backend_and_caps(cfg: Any, queue_root: str) -> "tuple[Backend, QueueCa
         command = [sys.executable, str(Path(worker_child.__file__).resolve()),
                   "--worker", str(cfg.worker_executable), "--state", str(cfg.worker_state),
                   "--queue-root", str(queue_root)]
-        return SubprocessBackend(command), QueueCaps(), MECHANICAL_TASKS
+        return SubprocessBackend(command, bridge_child=True), QueueCaps(), MECHANICAL_TASKS
 
     # name == "gemma_certified"
     if os.name != "posix":
@@ -112,5 +112,5 @@ def build_backend_and_caps(cfg: Any, queue_root: str) -> "tuple[Backend, QueueCa
                    for task in pilot_tasks)
             or len(set(pilot_tasks)) != len(pilot_tasks)):
         raise BackendSelectionError("gemma_pilot_tasks_invalid")
-    return (SubprocessBackend(command), gemma_queue_caps_for(cfg),
+    return (SubprocessBackend(command, bridge_child=True), gemma_queue_caps_for(cfg),
             frozenset({"summarize", *pilot_tasks}))

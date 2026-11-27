@@ -25,7 +25,7 @@ import os
 import uuid
 from typing import Any
 
-from .. import runner, token_usage
+from .. import claude_token, runner, token_usage
 from ..config import Config
 from ..errors import ErrorCategory
 from .base import PeerOutcome, auth_failure_reason, parse_single_object
@@ -116,6 +116,7 @@ def run_consultation(
     spec = cfg.peer(PEER)
     argv = build_argv(cfg, schema, session_id, resume, research=research)
     env = runner.scrubbed_env(cfg.peer_extra_env(PEER))
+    env.update(claude_token.child_auth_env())
     result = runner.run(
         argv,
         cwd=workspace,
@@ -138,7 +139,9 @@ def run_consultation(
         group_kill=result.group_kill,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
-        notes={"credential_context": runner.credential_context(env), "research": research},
+        notes={"credential_context": runner.credential_context(env),
+               "credential_source": "setup_token" if env.get("CLAUDE_CODE_OAUTH_TOKEN") else "login",
+               "research": research},
     )
 
     if result.spawn_failed:

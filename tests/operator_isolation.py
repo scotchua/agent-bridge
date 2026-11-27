@@ -20,6 +20,9 @@ STATE_ENV = "CODEX_JOB_RUNNER_STATE"
 os.environ["AGENT_BRIDGE_NO_DESKTOP_ALERTS"] = "1"
 
 os.environ["AGENT_BRIDGE_NO_AUTO_REQUALIFY"] = "1"
+# A fresh bridge interpreter cannot inherit conftest's reader seam.  This
+# disable-only switch keeps every test child off the operator's Keychain.
+os.environ["AGENT_BRIDGE_DISABLE_CLAUDE_TOKEN"] = "1"
 if STATE_ENV not in os.environ:
     _root = tempfile.mkdtemp(prefix="ab-operator-state-")
     atexit.register(shutil.rmtree, _root, ignore_errors=True)

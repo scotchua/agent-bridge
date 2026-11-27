@@ -15,7 +15,7 @@ import sqlite3
 import sys
 from typing import Any
 
-from . import drift, operator_settings, registry, store
+from . import claude_token, drift, operator_settings, registry, store
 from .broker import error_response
 from .capacity_router import RoutingError, StageRouter
 from .config import Config, load as load_config
@@ -170,6 +170,9 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
                   f"(held for {hold['age_days']}d)")
         print()
     indeterminate_ids = [hold["conversation_id"] for hold in indeterminate]
+    # Keep status machine-readable. The field is an attention line, and the
+    # helper suppresses repeat login/token reminders for the same local day.
+    attention = claude_token.attention_once_today()
     print(json.dumps({
         "state_root": cfg.state_root,
         "config": cfg.path,
@@ -188,7 +191,28 @@ def cmd_status(cfg: Config, _: argparse.Namespace) -> int:
         "indeterminate_holds": indeterminate,
         "ledger_records": ledger_lines,
         "retention_days": cfg.raw["retention"],
+        "claude_token_attention": attention,
     }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_claude_token(_: Config, args: argparse.Namespace) -> int:
+    if args.claude_token_command == "mark-set":
+        try:
+            stamp = claude_token.mark_set(args.minted_on)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Claude setup-token mint date recorded: {stamp}")
+        return 0
+    if args.claude_token_command == "clear-date":
+        claude_token.clear_date()
+        print("Claude setup-token mint date cleared.")
+        return 0
+    stamp = claude_token.set_on()
+    remaining = claude_token.days_left()
+    print(json.dumps({"source": claude_token.source(), "set_on": stamp,
+                      "days_left": remaining}, sort_keys=True))
     return 0
 
 
@@ -757,6 +781,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="Show broker state.")
+    token = sub.add_parser("claude-token", help="Show or maintain the non-secret Claude token date record.")
+    token_sub = token.add_subparsers(dest="claude_token_command", required=True)
+    token_sub.add_parser("status", help="Show credential source and token mint date.")
+    mark = token_sub.add_parser("mark-set", help="Record the setup-token mint date after Keychain storage.")
+    mark.add_argument("--minted-on", default=None, help="YYYY-MM-DD; defaults to today.")
+    token_sub.add_parser("clear-date", help="Remove only the local mint-date record.")
     health = sub.add_parser("health", help="Check pinned CLI and local login visibility; no login changes.")
     health.add_argument("--peer", choices=("claude", "codex"))
     health.add_argument("--json", action="store_true")
@@ -816,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
                 "reporting": cmd_reporting, "local-first": cmd_local_first,
                 "indeterminate": cmd_indeterminate, "resolve": cmd_resolve,
                 "archive": cmd_archive, "stage-reconcile": cmd_stage_reconcile,
+                "claude-token": cmd_claude_token,
                 "operator-settings": cmd_operator_settings}[
             args.command](cfg, args)
     except BrokerError as exc:
