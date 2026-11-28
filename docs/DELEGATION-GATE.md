@@ -324,6 +324,21 @@ Mixed repository/task writes must also satisfy
 the repository receipts, and repositories inside the task tree keep their
 ordinary receipt checks. Protected-state checks run first in every case.
 
+One task-folder write has its own recognised form: the manifest-bound
+release installer. Only its exact canonical command is allowed, only for an
+manifest pinned by digest under the protected state root with independent
+root-owned system authorization for that digest and state root,
+and only into the named existing task under that task's live claim and
+ledger owner. The protected-state, link, repository and ownership checks
+cover its whole write set (payloads, their temporaries, folders it may
+create, `task.json` and its temporary). Other recognised literal launches
+are denied (`release_install_unresolved`). Quoted mentions route normally;
+opaque bodies and dynamic spellings keep ordinary heuristic routing. The
+gate and installer independently verify system authorization, so forging
+state-root cache files cannot approve a release. Hooked clients must lack
+root access; clients running as root cannot use the approval exemption. See
+[RELEASE-INSTALL.md](RELEASE-INSTALL.md).
+
 Stages therefore carry a generation (`implementation`, `implementation#2`), so
 a completed or superseded decision is history rather than a wall, and a stage
 the decider itself still held on a route the policy no longer chooses is

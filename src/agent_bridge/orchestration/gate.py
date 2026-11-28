@@ -68,7 +68,8 @@ from .. import python_runtime, store
 from ..capacity_router import (CapacityObservation, PRESENCE_SOURCE, RoutingError,
                               capacity_fingerprint, upsert_observation,
                               validate_observation)
-from . import autoroute, claim_reconcile, config as orchestration_config, literal_records, localfirst
+from . import (autoroute, claim_reconcile, config as orchestration_config, literal_records,
+               localfirst, release_install)
 
 CLIENTS = ("claude", "codex")
 RECEIPT_DIR = "routing"
@@ -2094,6 +2095,169 @@ def _task_record_owner_id(client: str, session_id: Any) -> str | None:
     return f"{client}-coordinator:{session_id}"
 
 
+def _tasks_root() -> str:
+    return os.path.realpath(os.path.expanduser("~/Claude/team-state/tasks"))
+
+
+_RELEASE_INSTALLER = os.path.realpath(release_install.__file__)
+
+
+def _release_install_attempt(command: str) -> bool:
+    """Recognise literal launch positions, never prose inside another command.
+
+    This is a routing aid, not the approval boundary. Opaque interpreters,
+    substitutions and renamed copies keep ordinary routing; the installer
+    independently requires privileged authorization even through those paths.
+    """
+    commands: list[list[str]] = [[]]
+    redirect = False
+    end = 0
+    for match in _SHELL_TOKEN.finditer(command):
+        if command[end:match.start()].strip():
+            return False
+        end = match.end()
+        raw = match.group()
+        if raw in {"<", ">", ">>", "<>", ">|", "&>", "&>>", ">&", "<&"}:
+            redirect = True
+        elif raw == "\n" or all(char in ";&|()" for char in raw):
+            if redirect:
+                return False
+            commands.append([])
+        elif all(char in ";&|()<>" for char in raw):
+            return False  # here-docs and other opaque syntax use ordinary routing
+        else:
+            try:
+                words = shlex.split(raw, posix=True)
+            except ValueError:
+                return False
+            if len(words) != 1:
+                return False
+            if redirect:
+                redirect = False
+            else:
+                commands[-1].append(words[0])
+    if command[end:].strip() or redirect:
+        return False
+    for words in commands:
+        # Skip known launch wrappers and environment assignments. Only inspect
+        # the executable and Python's script/module slot, not arbitrary args.
+        while words and (_ENV_ASSIGNMENT.match(words[0]) or
+                         _program_name(words[0]).lower() in {"env", "exec", "command", "sudo"}
+                         or words[0].startswith("-")):
+            words = words[1:]
+        if not words:
+            continue
+        name = _program_name(words[0]).lower()
+        if re.fullmatch(r"release_install(?:\.pyc?)?", name):
+            return True
+        if not re.fullmatch(r"python(?:[0-9.]+)?[tw]?(?:\.exe)?", name):
+            continue
+        args = words[1:]
+        while args and args[0].startswith("-"):
+            flag = args.pop(0)
+            if flag == "-c" or (flag.startswith("-c") and len(flag) > 2):
+                break
+            if "m" in flag:
+                module = flag.partition("m")[2] or (args[0] if args else "")
+                if module == "agent_bridge.orchestration.release_install":
+                    return True
+                break
+            if flag in {"-W", "-X"} and args:
+                args.pop(0)
+        else:
+            if args and re.fullmatch(r"release_install(?:\.pyc?)?",
+                                     _program_name(args[0]).lower()):
+                return True
+    return False
+
+
+def _judge_release_install(client: str, command: str, *, state_root: str,
+                           protected: tuple[str, ...], capacity_db: str | None,
+                           clock: Any = time.time) -> Decision | None:
+    """The one canonical, manifest-bound release install, or None.
+
+    Unrecognised commands keep ordinary shell routing. Recognised literal
+    launches need the canonical form. Approval is independently checked by
+    the gate and installer against the privileged system authority.
+    The canonical form is allowed only when the gate itself loads the
+    operator-pinned manifest by digest (the same ``release_install.plan`` the
+    installer runs), every path in its write set (payloads, their
+    manifest-scoped temporaries, folders it may create, ``task.json`` and its
+    temporary) is confined to the named existing task, free of links,
+    protected paths and repositories, and the task's live claim and ledger row
+    name the manifest's owner and stage on this route. The installer re-checks
+    all of it, and takes the task's locks, at run time.
+    """
+    argv = literal_records.canonical_argv(command)
+    parsed = None if argv is None else release_install.parse_command_words(argv)
+    if parsed is None:
+        if _release_install_attempt(command):
+            return Decision("deny", "release_install_unresolved",
+                            "delegation-first gate: the release installer runs only in its exact "
+                            "canonical form (see docs/RELEASE-INSTALL.md); operator acceptance "
+                            "runs outside hooked clients")
+        return None
+
+    def refuse(code: str, text: str) -> Decision:
+        return Decision("deny", code, f"delegation-first gate: release install refused: {text}")
+
+    if not literal_records._interpreter_path_is_clean(parsed["python"]) \
+            or parsed["installer"] != _RELEASE_INSTALLER:
+        return refuse("release_install_unresolved",
+                      "interpreter or installer is not the gate's own pinned file")
+    tasks_root = _tasks_root()
+    if (capacity_db is None or parsed["state_root"] != os.path.realpath(state_root)
+            or parsed["tasks_root"] != tasks_root
+            or parsed["capacity_db"] != os.path.realpath(capacity_db)):
+        return refuse("release_install_unresolved",
+                      "state root, task root or ledger differs from this gate's own")
+    item = parsed["task"]
+    now = float(clock())
+    try:
+        manifest, targets = release_install.plan(
+            parsed["state_root"], tasks_root, item, parsed["manifest_sha256"])
+    except release_install.InstallError as exc:
+        return refuse("release_install_not_approved", f"manifest is not usable ({exc.code})")
+    task_dir = os.path.join(tasks_root, item)
+    if os.path.islink(task_dir) or not os.path.isdir(task_dir):
+        return refuse("release_install_task_missing", f"task {item!r} is not an existing folder")
+    matched = [(path, root) for path in targets for root in protected if _under(path, root)]
+    if matched:
+        return Decision("deny", "gate_state_protected",
+                        "delegation-first gate: the target is the gate's own state or a hook file; "
+                        "nothing may write them through this client" + _explain_protected(matched),
+                        tuple(sorted({root for _, root in matched})))
+    if any(os.path.realpath(path) != path or not _under(path, task_dir)
+           or _same_path(path, task_dir) for path in targets):
+        return refuse("release_install_link", "a target leaves the task or crosses a link")
+    repos = tuple(sorted({repo for path in targets for repo in enclosing_repos(path)}))
+    if repos:
+        return Decision("deny", "release_install_repository",
+                        "delegation-first gate: release install refused: a target is inside "
+                        "a repository; repositories keep their ordinary receipts", repos)
+    ownership = _judge_task_records(client, targets, capacity_db, now)
+    if ownership is None or not ownership.allowed:
+        return ownership or refuse("task_claim_unavailable", "task ownership is unresolved")
+    claim = _task_claim(tasks_root, item).get("claim")
+    expected = manifest["claim"]
+    if (not claim or not claim["active"] or claim["lease_expires_at"] <= now
+            or claim["owner"] != expected["owner"] or claim["stage"] != expected["stage"]):
+        return refuse("release_install_claim", f"task {item!r} has no live claim for the "
+                      "manifest's owner and stage")
+    try:
+        rows = _task_ledger_rows(capacity_db)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return refuse("stage_db_unavailable", f"ownership ledger unreadable ({type(exc).__name__})")
+    if not any(row["item_id"] == item and row["stage"] == expected["stage"]
+               and row["owner_id"] == expected["owner"] and row["owner_route"] == client
+               and _live_owned_task_row(row, now) for row in rows):
+        return refuse("release_install_claim", f"task {item!r} stage {expected['stage']!r} is not "
+                      "live-owned by the manifest's owner on this route")
+    return Decision("allow", "release_install",
+                    f"operator-approved release {parsed['manifest_sha256'][:12]} for task {item!r}",
+                    extra={"task": item, "manifest_sha256": parsed["manifest_sha256"]})
+
+
 def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
                         now: float, *, session_id: Any = None) -> Decision | None:
     """Task evidence outside repositories follows existing task ownership.
@@ -2103,7 +2267,7 @@ def _judge_task_records(client: str, paths: list[str], capacity_db: str | None,
     require their ordinary routing receipts. The protected-path check runs
     before this function, including for symlinks resolving out of this tree.
     """
-    root = os.path.realpath(os.path.expanduser("~/Claude/team-state/tasks"))
+    root = _tasks_root()
     task_paths = [path for path in paths if _under(path, root) and not _same_path(path, root)]
     if not task_paths:
         return None
@@ -2456,6 +2620,13 @@ def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
     """
     if client not in CLIENTS:
         return Decision("deny", "client_invalid", "gate configured with an unknown client")
+    if tool_name in SHELL_TOOLS[client]:
+        # Before the isolated-receipt check, which would refuse this envelope.
+        release = _judge_release_install(client, _command_text(tool_input), state_root=state_root,
+                                         protected=protected, capacity_db=capacity_db,
+                                         clock=clock)
+        if release is not None:
+            return release
     kind, paths = classify(client, tool_name, tool_input, cwd)
     if kind == "other":
         return Decision("allow", "not_gated", "tool is not an implementation write", logged=False)
