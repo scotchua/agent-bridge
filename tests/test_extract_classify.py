@@ -133,6 +133,19 @@ class ExtractClassifyTests(unittest.TestCase):
                 with self.assertRaisesRegex(gemma_child.GemmaRefusal, "extract_document_0_schema_invalid"):
                     self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
 
+    def test_extract_new_field_set_keeps_value_checks(self):
+        documents = [{"id": "one", "text": "Northwind Co.\nTotal Due: 52.50"}]
+        cases = ((dict(issuer=52.5), "extract_document_0_schema_invalid"),
+                 (dict(total="99.99"), "extract_document_0_value_absent"),
+                 (dict(recipient="Sample LLC"), "extract_document_0_value_absent"))
+        for values, reason in cases:
+            with self.subTest(values=values):
+                record = {name: None for name in gemma_child.EXTRACT_FIELDS}
+                record.update(values)
+                (self.install / "extract_records.json").write_text(json.dumps([record]))
+                with self.assertRaisesRegex(gemma_child.GemmaRefusal, reason):
+                    self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
+
     def test_wrong_task_or_input_receipt_is_rejected(self):
         for override in ({"task": "classify"}, {"input_sha256": "0" * 64}):
             with self.subTest(override=override):

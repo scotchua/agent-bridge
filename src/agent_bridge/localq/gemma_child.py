@@ -442,7 +442,7 @@ def _extract(text: str, documents: Any, job_id: str, delegate: Path, python: Pat
             keys = set(candidate)
             matched = next((names for names in (EXTRACT_FIELDS, LEGACY_EXTRACT_FIELDS)
                             if keys == set(names)), None)
-            if matched is None or (field_set is not None and matched is not field_set):
+            if matched is None or (field_set is not None and matched != field_set):
                 raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
             field_set = matched
             fields = {}
