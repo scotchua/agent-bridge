@@ -325,14 +325,17 @@ the repository receipts, and repositories inside the task tree keep their
 ordinary receipt checks. Protected-state checks run first in every case.
 
 One task-folder write has its own recognised form: the manifest-bound
-release installer. Only its exact canonical command is allowed, only for an
+release installer. Only its exact canonical command is allowed, only for a
 manifest pinned by digest under the protected state root with independent
 root-owned system authorization for that digest and state root,
 and only into the named existing task under that task's live claim and
 ledger owner. The protected-state, link, repository and ownership checks
 cover its whole write set (payloads, their temporaries, folders it may
 create, `task.json` and its temporary). Other recognised literal launches
-are denied (`release_install_unresolved`). Quoted mentions route normally;
+are denied (`release_install_unresolved`), including launches through `nice`,
+`time`, `timeout`, `nohup`, `env` and `sudo`. This is a routing aid for
+recognised launch spellings, not approval enforcement. Read commands and
+commit messages that only mention the installer route normally;
 opaque bodies and dynamic spellings keep ordinary heuristic routing. The
 gate and installer independently verify system authorization, so forging
 state-root cache files cannot approve a release. Hooked clients must lack
