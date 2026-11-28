@@ -65,6 +65,25 @@ MAX_FILE_BYTES = 16 << 20
 MAX_TOTAL_BYTES = 64 << 20
 MAX_FILES = 64
 MAX_DEPTH = 4
+#: The versioned nightly library package, the only exception to the general
+#: segment and depth rules: ``nightly/bridge-runtime/<release>/files.json``
+#: plus ``.../<release>/src/<name>`` for exactly these names. ``files.json``
+#: maps each name to its source sha256 as compact sorted JSON plus LF, and
+#: ``<release>`` is the sha256 of those index bytes.
+PACKAGE_ROOT = ("nightly", "bridge-runtime")
+PACKAGE_INDEX = "files.json"
+PACKAGE_SOURCES = (
+    "agent_bridge/__init__.py",
+    "agent_bridge/bounded_capture.py",
+    "agent_bridge/localq/__init__.py",
+    "agent_bridge/localq/quality.py",
+    "agent_bridge/localq/runtime.py",
+    "agent_bridge/localq/spool.py",
+    "agent_bridge/platform/__init__.py",
+    "agent_bridge/platform/base.py",
+    "agent_bridge/platform/posix.py",
+    "agent_bridge/store.py",
+)
 #: A claim or ledger lease must outlive the install by at least this much.
 LEASE_MARGIN_SECONDS = 30.0
 
@@ -149,6 +168,40 @@ def _overlaps(path: str, reserved: list[str]) -> bool:
                for r in reserved)
 
 
+def package_index(hashes: dict) -> bytes:
+    """The exact ``files.json`` bytes for source ``name -> sha256``."""
+    return (_canon(hashes) + "\n").encode("utf-8")
+
+
+def _package_member(parts: list[str]) -> tuple[str, str] | None:
+    """``(release, member)`` for an exact package path, else None."""
+    if len(parts) < 4 or tuple(parts[:2]) != PACKAGE_ROOT or not _HEX.fullmatch(parts[2]):
+        return None
+    member = "/".join(parts[3:])
+    if member == PACKAGE_INDEX or (parts[3] == "src" and "/".join(parts[4:]) in PACKAGE_SOURCES):
+        return parts[2], member
+    return None
+
+
+def _check_package(members: dict[tuple[str, str], str]) -> bool:
+    """One release, exactly its index and sources, all hashes consistent.
+
+    The index bytes are fully determined by the source hashes, so the
+    manifest alone fixes them; blob and payload hash checks then bind the
+    actual bytes before anything is written."""
+    if not members:
+        return True
+    releases = {release for release, _ in members}
+    if len(releases) != 1:
+        return False
+    (release,) = releases
+    expected = {PACKAGE_INDEX, *("src/" + name for name in PACKAGE_SOURCES)}
+    if {member for _, member in members} != expected:
+        return False
+    index = package_index({name: members[(release, "src/" + name)] for name in PACKAGE_SOURCES})
+    return _sha(index) == release == members[(release, PACKAGE_INDEX)]
+
+
 def validate_manifest(value, item: str) -> dict:
     """Exact schema; anything else is ``manifest_invalid``."""
     def bad(detail: str):
@@ -173,18 +226,24 @@ def validate_manifest(value, item: str) -> dict:
         bad("files")
     seen: set[str] = set()
     folders: set[str] = set()
+    package: dict[tuple[str, str], str] = {}
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "previous_sha256"}:
             bad("file entry keys")
         path = entry["path"]
         parts = path.split("/") if isinstance(path, str) else []
-        if (not 1 <= len(parts) <= MAX_DEPTH
-                or not all(_SEGMENT.fullmatch(part) for part in parts)
+        member = _package_member(parts)
+        if member is None and [p.casefold() for p in parts[:2]] == list(PACKAGE_ROOT):
+            bad("file path outside the package layout")
+        if ((member is None and (not 1 <= len(parts) <= MAX_DEPTH
+                                 or not all(_SEGMENT.fullmatch(part) for part in parts)))
                 or path.casefold() in seen
                 or _overlaps(path.casefold(), reserved)):
             bad("file path")
         if not isinstance(entry["sha256"], str) or not _HEX.fullmatch(entry["sha256"]):
             bad("sha256")
+        if member is not None:
+            package[member] = entry["sha256"]
         previous = entry["previous_sha256"]
         if previous is not None and (not isinstance(previous, str) or not _HEX.fullmatch(previous)):
             bad("previous_sha256")
@@ -192,6 +251,8 @@ def validate_manifest(value, item: str) -> dict:
         folders.update("/".join(parts[:i]).casefold() for i in range(1, len(parts)))
     if seen & folders:
         bad("a file path is also a folder")
+    if not _check_package(package):
+        bad("package files or index")
     activation = value["activation"]
     if not isinstance(activation, dict) or set(activation) != {"field", "previous", "value"}:
         bad("activation keys")

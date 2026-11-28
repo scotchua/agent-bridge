@@ -121,6 +121,15 @@ numbers are refused.
   lock file (`nightly`, `nightly/state`), or anything under `task.json` or a
   lock file. The comparison ignores case. `previous_sha256` is `null` when
   the file must be absent, or the hash the current file must have.
+* The one exception to the segment and depth rules is the versioned nightly
+  library package: `nightly/bridge-runtime/<release>/files.json` plus
+  `nightly/bridge-runtime/<release>/src/<name>` for exactly the ten
+  `PACKAGE_SOURCES` names in `release_install.py`. All eleven must be present,
+  for one release only. `files.json` is the flat object of name to source
+  sha256, compact with sorted keys, UTF-8 and one trailing LF, and
+  `<release>` (lowercase hex) is the sha256 of those bytes and the manifest's
+  `sha256` for `files.json`. Any other path under `nightly/bridge-runtime`,
+  in any case, is refused.
 * `activation.previous`: `{"absent": true}` or `{"value": <json>}`, the value
   `current_stable_nightly_assignment` must hold before replacement.
 
