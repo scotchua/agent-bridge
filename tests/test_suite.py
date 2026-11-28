@@ -26,11 +26,16 @@ from agent_bridge import (  # noqa: E402
     admin, broker, envelope, preflight, registry, runner,
     schema_validate, store, worker,
 )
+from agent_bridge import claude_token  # noqa: E402
 from agent_bridge.backends import base  # noqa: E402
 from agent_bridge.errors import BrokerError, hint as error_hint  # noqa: E402
 from agent_bridge.mcp_server import build_tools  # noqa: E402
 from agent_bridge.errors import ErrorCategory  # noqa: E402
 from agent_bridge.platform import platform as active_platform  # noqa: E402
+
+# This runner does not load pytest's conftest.  Its fake-peer tests must not
+# read an operator's Keychain item or pass it into subprocesses.
+claude_token._reader = lambda: None
 
 # A process group containing a SIBLING, not just its leader. Reaping must kill
 # the whole group, so a single-process group would let a leader-only kill pass.
@@ -307,11 +312,17 @@ def test_tool_exposure() -> None:
         # nothing about the tool and everything about shebangs.
         launcher = [os.path.join(REPO, "bin", "agent-bridge-mcp.cmd")] \
             if os.name == "nt" else [os.path.join(REPO, "bin", "agent-bridge-mcp")]
-        proc = subprocess.run(launcher, capture_output=True, timeout=60)
+        # Test argument validation with the interpreter running this suite.
+        # A scratch HOME has no installer record, and sandboxed PATH lookup
+        # may select Python installations whose version probes cannot run.
+        # Both platform launchers support this explicit interpreter override.
+        launcher_env = dict(os.environ, AGENT_BRIDGE_PYTHON=sys.executable)
+        proc = subprocess.run(launcher, capture_output=True, timeout=60,
+                              env=launcher_env)
         check("--caller is required",
               proc.returncode != 0 and b"--caller" in proc.stderr, proc.stderr.decode())
         proc = subprocess.run(launcher + ["--caller", "gpt"],
-                              capture_output=True, timeout=60)
+                              capture_output=True, timeout=60, env=launcher_env)
         check("--caller rejects an unknown value",
               proc.returncode != 0 and b"invalid choice" in proc.stderr
               and b"gpt" in proc.stderr, proc.stderr.decode())

@@ -10,7 +10,7 @@ import os
 import tempfile
 from typing import Any
 
-from . import preflight, runner, store
+from . import claude_token, preflight, runner, store
 from .config import Config, effective_config_sha256
 from .execution import claude_task
 from .errors import BrokerError
@@ -25,10 +25,20 @@ def peer_env(cfg: Config, peer: str) -> dict[str, str]:
     extra = cfg.peer_extra_env(peer)
     if peer == "codex":
         extra["CODEX_HOME"] = os.path.expanduser(cfg.peer(peer)["codex_home"])
-    return runner.scrubbed_env(extra)
+    env = runner.scrubbed_env(extra)
+    if peer == "claude":
+        env.update(claude_token.child_auth_env())
+    return env
 
 
 def auth_status(peer: str, executable: str, env: dict[str, str]) -> dict[str, Any]:
+    # This is also called by setup checks, which pass a generic scrubbed env.
+    # Do not trust a caller-provided OAuth variable; only the Keychain reader
+    # may add one to a Claude child.
+    env = dict(env)
+    if peer == "claude":
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        env.update(claude_token.child_auth_env())
     argv = [executable, *(["--safe-mode", "--setting-sources", "", "auth", "status"]
                          if peer == "claude" else ["login", "status"])]
     # No caller cwd, stdin, raw output, or credentials enter the report.
@@ -42,6 +52,7 @@ def auth_status(peer: str, executable: str, env: dict[str, str]) -> dict[str, An
                                  "timeout" if result.timed_out else "output_incomplete")
         return report
     if peer == "claude":
+        report["credential_source"] = "setup_token" if env.get("CLAUDE_CODE_OAUTH_TOKEN") else "login"
         try:
             value = json.loads(result.stdout)
         except (ValueError, UnicodeError):
@@ -112,6 +123,12 @@ def inspect_peer(cfg: Config, peer: str) -> dict[str, Any]:
     else:
         report["operator_login_argv"] = None
     if peer == "claude":
+        report["credential_source"] = report["auth"].get("credential_source", claude_token.source())
+        issue = claude_token.diagnostic()
+        if issue == "keychain_locked":
+            report["keychain_diagnostic"] = "Claude setup-token Keychain item is locked; using login fallback."
+        elif issue in {"keychain_access_denied", "keychain_access_failed"}:
+            report["keychain_diagnostic"] = "Claude setup-token Keychain access was denied; using login fallback."
         storage = env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
         if storage is None:
             storage = env.get("CLAUDE_CONFIG_DIR")
@@ -126,6 +143,9 @@ def inspect_peer(cfg: Config, peer: str) -> dict[str, Any]:
             "Sign in within this config directory; never copy a login from another home, "
             "because two homes holding one refresh grant can invalidate each other."
         )
+        if report["credential_source"] == "setup_token" and report["auth"]["state"] == "not_signed_in":
+            # A rejected/revoked token is distinct from the calendar warning.
+            report["recovery"] = "The Claude bridge token was rejected or expired. Run `claude setup-token` and store the new token (see docs/bridge-health.md)."
     else:
         report["auth_file_present"] = os.path.isfile(os.path.join(env["CODEX_HOME"], "auth.json"))
         report["recovery"] = (
@@ -155,6 +175,10 @@ def cmd_health(cfg: Config, args: Any) -> int:
                 print(f"  Different PATH CLI: {row['path_executable']}")
                 print("  The bridge keeps its tested pin; it does not follow PATH upgrades.")
             print(f"  Credential context: {json.dumps(row['context'], sort_keys=True)}")
+            if row.get("credential_source"):
+                print(f"  Credential source: {row['credential_source']}")
+            if row.get("keychain_diagnostic"):
+                print(f"  {row['keychain_diagnostic']}")
             print(f"  {row['recovery']}")
         print("\nNo login or configuration changes were requested by this check.")
     return 0 if all(r["preflight"] == "ok" and r["auth"]["state"] == "signed_in"

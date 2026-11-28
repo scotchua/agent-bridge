@@ -663,6 +663,58 @@ class GemmaInvokeTests(unittest.TestCase):
                     self.invoke("[A1] Synthetic", task_type="log_triage")
                 (self.fx["install"] / "receipt_override.json").unlink()
 
+    # Expected options come from the installed delegate's own derivation
+    # (local-delegate delegate.py): schema is on for extract, and triage keeps
+    # two repair retries unless --no-repair, which this adapter never passes.
+    DELEGATE_OPTIONS = {
+        "summarize": {"schema": False, "repair_retries": 0},
+        "extract": {"schema": True, "repair_retries": 0},
+        "classify": {"schema": False, "repair_retries": 0},
+        "triage": {"schema": False, "repair_retries": 2},
+    }
+
+    def _full_options(self, delegate_task: str, timeout: float = 5.0) -> dict:
+        return {"chunk_chars": 24000, "job_timeout": float(timeout), "think": False,
+                "second_pass": False, "map_scope": "run", "roster_sha256": None,
+                **self.DELEGATE_OPTIONS[delegate_task]}
+
+    def test_expected_options_match_delegate_derivation_per_task(self):
+        for task, delegate_task in (("summarize", "summarize"), ("extract", "extract"),
+                                    ("classify", "classify"), ("log_triage", "triage")):
+            with self.subTest(task=task):
+                self.assertEqual(gemma_child._effective_options(5, delegate_task),
+                                 self._full_options(delegate_task))
+
+    def test_extract_receipt_binds_schema_on(self):
+        documents = [{"id": "one", "text": "Alpha invoice"}]
+        source = json.dumps(documents, separators=(",", ":"))
+        self.invoke(source, task_type="extract", params={"documents": documents})
+        receipts = list(self.fx["receipts"].glob("local-delegate-*.json"))
+        self.assertEqual(len(receipts), 1)
+        options = json.loads(receipts[0].read_text())["effective_options"]
+        self.assertEqual(options, self._full_options("extract"))
+
+    def test_receipt_options_that_differ_from_delegate_derivation_are_refused(self):
+        documents = [{"id": "one", "text": "Alpha invoice"}]
+        source = json.dumps(documents, separators=(",", ":"))
+        cases = (
+            ("extract", {**self._full_options("extract"), "schema": False},
+             lambda: self.invoke(source, task_type="extract", params={"documents": documents}),
+             gemma_child.GemmaRefusal, "^extract_document_0_failed:receipt_invalid$"),
+            ("triage", {**self._full_options("triage"), "repair_retries": 0},
+             lambda: self.invoke("[A1] Synthetic", task_type="log_triage"),
+             gemma_child.GemmaReceiptError, "receipt_invalid"),
+            ("summarize", {**self._full_options("summarize"), "schema": True},
+             lambda: self.invoke("Synthetic text"),
+             gemma_child.GemmaReceiptError, "receipt_invalid"),
+        )
+        for name, options, call, error, reason in cases:
+            with self.subTest(case=name):
+                self.override({"effective_options": options})
+                with self.assertRaisesRegex(error, reason):
+                    call()
+                (self.fx["install"] / "receipt_override.json").unlink()
+
     def test_changed_delegate_or_validator_source_refuses_before_spawn(self):
         delegate_digest = file_sha256(self.fx["delegate"])
         validator_digest = file_sha256(self.fx["validator"])

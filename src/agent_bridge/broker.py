@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import envelope, preflight, provenance, receipts, registry, send_binding, store
+from . import claude_token, envelope, preflight, provenance, receipts, registry, send_binding, store
 from .config import Config, canonical_uuid
 from .errors import BrokerError, ErrorCategory, hint, is_retryable, category_from_status
 
@@ -568,6 +568,7 @@ def _spawn_worker(cfg: Config, job_dir: str) -> int:
                  "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
                  "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"}
     env = {k: v for k, v in os.environ.items() if k in keep}
+    env.update(claude_token.disable_child_env())
     env["PYTHONPATH"] = src_root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     snapshot = os.path.join(job_dir, "config.snapshot.json")
