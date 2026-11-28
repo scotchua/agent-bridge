@@ -14,6 +14,7 @@ import errno
 import hashlib
 import json
 import os
+import py_compile
 import shlex
 import stat
 import subprocess
@@ -33,6 +34,13 @@ from agent_bridge.orchestration import gate, release_install as ri  # noqa: E402
 FIELD = ri.ACTIVATION_FIELD
 PYTHON = os.path.realpath(sys.executable)
 INSTALLER = os.path.realpath(ri.__file__)
+VERIFY_APPROVAL = ri._verify_approval
+# Exercise the isolated CLI with a synthetic authority, never a system store.
+# This override exists only inside the test child, not in the production CLI.
+ISOLATED_FIXTURE = ("import runpy, sys\n"
+                    "m = runpy.run_path(sys.argv.pop(1))\n"
+                    "m['main'].__globals__['_verify_approval'] = lambda *args: None\n"
+                    "raise SystemExit(m['main']())\n")
 HOLD_LOCK = ("import fcntl, os, sys\n"
              "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
              "fcntl.flock(fd, fcntl.LOCK_EX)\n"
@@ -91,6 +99,9 @@ class ReleaseInstallCase(unittest.TestCase):
         self.files = release_files()
         self.payload = self.fixture()
         self.digest = ""
+        self.approval = mock.patch.object(ri, "_verify_approval", return_value=None)
+        self.approval.start()
+        self.addCleanup(self.approval.stop)
 
     # ------------------------------------------------------------ fixture
 
@@ -141,8 +152,13 @@ class ReleaseInstallCase(unittest.TestCase):
                           now=change.get("now"))
 
     def run_process(self):
-        completed = subprocess.run(self.words(), capture_output=True, timeout=60, check=False)
+        completed = self.entry_process(self.words()[8:])
         return completed.returncode, json.loads(completed.stdout)
+
+    def entry_process(self, args):
+        return subprocess.run([PYTHON, "-I", "-S", "-B", "-c", ISOLATED_FIXTURE,
+                               INSTALLER, *args], env={"LANG": "en_US.UTF-8"},
+                              capture_output=True, timeout=60, check=False)
 
     def tree(self) -> dict:
         """Every entry under the tasks and the store, never opening a non-regular file."""
@@ -217,16 +233,188 @@ def remove_special(path: Path, kind: str) -> None:
 SPECIAL_KINDS = ("folder", "fifo") if hasattr(os, "mkfifo") else ("folder",)
 
 
+@unittest.skipUnless(os.name == "posix", "the approval authority requires POSIX")
+class ApprovalAuthorityTests(unittest.TestCase):
+    def test_root_owned_nonwritable_evidence_is_required_including_acl_access(self):
+        trusted = mock.Mock(st_uid=0, st_mode=stat.S_IFREG | 0o644)
+        with mock.patch.object(ri.os, "geteuid", return_value=501):
+            for uid, mode, access in ((501, 0o644, False), (0, 0o664, False),
+                                      (0, 0o644, True)):
+                with self.subTest(uid=uid, mode=mode, access=access):
+                    info = mock.Mock(st_uid=uid, st_mode=stat.S_IFREG | mode)
+                    with mock.patch.object(ri.os, "access", return_value=access):
+                        with self.assertRaises(ri.InstallError) as caught:
+                            ri._trusted_authority("/synthetic", info, directory=False)
+                    self.assertEqual(caught.exception.code, "operator_approval_untrusted")
+            with mock.patch.object(ri.os, "access", return_value=False) as access:
+                ri._trusted_authority("/synthetic", trusted, directory=False)
+                access.assert_called_once_with("/synthetic", os.W_OK, effective_ids=True)
+            with mock.patch.object(ri.os, "access", side_effect=NotImplementedError):
+                with self.assertRaises(ri.InstallError) as caught:
+                    ri._trusted_authority("/synthetic", trusted, directory=False)
+                self.assertEqual(caught.exception.code, "operator_approval_unavailable")
+
+    def test_verifier_binds_exact_evidence_state_and_digest_and_observes_revocation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            state = str(root / "state")
+            digest = "a" * 64
+            name, evidence = ri._authorization(state, digest)
+            path = root / name
+            path.write_bytes(evidence)
+            real_fstat = os.fstat
+
+            def root_stat(fd):
+                info = real_fstat(fd)
+                values = list(info)
+                values[4] = 0  # synthetic root-owned evidence, no system files touched
+                return os.stat_result(values)
+
+            with mock.patch.object(ri, "_authority_dir",
+                                   side_effect=lambda: os.open(root, ri._DIRFLAGS)), \
+                    mock.patch.object(ri, "AUTHORIZATION_ROOT", str(root)), \
+                    mock.patch.object(ri.os, "geteuid", return_value=501), \
+                    mock.patch.object(ri.os, "fstat", side_effect=root_stat), \
+                    mock.patch.object(ri.os, "access", return_value=False):
+                VERIFY_APPROVAL(state, digest)
+                path.write_bytes(evidence.replace(b'"version":1', b'"version":2'))
+                with self.assertRaises(ri.InstallError) as caught:
+                    VERIFY_APPROVAL(state, digest)
+                self.assertEqual(caught.exception.code, "operator_approval_untrusted")
+                path.write_bytes(evidence)
+                for changed_state, changed_digest in ((state + "-other", digest),
+                                                       (state, "b" * 64)):
+                    with self.assertRaises(ri.InstallError) as caught:
+                        VERIFY_APPROVAL(changed_state, changed_digest)
+                    self.assertEqual(caught.exception.code, "operator_approval_unavailable")
+                path.unlink()
+                with self.assertRaises(ri.InstallError) as caught:
+                    VERIFY_APPROVAL(state, digest)
+                self.assertEqual(caught.exception.code, "operator_approval_unavailable")
+                # Links and special files never substitute for evidence.
+                outside = root / "outside"
+                outside.write_bytes(evidence)
+                path.symlink_to(outside)
+                with self.assertRaises(ri.InstallError):
+                    VERIFY_APPROVAL(state, digest)
+                path.unlink()
+                if hasattr(os, "mkfifo"):
+                    os.mkfifo(path)
+                    with self.assertRaises(ri.InstallError) as caught:
+                        VERIFY_APPROVAL(state, digest)
+                    self.assertEqual(caught.exception.code, "operator_approval_untrusted")
+
+    def test_authority_walk_rejects_untrusted_ancestors_and_root_clients(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(ri, "AUTHORIZATION_ROOT", str(Path(temp).resolve())), \
+                mock.patch.object(ri.os, "geteuid", return_value=501):
+            # A user-controlled trust root, even with correct bytes, is unusable.
+            with self.assertRaises(ri.InstallError) as caught:
+                VERIFY_APPROVAL("/synthetic", "a" * 64)
+            self.assertEqual(caught.exception.code, "operator_approval_untrusted")
+        with mock.patch.object(ri.os, "geteuid", return_value=0):
+            with self.assertRaises(ri.InstallError) as caught:
+                VERIFY_APPROVAL("/synthetic", "a" * 64)
+            self.assertEqual(caught.exception.code, "operator_approval_untrusted")
+
+    def test_authorize_publishes_only_scoped_evidence_under_fixed_authority(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve() / "authority"
+            with mock.patch.object(ri, "AUTHORIZATION_ROOT", str(root)), \
+                    mock.patch.object(ri, "_trusted_authority"), \
+                    mock.patch.object(ri.os, "geteuid", return_value=0):
+                result = ri.authorize("/synthetic", "a" * 64)
+            name, evidence = ri._authorization("/synthetic", "a" * 64)
+            self.assertEqual(result["authorization"], str(root / name))
+            self.assertEqual((root / name).read_bytes(), evidence)
+            self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), 0o644)
+            self.assertEqual(list(root.iterdir()), [root / name])
+
+
 class OperatorAcceptanceTests(ReleaseInstallCase):
+    def test_all_review_bypasses_cannot_create_approval(self):
+        self.approval.stop()  # These children and the gate use the real boundary.
+        launchers = self.home / "launchers"
+        launchers.mkdir()
+        script = launchers / "release_install.py"
+        script.write_bytes(Path(INSTALLER).read_bytes())
+        cache = launchers / "__pycache__/release_install.cpython-312.pyc"
+        cache.parent.mkdir()
+        py_compile.compile(str(script), cfile=str(cache), doraise=True)
+        args = ["accept", "--state-root", str(self.state),
+                "--manifest", str(self.payload / "manifest.json"),
+                "--payload-dir", str(self.payload), "--tasks-root", str(self.tasks),
+                "--capacity-db", str(self.db)]
+        tail = shlex.join(args[1:])
+        code = ("import runpy,sys; sys.argv=" + repr([str(script), *args]) +
+                "; runpy.run_path(" + repr(str(script)) + ",run_name='__main__')")
+        commands = [
+            f"{shlex.quote(PYTHON)} {shlex.quote(str(script))} $(echo accept) {tail}",
+            f"{shlex.quote(PYTHON)} {shlex.quote(str(launchers))}/release_inst?ll.py accept {tail}",
+            shlex.join([PYTHON, str(cache), *args]),
+            shlex.join([PYTHON, "-c", code]),
+        ]
+        snapshot = self.tree()
+        self.digest = sha((self.payload / "manifest.json").read_bytes())
+        for command in commands:
+            with self.subTest(command=command):
+                result = subprocess.run(["/bin/sh", "-c", command],
+                                        env={"HOME": str(self.home), "LANG": "en_US.UTF-8"},
+                                        capture_output=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(json.loads(result.stdout)["code"], {
+                    "operator_approval_unavailable", "operator_approval_untrusted"})
+                self.assertEqual(self.tree(), snapshot)
+        # Forging the entire old cache still cannot authorize canonical install.
+        for entry in self.manifest()["files"]:
+            target = self.state / ri.STORE_DIR / ri.BLOB_DIR / entry["sha256"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.files[entry["path"]])
+        approved = self.state / ri.STORE_DIR / ri.APPROVED_DIR / (self.digest + ".json")
+        approved.parent.mkdir()
+        approved.write_bytes((self.payload / "manifest.json").read_bytes())
+        with self.pinned():
+            self.assertEqual(self.judge(shlex.join(self.words())).code,
+                             "release_install_not_approved")
+        snapshot = self.tree()
+        result = subprocess.run(self.words(), capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(json.loads(result.stdout)["code"], {
+            "operator_approval_unavailable", "operator_approval_untrusted"})
+        self.assertEqual(self.tree(), snapshot)
+
+    def test_authorize_needs_separate_privilege(self):
+        with mock.patch.object(ri.os, "geteuid", return_value=501), \
+                mock.patch.object(ri, "_authority_dir") as authority:
+            with self.assertRaises(ri.InstallError) as caught:
+                ri.authorize(str(self.state), "a" * 64)
+            self.assertEqual(caught.exception.code, "operator_privilege_required")
+            authority.assert_not_called()
+
+    def test_read_only_mentions_and_commit_prose_keep_ordinary_routing(self):
+        for command in ("grep -n 'release_install accept' docs/RELEASE-INSTALL.md",
+                        'git commit -m "Add release_install install path"',
+                        "grep -n accept < release_install.py",
+                        "grep ';' release_install.py"):
+            with self.subTest(command=command):
+                self.assertIsNone(gate._judge_release_install(
+                    "codex", command, state_root=str(self.state), protected=(),
+                    capacity_db=str(self.db)))
+                decision = self.judge(command)
+                self.assertTrue(decision.allowed, decision)
+                self.assertNotIn("release_install", decision.code)
+        self.assertEqual(gate.classify("codex", "Bash", {"command":
+            "grep -n 'release_install accept' docs/RELEASE-INSTALL.md"}, str(self.home)),
+            ("shell_read", []))
+
     def test_clean_entry_points_accept_judge_install_and_activate_last(self):
         lock_inodes = {lock: os.stat(self.task / lock).st_ino for lock in ri.LOCKS}
         before = self.record()
-        accepted = subprocess.run(
-            [PYTHON, "-I", "-S", "-B", INSTALLER, "accept",
+        accepted = self.entry_process(
+            ["accept",
              "--state-root", str(self.state), "--manifest", str(self.payload / "manifest.json"),
              "--payload-dir", str(self.payload), "--tasks-root", str(self.tasks),
-             "--capacity-db", str(self.db)],
-            env={"LANG": "en_US.UTF-8"}, capture_output=True, timeout=60, check=False)
+             "--capacity-db", str(self.db)])
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
         result = json.loads(accepted.stdout)
         self.digest = result["manifest_sha256"]
@@ -245,8 +433,7 @@ class OperatorAcceptanceTests(ReleaseInstallCase):
             self.assertEqual(decision.extra["manifest_sha256"], self.digest)
             self.assertFalse(self.judge(result["command"], "claude").allowed)   # route binds
         self.assertEqual(self.record(), before)                  # judging writes nothing
-        installed = subprocess.run(shlex.split(result["command"]), capture_output=True,
-                                   timeout=60, check=False)
+        installed = self.entry_process(shlex.split(result["command"])[8:])
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         self.assertEqual(json.loads(installed.stdout)["status"], "installed")
         self.assertInstalled()
@@ -264,8 +451,7 @@ class OperatorAcceptanceTests(ReleaseInstallCase):
             self.assertEqual((self.task / lock).read_bytes(), b"")
         self.assertFalse([p for p in self.task.rglob("*") if p.name.endswith(ri.TEMP_SUFFIX)])
         snapshot = self.tree()
-        again = subprocess.run(shlex.split(result["command"]), capture_output=True, timeout=60,
-                               check=False)
+        again = self.entry_process(shlex.split(result["command"])[8:])
         self.assertEqual(json.loads(again.stdout)["status"], "already_installed")
         self.assertEqual(self.tree(), snapshot)
 
@@ -535,6 +721,48 @@ class RefusalTests(ReleaseInstallCase):
         self.assertRefused("ledger_not_owned", now=time.time() + 650)
         self.assertEqual(self.tree(), snapshot)
 
+    def test_claim_binding_released_at_and_nonfinite_task_json(self):
+        record = self.record()
+        for field, value, code in (("owner", "other", "claim_mismatch"),
+                                   ("stage", "other", "claim_mismatch"),
+                                   ("released_at", time.time(), "claim_not_live")):
+            changed = json.loads(json.dumps(record))
+            changed["workload"]["claim"][field] = value
+            (self.task / "task.json").write_text(json.dumps(changed), encoding="utf-8")
+            snapshot = self.tree()
+            self.assertRefused(code)
+            self.assertEqual(self.tree(), snapshot)
+        (self.task / "task.json").write_text(
+            json.dumps(record)[:-1] + ', "overflow": 1e400}', encoding="utf-8")
+        snapshot = self.tree()
+        self.assertRefused("task_record_unreadable")
+        self.assertEqual(self.tree(), snapshot)
+
+    def test_gate_codes_bind_task_links_claim_and_ledger(self):
+        command = shlex.join(self.words())
+        with self.pinned():
+            # Moving the task aside leaves a valid approval for a missing task.
+            aside = self.tasks / "aside"
+            self.task.rename(aside)
+            self.assertEqual(self.judge(command).code, "release_install_task_missing")
+            aside.rename(self.task)
+            target = self.home / "outside"
+            target.mkdir()
+            (self.task / "release").symlink_to(target, target_is_directory=True)
+            self.assertEqual(self.judge(command).code, "release_install_link")
+            (self.task / "release").unlink()
+            with mock.patch.object(gate, "_task_ledger_rows", side_effect=OSError):
+                self.assertEqual(self.judge(command).code, "stage_db_unavailable")
+            # The claim remains live and ledger-consistent, but differs from
+            # the manifest that the operator authorized.
+            changed = self.manifest()
+            changed["claim"]["owner"] = "another-owner"
+            raw = json.dumps(changed).encode()
+            approved = self.state / ri.STORE_DIR / ri.APPROVED_DIR / (sha(raw) + ".json")
+            approved.write_bytes(raw)
+            self.assertEqual(self.judge(shlex.join(self.words(
+                manifest_sha256=sha(raw)))).code, "release_install_claim")
+
     def test_bad_hashes_write_nothing(self):
         blob = self.state / ri.STORE_DIR / ri.BLOB_DIR / sha(self.files["nightly/review.json"])
         good = blob.read_bytes()
@@ -707,9 +935,11 @@ class RefusalTests(ReleaseInstallCase):
             [sys.executable, INSTALLER, "accept", "--state-root", str(self.state)],
         ]
         with self.pinned():
-            for words in variants:
+            for index, words in enumerate(variants):
                 with self.subTest(words=words):
-                    self.assertFalse(self.judge(shlex.join(words)).allowed)
+                    self.assertEqual(self.judge(shlex.join(words)).code,
+                                     "release_install_not_approved" if index == 2
+                                     else "release_install_unresolved")
             self.assertEqual(self.judge(shlex.join(variants[1])).code, "release_install_unresolved")
         self.assertIsNone(gate._judge_release_install(
             "codex", f"cat {shlex.quote(INSTALLER)}", state_root=str(self.state),
@@ -778,6 +1008,18 @@ class RecoveryTests(ReleaseInstallCase):
         self.assertEqual(self.run_install()["status"], "installed")
         self.assertEqual(self.run_install()["status"], "already_installed")
         self.assertInstalled()
+
+    def test_interrupted_restore_with_previous_bytes_requires_manual_recovery(self):
+        previous = (self.task / "task.json").read_bytes()
+        self.run_install()
+        # A crash during restoration leaves old bytes in the temporary while
+        # the destination still carries the activated record. Preserve it for
+        # operator inspection; automatic recovery of this window is deferred.
+        temporary = self.task / ri.temp_name("task.json", self.digest)
+        temporary.write_bytes(previous)
+        snapshot = self.tree()
+        self.assertRefused("temporary_conflict")
+        self.assertEqual(self.tree(), snapshot)
 
 
 if __name__ == "__main__":

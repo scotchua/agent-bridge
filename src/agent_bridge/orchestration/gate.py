@@ -232,13 +232,7 @@ _BRIDGE_LAUNCHERS = tuple(re.compile(pattern) for pattern in (
     r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.delegation_verify(\s|$|[;&|)'\"]))",
     r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.capacity_feed(\s|$|[;&|)'\"]))",
     r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.gate)\b[^;&|]*\b(?i:install)\b",
-    # The release installer writes task folders and its ``accept`` writes the
-    # operator store. Every invocation is a write; ``judge`` then allows only
-    # the one canonical, manifest-bound form (``_judge_release_install``).
-    r"(^|[\s;&|('\"/\\])(?i:release_install)(?i:\.pyc?)?\s+(?i:install|accept)(\s|$|[;&|)'\"])",
-    r"(?i:(^|[\s;&|('\"])-[a-z]*m\s*agent_bridge\.orchestration\.release_install)(\s|$|[;&|)'\"])",
 ))
-_RELEASE_INSTALL_LAUNCHERS = _BRIDGE_LAUNCHERS[-2:]
 _SHELL_QUOTING = re.compile(r"[\"'\\]")
 
 
@@ -2108,13 +2102,83 @@ def _tasks_root() -> str:
 _RELEASE_INSTALLER = os.path.realpath(release_install.__file__)
 
 
+def _release_install_attempt(command: str) -> bool:
+    """Recognise literal launch positions, never prose inside another command.
+
+    This is a routing aid, not the approval boundary. Opaque interpreters,
+    substitutions and renamed copies keep ordinary routing; the installer
+    independently requires privileged authorization even through those paths.
+    """
+    commands: list[list[str]] = [[]]
+    redirect = False
+    end = 0
+    for match in _SHELL_TOKEN.finditer(command):
+        if command[end:match.start()].strip():
+            return False
+        end = match.end()
+        raw = match.group()
+        if raw in {"<", ">", ">>", "<>", ">|", "&>", "&>>", ">&", "<&"}:
+            redirect = True
+        elif raw == "\n" or all(char in ";&|()" for char in raw):
+            if redirect:
+                return False
+            commands.append([])
+        elif all(char in ";&|()<>" for char in raw):
+            return False  # here-docs and other opaque syntax use ordinary routing
+        else:
+            try:
+                words = shlex.split(raw, posix=True)
+            except ValueError:
+                return False
+            if len(words) != 1:
+                return False
+            if redirect:
+                redirect = False
+            else:
+                commands[-1].append(words[0])
+    if command[end:].strip() or redirect:
+        return False
+    for words in commands:
+        # Skip known launch wrappers and environment assignments. Only inspect
+        # the executable and Python's script/module slot, not arbitrary args.
+        while words and (_ENV_ASSIGNMENT.match(words[0]) or
+                         _program_name(words[0]).lower() in {"env", "exec", "command", "sudo"}
+                         or words[0].startswith("-")):
+            words = words[1:]
+        if not words:
+            continue
+        name = _program_name(words[0]).lower()
+        if re.fullmatch(r"release_install(?:\.pyc?)?", name):
+            return True
+        if not re.fullmatch(r"python(?:[0-9.]+)?[tw]?(?:\.exe)?", name):
+            continue
+        args = words[1:]
+        while args and args[0].startswith("-"):
+            flag = args.pop(0)
+            if flag == "-c" or (flag.startswith("-c") and len(flag) > 2):
+                break
+            if "m" in flag:
+                module = flag.partition("m")[2] or (args[0] if args else "")
+                if module == "agent_bridge.orchestration.release_install":
+                    return True
+                break
+            if flag in {"-W", "-X"} and args:
+                args.pop(0)
+        else:
+            if args and re.fullmatch(r"release_install(?:\.pyc?)?",
+                                     _program_name(args[0]).lower()):
+                return True
+    return False
+
+
 def _judge_release_install(client: str, command: str, *, state_root: str,
                            protected: tuple[str, ...], capacity_db: str | None,
                            clock: Any = time.time) -> Decision | None:
     """The one canonical, manifest-bound release install, or None.
 
-    None means the command is not an installer invocation at all and keeps
-    ordinary shell routing. Any other spelling of the installer is a deny.
+    Unrecognised commands keep ordinary shell routing. Recognised literal
+    launches need the canonical form. Approval is independently checked by
+    the gate and installer against the privileged system authority.
     The canonical form is allowed only when the gate itself loads the
     operator-pinned manifest by digest (the same ``release_install.plan`` the
     installer runs), every path in its write set (payloads, their
@@ -2127,9 +2191,7 @@ def _judge_release_install(client: str, command: str, *, state_root: str,
     argv = literal_records.canonical_argv(command)
     parsed = None if argv is None else release_install.parse_command_words(argv)
     if parsed is None:
-        unquoted = _SHELL_QUOTING.sub("", command)
-        if any(pattern.search(text) for pattern in _RELEASE_INSTALL_LAUNCHERS
-               for text in (command, unquoted)):
+        if _release_install_attempt(command):
             return Decision("deny", "release_install_unresolved",
                             "delegation-first gate: the release installer runs only in its exact "
                             "canonical form (see docs/RELEASE-INSTALL.md); operator acceptance "

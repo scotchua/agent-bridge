@@ -8,16 +8,16 @@ invocation and run it isolated::
         --state-root <SR> --tasks-root <TR> --capacity-db <DB> \
         --task <ITEM> --manifest-sha256 <HEX>
 
-Trust comes from the operator-only store under the gate's protected state
-root, never from the caller: ``<SR>/release-install/approved/<HEX>.json`` is
+Trust comes from a separate root-owned authorization, never from the caller.
+``<SR>/release-install/approved/<HEX>.json`` is
 the manifest whose bytes hash to ``<HEX>``, and every payload byte comes from
-``<SR>/release-install/blobs/<sha256>``. ``accept`` (run by the operator,
-outside any hooked client) is the only writer of that store. The gate and the
-installer call the same :func:`plan`, so both verify the same digest and the
+``<SR>/release-install/blobs/<sha256>``. ``accept`` can populate that cache
+only after privileged ``authorize`` approves the digest and state root.
+The gate and installer call the same :func:`plan`, so both verify the same digest and the
 same write set (:func:`write_targets`). See docs/RELEASE-INSTALL.md.
 
 The module imports on every platform (the gate loads it everywhere); only
-``install`` and ``accept`` require POSIX, and ``fcntl`` is imported lazily.
+the three entry points require POSIX, and ``fcntl`` is imported lazily.
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ from pathlib import Path
 SCHEMA = "agent-bridge.release-install.v1"
 STORE_DIR = "release-install"
 APPROVED_DIR = "approved"
+# Fixed system trust anchor, deliberately not configurable via args or env.
+# /etc is a system symlink on macOS; resolve that once, then walk without links.
+AUTHORIZATION_ROOT = os.path.realpath("/etc/agent-bridge/release-approvals")
 BLOB_DIR = "blobs"
 TASK_RECORD = "task.json"
 ACTIVATION_FIELD = "current_stable_nightly_assignment"
@@ -109,7 +112,14 @@ def _strict_json(data: bytes):
     def constant(_name):
         raise ValueError("non-finite number")
 
-    return json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    def number(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError("non-finite number")
+        return value
+
+    return json.loads(data.decode("utf-8"), object_pairs_hook=pairs,
+                      parse_constant=constant, parse_float=number)
 
 
 def _canon(value) -> str:
@@ -251,11 +261,117 @@ def _read_regular(path: str, limit: int, code: str) -> bytes:
     return data
 
 
+def _authorization(state_root: str, digest: str) -> tuple[str, bytes]:
+    if not isinstance(digest, str) or not _HEX.fullmatch(digest):
+        raise InstallError("manifest_digest_invalid")
+    if not os.path.isabs(state_root) or os.path.realpath(state_root) != state_root:
+        raise InstallError("argument_not_canonical", "--state-root")
+    evidence = (_canon({"version": 1, "state_root": state_root,
+                        "manifest_sha256": digest}) + "\n").encode("utf-8")
+    return _sha(evidence) + ".json", evidence
+
+
+def _trusted_authority(path: str, info: os.stat_result, *, directory: bool) -> None:
+    """Check ownership, DAC, and this account's effective access (including ACLs).
+
+    Root-run clients cannot establish independence from the authority and are
+    refused by verification. Root is admitted here only by ``authorize``.
+    """
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if info.st_uid != 0 or info.st_mode & 0o022 or not kind(info.st_mode):
+        raise InstallError("operator_approval_untrusted")
+    if os.geteuid() != 0:
+        try:
+            writable = os.access(path, os.W_OK, effective_ids=True)
+        except (NotImplementedError, OSError):
+            raise InstallError("operator_approval_unavailable") from None
+        if writable:
+            raise InstallError("operator_approval_untrusted")
+
+
+def _authority_dir(*, create: bool = False) -> int:
+    """Pin each root-owned ancestor by descriptor before reading/creating below it."""
+    fd = os.open(os.path.sep, _DIRFLAGS)
+    current = os.path.sep
+    try:
+        _trusted_authority(current, os.fstat(fd), directory=True)
+        for part in Path(AUTHORIZATION_ROOT).parts[1:]:
+            created = False
+            if create:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=fd)
+                    created = True
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, _DIRFLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            current = os.path.join(current, part)
+            if created:
+                os.fchmod(fd, 0o755)  # readable authority even with operator umask 077
+            _trusted_authority(current, os.fstat(fd), directory=True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _verify_approval(state_root: str, digest: str) -> None:
+    if not _supported():
+        raise InstallError("unsupported_platform")
+    if os.geteuid() == 0:
+        raise InstallError("operator_approval_untrusted", "clients must run without root privileges")
+    name, expected = _authorization(state_root, digest)
+    try:
+        folder = _authority_dir()
+        try:
+            fd = os.open(name, _READFLAGS, dir_fd=folder)
+            try:
+                _trusted_authority(os.path.join(AUTHORIZATION_ROOT, name), os.fstat(fd),
+                                   directory=False)
+            except BaseException:
+                os.close(fd)
+                raise
+            data, _ = _read_fd(fd, MAX_MANIFEST_BYTES, name,
+                               "operator_approval_untrusted", "operator_approval_unavailable")
+        finally:
+            os.close(folder)
+    except OSError:
+        raise InstallError("operator_approval_unavailable") from None
+    if data != expected:
+        raise InstallError("operator_approval_untrusted")
+
+
+def authorize(state_root: str, manifest_sha256: str) -> dict:
+    """Privileged operator entry point; never reads or writes the user's cache.
+
+    Use a trusted root-owned deployment of this file and interpreter. Human
+    control comes from OS privilege elevation, not shell spelling or a TTY.
+    """
+    if not _supported():
+        raise InstallError("unsupported_platform")
+    if os.geteuid() != 0:
+        raise InstallError("operator_privilege_required")
+    name, evidence = _authorization(state_root, manifest_sha256)
+    try:
+        folder = _authority_dir(create=True)
+        try:
+            _write_at(folder, name, "." + name + TEMP_SUFFIX, evidence, 0o644)
+        finally:
+            os.close(folder)
+    except OSError:
+        raise InstallError("operator_approval_unavailable") from None
+    return {"status": "authorized", "manifest_sha256": manifest_sha256,
+            "authorization": os.path.join(AUTHORIZATION_ROOT, name)}
+
+
 def load_manifest(state_root: str, item: str, digest: str) -> dict:
     if not isinstance(digest, str) or not _HEX.fullmatch(digest):
         raise InstallError("manifest_digest_invalid")
     if not valid_item(item):
         raise InstallError("task_invalid")
+    _verify_approval(state_root, digest)
     path = os.path.join(_store(state_root), APPROVED_DIR, digest + ".json")
     data = _read_regular(path, MAX_MANIFEST_BYTES, "manifest_not_approved")
     if _sha(data) != digest:
@@ -469,7 +585,8 @@ def _current(item_fd: int, parts: list[str], limit: int = MAX_FILE_BYTES) -> tup
 def _check_temp(dir_fd: int, name: str, digest: str, expected: list[bytes], limit: int) -> None:
     """A leftover temporary must be this install's own: a plain file whose
     bytes are a prefix of what this manifest writes to ``name``, or of
-    ``name``'s current bytes (an interrupted restore). Anything else is
+    ``name``'s current bytes. An interrupted rollback can leave previous bytes
+    matching neither; those require operator recovery. Anything else is
     refused and left in place, never deleted."""
     temporary = temp_name(name, digest)
     found = _read_at(dir_fd, temporary, limit)
@@ -812,7 +929,8 @@ def _publish(path: str, data: bytes) -> None:
     directory, name = os.path.split(path)
     fd = os.open(directory, _DIRFLAGS)
     try:
-        # The operator-only store has no other writer, so its stray is ours.
+        # This is a disposable content cache. Authorization is independent;
+        # the manifest and payload hashes are checked again before installing.
         _write_at(fd, name, "." + name + TEMP_SUFFIX, data, FILE_MODE)
     finally:
         os.close(fd)
@@ -820,7 +938,7 @@ def _publish(path: str, data: bytes) -> None:
 
 def accept(state_root: str, manifest_file: str, payload_dir: str, tasks_root: str,
            capacity_db: str) -> dict:
-    """Operator-only: verify a reviewed payload and pin it into the protected store.
+    """Cache a payload that already has independent privileged authorization.
 
     Everything is read and verified before the first store write."""
     if not _supported():
@@ -836,6 +954,8 @@ def accept(state_root: str, manifest_file: str, payload_dir: str, tasks_root: st
     if not valid_item(item):
         raise InstallError("task_invalid")
     manifest = validate_manifest(value, item)
+    digest = _sha(data)
+    _verify_approval(state_root, digest)
     payload_root = os.path.realpath(payload_dir)
     blobs = []
     for entry in manifest["files"]:
@@ -849,7 +969,6 @@ def accept(state_root: str, manifest_file: str, payload_dir: str, tasks_root: st
         os.makedirs(folder, mode=DIR_MODE, exist_ok=True)
     for entry, blob in zip(manifest["files"], blobs):
         _publish(os.path.join(store, BLOB_DIR, entry["sha256"]), blob)
-    digest = _sha(data)
     _publish(os.path.join(store, APPROVED_DIR, digest + ".json"), data)
     words = command_words(os.path.realpath(sys.executable), os.path.realpath(__file__),
                           state_root, tasks_root, capacity_db, item, digest)
@@ -865,6 +984,12 @@ def main(argv: list[str] | None = None) -> int:
             if parsed is None:
                 raise InstallError("usage", "install takes exactly the five flags in order")
             result = install(**parsed)
+        elif args[:1] == ["authorize"]:
+            parser = argparse.ArgumentParser(prog="release_install.py authorize", allow_abbrev=False)
+            parser.add_argument("--state-root", required=True)
+            parser.add_argument("--manifest-sha256", required=True)
+            options = parser.parse_args(args[1:])
+            result = authorize(options.state_root, options.manifest_sha256)
         elif args[:1] == ["accept"]:
             parser = argparse.ArgumentParser(prog="release_install.py accept", allow_abbrev=False)
             for flag in ("--state-root", "--manifest", "--payload-dir", "--tasks-root",
@@ -874,7 +999,7 @@ def main(argv: list[str] | None = None) -> int:
             result = accept(options.state_root, options.manifest, options.payload_dir,
                             options.tasks_root, options.capacity_db)
         else:
-            raise InstallError("usage", "subcommand is install or accept")
+            raise InstallError("usage", "subcommand is install, accept or authorize")
     except InstallError as exc:
         print(json.dumps({"status": "refused", "code": exc.code, "detail": exc.detail}))
         return 2
