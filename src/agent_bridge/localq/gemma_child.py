@@ -189,7 +189,7 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
            receipt_root: str, receipt_validator: str, model_digest: str,
            delegate_sha256: str, validator_sha256: str,
            timeout: float = 600.0) -> dict[str, Any]:
-    """Invoke the certified delegate once and validate its exact receipt."""
+    """Invoke the certified delegate and validate each attempt's exact receipt."""
     task = payload.get("task_type")
     if task not in SUPPORTED_TASKS:
         raise ValueError(UNSUPPORTED_KIND_REASON)
@@ -229,9 +229,18 @@ def invoke(payload: dict[str, Any], *, delegate: str, python: str,
 
     with _load_validator(validator_path) as validator:
         if task == "summarize":
-            return _invoke_validated(
-                text, job_id, delegate_path, python_path, receipt_root_path,
-                model_digest, timeout, validator, task)
+            deadline = time.monotonic() + timeout
+            for attempt in range(2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GemmaRefusal("gemma_delegate_timeout")
+                call = _invoke_validated(
+                    text, job_id, delegate_path, python_path, receipt_root_path,
+                    model_digest, timeout, validator, task, capture_timeout=remaining)
+                if call["output"]["text"].strip():
+                    return call
+                if attempt == 1:
+                    raise GemmaRefusal("summary_empty_output")
         if task == "classify":
             return _classify(text, job_id, delegate_path, python_path, receipt_root_path,
                              model_digest, timeout, validator)
@@ -411,50 +420,74 @@ def _failure_reason(exc: BaseException) -> str:
     return detail if detail else type(exc).__name__
 
 
+def _extract_records(output: str, text: str, position: int) -> list[dict[str, Any]]:
+    """Repair only a whole JSON fence, then enforce the original record contract.
+
+    The receipt has already validated the unmodified stdout. Never search for
+    JSON inside prose or salvage a truncated response by inventing delimiters.
+    """
+    fenced = re.fullmatch(r"\s*```(?:json)?[ \t]*\r?\n(.*?)\r?\n```\s*", output,
+                          flags=re.DOTALL)
+    if fenced is not None:
+        output = fenced[1]
+    try:
+        parsed = json.loads(output)
+    except ValueError as exc:
+        # JSON decoder messages can quote document content. Keep a fixed code.
+        raise GemmaRefusal(f"extract_document_{position}_json_invalid") from exc
+    if not isinstance(parsed, list):
+        raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+    records = []
+    field_set = None
+    for candidate in parsed:
+        if not isinstance(candidate, dict):
+            raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+        keys = set(candidate)
+        matched = next((names for names in (EXTRACT_FIELDS, LEGACY_EXTRACT_FIELDS)
+                        if keys == set(names)), None)
+        if matched is None or (field_set is not None and matched != field_set):
+            raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+        field_set = matched
+        fields = {}
+        for field in field_set:
+            value = candidate[field]
+            if value is not None and not isinstance(value, str):
+                raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+            spans = _spans(text, value)
+            if value is not None and not spans:
+                raise GemmaRefusal(f"extract_document_{position}_value_absent")
+            fields[field] = {"value": value, "spans": spans, "ambiguous": len(spans) > 1}
+        records.append({"fields": fields})
+    return records
+
+
 def _extract(text: str, documents: Any, job_id: str, delegate: Path, python: Path,
              receipt_root: Path, model_digest: str, timeout: float, validator: Any) -> dict[str, Any]:
-    """Call the delegate once per explicit document; never infer association."""
+    """Process explicit documents; retry an unusable draft once within the batch deadline."""
     valid_documents = _document_params(documents)
     deadline = time.monotonic() + timeout
     output_documents = []
     batch_model_digest: str | None = None
     for position, document in enumerate(valid_documents):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GemmaRefusal(f"extract_document_{position}_deadline_exceeded")
-        try:
-            # The delegate gets the fixed certified job timeout; only this
-            # adapter's wait shrinks to the batch's remaining deadline.
-            call = _invoke_validated(document["text"], f"{job_id}:{position}", delegate,
-                                     python, receipt_root, model_digest, timeout, validator,
-                                     "extract", capture_timeout=remaining)
-            parsed = json.loads(call["output"]["text"])
-        except (GemmaRefusal, GemmaReceiptError, ValueError, json.JSONDecodeError) as exc:
-            raise GemmaRefusal(
-                f"extract_document_{position}_failed:{_failure_reason(exc)}") from exc
-        if not isinstance(parsed, list):
-            raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
-        records = []
-        field_set = None
-        for candidate in parsed:
-            if not isinstance(candidate, dict):
-                raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
-            keys = set(candidate)
-            matched = next((names for names in (EXTRACT_FIELDS, LEGACY_EXTRACT_FIELDS)
-                            if keys == set(names)), None)
-            if matched is None or (field_set is not None and matched != field_set):
-                raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
-            field_set = matched
-            fields = {}
-            for field in field_set:
-                value = candidate[field]
-                if value is not None and not isinstance(value, str):
-                    raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
-                spans = _spans(document["text"], value)
-                if value is not None and not spans:
-                    raise GemmaRefusal(f"extract_document_{position}_value_absent")
-                fields[field] = {"value": value, "spans": spans, "ambiguous": len(spans) > 1}
-            records.append({"fields": fields})
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GemmaRefusal(f"extract_document_{position}_deadline_exceeded")
+            try:
+                # Keep the certified options and exact source bytes on retry.
+                call = _invoke_validated(document["text"], f"{job_id}:{position}", delegate,
+                                         python, receipt_root, model_digest, timeout, validator,
+                                         "extract", capture_timeout=remaining)
+            except (GemmaRefusal, GemmaReceiptError, ValueError) as exc:
+                # Receipt, certification and execution failures are final.
+                raise GemmaRefusal(
+                    f"extract_document_{position}_failed:{_failure_reason(exc)}") from exc
+            try:
+                records = _extract_records(call["output"]["text"], document["text"], position)
+                break
+            except GemmaRefusal:
+                if attempt == 1:
+                    raise
         status = "no_record" if not records else "ok" if len(records) == 1 else "multiple_records"
         if call["model_digest"] != model_digest:
             raise GemmaRefusal(f"extract_document_{position}_failed:receipt_model_digest_mismatch")

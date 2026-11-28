@@ -92,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
                       + "\n".join(rows or ["- none"]) + "\n").encode("utf-8")
     else:
         output = b"SUMMARY: " + input_bytes[:80]
+    sequence = here / "output_sequence.json"
+    if sequence.is_file():
+        outputs = json.loads(sequence.read_text(encoding="utf-8"))
+        output = outputs[min(int(calls.read_text()) - 1, len(outputs) - 1)].encode("utf-8")
     sys.stdout.buffer.write(output)
     sys.stdout.buffer.flush()
     if mode == "missing-receipt":

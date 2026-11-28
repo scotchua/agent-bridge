@@ -668,7 +668,13 @@ use submission day and current outcome, separating dependency-held jobs from
 other queued jobs. Feedback covers completed work submitted in that window;
 rework and discard rates divide by reviewed work, with unreviewed work counted
 separately and rates shown as unavailable when nothing is reviewed. Checkpoint
-totals use creation time. The report includes metadata only, with no job
+totals use creation time. `failed_jobs` groups failed jobs in the submission
+window by task type and a fixed `error_code`; `checkpoint_refusals` groups
+refused checkpoints by caller, task type and fixed reason, including
+`log_triage` refusals. Both also appear in text and `--work-split` output.
+Document and line positions are collapsed. Unrecognized diagnostics become
+`unknown_failure` or `unknown_refusal`; older exception-only records cannot
+recover a more specific cause. The report includes metadata only, with no job
 content or raw errors. Missing databases produce a fixed error class and are
 never created by the command.
 
