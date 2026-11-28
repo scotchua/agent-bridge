@@ -113,6 +113,11 @@ _BACKEND_EXCEPTION_NAMES = frozenset({
     "FileNotFoundError", "KeyError", "IndexError", "UnicodeError",
     "UnicodeDecodeError", "JSONDecodeError", "TimeoutExpired",
 })
+_BACKEND_FIXED_REASONS = {
+    "BackendSelectionError": frozenset({
+        "gemma_config_reload_failed", "gemma_config_restart_required",
+    }),
+}
 _WORKER_VALUE_REASONS = frozenset({
     "worker path must be an existing absolute regular file",
     "worker state must be an existing absolute directory",
@@ -196,6 +201,9 @@ def _failure_text(exc: BaseException) -> str:
     if type(exc) is _ChildFailure:
         return f"RuntimeError: {exc}"
     name = type(exc).__name__
+    for reason in _BACKEND_FIXED_REASONS.get(name, ()):
+        if exc.args == (reason,):
+            return reason
     if type(exc) is RuntimeError and str(exc) in _RUNTIME_REASONS:
         return f"RuntimeError: {exc}"
     return name if name in _BACKEND_EXCEPTION_NAMES else "backend_failure"
@@ -210,7 +218,8 @@ def failure_code(error: Any) -> str:
     """
     if not isinstance(error, str):
         return "unknown_failure"
-    classes = _BACKEND_EXCEPTION_NAMES | frozenset(_CHILD_REASONS) | {"backend_failure"}
+    classes = (_BACKEND_EXCEPTION_NAMES | frozenset(_CHILD_REASONS) | {"backend_failure"}
+               | frozenset().union(*_BACKEND_FIXED_REASONS.values()))
     if error in classes:
         return error
     if error == "payload_unreadable":
@@ -637,7 +646,7 @@ class LocalQueue:
                                (self.clock(), row["job_id"]))
             db.execute("COMMIT")
 
-    def _client_data_health_refusal(self) -> str | None:
+    def _client_data_health_refusal(self, config_snapshot: Any | None = None) -> str | None:
         """Check the backend-specific client-data admission invariant.
 
         The health gate is intentionally consulted only after confirming the
@@ -650,7 +659,8 @@ class LocalQueue:
         if gate is None:
             return "client_data_health_unverified"
         try:
-            reason = gate.check()
+            reason = (gate.check() if config_snapshot is None
+                      else gate.check(config_snapshot=config_snapshot))
         except Exception:
             return "client_data_health_unverified"
         if reason in {None, "client_data_health_unverified", "client_data_health_failed",
@@ -851,33 +861,40 @@ class LocalQueue:
             db.execute("UPDATE jobs SET status='running',lease_owner=?,lease_until=?,updated_at=?,backend_id=? WHERE job_id=?",
                        (owner, now + self.caps.lease_seconds, now, self.backend_id, row["job_id"]))
             db.execute("COMMIT")
-        if row["classification"] == "client_derived":
-            reason = self._client_data_health_refusal()
-            if reason is not None:
-                now = self.clock()
-                with self._db() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute("""UPDATE jobs SET status='failed',updated_at=?,lease_owner=NULL,lease_until=NULL,
-                        error=?,disposition_json=? WHERE job_id=?""",
-                               (now, reason, self._normalized({"outcome": "failed", "reason": reason}),
-                                row["job_id"]))
-                    db.execute("COMMIT")
-                return self.result(row["job_id"])
-        try:
-            input_value = self._read_blob(row["input_blob"])
-            params = json.loads(row["params_json"])
-            if not isinstance(input_value, str) or not isinstance(params, dict):
-                raise ValueError("stored payload has an invalid shape")
-        except Exception:
-            return self._fail_unreadable_payload(row["job_id"])
-        payload = {"task_type": row["task_type"], "input": input_value,
-                   "params": params, "job_id": row["job_id"]}
         outcome, result, error = "complete", None, None
         stop_renewal = threading.Event()
-        renewer = threading.Thread(target=self._renew_lease_while_running,
-                                   args=(row["job_id"], owner, stop_renewal), daemon=True)
-        renewer.start()
+        renewer = None
+        prepare = getattr(self.backend, "prepare_job", None)
+        discard = getattr(self.backend, "discard_job", None)
         try:
+            # An optional backend hook binds the health check and execution to
+            # one operator config read. Never put this snapshot in the payload.
+            snapshot = prepare(row["job_id"]) if prepare is not None else None
+            if row["classification"] == "client_derived":
+                reason = (self._client_data_health_refusal() if snapshot is None
+                          else self._client_data_health_refusal(snapshot))
+                if reason is not None:
+                    now = self.clock()
+                    with self._db() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        db.execute("""UPDATE jobs SET status='failed',updated_at=?,lease_owner=NULL,lease_until=NULL,
+                            error=?,disposition_json=? WHERE job_id=?""",
+                                   (now, reason, self._normalized({"outcome": "failed", "reason": reason}),
+                                    row["job_id"]))
+                        db.execute("COMMIT")
+                    return self.result(row["job_id"])
+            try:
+                input_value = self._read_blob(row["input_blob"])
+                params = json.loads(row["params_json"])
+                if not isinstance(input_value, str) or not isinstance(params, dict):
+                    raise ValueError("stored payload has an invalid shape")
+            except Exception:
+                return self._fail_unreadable_payload(row["job_id"])
+            payload = {"task_type": row["task_type"], "input": input_value,
+                       "params": params, "job_id": row["job_id"]}
+            renewer = threading.Thread(target=self._renew_lease_while_running,
+                                       args=(row["job_id"], owner, stop_renewal), daemon=True)
+            renewer.start()
             result = self.backend.run(payload, self.caps.timeout_seconds)
             if not isinstance(result, dict):
                 raise RuntimeError("executor result must be an object")
@@ -886,8 +903,13 @@ class LocalQueue:
         except Exception as exc:  # backend error was observed, so it is not indeterminate
             outcome, error = "failed", _failure_text(exc)
         finally:
-            stop_renewal.set()
-            renewer.join()
+            try:
+                if renewer is not None and renewer.ident is not None:
+                    stop_renewal.set()
+                    renewer.join()
+            finally:
+                if discard is not None:
+                    discard(row["job_id"])
         now = self.clock()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
