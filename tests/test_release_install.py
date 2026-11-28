@@ -65,6 +65,41 @@ def release_files() -> dict[str, bytes]:
     return files
 
 
+#: The published index bytes for one real release, verbatim.
+ACTUAL_INDEX = (
+    b'{"agent_bridge/__init__.py":"539e52b03a73961d715ee9ed72159efbc430e587763f1f10d39d4f2f8bd977df",'
+    b'"agent_bridge/bounded_capture.py":"e354d94df36aca13e51432fc341f75e7ca63445dff01639b9b814044c653ad81",'
+    b'"agent_bridge/localq/__init__.py":"24e193e2228d9aac6f7408712930e03523139460e1230abbf2d03bbc5de94f06",'
+    b'"agent_bridge/localq/quality.py":"5684736b3a8f701cfb1c2d1ae235e29d4a9c5f87b65241e3c1b0f188fdf5036b",'
+    b'"agent_bridge/localq/runtime.py":"495c35c23e8aac0c415eea8ed0d7bbf7b3a4a3a5877820c4039d0aa42a71b1cd",'
+    b'"agent_bridge/localq/spool.py":"dd38d4be31d4876fbc7b7037d4f1ab7274f012fc89f5a598df6cec87351a666d",'
+    b'"agent_bridge/platform/__init__.py":"f78ae3a7f5643012846180fe521679a846d59db513cb6161625e7616228e904b",'
+    b'"agent_bridge/platform/base.py":"da82aa91f9ebab211f5ad90fc5ab171ea24cd86f4b4827939ee8d8cc759e4761",'
+    b'"agent_bridge/platform/posix.py":"07616ac8f1823f2088ee8cfea2990afcad4038ce714cd7129eaffb42deaed36a",'
+    b'"agent_bridge/store.py":"6bb5b69640a7a703760959c44d75168a9aa951e87d444172c75d52477ffc88c0"}\n')
+ACTUAL_RELEASE = "82dfe39b6eeab4aedc578258f96d683674fdd3a9cefcc418f78e7dec20ab4b4a"
+PACKAGE_NAMES = list(json.loads(ACTUAL_INDEX))
+ORDINARY_NIGHTLY = [f"nightly/channel-{n:02d}.json" for n in range(1, 23)]
+
+
+def canonical_index(hashes: dict[str, str]) -> bytes:
+    """Independent of the installer: compact, sorted, UTF-8, one LF."""
+    return (json.dumps(hashes, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def package_release_files() -> tuple[str, dict[str, bytes]]:
+    """22 ordinary nightly files and one package with synthetic sources."""
+    files = {name: f'{{"channel": "{name}"}}\n'.encode() for name in ORDINARY_NIGHTLY}
+    sources = {name: f'"""synthetic {name}"""\nVALUE = {n}\n'.encode()
+               for n, name in enumerate(PACKAGE_NAMES)}
+    index = canonical_index({name: sha(data) for name, data in sources.items()})
+    release = sha(index)
+    prefix = f"nightly/bridge-runtime/{release}/"
+    files[prefix + "files.json"] = index
+    files.update({prefix + "src/" + name: data for name, data in sources.items()})
+    return release, files
+
+
 @unittest.skipUnless(os.name == "posix", "the release installer is POSIX-only")
 class ReleaseInstallCase(unittest.TestCase):
     def setUp(self):
@@ -506,6 +541,209 @@ class OperatorAcceptanceTests(ReleaseInstallCase):
                 remove_special(target, kind)
         target.write_bytes(self.files["nightly/review.json"])
         self.accept(payload)
+
+
+class NightlyPackageTests(ReleaseInstallCase):
+    """The versioned library package beside 22 ordinary nightly files."""
+
+    def setUp(self):
+        super().setUp()
+        self.release, self.files = package_release_files()
+        self.prefix = f"nightly/bridge-runtime/{self.release}/"
+        self.payload = self.fixture()
+
+    def assertManifestInvalid(self, value):
+        with self.assertRaises(ri.InstallError) as caught:
+            ri.validate_manifest(value, self.item)
+        self.assertEqual(caught.exception.code, "manifest_invalid")
+
+    def test_package_installs_through_public_entry_points(self):
+        self.assertEqual(len(self.files), 33)
+        before = self.record()
+        accepted = self.entry_process(
+            ["accept",
+             "--state-root", str(self.state), "--manifest", str(self.payload / "manifest.json"),
+             "--payload-dir", str(self.payload), "--tasks-root", str(self.tasks),
+             "--capacity-db", str(self.db)])
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        result = json.loads(accepted.stdout)
+        self.digest = result["manifest_sha256"]
+        self.assertEqual(result["command"], shlex.join(self.words()))
+        with self.pinned():
+            decision = self.judge(result["command"])
+            self.assertEqual((decision.permission, decision.code), ("allow", "release_install"))
+        self.assertEqual(self.record(), before)
+        installed = self.entry_process(shlex.split(result["command"])[8:])
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertEqual(json.loads(installed.stdout),
+                         {"status": "installed", "task": self.item, "manifest_sha256": self.digest,
+                          "written": 33, "activated": True})
+        self.assertInstalled()
+        # The installed index names exactly the installed sources by hash.
+        root = self.task / self.prefix
+        index = (root / "files.json").read_bytes()
+        self.assertEqual(sha(index), self.release)
+        self.assertEqual(index, canonical_index(json.loads(index)))
+        self.assertEqual(json.loads(index), {name: sha((root / "src" / name).read_bytes())
+                                             for name in PACKAGE_NAMES})
+        for folder in ("nightly/bridge-runtime", self.prefix + "src/agent_bridge/localq"):
+            self.assertEqual(stat.S_IMODE((self.task / folder).stat().st_mode), 0o700)
+        self.assertFalse([p for p in self.task.rglob("*") if p.name.endswith(ri.TEMP_SUFFIX)])
+        snapshot = self.tree()
+        again = self.entry_process(shlex.split(result["command"])[8:])
+        self.assertEqual(json.loads(again.stdout)["status"], "already_installed")
+        self.assertEqual(self.tree(), snapshot)
+
+    def test_actual_index_shape_and_hashes_validate_schema_only(self):
+        self.assertEqual(sha(ACTUAL_INDEX), ACTUAL_RELEASE)
+        hashes = json.loads(ACTUAL_INDEX)
+        self.assertEqual(canonical_index(hashes), ACTUAL_INDEX)
+        self.assertEqual(ri.package_index(hashes), ACTUAL_INDEX)
+        self.assertEqual(tuple(hashes), ri.PACKAGE_SOURCES)
+        prefix = f"nightly/bridge-runtime/{ACTUAL_RELEASE}/"
+        value = self.manifest()
+        value["files"] = (
+            [{"path": name, "sha256": "0" * 64, "previous_sha256": None}
+             for name in ORDINARY_NIGHTLY]
+            + [{"path": prefix + "files.json", "sha256": ACTUAL_RELEASE, "previous_sha256": None}]
+            + [{"path": prefix + "src/" + name, "sha256": digest, "previous_sha256": None}
+               for name, digest in hashes.items()])
+        self.assertIs(ri.validate_manifest(value, self.item), value)
+        targets = ri.write_targets(value, "f" * 64)
+        # nightly/ and six package folders, 33 files and temporaries, the record pair.
+        self.assertEqual(len(targets), 7 + 2 * 33 + 2)
+        self.assertIn(("nightly", "bridge-runtime", ACTUAL_RELEASE, "src", "agent_bridge",
+                       "localq", "__init__.py"), targets)
+
+    def test_write_set_enumerates_every_folder_temporary_and_file(self):
+        self.accept()
+        _, targets = ri.plan(str(self.state), str(self.tasks), self.item, self.digest)
+        task = str(self.task)
+        expected = {os.path.join(task, "task.json"),
+                    os.path.join(task, ri.temp_name("task.json", self.digest))}
+        for name in self.files:
+            parts = name.split("/")
+            expected.update(os.path.join(task, *parts[:i]) for i in range(1, len(parts)))
+            expected.add(os.path.join(task, *parts[:-1], ri.temp_name(parts[-1], self.digest)))
+            expected.add(os.path.join(task, *parts))
+        self.assertEqual(len(targets), len(set(targets)))
+        self.assertEqual(set(targets), expected)
+        self.assertEqual(len(targets), 7 + 2 * 33 + 2)
+        for lock in ri.LOCKS:
+            self.assertNotIn(os.path.join(task, *lock.split("/")), targets)
+
+    def test_invalid_packages_are_manifest_invalid(self):
+        base = self.manifest()
+        index_path = self.prefix + "files.json"
+        source = self.prefix + "src/agent_bridge/store.py"
+        other = "0" * 64
+
+        def entry(path, digest=None):
+            return {"path": path, "sha256": digest or "a" * 64, "previous_sha256": None}
+
+        def edit(change):
+            value = json.loads(json.dumps(base))
+            change(value["files"])
+            return value
+
+        def set_hash(path, digest):
+            return lambda files: next(f for f in files if f["path"] == path).update(sha256=digest)
+
+        def rename(old, new):
+            return lambda files: next(f for f in files if f["path"] == old).update(path=new)
+
+        cases = {
+            "missing source": lambda files: files.remove(
+                next(f for f in files if f["path"] == source)),
+            "missing index": lambda files: files.remove(
+                next(f for f in files if f["path"] == index_path)),
+            "extra source": lambda files: files.append(entry(self.prefix + "src/agent_bridge/x.py")),
+            "extra release file": lambda files: files.append(entry(self.prefix + "notes.txt")),
+            "bytecode in src": lambda files: files.append(
+                entry(self.prefix + "src/agent_bridge/__pycache__/store.cpython-312.pyc")),
+            "second release": lambda files: files.append(
+                entry(f"nightly/bridge-runtime/{other}/files.json", other)),
+            "source hash not in index": set_hash(source, other),
+            "index hash differs": set_hash(index_path, other),
+            "release differs from index": lambda files: [
+                f.update(path=f["path"].replace(self.release, other)) for f in files],
+            "uppercase release": lambda files: [
+                f.update(path=f["path"].replace(self.release, self.release.upper()))
+                for f in files],
+            "namespace case": rename(source, source.replace("bridge-runtime", "Bridge-Runtime")),
+            "traversal": rename(source, self.prefix + "src/../files.json"),
+            "namespace file": lambda files: files.append(entry("nightly/bridge-runtime")),
+            "flat namespace file": lambda files: files.append(entry("nightly/bridge-runtime/x")),
+            "package name elsewhere": lambda files: files.append(
+                entry("release/agent_bridge/__init__.py")),
+            "deep path elsewhere": lambda files: files.append(entry("nightly/a/b/c/d.json")),
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                self.assertManifestInvalid(edit(change))
+        ri.validate_manifest(base, self.item)                       # the base stays valid
+
+    def test_invalid_input_refuses_before_any_write(self):
+        # An approved but inconsistent manifest: accept, plan, gate and install refuse.
+        value = self.manifest()
+        value["files"] = [f for f in value["files"]
+                          if f["path"] != self.prefix + "src/agent_bridge/store.py"]
+        bad = self.home / "bad"
+        bad.mkdir()
+        (bad / "manifest.json").write_text(json.dumps(value), encoding="utf-8")
+        snapshot = self.tree()
+        with self.assertRaises(ri.InstallError) as caught:
+            ri.accept(str(self.state), str(bad / "manifest.json"), str(self.payload),
+                      str(self.tasks), str(self.db))
+        self.assertEqual(caught.exception.code, "manifest_invalid")
+        self.assertFalse((self.state / ri.STORE_DIR).exists())
+        # Non-canonical index bytes (same mapping, pretty-printed) never reach the store.
+        index = self.payload / self.prefix / "files.json"
+        good = index.read_bytes()
+        index.write_text(json.dumps(json.loads(good), indent=2) + "\n", encoding="utf-8")
+        with self.assertRaises(ri.InstallError) as caught:
+            ri.accept(str(self.state), str(self.payload / "manifest.json"), str(self.payload),
+                      str(self.tasks), str(self.db))
+        self.assertEqual(caught.exception.code, "payload_hash_mismatch")
+        self.assertFalse((self.state / ri.STORE_DIR).exists())
+        index.write_bytes(good)
+        self.assertEqual(self.tree(), snapshot)
+        self.accept()
+        raw = json.dumps(value).encode()
+        (self.state / ri.STORE_DIR / ri.APPROVED_DIR / (sha(raw) + ".json")).write_bytes(raw)
+        snapshot = self.tree()
+        self.assertRefused("manifest_invalid", digest=sha(raw))
+        with self.pinned():
+            self.assertEqual(self.judge(shlex.join(self.words(manifest_sha256=sha(raw)))).code,
+                             "release_install_not_approved")
+        self.assertEqual(self.tree(), snapshot)
+        # A tampered index blob in the store.
+        blob = self.state / ri.STORE_DIR / ri.BLOB_DIR / self.release
+        blob.write_bytes(good[:-1])
+        snapshot = self.tree()
+        self.assertRefused("blob_hash_mismatch")
+        self.assertEqual(self.tree(), snapshot)
+        blob.write_bytes(good)
+        # The last source's destination is a folder: nothing earlier is written.
+        last = self.task / self.prefix / "src/agent_bridge/store.py"
+        last.mkdir(parents=True)
+        snapshot = self.tree()
+        self.assertRefused("destination_type_refused")
+        self.assertEqual(self.tree(), snapshot)
+        last.rmdir()
+        self.assertEqual(self.run_install()["status"], "installed")
+        self.assertInstalled()
+
+    def test_package_still_needs_operator_authorization(self):
+        self.approval.stop()
+        snapshot = self.tree()
+        with self.assertRaises(ri.InstallError) as caught:
+            ri.accept(str(self.state), str(self.payload / "manifest.json"), str(self.payload),
+                      str(self.tasks), str(self.db))
+        self.assertIn(caught.exception.code,
+                      {"operator_approval_unavailable", "operator_approval_untrusted"})
+        self.assertEqual(self.tree(), snapshot)
+        self.assertFalse((self.state / ri.STORE_DIR).exists())
 
 
 class LockTests(ReleaseInstallCase):
