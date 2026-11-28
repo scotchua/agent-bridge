@@ -47,8 +47,13 @@ SUPPORTED_TASKS = frozenset({"summarize", "extract", "classify", "log_triage"})
 TRIAGE_RECORD_ID_RE = re.compile(r"\[([A-Za-z]{1,6}\d{1,4})\]")
 CERTIFIED_SUMMARIZE_INSTRUCTION = "Summarize in one sentence."
 UNSUPPORTED_KIND_REASON = "unsupported_kind"
-EXTRACT_FIELDS = ("party", "date", "doc_type", "reference", "description",
-                  "amount", "terms", "due_date", "account")
+EXTRACT_FIELDS = ("party", "issuer", "recipient", "date", "doc_type", "reference",
+                  "description", "amount", "total", "terms", "due_date", "account")
+# The certified delegate before it gained issuer, recipient and total. Accepted
+# until its pinned hash is replaced, so the adapter and delegate can land in
+# either order; records keep the field set the delegate actually returned.
+LEGACY_EXTRACT_FIELDS = ("party", "date", "doc_type", "reference", "description",
+                         "amount", "terms", "due_date", "account")
 MAX_EXTRACT_DOCUMENTS = 16
 MAX_EXTRACT_DOCUMENT_BYTES = 24_000
 # Certified delegate output is normally a short draft. This leaves ample
@@ -430,11 +435,18 @@ def _extract(text: str, documents: Any, job_id: str, delegate: Path, python: Pat
         if not isinstance(parsed, list):
             raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
         records = []
+        field_set = None
         for candidate in parsed:
-            if not isinstance(candidate, dict) or set(candidate) != set(EXTRACT_FIELDS):
+            if not isinstance(candidate, dict):
                 raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+            keys = set(candidate)
+            matched = next((names for names in (EXTRACT_FIELDS, LEGACY_EXTRACT_FIELDS)
+                            if keys == set(names)), None)
+            if matched is None or (field_set is not None and matched != field_set):
+                raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
+            field_set = matched
             fields = {}
-            for field in EXTRACT_FIELDS:
+            for field in field_set:
                 value = candidate[field]
                 if value is not None and not isinstance(value, str):
                     raise GemmaRefusal(f"extract_document_{position}_schema_invalid")
