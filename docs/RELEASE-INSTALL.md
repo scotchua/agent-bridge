@@ -189,7 +189,13 @@ agent-writable checkout or Python installation):
 
 ```text
 sudo /trusted/root-owned/python -I -S -B /trusted/root-owned/release_install.py authorize --state-root /canonical/state/root --manifest-sha256 <reviewed-digest>
+sudo -k
 ```
+
+Run `sudo -k` immediately after `authorize` to invalidate the cached sudo
+ticket, or run the privileged step from a terminal no agent tool can drive.
+A cached sudo ticket in an agent-reachable terminal tab counts as unattended
+root access.
 
 This writes only system authorization evidence; it never reads or writes the
 user's payload or cache as root. The operator controls privilege elevation.
@@ -262,8 +268,10 @@ an authorized client can repopulate it until system authorization is revoked.
   inspection and removal; automatic recovery of that crash window is not
   implemented.
 * `temporary_conflict`: a file with this manifest's temporary name holds
-  something else. The installer never deletes it. Inspect it, move it away,
-  and run the same command again. Files with any other name, including the
+  something else. The coded refusal's `detail` names the file relative to the
+  task folder, including after an interrupted rollback. The installer never
+  deletes it. Inspect it, move it away, and run the same command again.
+  Files with any other name, including the
   generic `.<name>.release-install-tmp`, are never touched.
 * After success, the same command reports `already_installed` and writes
   nothing.

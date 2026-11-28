@@ -2141,10 +2141,33 @@ def _release_install_attempt(command: str) -> bool:
     for words in commands:
         # Skip known launch wrappers and environment assignments. Only inspect
         # the executable and Python's script/module slot, not arbitrary args.
-        while words and (_ENV_ASSIGNMENT.match(words[0]) or
-                         _program_name(words[0]).lower() in {"env", "exec", "command", "sudo"}
-                         or words[0].startswith("-")):
+        while words:
+            if _ENV_ASSIGNMENT.match(words[0]):
+                words = words[1:]
+                continue
+            wrapper = _program_name(words[0]).lower()
+            value_options = {
+                "env": {"-u", "--unset", "-C", "--chdir"},
+                "sudo": {"-u", "--user", "-g", "--group", "-h", "--host",
+                         "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout",
+                         "-R", "--chroot", "-D", "--chdir"},
+                "nice": {"-n", "--adjustment"},
+                "time": {"-f", "--format", "-o", "--output"},
+                "timeout": {"-k", "--kill-after", "-s", "--signal"},
+                "nohup": set(), "exec": {"-a"}, "command": set(),
+            }.get(wrapper)
+            if value_options is None:
+                break
             words = words[1:]
+            while words and words[0].startswith("-"):
+                option = words[0]
+                words = words[1:]
+                if option == "--":
+                    break
+                if option in value_options:
+                    words = words[1:]  # the option's value is not the executable
+            if wrapper == "timeout":
+                words = words[1:]  # duration precedes the wrapped executable
         if not words:
             continue
         name = _program_name(words[0]).lower()

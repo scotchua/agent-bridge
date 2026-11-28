@@ -233,6 +233,36 @@ def remove_special(path: Path, kind: str) -> None:
 SPECIAL_KINDS = ("folder", "fifo") if hasattr(os, "mkfifo") else ("folder",)
 
 
+class InstallerLaunchRoutingTests(unittest.TestCase):
+    def test_wrapped_literal_launches_require_the_canonical_form(self):
+        wrappers = ("nice", "nice -n 10", "time", "time -f %E -o timing.txt",
+                    "timeout 30", "timeout -k 5 --signal TERM 30", "nohup",
+                    "env -u PYTHONPATH", "env --unset PYTHONPATH",
+                    "sudo -u operator", "sudo -g staff", "sudo -u operator -g staff --",
+                    "nice -n 5 time timeout 30 nohup env -u PYTHONPATH sudo -u operator")
+        launches = ("release_install.py install", "python3 -I -S -B release_install.py install",
+                    "python3 -m agent_bridge.orchestration.release_install accept")
+        for wrapper in wrappers:
+            for launch in launches:
+                with self.subTest(wrapper=wrapper, launch=launch):
+                    decision = gate._judge_release_install(
+                        "codex", f"{wrapper} {launch}", state_root="unused",
+                        protected=(), capacity_db=None)
+                    self.assertIsNotNone(decision)
+                    self.assertEqual((decision.allowed, decision.code),
+                                     (False, "release_install_unresolved"))
+
+    def test_wrapped_reads_and_prose_keep_ordinary_routing(self):
+        for command in ("nice cat release_install.py", "timeout 30 cat release_install.py",
+                        "env -u release_install.py cat README.md",
+                        "sudo -u release_install.py cat README.md",
+                        "time git commit -m 'release_install.py install'",
+                        "nohup grep 'release_install.py accept' docs/RELEASE-INSTALL.md"):
+            with self.subTest(command=command):
+                self.assertIsNone(gate._judge_release_install(
+                    "codex", command, state_root="unused", protected=(), capacity_db=None))
+
+
 @unittest.skipUnless(os.name == "posix", "the approval authority requires POSIX")
 class ApprovalAuthorityTests(unittest.TestCase):
     def test_root_owned_nonwritable_evidence_is_required_including_acl_access(self):
@@ -262,6 +292,8 @@ class ApprovalAuthorityTests(unittest.TestCase):
             name, evidence = ri._authorization(state, digest)
             path = root / name
             path.write_bytes(evidence)
+            root.chmod(0o755)
+            path.chmod(0o644)
             real_fstat = os.fstat
 
             def root_stat(fd):
@@ -677,7 +709,7 @@ class WriteSetTests(ReleaseInstallCase):
                 temp.write_bytes(b"[someone else's notes]\n")
                 snapshot = self.tree()
                 error = self.assertRefused("temporary_conflict")
-                self.assertEqual(error.detail, temp.name)
+                self.assertEqual(error.detail, str(temp.relative_to(self.task)))
                 self.assertEqual(self.tree(), snapshot)                # kept, nothing written
                 temp.unlink()
         # An interrupted write of this install's own is replaced on retry.
@@ -737,6 +769,10 @@ class RefusalTests(ReleaseInstallCase):
         snapshot = self.tree()
         self.assertRefused("task_record_unreadable")
         self.assertEqual(self.tree(), snapshot)
+        status, result = self.run_process()
+        self.assertEqual((status, result["status"], result["code"]),
+                         (2, "refused", "task_record_unreadable"))
+        self.assertEqual(self.tree(), snapshot)
 
     def test_gate_codes_bind_task_links_claim_and_ledger(self):
         command = shlex.join(self.words())
@@ -755,13 +791,16 @@ class RefusalTests(ReleaseInstallCase):
                 self.assertEqual(self.judge(command).code, "stage_db_unavailable")
             # The claim remains live and ledger-consistent, but differs from
             # the manifest that the operator authorized.
-            changed = self.manifest()
-            changed["claim"]["owner"] = "another-owner"
-            raw = json.dumps(changed).encode()
-            approved = self.state / ri.STORE_DIR / ri.APPROVED_DIR / (sha(raw) + ".json")
-            approved.write_bytes(raw)
-            self.assertEqual(self.judge(shlex.join(self.words(
-                manifest_sha256=sha(raw)))).code, "release_install_claim")
+            for field in ("owner", "stage"):
+                with self.subTest(field=field):
+                    changed = self.manifest()
+                    changed["claim"][field] = "another-" + field
+                    raw = json.dumps(changed).encode()
+                    approved = self.state / ri.STORE_DIR / ri.APPROVED_DIR / (sha(raw) + ".json")
+                    approved.write_bytes(raw)
+                    decision = self.judge(shlex.join(self.words(manifest_sha256=sha(raw))))
+                    self.assertEqual((decision.allowed, decision.code),
+                                     (False, "release_install_claim"))
 
     def test_bad_hashes_write_nothing(self):
         blob = self.state / ri.STORE_DIR / ri.BLOB_DIR / sha(self.files["nightly/review.json"])
@@ -937,9 +976,10 @@ class RefusalTests(ReleaseInstallCase):
         with self.pinned():
             for index, words in enumerate(variants):
                 with self.subTest(words=words):
-                    self.assertEqual(self.judge(shlex.join(words)).code,
-                                     "release_install_not_approved" if index == 2
-                                     else "release_install_unresolved")
+                    decision = self.judge(shlex.join(words))
+                    self.assertEqual((decision.allowed, decision.code),
+                                     (False, "release_install_not_approved" if index == 2
+                                      else "release_install_unresolved"))
             self.assertEqual(self.judge(shlex.join(variants[1])).code, "release_install_unresolved")
         self.assertIsNone(gate._judge_release_install(
             "codex", f"cat {shlex.quote(INSTALLER)}", state_root=str(self.state),
@@ -1018,7 +1058,29 @@ class RecoveryTests(ReleaseInstallCase):
         temporary = self.task / ri.temp_name("task.json", self.digest)
         temporary.write_bytes(previous)
         snapshot = self.tree()
-        self.assertRefused("temporary_conflict")
+        error = self.assertRefused("temporary_conflict")
+        self.assertEqual(error.detail, temporary.name)
+        self.assertEqual(self.tree(), snapshot)
+        status, result = self.run_process()
+        self.assertEqual((status, result["status"], result["code"], result["detail"]),
+                         (2, "refused", "temporary_conflict", temporary.name))
+        self.assertEqual(self.tree(), snapshot)
+        temporary.unlink()  # operator removes the inspected rollback temporary
+        self.assertEqual(self.run_install()["status"], "already_installed")
+        self.assertInstalled()
+
+    def test_interrupted_payload_restore_names_the_nested_temporary(self):
+        # Use previous bytes that are not a prefix of the new queue.
+        self.old_queue = b'{"entry": 0}\n'
+        (self.task / "nightly/queue.jsonl").write_bytes(self.old_queue)
+        (self.payload / "manifest.json").write_text(json.dumps(self.manifest()), encoding="utf-8")
+        self.accept()
+        self.run_install()
+        temporary = self.task / "nightly" / ri.temp_name("queue.jsonl", self.digest)
+        temporary.write_bytes(self.old_queue)
+        snapshot = self.tree()
+        error = self.assertRefused("temporary_conflict")
+        self.assertEqual(error.detail, str(temporary.relative_to(self.task)))
         self.assertEqual(self.tree(), snapshot)
 
 

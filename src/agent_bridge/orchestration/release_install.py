@@ -582,7 +582,8 @@ def _current(item_fd: int, parts: list[str], limit: int = MAX_FILE_BYTES) -> tup
         os.close(dir_fd)
 
 
-def _check_temp(dir_fd: int, name: str, digest: str, expected: list[bytes], limit: int) -> None:
+def _check_temp(dir_fd: int, name: str, digest: str, expected: list[bytes], limit: int,
+                *, relative_dir: str = "") -> None:
     """A leftover temporary must be this install's own: a plain file whose
     bytes are a prefix of what this manifest writes to ``name``, or of
     ``name``'s current bytes. An interrupted rollback can leave previous bytes
@@ -591,7 +592,7 @@ def _check_temp(dir_fd: int, name: str, digest: str, expected: list[bytes], limi
     temporary = temp_name(name, digest)
     found = _read_at(dir_fd, temporary, limit)
     if found is not None and not any(data.startswith(found[0]) for data in expected):
-        raise InstallError("temporary_conflict", temporary)
+        raise InstallError("temporary_conflict", os.path.join(relative_dir, temporary))
 
 
 def _write_at(dir_fd: int, name: str, temporary: str, data: bytes, mode: int, *,
@@ -773,7 +774,8 @@ def _preflight(item_fd: int, manifest: dict, blobs: list[bytes], digest: str,
             try:
                 current = _read_at(dir_fd, parts[-1], MAX_FILE_BYTES)
                 _check_temp(dir_fd, parts[-1], digest,
-                            [blob] + ([] if current is None else [current[0]]), MAX_FILE_BYTES)
+                            [blob] + ([] if current is None else [current[0]]), MAX_FILE_BYTES,
+                            relative_dir="/".join(parts[:-1]))
             finally:
                 os.close(dir_fd)
         current_hash = None if current is None else _sha(current[0])
