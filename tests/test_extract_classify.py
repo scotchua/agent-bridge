@@ -99,6 +99,40 @@ class ExtractClassifyTests(unittest.TestCase):
         with self.assertRaisesRegex(gemma_child.GemmaRefusal, "extract_document_0_value_absent"):
             self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
 
+    def test_extract_issuer_recipient_total_are_bound_to_spans(self):
+        text = "Northwind Co.\nBill To: Sample LLC\nTotal Due: 52.50"
+        documents = [{"id": "one", "text": text}]
+        record = {name: None for name in gemma_child.EXTRACT_FIELDS}
+        record.update(issuer="Northwind Co.", recipient="Sample LLC", total="52.50")
+        (self.install / "extract_records.json").write_text(json.dumps([record]))
+        result = self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
+        fields = result["output"]["documents"][0]["records"][0]["fields"]
+        self.assertEqual(list(fields), list(gemma_child.EXTRACT_FIELDS))
+        self.assertEqual(fields["issuer"]["spans"], [[0, 13]])
+        self.assertEqual(fields["recipient"]["value"], "Sample LLC")
+        self.assertEqual(fields["total"]["spans"], [[text.index("52.50"), len(text)]])
+
+    def test_extract_legacy_field_set_is_accepted_unchanged(self):
+        documents = [{"id": "one", "text": "Alpha"}]
+        legacy = {name: None for name in gemma_child.LEGACY_EXTRACT_FIELDS}
+        legacy["party"] = "Alpha"
+        (self.install / "extract_records.json").write_text(json.dumps([legacy]))
+        result = self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
+        fields = result["output"]["documents"][0]["records"][0]["fields"]
+        self.assertEqual(list(fields), list(gemma_child.LEGACY_EXTRACT_FIELDS))
+        self.assertEqual(fields["party"]["spans"], [[0, 5]])
+
+    def test_extract_mixed_or_partial_field_sets_are_refused(self):
+        documents = [{"id": "one", "text": "Alpha"}]
+        new = {name: None for name in gemma_child.EXTRACT_FIELDS}
+        legacy = {name: None for name in gemma_child.LEGACY_EXTRACT_FIELDS}
+        partial = dict(legacy, issuer=None)
+        for records in ([new, legacy], [legacy, new], [partial], [dict(new, extra=None)]):
+            with self.subTest(keys=[sorted(r) for r in records]):
+                (self.install / "extract_records.json").write_text(json.dumps(records))
+                with self.assertRaisesRegex(gemma_child.GemmaRefusal, "extract_document_0_schema_invalid"):
+                    self.invoke(json.dumps(documents), task="extract", params={"documents": documents})
+
     def test_wrong_task_or_input_receipt_is_rejected(self):
         for override in ({"task": "classify"}, {"input_sha256": "0" * 64}):
             with self.subTest(override=override):
