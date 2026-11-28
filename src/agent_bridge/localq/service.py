@@ -90,7 +90,8 @@ class Service:
 
     @classmethod
     def for_config(cls, cfg: Any, *, root: str | None = None,
-                   sampler: MacSampler | None = None) -> "Service":
+                   sampler: MacSampler | None = None,
+                   config_path: str | Path | None = None) -> "Service":
         """Build the Service the way production does: the backend is
         chosen exactly once, from the operator's own configuration file,
         never from anything an assistant-facing request supplies.
@@ -98,13 +99,21 @@ class Service:
         ``root`` overrides ``cfg.local_queue_root`` for a caller that must
         use a disposable queue (calibration, delegation verification) and
         must never touch the operator's real one; production omits it.
+        With ``config_path``, Gemma pins are reloaded for every execution;
+        callers omitting it retain the fixed configuration they supplied.
         """
-        from .backend_select import build_backend_and_caps  # deferred: avoids a light import cycle
+        from .backend_select import (GemmaPinSource, RefreshingGemmaBackend,
+                                     build_backend_and_caps)  # deferred: avoids a light import cycle
         from .client_data_health import ClientDataHealthGate
 
         queue_root = str(root) if root is not None else str(cfg.local_queue_root)
         backend, caps, allowed = build_backend_and_caps(cfg, queue_root)
         health_gate = ClientDataHealthGate.from_config(cfg)
+        if config_path is not None and cfg.local_backend == "gemma_certified":
+            pins = GemmaPinSource(cfg, config_path)
+            backend = RefreshingGemmaBackend(backend, pins)
+            if health_gate is not None:
+                health_gate.delegate_pin_source = pins.current
         return cls(queue_root, str(cfg.worker_executable), str(cfg.worker_state),
                   sampler=sampler, backend=backend, caps=caps, allowed_task_types=allowed,
                   backend_id=str(getattr(cfg, "local_backend", "private_worker")),

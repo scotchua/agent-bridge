@@ -15,6 +15,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ class ClientDataHealthGate:
         self.record = record
         self.delegate_executable = delegate_executable
         self.delegate_sha256 = delegate_sha256
+        self.delegate_pin_source: Callable[[], Any] | None = None
 
     @classmethod
     def from_config(cls, cfg: Any) -> "ClientDataHealthGate | None":
@@ -143,7 +145,7 @@ class ClientDataHealthGate:
         proc.stdout.close()
         return code, output
 
-    def _binding_reason(self, reported_hash: str) -> str | None:
+    def _binding_reason(self, reported_hash: str, delegate_sha256: str | None) -> str | None:
         try:
             record_bytes = self.record.read_bytes()
         except OSError:
@@ -160,7 +162,7 @@ class ClientDataHealthGate:
         hashes = record.get("wrapper_hashes")
         if not isinstance(hashes, dict) or set(hashes) != set(_WRAPPER_FILES):
             return HEALTH_BINDING_MISMATCH
-        if not isinstance(self.delegate_executable, Path) or not _is_sha256(self.delegate_sha256):
+        if not isinstance(self.delegate_executable, Path) or not _is_sha256(delegate_sha256):
             return HEALTH_BINDING_MISMATCH
         try:
             actual = {
@@ -171,12 +173,20 @@ class ClientDataHealthGate:
             return HEALTH_BINDING_MISMATCH
         if any(hashes.get(name) != actual[name] for name in _WRAPPER_FILES):
             return HEALTH_BINDING_MISMATCH
-        if hashes["delegate.py"] != self.delegate_sha256:
+        if hashes["delegate.py"] != delegate_sha256:
             return HEALTH_BINDING_MISMATCH
         return None
 
-    def check(self) -> str | None:
+    def check(self, *, config_snapshot: Any | None = None) -> str | None:
         """Return a fixed refusal reason, or ``None`` only for a full pass."""
+        delegate_sha256 = self.delegate_sha256
+        if config_snapshot is not None:
+            delegate_sha256 = config_snapshot.gemma_delegate_sha256
+        elif self.delegate_pin_source is not None:
+            try:
+                delegate_sha256 = self.delegate_pin_source().gemma_delegate_sha256
+            except Exception:
+                return HEALTH_UNVERIFIED
         status = self._status()
         if status is None:
             return HEALTH_UNVERIFIED
@@ -197,4 +207,4 @@ class ClientDataHealthGate:
             return HEALTH_UNVERIFIED
         if code != 0 or result != "verified" or not _is_sha256(record_hash):
             return HEALTH_UNVERIFIED
-        return self._binding_reason(record_hash)
+        return self._binding_reason(record_hash, delegate_sha256)

@@ -8,12 +8,16 @@ configuration file (:func:`~.service.Service.for_config`, called by
 MCP tool surface a caller actually talks to (``localq.mcp``,
 ``orchestration.server``) never reads a "backend" field out of a request and
 has no such field in its schemas.
+
+When the Service knows the operator's config path, only the certified Gemma
+pins refresh per job. The backend choice and executable paths stay fixed.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +40,92 @@ LOCAL_BACKENDS = frozenset({"private_worker", "gemma_certified"})
 
 class BackendSelectionError(ValueError):
     """The configured ``local_backend`` cannot be built."""
+
+
+class GemmaPinSource:
+    """Reload only from the operator's config; never retain last-good pins."""
+
+    PATH_FIELDS = ("gemma_delegate_executable", "gemma_python_executable",
+                   "gemma_receipt_root", "gemma_receipt_validator_executable")
+    RESTART_FIELDS = (*PATH_FIELDS, "gemma_timeout_seconds", "gemma_pilot_tasks",
+                      "client_data_health_command", "client_data_health_path",
+                      "client_data_health_timeout_seconds", "client_data_health_record")
+    PIN_FLAGS = {"gemma_delegate_sha256": "--delegate-sha256",
+                 "gemma_receipt_validator_sha256": "--validator-sha256",
+                 "gemma_model_digest": "--model-digest"}
+
+    def __init__(self, cfg: Any, config_path: str | Path):
+        self.config_path = Path(config_path).expanduser().absolute()
+        self.settings = tuple(getattr(cfg, field) for field in self.RESTART_FIELDS)
+
+    def current(self) -> Any:
+        from ..orchestration.config import load
+
+        try:
+            cfg = load(self.config_path)
+        except Exception:
+            # Never expose loader diagnostics that could contain config data.
+            raise BackendSelectionError("gemma_config_reload_failed") from None
+        if (cfg.local_backend != "gemma_certified"
+                or tuple(getattr(cfg, field) for field in self.RESTART_FIELDS) != self.settings):
+            raise BackendSelectionError("gemma_config_restart_required")
+        if any(getattr(cfg, field, None) is None for field in self.PIN_FLAGS):
+            raise BackendSelectionError("gemma_config_reload_failed")
+        return cfg
+
+
+class RefreshingGemmaBackend(SubprocessBackend):
+    """Keep the complete subprocess interface and per-job immutable argv."""
+
+    def __init__(self, backend: SubprocessBackend, pins: GemmaPinSource):
+        super().__init__(list(backend.command), capture_limit_bytes=backend.capture_limit_bytes,
+                         bridge_child=backend.bridge_child)
+        self.pins = pins
+        # LocalQueue._run_once_under_lock prepares, gates, runs and discards
+        # synchronously on one thread. Payload job IDs cannot confer access to
+        # that thread's preparation on unrelated callers.
+        self._preparation = threading.local()
+
+    @property
+    def _job_snapshots(self) -> dict[str, Any]:
+        if not hasattr(self._preparation, "snapshots"):
+            self._preparation.snapshots = {}
+            self._preparation.prepared = set()
+        return self._preparation.snapshots
+
+    def prepare_job(self, job_id: str) -> Any:
+        """Bind one operator config snapshot to the gate and child for this job."""
+        cfg = self.pins.current()
+        self._job_snapshots[job_id] = cfg
+        self._preparation.prepared.add(job_id)
+        return cfg
+
+    def discard_job(self, job_id: str) -> None:
+        """Also called when the queue refuses a job before launching its child."""
+        self._job_snapshots.pop(job_id, None)
+        self._preparation.prepared.discard(job_id)
+
+    def run(self, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+        snapshots = self._job_snapshots
+        job_id = payload.get("job_id")
+        if job_id in self._preparation.prepared:
+            cfg = snapshots.pop(job_id, None)
+            if cfg is None:
+                raise BackendSelectionError("gemma_config_reload_failed")
+            # Keep the marker until discard_job: a consumed or lost snapshot
+            # must never turn a prepared execution into a fresh config read.
+        else:  # Direct callers have no preparation on this thread.
+            cfg = self.pins.current()
+        command = list(self.command)
+        for field, flag in self.pins.PIN_FLAGS.items():
+            command[command.index(flag) + 1] = str(getattr(cfg, field))
+        child = SubprocessBackend(command, capture_limit_bytes=self.capture_limit_bytes,
+                                  bridge_child=self.bridge_child)
+        # Share the active process registry so inherited cancel() still kills
+        # the actual child's process group, including during a config change.
+        child._lock = self._lock
+        child._processes = self._processes
+        return child.run(payload, timeout_seconds)
 
 
 def gemma_queue_caps_for(cfg: Any) -> QueueCaps:

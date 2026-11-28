@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     # The local backend (gemma_certified or the existing private worker) is
     # chosen exactly once, here, from the operator's own configuration file.
     # Nothing this server exposes to a caller can change it.
-    service = Service.for_config(cfg)
+    service = Service.for_config(cfg, config_path=args.config)
     router = StageRouter(cfg.capacity_db, harness_probe=(
         HarnessReadinessProbe.for_config(cfg) if cfg.execution_queue_root is not None else None))
     execution = None
