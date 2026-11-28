@@ -39,6 +39,28 @@ def main(argv: list[str] | None = None) -> int:
         time.sleep(float(_read(here, "sleep_seconds.txt", "5")))
     if mode == "unavailable":
         return 3
+    failures = {
+        "config-missing": "delegate: config not found: /synthetic/private/config.json\n",
+        "config-json": "delegate: config is not valid JSON (/synthetic/config.json): bad data\n",
+        "prompt-missing": "delegate: no prompt for task 'summarize': expected /synthetic/prompt.md\n",
+        "usage-error": "usage: /synthetic/delegate.py [-h]\n/synthetic/delegate.py: error: unrecognized arguments: --old-version\n",
+        "usage-die": "delegate: --task is required (or pass --show-routing)\n",
+        "import-error": "ModuleNotFoundError: No module named 'synthetic_private_module'\n",
+        "import-error-plain": "ImportError: cannot import name 'synthetic_private_name'\n",
+        "traceback": "Traceback (most recent call last):\n  File \"/synthetic/private/delegate.py\", line 1\nRuntimeError: synthetic setup failure\n",
+        "model-mismatch": "delegate: model digest does not match config.json\n",
+        "model-missing": "delegate: model is missing or has no unique digest\n",
+        "endpoint-unreachable": "delegate: could not reach the configured Ollama endpoint\n",
+        "input-invalid": "delegate: input must be valid UTF-8\n",
+    }
+    if mode in failures:
+        sys.stderr.write(failures[mode])
+        return 1
+    if mode in {"failure-unmatched", "failure-config-with-input"}:
+        prefix = (b"delegate: config not found: " if mode == "failure-config-with-input"
+                  else b"unrecognized failure: ")
+        sys.stderr.buffer.write(prefix + input_bytes + b"\n")
+        return 1
     if mode == "cert-refused":
         sys.stderr.write("delegate: task=extract source line Alpha invoice\n"
                          "delegate: route certification refused: matching_certificate_missing\n")

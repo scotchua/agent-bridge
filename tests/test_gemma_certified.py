@@ -694,10 +694,59 @@ class GemmaInvokeTests(unittest.TestCase):
             "extract_document_0_failed:gemma_certification_refused_matching_certificate_missing")
         self.assertNotIn("Alpha", str(caught.exception))
 
-    def test_unpatterned_certification_refusal_stays_generic(self):
+    def test_invalid_certification_configuration_has_fixed_config_code(self):
         self.mode("cert-refused-prose")
-        with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^gemma_delegate_unavailable$"):
+        with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^gemma_delegate_config_invalid$"):
             self.invoke()
+
+    def assert_delegate_failure(self, mode, code, text="synthetic setup input"):
+        self.mode(mode)
+        calls = self.fx["install"] / "calls.txt"
+        before = int(calls.read_text()) if calls.exists() else 0
+        with self.assertRaises(gemma_child.GemmaRefusal) as caught:
+            self.invoke(text)
+        self.assertEqual(str(caught.exception), code)
+        self.assertEqual(int(calls.read_text()), before + 1)
+
+    def test_delegate_config_invalid(self):
+        for mode in ("config-missing", "config-json", "prompt-missing"):
+            with self.subTest(mode=mode):
+                self.assert_delegate_failure(mode, "gemma_delegate_config_invalid")
+
+    def test_delegate_usage_error(self):
+        for mode in ("usage-error", "usage-die"):
+            with self.subTest(mode=mode):
+                self.assert_delegate_failure(mode, "gemma_delegate_usage_error")
+
+    def test_delegate_import_error(self):
+        for mode in ("import-error", "import-error-plain", "traceback"):
+            with self.subTest(mode=mode):
+                self.assert_delegate_failure(mode, "gemma_delegate_import_error")
+
+    def test_delegate_model_mismatch(self):
+        for mode in ("model-mismatch", "model-missing"):
+            with self.subTest(mode=mode):
+                self.assert_delegate_failure(mode, "gemma_delegate_model_mismatch")
+
+    def test_delegate_endpoint_unreachable(self):
+        self.assert_delegate_failure("endpoint-unreachable", "gemma_delegate_endpoint_unreachable")
+
+    def test_delegate_input_invalid(self):
+        self.assert_delegate_failure("input-invalid", "gemma_delegate_input_invalid")
+
+    def test_delegate_stderr_with_input_returns_only_fixed_code(self):
+        source = "[R42] Private invoice /synthetic/private/input.txt café"
+        for mode, code in (("failure-unmatched", "gemma_delegate_unavailable"),
+                           ("failure-config-with-input", "gemma_delegate_config_invalid")):
+            with self.subTest(mode=mode):
+                self.assert_delegate_failure(mode, code, source)
+        # Known fragments embedded in prose or indented source are not prefixes.
+        for source in ("\nquoted delegate: config not found: /synthetic/private",
+                       "\n  delegate: input must be valid UTF-8",
+                       "\nquoted ImportError: private input",
+                       "\nusage: private input", "\nerror: private input"):
+            with self.subTest(source=source):
+                self.assert_delegate_failure("failure-unmatched", "gemma_delegate_unavailable", source)
 
     def test_classify_preserves_unsure_and_blank_lines(self):
         result = self.invoke("a\n\nb", task_type="classify", params={})
@@ -961,6 +1010,35 @@ class QueueIntegrationTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "failed", terminal)
         self.assertIn("log_triage_output_invalid", terminal["error"])
         self.assertNotIn("Private second", terminal["error"])
+
+    def test_delegate_failure_codes_survive_queue_without_stderr_content(self):
+        from agent_bridge.localq.spool import failure_code
+
+        queue = self.queue()
+        source = "[R42] Private invoice /synthetic/private/input.txt café"
+        for mode, code in (
+                ("config-missing", "gemma_delegate_config_invalid"),
+                ("usage-error", "gemma_delegate_usage_error"),
+                ("import-error", "gemma_delegate_import_error"),
+                ("model-mismatch", "gemma_delegate_model_mismatch"),
+                ("endpoint-unreachable", "gemma_delegate_endpoint_unreachable"),
+                ("input-invalid", "gemma_delegate_input_invalid"),
+                ("failure-config-with-input", "gemma_delegate_config_invalid"),
+                ("failure-unmatched", "gemma_delegate_unavailable")):
+            with self.subTest(mode=mode):
+                (self.fx["install"] / "mode.txt").write_text(mode, encoding="utf-8")
+                queue.submit(task_type="summarize", input=source + mode, params={},
+                             priority="interactive", classification="synthetic",
+                             caller="codex", purpose="work")
+                terminal = queue.run_once("runner")
+                self.assertEqual(terminal["status"], "failed")
+                expected = "RuntimeError: child exited unsuccessfully: GemmaRefusal: " + code
+                self.assertEqual(terminal["error"], expected)
+                with queue._db() as db:
+                    stored = db.execute("SELECT error FROM jobs WHERE job_id=?",
+                                        (terminal["job_id"],)).fetchone()[0]
+                self.assertEqual(stored, expected)
+                self.assertEqual(failure_code(stored), code)
 
     @unittest.skipUnless(os.name == "posix", "process-group termination is POSIX-only")
     def test_outer_timeout_kills_adapter_and_delegate_group(self):
