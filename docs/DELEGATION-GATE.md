@@ -301,6 +301,16 @@ Mixed repository/task writes must also satisfy
 the repository receipts, and repositories inside the task tree keep their
 ordinary receipt checks. Protected-state checks run first in every case.
 
+One task-folder write has its own recognised form: the manifest-bound
+release installer. Only its exact canonical command is allowed, only for an
+operator-approved manifest pinned by digest under the protected state root,
+and only into the named existing task under that task's live claim and
+ledger owner. The protected-state, link, repository and ownership checks
+cover its whole write set (payloads, their temporaries, folders it may
+create, `task.json` and its temporary). Every other spelling of the
+installer is denied (`release_install_unresolved`). See
+[RELEASE-INSTALL.md](RELEASE-INSTALL.md).
+
 Stages therefore carry a generation (`implementation`, `implementation#2`), so
 a completed or superseded decision is history rather than a wall, and a stage
 the decider itself still held on a route the policy no longer chooses is

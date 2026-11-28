@@ -503,16 +503,20 @@ class HookProcessTests(GateCase):
         self.owned_now()
         config = self.write_config()
         command = gate.hook_command(str(ROOT), "claude", str(config)) + " --no-automatic-routing"
+        # The launcher's supported explicit setting names the interpreter
+        # running this test, so the fixture never depends on what PATH or a
+        # recorded launcher choice offers inside an isolated verifier.
+        env = {**os.environ, "AGENT_BRIDGE_PYTHON": sys.executable}
         denied = subprocess.run(command, shell=True, input=json.dumps({
             "tool_name": "Write", "tool_input": {"file_path": str(self.other / "b.py")},
-            "cwd": str(self.other)}).encode(), capture_output=True, timeout=60)
+            "cwd": str(self.other)}).encode(), capture_output=True, timeout=60, env=env)
         self.assertEqual(denied.returncode, 0, denied.stderr)
         out = json.loads(denied.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("[no_routing_receipt]", out["hookSpecificOutput"]["permissionDecisionReason"])
         allowed = subprocess.run(command, shell=True, input=json.dumps({
             "tool_name": "Write", "tool_input": {"file_path": str(self.repo / "b.py")},
-            "cwd": str(self.repo)}).encode(), capture_output=True, timeout=60)
+            "cwd": str(self.repo)}).encode(), capture_output=True, timeout=60, env=env)
         self.assertEqual(allowed.stdout.strip(), b"{}", allowed.stderr)
 
     def test_garbage_input_denies_rather_than_crashing(self):
