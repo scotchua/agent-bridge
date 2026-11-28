@@ -128,6 +128,33 @@ class LocalStatusTests(unittest.TestCase):
             else:
                 self.assertIn("extract\textract_json_invalid\t2", out.getvalue())
 
+    def test_delegate_setup_codes_are_reported_for_direct_and_nested_failures(self):
+        codes = ("gemma_delegate_config_invalid", "gemma_delegate_usage_error",
+                 "gemma_delegate_import_error", "gemma_delegate_model_mismatch",
+                 "gemma_delegate_endpoint_unreachable", "gemma_delegate_input_invalid")
+        prefix = "RuntimeError: child exited unsuccessfully: GemmaRefusal: "
+        for code in codes:
+            self.job(status="failed", task="summarize", error=prefix + code)
+            self.job(status="failed", task="extract",
+                     error=prefix + "extract_document_0_failed:" + code)
+            self.job(status="failed", task="classify", error=prefix + "classify_failed:" + code)
+        self.job(status="failed", error=prefix + codes[0] + " SECRET INPUT /private/path [R42]")
+        result = local_status.report(str(self.config), now=self.now)
+        rows = {(row["task_type"], row["error_code"]): row["count"]
+                for row in result["failed_jobs"]}
+        self.assertEqual(rows, {
+            **{(task, code): 1 for task in ("summarize", "extract", "classify") for code in codes},
+            ("summarize", "unknown_failure"): 1,
+        })
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(local_status.main(["--config", str(self.config)]), 0)
+        for code in codes:
+            self.assertIn(code, out.getvalue())
+        self.assertNotIn("SECRET", out.getvalue())
+        self.assertNotIn("/private/path", out.getvalue())
+        self.assertNotIn("[R42]", out.getvalue())
+
     def test_checkpoint_refusals_show_fixed_triage_reasons_without_contents(self):
         with contextlib.closing(sqlite3.connect(self.queue / "routing.sqlite3")) as db, db:
             db.execute("DELETE FROM checkpoints")

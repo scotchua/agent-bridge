@@ -139,6 +139,9 @@ _GEMMA_REFUSAL_REASONS = frozenset({
     "custom_instruction_unsupported", "delegate_source_changed",
     "receipt_validator_source_changed", "gemma_delegate_timeout",
     "gemma_delegate_unavailable", "gemma_delegate_output_overflow",
+    "gemma_delegate_config_invalid", "gemma_delegate_usage_error",
+    "gemma_delegate_import_error", "gemma_delegate_model_mismatch",
+    "gemma_delegate_endpoint_unreachable", "gemma_delegate_input_invalid",
     "classify_line_count_mismatch", "log_triage_output_invalid",
     "summary_empty_output",
 })

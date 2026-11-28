@@ -257,19 +257,66 @@ _CERTIFICATION_REFUSAL = re.compile(
 
 DELEGATE_STDERR_TAIL_BYTES = 4096
 
+# Literal prefixes from the installed delegate's die() messages. Keep this
+# vocabulary closed: suffixes can contain paths, identifiers or source text.
+_DELEGATE_FAILURE_PREFIXES = (
+    ("gemma_delegate_config_invalid", (
+        b"delegate: config not found:",
+        b"delegate: config is not valid JSON (",
+        b"delegate: no prompt for task ",
+        b"delegate: no model configured for task ",
+        b"delegate: model has no valid pinned digest in config.json",
+        b"delegate: route certification refused: invalid certification configuration",
+    )),
+    ("gemma_delegate_usage_error", (
+        b"delegate: --task is required (or pass --show-routing)",
+        b"delegate: --invocation-id must be 32 lowercase hex characters",
+        b"delegate: --chunk-chars must be at least 500",
+        b"delegate: preparation requires redact, both passes, schema, run scope and --known-identifiers",
+    )),
+    ("gemma_delegate_model_mismatch", (
+        b"delegate: model digest does not match config.json",
+        b"delegate: model is missing or has no unique digest",
+    )),
+    ("gemma_delegate_endpoint_unreachable", (
+        b"delegate: could not reach the configured Ollama endpoint",
+    )),
+    ("gemma_delegate_input_invalid", (
+        b"delegate: input must be valid UTF-8",
+        b"delegate: input file not found:",
+        b"delegate: no input: pass file paths or pipe text on stdin",
+        b"delegate: input was empty",
+        b"delegate: input file was empty:",
+    )),
+)
+
 
 def _delegate_refusal(tail: bytes) -> str | None:
-    """Return a content-free certification refusal code from a stderr tail.
+    """Return only a refusal code from the bounded, in-memory stderr tail.
 
-    The tail (at most DELEGATE_STDERR_TAIL_BYTES, held in memory only) is
-    scanned for one fixed delegate pattern with a short identifier. Only that
-    identifier is returned; all other stderr text is dropped, so source content
-    never reaches the queue. When several refusals appear, the last one wins.
+    Preserve certification identifiers and their last-match precedence. Other
+    failures match fixed line prefixes only and return literal codes; no
+    suffix or other source content can reach the queue.
     """
     matches = _CERTIFICATION_REFUSAL.findall(tail)
-    if not matches:
-        return None
-    return "gemma_certification_refused_" + matches[-1].decode("ascii")
+    if matches:
+        return "gemma_certification_refused_" + matches[-1].decode("ascii")
+    lines = tail.splitlines()
+    for line in reversed(lines):
+        for code, prefixes in _DELEGATE_FAILURE_PREFIXES:
+            if line.startswith(prefixes):
+                return code
+    # argparse includes the script name before "error:". Require both its
+    # usage header and an error line rather than matching arbitrary prose.
+    if (any(line.startswith(b"usage:") for line in lines)
+            and any(line.startswith(b"error:") or re.match(rb"^[^\r\n]+: error:", line)
+                    for line in lines)):
+        return "gemma_delegate_usage_error"
+    if any(line.startswith((b"Traceback (most recent call last):",
+                            b"ModuleNotFoundError:", b"ImportError:"))
+           for line in lines):
+        return "gemma_delegate_import_error"
+    return None
 
 
 def _invoke_validated(text: str, job_id: str, delegate_path: Path,
