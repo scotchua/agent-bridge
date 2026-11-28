@@ -140,6 +140,7 @@ _GEMMA_REFUSAL_REASONS = frozenset({
     "receipt_validator_source_changed", "gemma_delegate_timeout",
     "gemma_delegate_unavailable", "gemma_delegate_output_overflow",
     "classify_line_count_mismatch", "log_triage_output_invalid",
+    "summary_empty_output",
 })
 _GEMMA_RECEIPT_REASONS = frozenset({
     "receipt_validator_unloadable", "receipt_validator_contract_missing",
@@ -164,7 +165,7 @@ LOCAL_CHILD_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 def _fixed_child_detail(error: str, detail: str) -> bool:
     if detail in _CHILD_REASONS[error]:
         return True
-    match = re.fullmatch(r"extract_document_(\d+)_(invalid|oversize|deadline_exceeded|schema_invalid|value_absent)", detail)
+    match = re.fullmatch(r"extract_document_(\d+)_(invalid|oversize|deadline_exceeded|json_invalid|schema_invalid|value_absent)", detail)
     if match and error in {"ValueError", "GemmaRefusal"} and len(match[1]) <= 2 and int(match[1]) < 16:
         return True
     match = re.fullmatch(r"classify_line_(\d+)_invalid", detail)
@@ -198,6 +199,54 @@ def _failure_text(exc: BaseException) -> str:
     if type(exc) is RuntimeError and str(exc) in _RUNTIME_REASONS:
         return f"RuntimeError: {exc}"
     return name if name in _BACKEND_EXCEPTION_NAMES else "backend_failure"
+
+
+def failure_code(error: Any) -> str:
+    """Map stored failures to a closed vocabulary for content-free reports.
+
+    Old records can contain only an exception class. Do not infer a cause from
+    those, or expose arbitrary text (including certification identifiers).
+    Document/line positions are deliberately collapsed across jobs.
+    """
+    if not isinstance(error, str):
+        return "unknown_failure"
+    classes = _BACKEND_EXCEPTION_NAMES | frozenset(_CHILD_REASONS) | {"backend_failure"}
+    if error in classes:
+        return error
+    if error == "payload_unreadable":
+        return error
+    for reason in _RUNTIME_REASONS:
+        if error == "RuntimeError: " + reason:
+            return reason.replace(" ", "_")
+    prefix = "RuntimeError: child exited unsuccessfully"
+    if error == prefix:
+        return "child_failed"
+    for kind, reasons in _CHILD_REASONS.items():
+        if error == prefix + ": " + kind:
+            return kind
+        detail_prefix = prefix + ": " + kind + ": "
+        if not error.startswith(detail_prefix):
+            continue
+        detail = error[len(detail_prefix):]
+        if len(detail) > FAILURE_TEXT_LIMIT or not _fixed_child_detail(kind, detail):
+            return "unknown_failure"
+        if kind == "GemmaRefusal":
+            nested = re.fullmatch(r"(?:extract_document_\d+|classify)_failed:(.+)", detail)
+            if nested:
+                # Reuse the same fixed mapping for the underlying cause.
+                return next((code for child_kind in _CHILD_REASONS
+                             if (code := failure_code(prefix + ": " + child_kind + ": " + nested[1]))
+                             != "unknown_failure"), "unknown_failure")
+            if detail.startswith("gemma_certification_refused_"):
+                return "gemma_certification_refused"
+        if detail in reasons:
+            return detail.replace(" ", "_").replace(",", "").replace("-", "_")
+        match = re.fullmatch(r"extract_document_\d+_(invalid|oversize|deadline_exceeded|json_invalid|schema_invalid|value_absent)", detail)
+        if match:
+            return "extract_" + match[1]
+        if re.fullmatch(r"classify_line_\d+_invalid", detail):
+            return "classify_line_invalid"
+    return "unknown_failure"
 
 
 class FakeBackend:

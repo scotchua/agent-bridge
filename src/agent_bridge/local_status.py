@@ -14,13 +14,26 @@ from typing import Any
 
 from . import drift
 from .localq import quality
-from .localq.spool import COORDINATOR_CHORES, MECHANICAL_TASKS
-from .localq.intake import CHORE_WAIVER_REASONS
+from .localq.spool import COORDINATOR_CHORES, MECHANICAL_TASKS, failure_code
+from .localq.intake import CHORE_WAIVER_REASONS, CLOSED_REFUSAL_REASONS
 from .orchestration.config import load, OrchestrationConfigError
 
 
 def _connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def _checkpoint_refusals(db: sqlite3.Connection, start: float, now: float) -> list[dict[str, Any]]:
+    db.create_function("fixed_refusal_reason", 1,
+                       lambda reason: reason if reason in CLOSED_REFUSAL_REASONS else "unknown_refusal")
+    db.create_function("fixed_task_type", 1,
+                       lambda task: task if task in MECHANICAL_TASKS else "unknown")
+    return [{"caller": caller, "task_type": task, "reason": reason, "count": count}
+            for caller, task, reason, count in db.execute("""SELECT
+                CASE WHEN caller IN ('claude','codex') THEN caller ELSE 'unknown' END,
+                fixed_task_type(task_type), fixed_refusal_reason(reason), COUNT(*)
+                FROM checkpoints WHERE created_at >= ? AND created_at <= ? AND status='refused'
+                GROUP BY 1,2,3 ORDER BY 1,2,3""", (start, now))]
 
 
 def _inline_output_counts(state_root: Path, start: float, now: float) -> tuple[list[dict[str, Any]], int]:
@@ -129,9 +142,17 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
     jobs: Counter = Counter()
     split_jobs: Counter = Counter()
     feedback: dict[str, Counter] = defaultdict(Counter)
-    # Do not select content, blob paths, disposition, or error text. Only
-    # the fixed dependency class is derived inside SQLite.
+    # Do not select content, blob paths, disposition, or error text. Derive
+    # dependency classes and closed failure codes inside SQLite.
     with closing(_connect(cfg.local_queue_root / "localq.sqlite3")) as db:
+        db.create_function("local_failure_code", 1, failure_code)
+        db.create_function("fixed_task_type", 1,
+                           lambda task: task if task in MECHANICAL_TASKS else "unknown")
+        failures = [{"task_type": task, "error_code": code, "count": count}
+                    for task, code, count in db.execute("""SELECT fixed_task_type(task_type),
+                        local_failure_code(error), COUNT(*) FROM jobs
+                        WHERE submitted_at >= ? AND submitted_at <= ? AND status='failed'
+                        GROUP BY 1,2 ORDER BY 1,2""", (start, now))]
         rows = db.execute("""SELECT submitted_at, caller, purpose, task_type,
             CASE WHEN status='queued' AND error LIKE 'waiting_on_dependency:%'
                  THEN 'held waiting_on_dependency'
@@ -173,6 +194,7 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                            FROM checkpoints WHERE created_at >= ? AND created_at <= ?
                            GROUP BY caller, status ORDER BY caller, status""", (start, now))]
         chores = _chore_counts(db, start, now)
+        checkpoint_refusals = _checkpoint_refusals(db, start, now)
     feedback_rows = []
     for task, counts in sorted(feedback.items()):
         reviewed = sum(counts[key] for key in ("used", "reworked", "discarded"))
@@ -187,6 +209,7 @@ def report(config_path: str, days: int = 7, *, now: float | None = None) -> dict
                       "outcome": outcome, "count": count}
                      for (day, caller, purpose, outcome), count in sorted(jobs.items())],
             "feedback": feedback_rows, "checkpoints": checkpoints,
+            "failed_jobs": failures, "checkpoint_refusals": checkpoint_refusals,
             "quality_backend_id": cfg.local_backend, "quality_window_days": 14,
             "quality": [{"task_type": task, **row} for task, row in quality_rows.items()],
             "disabled_for_quality": sorted(disabled),
@@ -288,4 +311,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Unaccounted chores (pending or skipped): " +
               (str(sum(row["count"] for row in split["unaccounted_chores"]))
                if split["chore_accounting_available"] else "accounting unavailable"))
+    if not args.json:
+        print("Failed jobs by task type and fixed error code (submission window):")
+        for row in result["failed_jobs"]:
+            print("{task_type}\t{error_code}\t{count}".format(**row))
+        print("Refused checkpoints by caller, task type and fixed reason:")
+        for row in result["checkpoint_refusals"]:
+            print("{caller}\t{task_type}\t{reason}\t{count}".format(**row))
     return 0

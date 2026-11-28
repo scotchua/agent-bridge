@@ -45,8 +45,8 @@ class LocalStatusTests(unittest.TestCase):
                 task_type TEXT, status TEXT, feedback_json TEXT, error TEXT,
                 input_blob TEXT, result_blob TEXT, params_json TEXT)""")
         with contextlib.closing(sqlite3.connect(self.queue / "routing.sqlite3")) as db, db:
-            db.execute("CREATE TABLE checkpoints (created_at REAL, caller TEXT, status TEXT)")
-            db.executemany("INSERT INTO checkpoints VALUES (?,?,?)", [
+            db.execute("CREATE TABLE checkpoints (created_at REAL, caller TEXT, status TEXT, task_type TEXT, reason TEXT)")
+            db.executemany("INSERT INTO checkpoints (created_at,caller,status) VALUES (?,?,?)", [
                 (self.now, "claude", "eligible"), (self.now, "claude", "eligible"),
                 (self.now, "codex", "refused"), (self.start - 1, "codex", "eligible")])
 
@@ -83,6 +83,76 @@ class LocalStatusTests(unittest.TestCase):
             {"caller": "claude", "status": "eligible", "count": 2},
             {"caller": "codex", "status": "refused", "count": 1}])
         self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_failures_have_closed_codes_grouped_by_type_and_window(self):
+        prefix = "RuntimeError: child exited unsuccessfully: "
+        for detail in ("extract_document_0_json_invalid", "extract_document_15_json_invalid"):
+            self.job(status="failed", task="extract", error=prefix + "GemmaRefusal: " + detail)
+        for task, error in (
+            ("summarize", prefix + "GemmaRefusal: gemma_delegate_timeout"),
+            ("summarize", prefix + "GemmaRefusal: summary_empty_output"),
+            ("extract", prefix + "GemmaRefusal: extract_document_2_failed:receipt_invalid"),
+            ("extract", prefix + "GemmaRefusal: extract_document_0_failed:gemma_certification_refused_matching_certificate_missing"),
+            ("extract", prefix + "GemmaRefusal: gemma_certification_refused_private_source_text"),
+            ("extract", "GemmaRefusal: SECRET INPUT"),
+            ("summarize", "JSONDecodeError"),
+            ("classify", prefix + "GemmaRefusal: classify_line_22_invalid"),
+            ("SECRET TYPE", "SECRET ERROR"),
+        ):
+            self.job(status="failed", task=task, error=error)
+        self.job(status="failed", error="SECRET", at=self.start - 1)
+        self.job(status="failed", error="SECRET", at=self.now + 1)
+        self.job(status="complete", error="SECRET")
+        result = local_status.report(str(self.config), now=self.now)
+        rows = {(row["task_type"], row["error_code"]): row["count"] for row in result["failed_jobs"]}
+        self.assertEqual(rows, {
+            ("extract", "extract_json_invalid"): 2,
+            ("summarize", "gemma_delegate_timeout"): 1,
+            ("summarize", "summary_empty_output"): 1,
+            ("extract", "receipt_invalid"): 1,
+            ("extract", "gemma_certification_refused"): 2,
+            ("extract", "unknown_failure"): 1,
+            ("summarize", "JSONDecodeError"): 1,
+            ("classify", "classify_line_invalid"): 1,
+            ("unknown", "unknown_failure"): 1,
+        })
+        self.assertNotIn("SECRET", json.dumps(result["failed_jobs"]))
+        self.assertNotIn("private_source_text", json.dumps(result))
+        for flags in ([], ["--work-split"], ["--json"]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(local_status.main(["--config", str(self.config), *flags]), 0)
+            self.assertNotIn("SECRET ERROR", out.getvalue())
+            if flags == ["--json"]:
+                self.assertEqual(json.loads(out.getvalue())["failed_jobs"], result["failed_jobs"])
+            else:
+                self.assertIn("extract\textract_json_invalid\t2", out.getvalue())
+
+    def test_checkpoint_refusals_show_fixed_triage_reasons_without_contents(self):
+        with contextlib.closing(sqlite3.connect(self.queue / "routing.sqlite3")) as db, db:
+            db.execute("DELETE FROM checkpoints")
+            db.executemany("INSERT INTO checkpoints VALUES (?,?,?,?,?)", [
+                (self.now, "claude", "refused", "log_triage", "unsupported_kind"),
+                (self.now, "claude", "refused", "log_triage", "unsupported_kind"),
+                (self.now, "codex", "refused", "log_triage", "quality_disabled"),
+                (self.now, "codex", "refused", "log_triage", "SECRET REASON"),
+                (self.now, "codex", "eligible", "summarize", "eligible_mechanical_work"),
+                (self.start - 1, "codex", "refused", "log_triage", "classification_refused"),
+                (self.now + 1, "codex", "refused", "log_triage", "classification_refused"),
+            ])
+        result = local_status.report(str(self.config), now=self.now)
+        self.assertEqual(result["checkpoint_refusals"], [
+            {"caller": "claude", "task_type": "log_triage", "reason": "unsupported_kind", "count": 2},
+            {"caller": "codex", "task_type": "log_triage", "reason": "quality_disabled", "count": 1},
+            {"caller": "codex", "task_type": "log_triage", "reason": "unknown_refusal", "count": 1},
+        ])
+        self.assertNotIn("SECRET", json.dumps(result))
+        for flags in ([], ["--work-split"]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(local_status.main(["--config", str(self.config), *flags]), 0)
+            self.assertIn("claude\tlog_triage\tunsupported_kind\t2", out.getvalue())
+            self.assertNotIn("SECRET", out.getvalue())
 
     def test_cli_registration_json_text_and_readonly(self):
         self.job(status="queued", error="waiting_on_dependency:ollama SECRET")

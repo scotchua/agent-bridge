@@ -234,6 +234,8 @@ class LocalQueueTests(unittest.TestCase):
         for error, detail in (("RuntimeError", "private worker rejected request"),
                               ("GemmaReceiptError", "receipt_model_digest_mismatch"),
                               ("GemmaRefusal", "extract_document_1_failed:receipt_invalid"),
+                              ("GemmaRefusal", "extract_document_1_json_invalid"),
+                              ("GemmaRefusal", "summary_empty_output"),
                               ("GemmaRefusal", "classify_line_1_invalid")):
             with self.subTest(detail=detail):
                 response = json.dumps({"ok": False, "error": error, "error_detail": detail})

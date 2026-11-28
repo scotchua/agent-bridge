@@ -412,6 +412,112 @@ class GemmaInvokeTests(unittest.TestCase):
         (self.fx["install"] / "receipt_override.json").write_text(
             json.dumps(value), encoding="utf-8")
 
+    def output_sequence(self, *outputs):
+        (self.fx["install"] / "output_sequence.json").write_text(json.dumps(outputs), encoding="utf-8")
+
+    def extract_json(self, *, party="Alpha"):
+        record = dict.fromkeys(gemma_child.EXTRACT_FIELDS)
+        record["party"] = party
+        return json.dumps([record])
+
+    def test_fenced_extract_is_receipt_validated_before_repair(self):
+        raw = "```json\n" + self.extract_json() + "\n```\n"
+        self.output_sequence(raw)
+        result = self.invoke("manifest", task_type="extract",
+                             params={"documents": [{"id": "one", "text": "Alpha invoice"}]})
+        doc = result["output"]["documents"][0]
+        self.assertEqual(doc["records"][0]["fields"]["party"],
+                         {"value": "Alpha", "spans": [[0, 5]], "ambiguous": False})
+        receipt = json.loads((self.fx["receipts"] / f"local-delegate-{doc['invocation_id']}.json").read_text())
+        self.assertEqual(receipt["output_sha256"], hashlib.sha256(raw.encode()).hexdigest())
+        self.assertEqual((self.fx["install"] / "calls.txt").read_text(), "1")
+
+    def test_extract_retries_invalid_draft_once_with_exact_source_and_options(self):
+        for invalid in ("not JSON", "{}", self.extract_json(party="Invented")):
+            with self.subTest(invalid=invalid):
+                (self.fx["install"] / "calls.txt").unlink(missing_ok=True)
+                self.output_sequence(invalid, self.extract_json())
+                with mock.patch.object(gemma_child, "_invoke_validated",
+                                       wraps=gemma_child._invoke_validated) as calls:
+                    result = self.invoke("manifest", task_type="extract",
+                        params={"documents": [{"id": "one", "text": "Alpha invoice"}]})
+                self.assertEqual(calls.call_count, 2)
+                first, second = calls.call_args_list
+                self.assertEqual(first.args, second.args)
+                self.assertEqual(first.args[0], "Alpha invoice")
+                self.assertLessEqual(second.kwargs["capture_timeout"], first.kwargs["capture_timeout"])
+                self.assertEqual(result["output"]["documents"][0]["record_status"], "ok")
+
+    def test_extract_does_not_salvage_prose_truncation_or_invalid_fields(self):
+        valid = self.extract_json()
+        cases = [("Here are records:\n" + valid, "json_invalid"),
+                 (valid[:-1], "json_invalid"),
+                 ("```json\n" + valid + "\n```\nextra", "json_invalid"),
+                 ('[{"party":"Alpha"}]', "schema_invalid"),
+                 (self.extract_json(party="Absent"), "value_absent")]
+        for output, reason in cases:
+            with self.subTest(reason=reason, output=output):
+                (self.fx["install"] / "calls.txt").unlink(missing_ok=True)
+                self.output_sequence(output)
+                with self.assertRaisesRegex(gemma_child.GemmaRefusal, f"^extract_document_0_{reason}$"):
+                    self.invoke("manifest", task_type="extract",
+                        params={"documents": [{"id": "one", "text": "Alpha invoice"}]})
+                self.assertEqual((self.fx["install"] / "calls.txt").read_text(), "2")
+
+    def test_extract_retry_preserves_document_association_without_repeating_completed_document(self):
+        self.output_sequence(self.extract_json(), "bad JSON", self.extract_json(party="Beta"))
+        documents = [{"id": "first", "text": "Alpha invoice"},
+                     {"id": "second", "text": "Beta invoice"}]
+        with mock.patch.object(gemma_child, "_invoke_validated",
+                               wraps=gemma_child._invoke_validated) as calls:
+            result = self.invoke("manifest", task_type="extract", params={"documents": documents})
+        self.assertEqual([call.args[0] for call in calls.call_args_list],
+                         ["Alpha invoice", "Beta invoice", "Beta invoice"])
+        self.assertEqual([call.args[1] for call in calls.call_args_list], ["job-1:0", "job-1:1", "job-1:1"])
+        self.assertEqual([doc["id"] for doc in result["output"]["documents"]], ["first", "second"])
+        self.assertEqual([doc["records"][0]["fields"]["party"]["value"]
+                          for doc in result["output"]["documents"]], ["Alpha", "Beta"])
+
+    def test_extract_receipt_failure_is_not_repaired_or_retried(self):
+        self.output_sequence("```json\n" + self.extract_json() + "\n```")
+        self.override({"output_sha256": "0" * 64})
+        with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^extract_document_0_failed:receipt_invalid$"):
+            self.invoke("manifest", task_type="extract",
+                        params={"documents": [{"id": "one", "text": "Alpha invoice"}]})
+        self.assertEqual((self.fx["install"] / "calls.txt").read_text(), "1")
+
+    def test_blank_summary_retries_once_and_returns_second_bound_draft(self):
+        self.output_sequence(" \n", "Alpha completed the chore.")
+        with mock.patch.object(gemma_child, "_invoke_validated",
+                               wraps=gemma_child._invoke_validated) as calls:
+            result = self.invoke("Alpha source\n")
+        first, second = calls.call_args_list
+        self.assertEqual(first.args, second.args)
+        self.assertEqual(first.args[0], "Alpha source\n")
+        self.assertLessEqual(second.kwargs["capture_timeout"], first.kwargs["capture_timeout"])
+        self.assertEqual(result["output"]["text"], "Alpha completed the chore.")
+        self.assertEqual(len(list(self.fx["receipts"].glob("local-delegate-*.json"))), 2)
+        receipt = json.loads((self.fx["receipts"] / f"local-delegate-{result['invocation_id']}.json").read_text())
+        self.assertEqual(result["output_sha256"], receipt["output_sha256"])
+
+    def test_blank_summary_cannot_be_a_successful_draft(self):
+        self.output_sequence("\n\t ")
+        with self.assertRaisesRegex(gemma_child.GemmaRefusal, "^summary_empty_output$"):
+            self.invoke()
+        self.assertEqual((self.fx["install"] / "calls.txt").read_text(), "2")
+
+    def test_output_retry_never_restarts_original_deadline(self):
+        for task in ("summarize", "extract"):
+            with self.subTest(task=task):
+                reason = "gemma_delegate_timeout" if task == "summarize" else "extract_document_0_deadline_exceeded"
+                draft = {"output": {"text": " " if task == "summarize" else "bad JSON"}}
+                with mock.patch.object(gemma_child.time, "monotonic", side_effect=[0, 0, 5]), \
+                     mock.patch.object(gemma_child, "_invoke_validated", return_value=draft) as calls, \
+                     self.assertRaisesRegex(gemma_child.GemmaRefusal, f"^{reason}$"):
+                    self.invoke(task_type=task, params={"documents": [{"id": "one", "text": "Alpha"}]}
+                                if task == "extract" else {})
+                self.assertEqual(calls.call_count, 1)
+
     def test_raw_stdin_plain_stdout_and_full_bindings(self):
         text = "raw café → 世界\n"
         result = self.invoke(text)
